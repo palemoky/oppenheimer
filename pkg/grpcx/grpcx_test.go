@@ -2,6 +2,8 @@ package grpcx
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -27,6 +29,10 @@ func (p *probe) List(ctx context.Context, _ *healthpb.HealthListRequest) (*healt
 
 func (p *probe) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
 	switch req.GetService() {
+	case "raw":
+		return nil, fmt.Errorf("query: %w", errors.New("Error 1064: SELECT secret FROM t"))
+	case "canceled":
+		return nil, fmt.Errorf("query: %w", context.Canceled)
 	case "panic":
 		panic("secret internal detail")
 	case "slow":
@@ -109,6 +115,19 @@ func TestPanicBecomesInternalWithoutLeakingDetails(t *testing.T) {
 	// 服务端在 panic 之后仍然可用。
 	if err := check(t.Context(), conn, "ok"); err != nil {
 		t.Errorf("call after panic: %v", err)
+	}
+}
+
+func TestPlainErrorsAreSanitized(t *testing.T) {
+	conn, _, _ := startServer(t)
+
+	st := status.Convert(check(t.Context(), conn, "raw"))
+	if st.Code() != codes.Internal || st.Message() != "internal error" {
+		t.Errorf("plain error reached the client as %v %q, want Internal \"internal error\"", st.Code(), st.Message())
+	}
+
+	if code := status.Code(check(t.Context(), conn, "canceled")); code != codes.Canceled {
+		t.Errorf("wrapped context.Canceled = %v, want Canceled", code)
 	}
 }
 

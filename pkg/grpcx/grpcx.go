@@ -42,6 +42,7 @@ func Listen(ctx context.Context, logger *slog.Logger, name, addr string, registe
 	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(
 		// 顺序：日志在最外层，能记录到 recover 转换后的错误。
 		loggingInterceptor(logger),
+		sanitizeInterceptor(logger),
 		recoveryInterceptor(logger),
 	))
 	hs := health.NewServer()
@@ -96,6 +97,31 @@ func recoveryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 			}
 		}()
 		return handler(ctx, req)
+	}
+}
+
+// sanitizeInterceptor 保证返回给调用方的都是 gRPC 状态错误。
+//
+// handler 直接返回普通 error（例如包装过的数据库错误）时，gRPC 会把它作为 Unknown
+// 连同完整消息发给调用方，SQL 和内部细节就泄露出去了。这里统一兜底：
+// 细节只进日志，对外是不含内部信息的 Internal。
+func sanitizeInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		resp, err := handler(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		if _, ok := status.FromError(err); ok {
+			return resp, err
+		}
+		switch {
+		case errors.Is(err, context.Canceled):
+			return nil, status.Error(codes.Canceled, "request canceled")
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
+		}
+		logger.ErrorContext(ctx, "unhandled error in grpc handler", "method", info.FullMethod, "error", err.Error())
+		return nil, status.Error(codes.Internal, "internal error")
 	}
 }
 

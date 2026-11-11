@@ -88,7 +88,7 @@ services/<svc>/
 - 金额是 `int64` 的分。做乘法和求和时检查溢出。
 - 事务里只有数据库操作，不发 RPC。
 - 下游返回的业务错误（带原因码的）原样透传给上游；其他错误包装后返回，由 `grpcx` 记录。
-- 不属于业务错误的内部错误，返回 `codes.Internal`，消息里不带 SQL 或内部细节。
+- 不属于业务错误的内部错误，返回 `codes.Internal`，消息里不带 SQL 或内部细节。`grpcx` 的服务端拦截器会兜底：handler 返回的普通 error 一律记日志后转成 `Internal`。
 - 入参校验失败返回 `INVALID_ARGUMENT`。
 - 使用新版 Go 特性（`wg.Go`、`errors.AsType`、`for range n`、`slices`、`maps`、`t.Context()`、`testing/synctest` 等），lint 的 `modernize` 会检查。
 - 时间一律 UTC。需要“当前时间”的地方通过可注入的时钟取得，便于测试。
@@ -143,15 +143,28 @@ services/<svc>/
 
 一个事务内：
 
-1. `INSERT INTO reservation (order_id, status) VALUES (?, RELEASED)`。
-   - 插入成功：说明 Release 先于 Reserve 到达（或 Reserve 从未成功）。这一行就是“已释放”的标记，直接成功。
-   - 唯一键冲突：`SELECT status ... FOR UPDATE`
+1. `INSERT INTO reservation (order_id, status) VALUES (?, RELEASED) ON DUPLICATE KEY UPDATE status = status`，以受影响行数区分是否新插入。
+   - 新插入（1 行）：说明 Release 先于 Reserve 到达（或 Reserve 从未成功）。这一行就是“已释放”的标记，直接成功。
+   - 已存在（0 行）：此时已持有该行的排他锁，`SELECT status ... FOR UPDATE`
      - `RELEASED` → 成功（幂等）
      - `CONFIRMED` → `FAILED_PRECONDITION / RESERVATION_CONFIRMED`
      - `RESERVED` → 改为 `RELEASED`，按 `sku_id` 升序逐项
        `UPDATE sku_stock SET reserved = reserved - ?, available = available + ? WHERE sku_id = ? AND reserved >= ?`，每条必须恰好影响 1 行。
 
-要点：订单服务在 Reserve 超时后不知道预占是否成功，只能调 Release 兜底。这时 Release 可能先于仍在网络上的 Reserve 到达。如果 Release 对“不存在的预占”什么都不做，迟到的 Reserve 就会占住一份再也没人释放的库存（**悬挂**）。所以 Release 要留下标记（**空回滚**），让迟到的 Reserve 被第 1 步拒绝。这是 TCC 模式里的经典问题。
+要点：
+
+- **第 1 步不能用普通 `INSERT`**（本文最初的设计就是这样写的，在并发测试中稳定死锁）。普通 `INSERT` 撞上唯一键时，InnoDB 只给已有记录加**共享锁**；随后的 `FOR UPDATE` 要把它升级为排他锁。两个并发的 Release（或 Release 与 Confirm）都持有共享锁、又都等对方放锁，就死锁了。`ON DUPLICATE KEY UPDATE` 在冲突时直接加排他锁，并发请求在这里排队。
+- Reserve 的重复请求只读不改，所以它在唯一键冲突后用 `FOR SHARE` 读状态，多个重复请求可以同时持有共享锁，不存在升级。
+
+订单服务在 Reserve 超时后不知道预占是否成功，只能调 Release 兜底。这时 Release 可能先于仍在网络上的 Reserve 到达。如果 Release 对“不存在的预占”什么都不做，迟到的 Reserve 就会占住一份再也没人释放的库存（**悬挂**）。所以 Release 要留下标记（**空回滚**），让迟到的 Reserve 被第 1 步拒绝。这是 TCC 模式里的经典问题。
+
+### 死锁重试
+
+三个操作的事务遇到死锁（MySQL 错误 1213）时整体重试，最多 5 次，带随机抖动的指数退避。
+
+排序加锁和上面的锁选择消除了绝大多数死锁，但还剩一种在应用层无法排除：同一订单的多个重复 Reserve 同时到达，第一个因库存不足而回滚，排队等它的几个事务在记录消失后都继承了同一个间隙锁，又都要插入，彼此的插入意向锁与对方的间隙锁冲突。三个操作都幂等，被选为牺牲者的事务整个重来是安全的。
+
+测试中把重试次数调为 1 来证明其余场景**根本不会**死锁，而不是靠重试掩盖。
 
 ### GetStock
 
