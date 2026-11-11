@@ -33,6 +33,8 @@
 | pressly/goose | v3.30.0 | 稳定版 | 2026-11-11 | 数据库迁移，作为库嵌入各服务 |
 | gin | v1.12.0 | 稳定版 | 2026-11-11 | 仅 gateway 使用 |
 | oapi-codegen | v2.8.2 | 稳定版 | 2026-11-11 | 由 OpenAPI 规范生成 gateway 的类型和服务端接口；版本写在 `Makefile` 里，CI 通过 `make openapi-tools` 安装同一版本 |
+| twmb/franz-go | v1.22.3 | 稳定版 | 2026-11-11 | Kafka 客户端，见 ADR-0007；管理接口 `pkg/kadm` v1.20.0 |
+| redis/go-redis | v9.23.0 | 稳定版 | 2026-11-11 | Redis 客户端，见 ADR-0007 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
 ## 待引入（引入时查证并移到上表）

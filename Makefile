@@ -21,6 +21,12 @@ MYSQL_ROOT_PASSWORD ?= oppenheimer
 MYSQL_PORT          ?= 3306
 export OPPENHEIMER_TEST_MYSQL_DSN ?= root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:$(MYSQL_PORT))/
 
+# 集成测试连接的 Redis 和 Kafka，同样是 make up 启动的。测试各自用随机前缀和临时 topic 隔离。
+REDIS_PORT ?= 6379
+KAFKA_PORT ?= 9092
+export OPPENHEIMER_TEST_REDIS_ADDR    ?= 127.0.0.1:$(REDIS_PORT)
+export OPPENHEIMER_TEST_KAFKA_BROKERS ?= 127.0.0.1:$(KAFKA_PORT)
+
 .PHONY: help
 help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -68,8 +74,8 @@ test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
 
 .PHONY: test-unit
-test-unit: ## 只运行不依赖 MySQL 的测试
-	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= go test -race ./...) || exit 1; done
+test-unit: ## 只运行不依赖 MySQL、Redis、Kafka 的测试
+	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
 
 .PHONY: build
 build: ## 编译所有模块，并把各服务的二进制输出到 ./bin

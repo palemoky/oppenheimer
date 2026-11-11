@@ -70,22 +70,52 @@
 
 把同步的数据库直写改造成能扛峰值的链路。
 
-- [ ] Redis 库存预扣：Lua 脚本原子扣减，含用户限购
-- [ ] 库存预热与 Redis–MySQL 库存同步策略
-- [ ] 异步下单：网关受理 → Kafka → order 消费落库，客户端轮询结果
-- [ ] 本地消息表（outbox）：订单落库与事件发布在同一事务，由中继进程投递 Kafka
-- [ ] 消费端幂等：去重表或业务唯一键，按至少一次投递设计
-- [ ] Saga 补偿：下单失败或取消时回补 Redis 与 MySQL 库存（MySQL 侧的 Release、空回滚与防悬挂 1a 已实现，这里扩展到 Redis）
-- [ ] 把 1a 里三处重复的死锁重试、后台任务循环收敛到 `pkg/`（inventory 的事务重试、order 的 sweeper、payment 的 processor）
-- [ ] 超时未支付关单：延迟消息方案（Kafka 没有原生延迟，对比时间轮、Redis ZSET、分级延迟 topic 后选一种）
-- [ ] 支付成功与超时关单的并发冲突：1a 已用条件更新加退款答复实现，这里在引入 Kafka 后复核消息乱序和延迟下是否仍然成立
-- [ ] 分布式锁（`pkg/lock`）：Redis 实现，`SET NX PX` 加锁、Lua 校验持有者后解锁、看门狗续期
-  - 使用场景：缓存击穿时的重建互斥、同一用户的重复下单拦截、定时任务（outbox 中继、关单扫描、对账）的单实例执行
+设计规格见 [design/1b-high-concurrency.md](../design/1b-high-concurrency.md)。分四步，每一步结束时系统都能运行，`make lint test e2e` 通过。开发分支 `phase-1b`。
+
+### 步骤一：公共库
+
+基础（主会话串行完成）：
+
+- [x] 设计文档、ADR-0007（客户端选型）、ADR-0008（outbox 与事件）
+- [x] 事件契约 `api/proto/oppenheimer/event/v1/events.proto`
+- [x] 引入依赖；`pkg/redisx`、`pkg/testredis`；`pkg/kafkax` 的 `NewClient` 和 `EnsureTopics`
+- [x] `make test` 导出 Redis 和 Kafka 的测试地址
+
+公共库（派给子 Agent 并行实现，互不依赖，主会话评审后合并）：
+
+- [ ] `pkg/retry`、`pkg/worker`：重试与退避、周期任务（Sonnet）
+- [ ] `pkg/kafkax` 的生产者、消费者、延迟消费者，`pkg/testkafka`（Opus）
+- [ ] `pkg/lock`：加锁、Lua 解锁、看门狗续期、fencing token，含两个锁失效实验（Opus）
+- [ ] `pkg/outbox`：`Add` 与中继（Opus 实现，主会话逐行评审；依赖 `kafkax` 的生产者接口和 `worker`，在前两项合并后做）
+
+### 步骤二：事件化（outbox 加 Kafka 替换同步调用与轮询）
+
+- [ ] `order.proto` 删除 `HandlePaymentResult`；各服务迁移 `00002`（主会话串行）
+- [ ] order：状态转换写事件、消费 `payment.events`、删除结清逻辑（Fable 编写或逐行评审）
+- [ ] payment：出结果写事件、消费 `order.events` 的答复、删除回调轮询
+- [ ] inventory：消费 `order.events` 做 Confirm、Release
+- [ ] 三处重复的死锁重试、后台循环换成 `pkg/retry`、`pkg/worker`
+- [ ] 本机脚本、CI 接入 Kafka；端到端 7 个场景不改断言通过
+- [ ] 复核支付成功与超时关单的并发冲突在消息重复、延迟、乱序下仍然成立，结论写入设计文档
+
+消费端幂等一律用业务唯一键，不建去重表，理由见 ADR-0008。
+
+### 步骤三：削峰（动工前先细化设计文档第 6 节）
+
+- [ ] Redis 库存预扣：Lua 脚本原子扣减，含用户限购、占用记录
+- [ ] 库存预热与 Redis–MySQL 库存同步、对账
+- [ ] 异步下单：网关受理 → Kafka → order 消费落库，客户端轮询结果；先改 OpenAPI 规范
+- [ ] Saga 补偿扩展到 Redis：订单失败、取消、关闭时归还 Redis 占用
+- [ ] 超时未支付关单：延迟消息方案，对比时间轮、Redis ZSET、分级延迟 topic 后写 ADR
+
+### 步骤四：加固（动工前先细化设计文档第 7 节）
+
+- [ ] 分布式锁的使用：outbox 中继、sweeper 单实例运行；缓存重建互斥
   - 不用在库存扣减主链路上：那里用 Lua 原子操作和条件更新，比加锁更快也更安全，写清楚为什么
-  - 锁失效场景的实验：持锁进程卡顿超过过期时间、Redis 主从切换丢锁；用 fencing token 兜底
   - 对比 etcd 锁与 Redlock 的争议，写入面试考点
 - [ ] 缓存问题：穿透、击穿、雪崩各做一次针对性处理
 - [ ] 一致性测试升级：压测中途随机杀进程，恢复后对账零差异
+- [ ] 把 1b 的面试考点整理到 `docs/notes/1b-*.md`
 
 **验收**：本机压测下单接口吞吐相对 1a 有数量级提升；杀进程测试后订单、库存、支付三方对得上。
 
