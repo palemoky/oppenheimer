@@ -4,34 +4,28 @@
 
 ## 当前状态
 
-- **当前阶段**：1b（高并发改造），进行到步骤一（公共库）
-- **当前分支**：`phase-1b`（本地，有提交，**未推送**）
+- **当前阶段**：1b（高并发改造），步骤一、二已完成，下一步是步骤三（削峰）
+- **当前分支**：`phase-1b`（本地，有提交，**未推送**；工作区还有未提交的改动，见下）
 - **最后更新**：2026-11-11
 
 ## 上次做到哪
 
-1b 进行中，分四步（见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 和 [design/1b-high-concurrency.md](design/1b-high-concurrency.md)）。
+1b 分四步（见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 和 [design/1b-high-concurrency.md](design/1b-high-concurrency.md)）。
 
-**步骤一（公共库）已完成并提交在本地 `phase-1b`**，只差 outbox 的测试：
+**步骤一（公共库）、步骤二（事件化）都已完成**，本机 `make lint test e2e` 全部通过，端到端 7 个场景断言未改。
 
-- `pkg/retry`、`pkg/worker`、`pkg/kafkax`（生产者、消费者、延迟消费者）、`pkg/testkafka`、`pkg/lock`、`pkg/redisx`、`pkg/testredis`：子 Agent 实现，主会话评审后合入，`pkg` 模块 lint 和测试通过。
-- `pkg/outbox`：主会话编写，**还没有测试**。
-- 事件契约 `api/proto/oppenheimer/event/v1/events.proto`、辅助包 `api/eventx`、ADR-0007、ADR-0008。
-
-**步骤二（事件化）刚开始就暂停了**（主人的 token 限额将尽）：
-
-- 已做：`order.proto` 删除了 `HandlePaymentResult`；`scripts/run-local.sh`、`scripts/e2e.sh`、CI 已接入 Kafka 和 Redis。
-- **当前 `services/order` 和 `services/payment` 编译不过**，这是预期的中间状态：它们还在引用已删除的 RPC，要等事件化改造完成。`make lint test e2e` 现在跑不通。
-- 第二批四个子 Agent（order、payment、inventory 的事件化改造，outbox 测试）派出后立即被停止，没有产出任何改动，worktree 已清理。
+- 四个子 Agent 的提交已 cherry-pick 到 `phase-1b`：outbox 测试、inventory、payment、order 的事件化改造。三个服务的 diff 由主会话逐行评审，worktree 和分支都已清理。
+- 评审结论和仍然存在的缺口写在设计文档第 5.6 节；实现与原设计不一致的地方已经改回设计文档（5.1、5.2）。
+- **工作区有未提交的改动**（主会话所做，等主人说提交）：
+  - `pkg/outbox/outbox.go` 和测试：修了测试发现的两处缺陷（`Add` 不接受 nil 的 key 或消息体；`Flush` 在 Sender 只通过 errs 报失败时返回成功）。
+  - `scripts/e2e.sh`：删掉已无人读取的 `SETTLE_GRACE`。
+  - `docs/`：设计文档、阶段计划、本文件。
 
 ## 下一步
 
-1. 重新派出第二批四个子 Agent（worktree 并行，基于 `phase-1b`）：
-   - order、payment、inventory 各一个（Opus）：规格是设计文档第 5 节的 5.1、5.2、5.3 加“通用要求”。每个 Agent 只能改自己的 `services/<svc>/`，各自添加迁移 `00002`，在 `main.go` 里装配 Kafka 生产者、outbox 中继、消费者。要求它们报告与设计不一致之处和怀疑的一致性窗口。
-   - outbox 测试一个（Sonnet）：只写 `pkg/outbox/*_test.go`，重点是“id 小的事务后提交时不丢消息”“队首失败不饿死后面”“发送成功但标记前崩溃会重发”。
-2. 主会话逐行评审三个服务的 diff（都涉及资金、库存、订单状态），cherry-pick 合入，跑 `make lint test e2e`。端到端 7 个场景不改断言必须通过。
-3. 复核支付成功与超时关单的并发在消息重复、延迟、乱序下仍然成立，结论写入设计文档；勾选计划；CI 改动还没在 GitHub 上跑过，推送后重点看 test 和 e2e 任务（改成了用 `make up` 启动依赖）。
-4. 之后是步骤三（Redis 预扣、异步下单、延迟关单）和步骤四，动工前先细化设计文档第 6、7 节。
+1. 主人确认后提交工作区的改动，推送 `phase-1b`。CI 的改动（test 和 e2e 任务改成用 `make up` 启动依赖）**还没在 GitHub 上跑过**，推送后重点看这两个任务。
+2. 步骤三（Redis 预扣、异步下单、延迟关单）动工前先细化设计文档第 6 节。细化时必须回答的问题已经记在第 6 节里：异步下单后 `paid` 可能先于预占到达，库存服务对“预占不存在”的处置要改。延迟关单要对比时间轮、Redis ZSET、延迟 topic 并写 ADR。对外接口改为 202 加轮询，先改 OpenAPI 规范。
+3. 之后是步骤四，动工前细化第 7 节。
 
 已推迟的任务（记在对应阶段的计划里，不会丢）：
 
@@ -75,6 +69,9 @@
 | 2026-11-11 | ADR 重新编号：原 0005（OpenTelemetry）改为 0004，新增的 OpenAPI 为 0005、金额表示为 0006 | 主人删除了原 ADR-0004（可观测先于故障注入），序号补齐 |
 | 2026-11-11 | 「1a 补充」的 gateway 重构由主会话完成，没有派给子 Agent | 验证 ADR-0005 的待验证细节需要先把重构做出来，改动很小 |
 | 2026-11-11 | 「从 OpenAPI 规范生成客户端」从「1a 补充」移到阶段 3b | 和压测脚本一起评估，避免做两次 |
+| 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
+| 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
+| 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
 
 ## 会话日志
 
@@ -91,3 +88,5 @@
 同日实施「1a 补充」：写了 OpenAPI 规范，引入 `oapi-codegen`，gateway 改为实现生成的接口，本机 lint、测试、端到端全部通过。随后提交、推送、开 PR 并合并到 `main`（git 操作派给 Haiku 子 Agent）。生成客户端的可选任务移到阶段 3b。
 
 同日开始 1b：写了设计文档和 ADR-0007、ADR-0008，完成步骤一的公共库（三个子 Agent 并行实现，主会话评审合入，outbox 由主会话编写）。步骤二改了 proto 和脚本后暂停，服务改造尚未开始。
+
+同日继续 1b：重新派出第二批四个子 Agent，全部完成。主会话评审合入，修了 outbox 的两处缺陷，`make lint test e2e` 通过，复核结论写入设计文档第 5.6 节。步骤二完成，改动待提交和推送。

@@ -180,7 +180,7 @@ Redis 分布式锁。
 
 通用要求：
 
-- 每个服务新增迁移 `00002_outbox.sql` 建 outbox 表（以及下面列出的列变更）。
+- 发布事件的服务（order、payment）新增迁移 `00002_outbox.sql` 建 outbox 表（以及下面列出的列变更）。inventory 在步骤二只消费不发布，不建表，等它真要发布事件时再加迁移。
 - handler 和消费逻辑分开：消费逻辑写成 `func(ctx, *eventv1.XxxEvent) error`，用真实 MySQL 加直接调用来测，不需要 Kafka。Kafka 的行为由 `kafkax` 自己的测试和端到端测试覆盖。
 - 每个消费逻辑都要有“同一事件处理两次，结果和副作用与一次相同”的测试，以及与在线路径并发的测试。
 - 把各自的死锁重试、后台循环换成 `pkg/retry`、`pkg/worker`。
@@ -207,8 +207,10 @@ Redis 分布式锁。
 - 每个分支在同一个事务里 `outbox.Add` 一条 `payment_result_handled` 答复，和 `payment_results` 的记录一起提交。
 - 1a 里以错误返回的两种情况改为明确的处置，这样消费者不会因为业务原因卡住：
   - 金额或币种不一致：记录并答复 `REFUND_REQUIRED`，`reason = AMOUNT_MISMATCH`。
-  - 订单不存在：答复 `REFUND_REQUIRED`，`reason = ORDER_NOT_FOUND`。
-- `payment_results` 里已有该 `payment_id`：什么都不做（答复事件已在当时的事务里写过）。
+  - 订单不存在：支付成功的答复 `REFUND_REQUIRED`，`reason = ORDER_NOT_FOUND`；支付失败的答复 `ACCEPTED`（没有收钱，不能让支付服务去退一笔不存在的款）。
+  - 订单存在但不可支付（已取消、已关闭、创建失败、创建中、已被付清）：答复 `REFUND_REQUIRED`，`reason = ORDER_NOT_PAYABLE`。
+- `payment_results` 里已有该 `payment_id`：什么都不做（答复事件已在当时的事务里写过）。若记录的订单号与事件里的不同，说明事件与已记录的事实矛盾，进死信。
+- 订单不存在时没有订单行锁可以排队，同一 `payment_id` 的并发处理会在插入 `payment_results` 时撞主键。主键冲突按可重试处理：重做事务时读到已有记录，走“已处理过”的分支。
 - 订单被置为 `PAID` 时，同一个事务里还要写 `paid` 事件。一个事务，两条 outbox 记录。
 
 gRPC 的 `HandlePaymentResult` 及其请求、响应消息从 `order.proto` 里删除，`PaymentDisposition` 改用事件 proto 里的定义。只保留一条处理路径。
@@ -228,8 +230,13 @@ gRPC 的 `HandlePaymentResult` 及其请求、响应消息从 `order.proto` 里�
 **消费 `order.events`**，只处理 `payment_result_handled`：
 
 - `ACCEPTED`：`UPDATE payments SET notified = 1 WHERE payment_id = ? AND notified = 0`。
-- `REFUND_REQUIRED`：`UPDATE payments SET status = REFUNDED, notified = 1 WHERE payment_id = ? AND status = SUCCEEDED`；若该支付本来就是失败的（没有钱可退），只置 `notified = 1`。原因是 `AMOUNT_MISMATCH` 或 `ORDER_NOT_FOUND` 时记 error 日志，这两种情况说明系统有缺陷。
-- 支付单不存在：返回 `kafkax.Permanent`，进死信。
+- `REFUND_REQUIRED`：`UPDATE payments SET status = REFUNDED, notified = 1 WHERE payment_id = ? AND status = SUCCEEDED AND notified = 0`；若该支付本来就是失败的（没有钱可退），只置 `notified = 1`。原因是 `AMOUNT_MISMATCH` 或 `ORDER_NOT_FOUND` 时记 error 日志，这两种情况说明系统有缺陷。
+- 支付单不存在、答复里的订单号与支付单不符、不认识的处置：返回 `kafkax.Permanent`，进死信。
+- 答复到达时支付单还是 `PENDING`：返回普通错误让消费者重试，不做任何标记。正常不会发生（事件和状态变更同事务提交），但消费者不假设这一点。
+
+**第一次答复为准**（实现时补充，原设计的退款语句没有 `notified = 0`）。退款的前置条件必须带 `notified = 0`：否则一条 `ACCEPTED`（订单已付清）之后再来一条矛盾的 `REFUND_REQUIRED`，就会把已付清订单的钱退掉。订单服务按 `payment_id` 去重，正常不会给出两个不同的答复；但退款是不可逆的资金操作，不能把正确性押在对方没有缺陷上。矛盾的答复记 error 日志后忽略。
+
+已知的缺口：没有任何任务扫描“已出结果但长期 `notified = 0`”的支付单。答复进了死信或订单服务一直没处理时，只能靠死信和积压告警发现。留给 1d 的对账。
 
 `notified` 的含义从“回调已成功”变为“订单服务已答复”，对外接口不变。
 
@@ -265,12 +272,35 @@ gRPC 的 Confirm、Release 保留（测试和排障用），订单服务不再�
 - CI 的 test 和 e2e 任务改为用 `make up` 启动依赖（和本机相同的 compose 文件），不再单独声明 MySQL 服务容器。
 - 端到端测试的断言不变：7 个场景都必须通过。库存的最终状态现在是异步到达的，测试里已经是轮询等待。
 
+### 5.6 复核结论：消息重复、延迟、乱序下的并发正确性
+
+步骤二合入后逐行评审了三个服务，结论是 1a 的保证在事件化之后仍然成立。依据如下。
+
+**每个订单至多一条终态事件。** 状态机只有 `CREATING → FAILED | PENDING_PAYMENT` 和 `PENDING_PAYMENT → PAID | CANCELLED | CLOSED`，每个转换都是带前置状态的条件更新，事件只在影响 1 行的那个事务里写。所以支付、取消、关单三方并发时只有一方写出事件，库存服务对一个订单只会看到 `paid` 或者一种释放事件，不会两种都看到。万一看到了（说明有缺陷），Confirm 与 Release 互相拒绝，消息进死信，不会悄悄改库存。
+
+| 情况 | 订单侧（消费 `payment.events`） | 支付侧（消费答复） | 库存侧（消费 `order.events`） |
+|---|---|---|---|
+| 重复 | 订单行锁下以 `payment_results` 主键去重，第二次什么都不写 | 条件更新带 `notified = 0`，第二次影响 0 行 | Confirm、Release 以 `order_id` 幂等 |
+| 延迟 | 订单已不是 `PENDING_PAYMENT`，答复退款 | 无影响 | 无影响 |
+| 乱序 | 一笔支付只有一个最终结果，没有先后问题 | 第一次答复为准，矛盾的答复忽略并记 error | `failed` 先于迟到的 Reserve 到达时，空回滚标记挡住它 |
+
+**证据。** 各服务的单元测试覆盖了上表每一格（重复投递比较行数与副作用，并发场景带 `-race`）。端到端的 `TestPayRacingCancelEndsConsistent` 一次运行里 40 个订单 24 个付清、16 个取消，订单服务恰好记了 16 次“需要退款”，两个死信 topic 都是空的。
+
+**仍然存在的缺口**（都不影响上面的结论，记在这里避免以为已经解决）：
+
+- 支付单“已出结果但长期 `notified = 0`”没有任何任务扫描，见 5.2。
+- 订单侧不再有库存的兜底：1a 的 `stock_settled` 加补结清没有了，库存是否跟上完全取决于事件被消费。消费卡住（死信发不出去、分区停住）时只能靠积压告警发现，对账在 1d。
+- 迁移 `00002` 直接删除 `stock_settled`。升级时库里若还有未结清的终态订单，它们不会再被补结清，也没有事件。本项目只有开发库，没有处理；真实系统要先排空再升级。
+- outbox 中继没有配分布式锁，多副本时会重复发送（正确，只是浪费），步骤四处理。
+- 库存服务对 Confirm 遇到“预占不存在”直接进死信，前提是“订单存在就说明 Reserve 已提交”。步骤三改成异步下单后这个前提不再成立，见第 6 节。
+
 ## 6. 步骤三方案要点（动工前细化）
 
 - **Redis 预扣**：Redis 里保存每个 SKU 的可售数量，作为进入系统的闸门。一段 Lua 脚本原子地完成：幂等检查（同一幂等键返回已有订单号）、各 SKU 库存检查、用户限购检查、扣减、记录本次占用（hold）。MySQL 仍是库存的唯一事实来源，Redis 的数量允许偏小（少卖），不允许偏大（超卖由 MySQL 的条件更新兜底）。
 - **占用记录**让归还幂等：归还时先看 hold 是否存在，存在才加回并删除。订单失败、取消、关闭的事件触发归还。
 - **预热与同步**：启动或上架时从 MySQL 装载；定期对账，Redis 数量应等于 MySQL 可售数量减去“已占用但尚未在 MySQL 预占”的数量，偏差超过阈值告警并修正。
 - **异步下单**：gateway 调 order 的受理接口，预扣成功后把下单请求写入 topic `order.submit` 并立即返回 202 和订单号；order 的消费者落库并走 1a 的“推进”流程；客户端轮询订单状态。受理成功但消息没发出去（进程崩溃）的占用由对账归还。
+- **Confirm 遇到预占不存在**：异步下单后 `paid` 可能先于预占落库到达，库存服务要把 `RESERVATION_NOT_FOUND` 从“进死信”改成可重试，或者保证订单进入 `PENDING_PAYMENT` 之前预占已提交。细化时二选一。
 - **延迟关单**：倾向于固定时长的延迟 topic（`DelayConsumer`），保留低频的 sweeper 扫描兜底。动工时与时间轮、Redis ZSET 对比并写 ADR。
 
 ## 7. 步骤四方案要点（动工前细化）

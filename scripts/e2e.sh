@@ -32,7 +32,6 @@ export LOG_DIR="$ROOT/tmp/e2e-logs"
 # 缩短各时限，让超时关单这类场景能在几秒内测完。
 export PAYMENT_TIMEOUT=3s
 export SWEEP_INTERVAL=200ms
-export SETTLE_GRACE=500ms
 export LOG_LEVEL=warn
 
 export E2E_GATEWAY_URL=http://127.0.0.1:8080
