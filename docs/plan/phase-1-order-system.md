@@ -8,19 +8,62 @@
 
 用最简单的架构把业务做对，作为后面所有改造的对照基线。
 
-- [ ] 数据模型：订单、订单明细、库存、库存流水、支付单
-- [ ] 订单状态机：待支付 → 已支付 → 已取消 / 已关闭，更新 SQL 带状态前置条件
-- [ ] 订单号生成：雪花算法变体，预留分片基因位（为 1c 做准备）
-- [ ] inventory 服务：扣减、回补，`UPDATE ... SET stock = stock - ? WHERE stock >= ?` 防超卖，流水表保证幂等
-- [ ] order 服务：下单、查询、取消
-- [ ] payment 服务：模拟支付，异步回调 order，回调幂等
-- [ ] gateway：HTTP 入口，路由到各 gRPC 服务
-- [ ] 下单接口幂等：客户端幂等键 + 唯一索引
-- [ ] 并发测试：N 个并发抢 M 件库存，断言成交数等于 M、无超卖、无重复订单
+设计规格见 [design/1a-order-flow.md](../design/1a-order-flow.md)。
+
+基础（主会话串行完成）：
+
+- [x] 接口契约：`api/proto/oppenheimer/{inventory,order,payment}/v1/`
+- [x] 数据模型：各服务 `migrations/00001_init.sql`，每个服务独立的库
+- [x] `pkg/idgen`：雪花算法变体，低 6 位为分片基因，处理时钟回拨
+- [x] `pkg/errx`：gRPC 状态码加原因码的错误约定
+- [x] `pkg/mysqlx`：连接池、事务、迁移、错误分类
+- [x] `pkg/grpcx`：服务端（日志、panic 恢复、健康检查、优雅停止）与客户端（默认超时）
+- [x] `pkg/testdb`：每个测试一个隔离的库；CI 增加 MySQL 服务
+- [x] 设计文档
+
+服务（派给子 Agent 在各自的 worktree 并行实现，主会话评审后合并）：
+
+- [x] inventory：Reserve、Confirm、Release（含空回滚与防悬挂）、GetStock
+- [x] order：CreateOrder（幂等、可推进）、GetOrder、CancelOrder、HandlePaymentResult、结清与后台任务
+- [x] payment：CreatePayment、GetPayment、出结果与回调重试的后台任务
+- [x] gateway：HTTP 路由、JSON 约定、错误映射
+
+集成（主会话）：
+
+- [x] 合并四个服务，`make lint test` 通过
+- [x] `make seed` 准备示例 SKU；`make run` 一键启动四个服务；`make e2e` 跑端到端测试
+- [x] 端到端测试：主流程、并发抢购零超卖、幂等、超时关单、支付与取消并发
+- [x] 把 1a 的面试考点整理到 [notes/1a-consistency.md](../notes/1a-consistency.md)
+- [x] 推送并确认 CI 通过，合并到 `main`（PR #2，新增的 MySQL 集成测试和端到端任务首次运行即通过）
 
 **验收**：并发测试在 `-race` 下稳定通过；重复请求、重复回调不产生副作用。
 
 **面试考点**：超卖的几种解法与对比（悲观锁、乐观锁、条件更新）；幂等的实现方式；状态机为什么要带前置条件；雪花算法与时钟回拨。
+
+## 1a 补充：对外接口契约（OpenAPI）
+
+把 gateway 手写的 HTTP 接口改为规范先行，决定和理由见 [ADR-0005](../adr/0005-openapi-spec-first.md)。
+
+在 1a 合并到 `main` 之后、1b 开始之前做，从 `main` 新开分支。这是一次不改变对外行为的重构，不和 1a 的 PR 混在一起。gateway 不涉及资金、库存、订单状态，可以派给子 Agent，主会话评审。
+
+基础（主会话串行完成，属于共享部分）：
+
+- [ ] `Makefile`：`make tools` 安装 `oapi-codegen` v2.8.2；新增 `make openapi`；版本登记到 `docs/infra/versions.md`
+- [ ] 写 `api/openapi/gateway.yaml`（OpenAPI 3.1）：现有 6 个路由、`Idempotency-Key` 和 `X-User-Id` 请求头、统一的错误结构、各接口可能返回的状态码
+- [ ] 验证 ADR-0005 列出的四个待验证细节，把结论补进 ADR；结论影响方案时先改 ADR 和本计划
+
+实现：
+
+- [ ] gateway 重构：handler 实现生成的服务端接口，`dto.go` 换成生成的类型；保留现有中间件分组和 404、405 的统一错误响应
+- [ ] `server_test.go` 的行为断言不改，全部通过（断言需要改动的地方逐条列出并说明原因）
+- [ ] CI 增加生成结果一致性检查：重新生成后 `git diff --exit-code`
+- [ ] `docs/design/1a-order-flow.md` 第 6 节的路由表改为指向规范文件，只保留规范表达不了的约定
+- [ ] `make lint test e2e` 通过
+- [ ] 可选：从规范生成客户端，替换端到端测试里手写的请求结构
+
+**验收**：对外行为与重构前完全一致（现有 gateway 测试和端到端测试不改断言即通过）；改了规范不重新生成，或生成后 handler 没跟上，CI 或编译会失败。
+
+**面试考点**：规范先行与代码先行的取舍；为什么对外接口不直接从 proto 生成（BFF 层的意义）；接口的向后兼容规则（哪些改动是破坏性的）；64 位整数在 JSON 里为什么用字符串；金额为什么用整数最小货币单位而不是 decimal 或浮点，以及分摊时的舍入处理（见 [ADR-0006](../adr/0006-money-as-integer-minor-units.md)）。
 
 ## 1b 高并发改造
 
@@ -31,9 +74,10 @@
 - [ ] 异步下单：网关受理 → Kafka → order 消费落库，客户端轮询结果
 - [ ] 本地消息表（outbox）：订单落库与事件发布在同一事务，由中继进程投递 Kafka
 - [ ] 消费端幂等：去重表或业务唯一键，按至少一次投递设计
-- [ ] Saga 补偿：下单失败或取消时回补 Redis 与 MySQL 库存
+- [ ] Saga 补偿：下单失败或取消时回补 Redis 与 MySQL 库存（MySQL 侧的 Release、空回滚与防悬挂 1a 已实现，这里扩展到 Redis）
+- [ ] 把 1a 里三处重复的死锁重试、后台任务循环收敛到 `pkg/`（inventory 的事务重试、order 的 sweeper、payment 的 processor）
 - [ ] 超时未支付关单：延迟消息方案（Kafka 没有原生延迟，对比时间轮、Redis ZSET、分级延迟 topic 后选一种）
-- [ ] 支付成功与超时关单的并发冲突处理
+- [ ] 支付成功与超时关单的并发冲突：1a 已用条件更新加退款答复实现，这里在引入 Kafka 后复核消息乱序和延迟下是否仍然成立
 - [ ] 分布式锁（`pkg/lock`）：Redis 实现，`SET NX PX` 加锁、Lua 校验持有者后解锁、看门狗续期
   - 使用场景：缓存击穿时的重建互斥、同一用户的重复下单拦截、定时任务（outbox 中继、关单扫描、对账）的单实例执行
   - 不用在库存扣减主链路上：那里用 Lua 原子操作和条件更新，比加锁更快也更安全，写清楚为什么
@@ -89,7 +133,7 @@
   - 比对：从根向下只展开哈希不同的子树，定位到差异桶后再逐行比对
   - 处理变动中的数据：只对超过水位线（如 10 分钟前）的数据对账，或用一致性快照
   - 差异输出与修复流程；与全量逐行比对做性能对比，说明 Merkle 方案在什么数据量和差异率下才有优势
-- [ ] 埋点（OpenTelemetry SDK，见 ADR-0005）：链路贯穿 HTTP、gRPC、Kafka、MySQL、Redis；指标含 QPS、延迟、错误率和业务指标（下单成功数、库存扣减数）；日志带 trace id
+- [ ] 埋点（OpenTelemetry SDK，见 ADR-0004）：链路贯穿 HTTP、gRPC、Kafka、MySQL、Redis；指标含 QPS、延迟、错误率和业务指标（下单成功数、库存扣减数）；日志带 trace id
 
 **验收**：超出阈值的流量被拒绝而不是拖垮服务；手动停掉 Redis 或 inventory，系统按预案降级而不是雪崩；对账任务能发现并定位人为制造的数据差异。
 

@@ -1,0 +1,118 @@
+// Package httpapi 实现 gateway 的 HTTP 接口：把请求转成对下游服务的 gRPC 调用。
+package httpapi
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
+)
+
+const (
+	// DefaultCallTimeout 是单个请求内所有下游调用的总时限。
+	DefaultCallTimeout = 5 * time.Second
+	// maxBodyBytes 限制请求体大小，防止客户端用超大 body 占用内存。
+	maxBodyBytes = 1 << 20
+)
+
+// Deps 是 gateway 依赖的下游客户端。用接口注入，测试时换成假对象。
+type Deps struct {
+	Order     orderv1.OrderServiceClient
+	Payment   paymentv1.PaymentServiceClient
+	Inventory inventoryv1.InventoryServiceClient
+}
+
+// Config 是 HTTP 层的可调参数，零值取默认。
+type Config struct {
+	Logger      *slog.Logger
+	CallTimeout time.Duration
+}
+
+type server struct {
+	deps   Deps
+	logger *slog.Logger
+	// callTimeout 在中间件里转成 context 截止时间，handler 不必各自处理。
+	callTimeout time.Duration
+}
+
+// New 构造路由。返回 http.Handler 而不是 *gin.Engine，不让 gin 泄漏到装配层。
+func New(deps Deps, cfg Config) http.Handler {
+	// release 模式下 gin 不往标准输出打印路由表等调试信息。
+	gin.SetMode(gin.ReleaseMode)
+
+	s := &server{
+		deps:        deps,
+		logger:      cfg.Logger,
+		callTimeout: cfg.CallTimeout,
+	}
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
+	if s.callTimeout <= 0 {
+		s.callTimeout = DefaultCallTimeout
+	}
+
+	r := gin.New()
+	r.HandleMethodNotAllowed = true
+	r.NoRoute(func(c *gin.Context) {
+		writeError(c, http.StatusNotFound, "NOT_FOUND", "route not found")
+	})
+	r.NoMethod(func(c *gin.Context) {
+		writeError(c, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+	})
+	// 日志在最外层，才能记录到 recover 之后写出的 500。
+	r.Use(s.requestLog, s.recoverPanic)
+
+	api := r.Group("/api/v1", s.requireUser, s.withDeadline)
+	api.POST("/orders", s.createOrder)
+	api.GET("/orders/:order_id", s.getOrder)
+	api.POST("/orders/:order_id/cancel", s.cancelOrder)
+	api.POST("/orders/:order_id/pay", s.payOrder)
+	api.GET("/orders/:order_id/payment", s.getPayment)
+	api.GET("/skus/:sku_id/stock", s.getStock)
+	return r
+}
+
+// requestLog 记录方法、路径模板、状态码和耗时。
+// 用路由模板而不是实际路径，避免 ID 造成日志维度爆炸。
+func (s *server) requestLog(c *gin.Context) {
+	start := time.Now()
+	c.Next()
+
+	route := c.FullPath()
+	if route == "" {
+		route = "unmatched"
+	}
+	s.logger.LogAttrs(c.Request.Context(), slog.LevelInfo, "http request",
+		slog.String("method", c.Request.Method),
+		slog.String("route", route),
+		slog.Int("status", c.Writer.Status()),
+		slog.Duration("duration", time.Since(start)),
+	)
+}
+
+func (s *server) recoverPanic(c *gin.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.ErrorContext(c.Request.Context(), "handler panicked", "panic", r)
+			if !c.Writer.Written() {
+				writeError(c, http.StatusInternalServerError, "INTERNAL", "internal error")
+			}
+			c.Abort()
+		}
+	}()
+	c.Next()
+}
+
+func (s *server) withDeadline(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), s.callTimeout)
+	defer cancel()
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
+}

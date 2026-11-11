@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package oppenheimer.inventory.v1;
+
+import "oppenheimer/common/v1/money.proto";
+
+// InventoryService 管理商品（SKU）的价格与库存。
+//
+// 一笔订单对库存的占用有三个操作，都以 order_id 为幂等键，重复调用结果相同：
+//   Reserve  下单时预占：available -= n, reserved += n
+//   Confirm  支付成功后确认：reserved -= n, sold += n
+//   Release  取消或关单后释放：reserved -= n, available += n
+service InventoryService {
+  // Reserve 为订单预占库存，订单内所有 SKU 要么全部预占成功，要么全部不占。
+  //
+  // 错误：
+  //   NOT_FOUND            reason=SKU_NOT_FOUND       有 SKU 不存在
+  //   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK  有 SKU 可用库存不足
+  //   FAILED_PRECONDITION  reason=RESERVATION_RELEASED 该订单的预占已被释放（含先于 Reserve 到达的 Release），不允许再预占
+  //   ALREADY_EXISTS       reason=RESERVATION_MISMATCH 该订单已预占过，但本次的 SKU 或数量与上次不同
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+
+  // Confirm 把订单的预占转为已售。
+  //
+  // 错误：
+  //   NOT_FOUND            reason=RESERVATION_NOT_FOUND 该订单没有预占记录
+  //   FAILED_PRECONDITION  reason=RESERVATION_RELEASED  预占已被释放，不能确认
+  rpc Confirm(ConfirmRequest) returns (ConfirmResponse);
+
+  // Release 释放订单的预占。
+  //
+  // 订单没有预占记录时也返回成功，并记下“已释放”标记，使之后迟到的 Reserve 被拒绝。
+  //
+  // 错误：
+  //   FAILED_PRECONDITION  reason=RESERVATION_CONFIRMED 预占已确认为已售，不能释放
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+
+  // GetStock 查询一个 SKU 的库存。
+  //
+  // 错误：
+  //   NOT_FOUND  reason=SKU_NOT_FOUND
+  rpc GetStock(GetStockRequest) returns (GetStockResponse);
+}
+
+message ReserveItem {
+  int64 sku_id = 1;
+  // 数量，必须大于 0。
+  int32 quantity = 2;
+}
+
+message ReservedItem {
+  int64 sku_id = 1;
+  int32 quantity = 2;
+  // 预占时的单价，订单服务据此计算总金额。
+  oppenheimer.common.v1.Money unit_price = 3;
+}
+
+message ReserveRequest {
+  int64 order_id = 1;
+  // 同一请求内 sku_id 不能重复，至少一项。
+  repeated ReserveItem items = 2;
+}
+
+message ReserveResponse {
+  repeated ReservedItem items = 1;
+}
+
+message ConfirmRequest {
+  int64 order_id = 1;
+}
+
+message ConfirmResponse {}
+
+message ReleaseRequest {
+  int64 order_id = 1;
+}
+
+message ReleaseResponse {}
+
+message GetStockRequest {
+  int64 sku_id = 1;
+}
+
+message GetStockResponse {
+  int64 sku_id = 1;
+  int64 available = 2;
+  int64 reserved = 3;
+  int64 sold = 4;
+  oppenheimer.common.v1.Money unit_price = 5;
+}

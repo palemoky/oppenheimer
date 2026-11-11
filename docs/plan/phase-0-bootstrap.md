@@ -32,7 +32,7 @@
 - [x] `deploy/compose/docker-compose.yml`：MySQL 9.7.4（LTS）、Redis 8.10.3、Kafka 4.4.0（KRaft 单节点）
 - [x] `.gitignore`、`.editorconfig`
 - [x] GitHub Actions：`.github/workflows/ci.yml`，自动发现所有 go module，跑 lint、build、vet、`-race` 测试；另有 proto 检查任务
-- [ ] 推送后确认 CI 实际跑通（本地已全部通过，CI 本身还没有在 GitHub 上运行过）
+- [x] 推送后确认 CI 实际跑通（PR #1，14 项检查全部通过，已合并到 `main`）
 - [ ] CI 后续扩展（到对应阶段再加）：依赖 MySQL、Redis、Kafka 的集成测试（阶段 1）、镜像构建与推送（阶段 2）
 
 ## 已验证

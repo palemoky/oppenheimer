@@ -50,6 +50,9 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 任务说明自成一体：要做什么、完成标准、能改哪些目录、必须遵守的约束（从本文件里摘出相关的几条，不要让它通读全部文档）。
 - 给出它需要的接口和类型定义（proto、表结构、函数签名），或指明具体文件路径，不要让它自己在仓库里摸索。
 - 不传与任务无关的历史讨论、其他阶段的计划、其他服务的实现细节。
+- worktree 是从 `main` 建的。任务基于其他分支时，在任务说明里写明分支名，让它先把自己的分支快进到那个分支。
+- worktree 里没有 `./bin`（不入库）。需要 `make fmt` 或 `make proto` 时让它先运行 `make tools`。
+- 明确要求它报告“与设计不一致的地方”和“认为设计存在的问题”。1a 里两个真实的一致性缺陷都是这样被发现的。
 - 要求它返回简短结果：改了哪些文件、测试是否通过、遇到的问题和没做完的部分。不要返回大段代码或日志。
 - 主会话验收后再合并：读 diff、跑 `make lint test`。涉及资金、库存、订单状态的代码由 Fable 逐行评审。
 
@@ -62,13 +65,14 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 每个 worktree 一个分支，任务说明里写清楚它能改的目录范围。
 - 合并回主线前各自通过 `make lint test`，合并后在主线再跑一次。
 - `docs/PROGRESS.md` 和阶段计划的 checkbox 只由主会话更新，子 Agent 把结果报回来，避免文档冲突。
+- 合并时用 `git cherry-pick` 只取子 Agent 自己的提交。`go.work.sum` 冲突时保留任意一边再运行 `go work sync` 重新生成。合并完删除 worktree 和对应分支。
 
 ## 工程规范
 
 **Go**
 
 - Go 1.27，多模块用 go workspace。模块间的依赖要在 `go.mod` 里加指向本地目录的 `replace`（`go mod tidy` 不读 `go.work`）。
-- 常用命令都在 `Makefile` 里，`make help` 查看。proto 改动后运行 `make proto` 并把 `api/gen` 一起提交。
+- 常用命令都在 `Makefile` 里，`make help` 查看。`make test` 和 `make e2e` 需要先 `make up`。proto 改动后运行 `make proto` 并把 `api/gen` 一起提交。
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。
@@ -85,7 +89,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 **可观测**
 
-- 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0005。
+- 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0004。
 - 日志用 `slog` 输出 JSON，带 trace id。
 
 **版本选择**

@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package oppenheimer.payment.v1;
+
+import "google/protobuf/timestamp.proto";
+import "oppenheimer/common/v1/money.proto";
+
+// PaymentService 是模拟的支付服务：受理支付后异步得出结果，再回调订单服务。
+service PaymentService {
+  // CreatePayment 为订单发起支付。金额由支付服务向订单服务查询，不信任调用方。
+  //
+  // 以 order_id 幂等：同一订单重复发起返回已有的支付单。
+  // 受理成功只表示支付单已创建（PENDING），结果异步产生。
+  //
+  // 错误：
+  //   NOT_FOUND            reason=ORDER_NOT_FOUND
+  //   FAILED_PRECONDITION  reason=ORDER_NOT_PAYABLE 订单不在待支付状态
+  rpc CreatePayment(CreatePaymentRequest) returns (CreatePaymentResponse);
+
+  // GetPayment 按订单查询支付单。
+  //
+  // 错误：
+  //   NOT_FOUND  reason=PAYMENT_NOT_FOUND
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+}
+
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  // 已受理，等待结果。
+  PAYMENT_STATUS_PENDING = 1;
+  // 支付成功。
+  PAYMENT_STATUS_SUCCEEDED = 2;
+  // 支付失败。终态。
+  PAYMENT_STATUS_FAILED = 3;
+  // 支付成功后已退款。终态。
+  PAYMENT_STATUS_REFUNDED = 4;
+}
+
+// 模拟支付的结果，仅用于测试。
+enum SimulatedOutcome {
+  SIMULATED_OUTCOME_UNSPECIFIED = 0;
+  SIMULATED_OUTCOME_SUCCESS = 1;
+  SIMULATED_OUTCOME_FAILURE = 2;
+}
+
+message Payment {
+  int64 payment_id = 1;
+  int64 order_id = 2;
+  int64 user_id = 3;
+  PaymentStatus status = 4;
+  oppenheimer.common.v1.Money amount = 5;
+  google.protobuf.Timestamp create_time = 6;
+  // 订单服务是否已确认收到支付结果。
+  bool notified = 7;
+}
+
+message CreatePaymentRequest {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  // 模拟的支付结果，不填按成功处理。
+  SimulatedOutcome outcome = 3;
+}
+
+message CreatePaymentResponse {
+  Payment payment = 1;
+}
+
+message GetPaymentRequest {
+  int64 order_id = 1;
+  int64 user_id = 2;
+}
+
+message GetPaymentResponse {
+  Payment payment = 1;
+}

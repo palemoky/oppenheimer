@@ -18,6 +18,7 @@
 | Go | 1.27 | 稳定版 | 2026-11-11 | 本机已装 1.27.3；Go 没有 LTS，只支持最近两个大版本 |
 | actions/checkout | v7 | 稳定版 | 2026-11-11 | CI |
 | actions/setup-go | v7 | 稳定版 | 2026-11-11 | CI |
+| actions/upload-artifact | v7 | 稳定版 | 2026-11-11 | CI，端到端测试失败时上传服务日志 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
@@ -27,6 +28,10 @@
 | protoc-gen-go | v1.36.12 | 稳定版 | 2026-11-11 | 同上 |
 | protoc-gen-go-grpc | v1.6.2 | 稳定版 | 2026-11-11 | 同上 |
 | bufbuild/buf-action | v1 | 稳定版 | 2026-11-11 | CI |
+| google.golang.org/grpc | v1.85.0 | 稳定版 | 2026-11-11 | |
+| go-sql-driver/mysql | v1.10.1 | 稳定版 | 2026-11-11 | |
+| pressly/goose | v3.30.0 | 稳定版 | 2026-11-11 | 数据库迁移，作为库嵌入各服务 |
+| gin | v1.12.0 | 稳定版 | 2026-11-11 | 仅 gateway 使用 |
 
 ## 待引入（引入时查证并移到上表）
 

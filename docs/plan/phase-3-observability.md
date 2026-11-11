@@ -7,13 +7,13 @@
 ## 3a 可观测三件套
 
 - [ ] kube-prometheus-stack：Prometheus、Grafana、Alertmanager、node-exporter、kube-state-metrics
-- [ ] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0005）
+- [ ] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0004）
 - [ ] Collector 的部署形态（DaemonSet 还是 Deployment）、批处理、采样、内存限制，以及对 Collector 自身的监控
 - [ ] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟
 - [ ] 中间件 exporter：MySQL、Redis、Kafka（含消费延迟）
 - [ ] 日志：结构化日志（JSON，带 trace id），Loki 收集
 - [ ] 链路：SkyWalking OAP + BanyanDB + UI，通过 OTLP 接收器接入
-- [ ] 验证 ADR-0005 的待验证项：OTLP 链路在 SkyWalking 里是否够用，必要时选一个服务接 skywalking-go 对比，结论写回 ADR
+- [ ] 验证 ADR-0004 的待验证项：OTLP 链路在 SkyWalking 里是否够用，必要时选一个服务接 skywalking-go 对比，结论写回 ADR
 - [ ] 链路打通 HTTP → gRPC → Kafka → MySQL、Redis
 - [ ] Go 运行时指标与持续剖析入口：goroutine 数、堆、GC、pprof 端点（阶段 4 的泄漏类故障要用）
 - [ ] 指标、日志、链路通过 trace id 互相跳转

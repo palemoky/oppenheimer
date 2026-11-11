@@ -4,8 +4,8 @@
 
 | 阶段 | 内容 | 运行位置 | 计划文件 | 状态 |
 |---|---|---|---|---|
-| 0 | 文档与仓库骨架 | MacBook | [phase-0-bootstrap.md](plan/phase-0-bootstrap.md) | 🟡 |
-| 1 | Go 订单系统（1a 正确性 → 1b 高并发 → 1c 分库分表 → 1d 限流降级） | MacBook | [phase-1-order-system.md](plan/phase-1-order-system.md) | ⬜ |
+| 0 | 文档与仓库骨架 | MacBook | [phase-0-bootstrap.md](plan/phase-0-bootstrap.md) | ✅ |
+| 1 | Go 订单系统（1a 正确性 → 1b 高并发 → 1c 分库分表 → 1d 限流降级） | MacBook | [phase-1-order-system.md](plan/phase-1-order-system.md) | 🟡 1a |
 | 2 | Kubernetes 集群与部署 | Ubuntu | [phase-2-kubernetes.md](plan/phase-2-kubernetes.md) | ⬜ |
 | 3 | 可观测（OpenTelemetry）、压测基线、SLO 与告警、最小诊断 Agent | Ubuntu + Mac mini | [phase-3-observability.md](plan/phase-3-observability.md) | ⬜ |
 | 4 | 故障注入与复盘（Agent 同步参与并迭代） | Ubuntu + Mac mini | [phase-4-chaos.md](plan/phase-4-chaos.md) | ⬜ |

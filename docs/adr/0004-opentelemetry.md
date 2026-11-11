@@ -1,4 +1,4 @@
-# ADR-0005：用 OpenTelemetry 做埋点标准
+# ADR-0004：用 OpenTelemetry 做埋点标准
 
 - 状态：已采纳（后端对接细节待阶段 3a 验证）
 - 日期：2026-11-11

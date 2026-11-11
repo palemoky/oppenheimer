@@ -49,6 +49,22 @@ jobs:
     needs: detect
     if: needs.detect.outputs.modules != '[]'
     runs-on: ubuntu-latest
+    # 集成测试用的 MySQL，版本与 deploy/compose 保持一致。每个测试自建临时库。
+    services:
+      mysql:
+        image: mysql:9.7.4
+        env:
+          MYSQL_ROOT_PASSWORD: oppenheimer
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -poppenheimer --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+          --health-start-period 20s
+    env:
+      OPPENHEIMER_TEST_MYSQL_DSN: root:oppenheimer@tcp(127.0.0.1:3306)/
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +88,39 @@ jobs:
       - name: Coverage summary
         working-directory: ${{ matrix.module }}
         run: go tool cover -func=coverage.out | tail -n 1
+
+  # 端到端测试：启动四个服务，通过网关验证主流程和并发场景下的一致性。
+  e2e:
+    needs: detect
+    if: needs.detect.outputs.modules != '[]'
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.7.4
+        env:
+          MYSQL_ROOT_PASSWORD: oppenheimer
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -poppenheimer --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: '**/go.sum'
+      - name: Run end-to-end tests
+        run: make e2e
+      - name: Upload service logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: tmp/e2e-logs/
 
   # proto 的格式与规范检查，并确认入库的生成代码与 proto 定义一致。
   proto:
