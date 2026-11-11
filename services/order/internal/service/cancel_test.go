@@ -24,21 +24,30 @@ func TestCancelOrder(t *testing.T) {
 	wantErr(t, err, codes.NotFound, errx.ReasonOrderNotFound)
 	_, err = e.svc.CancelOrder(t.Context(), cancelReq(31337, 1))
 	wantErr(t, err, codes.NotFound, errx.ReasonOrderNotFound)
+	if n := e.outboxRows(t); n != 0 {
+		t.Fatalf("outbox = %d after failed cancels, want 0", n)
+	}
 
+	kicks := e.relay.kicks.Load()
 	for range 3 {
 		resp, err := e.svc.CancelOrder(t.Context(), cancelReq(o.GetOrderId(), 1))
 		if err != nil || resp.GetOrder().GetStatus() != orderv1.OrderStatus_ORDER_STATUS_CANCELLED {
 			t.Fatalf("cancel = %v, %v", resp, err)
 		}
 	}
-	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CANCELLED, true)
-	if n := e.inv.appliedCount("Release"); n != 1 {
-		t.Errorf("release applied %d times, want 1", n)
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_CANCELLED)
+	// 重复取消只有第一次完成转换，只有它写事件、通知中继。
+	e.wantEvents(t, o.GetOrderId(), "cancelled")
+	if got := e.relay.kicks.Load() - kicks; got != 1 {
+		t.Errorf("relay kicked %d times, want 1", got)
 	}
-	if n := e.inv.callCount("Release"); n != 1 {
-		t.Errorf("release called %d times, want 1 (repeat cancels must not settle again)", n)
+	ev := e.allEvents(t)[0]
+	if ev.GetUserId() != 1 || !ev.GetOccurTime().AsTime().Equal(stored.UpdatedAt) {
+		t.Errorf("event user_id = %d, occur_time = %s, want 1, %s", ev.GetUserId(), ev.GetOccurTime().AsTime(), stored.UpdatedAt)
 	}
-	wantStock(t, e.inv, skuA, 1000, 0, 0)
+	// 释放由库存服务消费 cancelled 事件完成，订单服务不再同步调用。
+	wantStock(t, e.inv, skuA, 998, 2, 0)
 }
 
 func TestCancelOrderNotCancellable(t *testing.T) {
@@ -50,7 +59,8 @@ func TestCancelOrderNotCancellable(t *testing.T) {
 	}
 	_, err := e.svc.CancelOrder(t.Context(), cancelReq(paid.GetOrderId(), 1))
 	wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderNotCancellable)
-	wantStatus(t, e.load(t, paid.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PAID, true)
+	wantStatus(t, e.load(t, paid.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PAID)
+	e.wantEvents(t, paid.GetOrderId(), "paid", "handled")
 
 	e.inv.inject("Reserve", fault{err: errTimeout})
 	if _, err := e.svc.CreateOrder(t.Context(), createReq(1, "creating", items(skuA, 1))); errx.Code(err) != codes.Unavailable {
@@ -59,6 +69,7 @@ func TestCancelOrderNotCancellable(t *testing.T) {
 	creating := e.loadByKey(t, 1, "creating")
 	_, err = e.svc.CancelOrder(t.Context(), cancelReq(creating.OrderID, 1))
 	wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderNotCancellable)
+	e.wantEvents(t, creating.OrderID)
 
 	_, err = e.svc.CancelOrder(t.Context(), cancelReq(0, 1))
 	wantErr(t, err, codes.InvalidArgument, errx.ReasonInvalidArgument)
@@ -82,10 +93,7 @@ func TestCancelOrderConcurrent(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
-	// 只有完成转换的那一次去结清。
-	if n := e.inv.callCount("Release"); n != 1 {
-		t.Errorf("release called %d times, want 1", n)
-	}
-	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CANCELLED, true)
-	wantStock(t, e.inv, skuA, 1000, 0, 0)
+	// 只有完成转换的那一次写事件。
+	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CANCELLED)
+	e.wantEvents(t, o.GetOrderId(), "cancelled")
 }

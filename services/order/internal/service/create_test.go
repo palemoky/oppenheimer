@@ -12,6 +12,7 @@ import (
 
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
 
 func TestCreateOrderValidation(t *testing.T) {
@@ -62,7 +63,7 @@ func TestCreateOrderSuccess(t *testing.T) {
 		t.Errorf("items = %v", o.GetItems())
 	}
 	stored := e.load(t, o.GetOrderId())
-	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT, false)
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
 	if stored.Items[0].UnitPrice != priceA || stored.Items[1].UnitPrice != priceB {
 		t.Errorf("stored unit prices = %+v", stored.Items)
 	}
@@ -193,7 +194,7 @@ func TestCreateOrderRejected(t *testing.T) {
 			wantErr(t, err, tc.code, tc.reason)
 
 			o := e.loadByKey(t, 1, "k")
-			wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED, true)
+			wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED)
 			if o.FailReason != tc.reason {
 				t.Errorf("fail_reason = %q, want %q", o.FailReason, tc.reason)
 			}
@@ -206,16 +207,17 @@ func TestCreateOrderRejected(t *testing.T) {
 			if n := e.inv.callCount("Reserve"); n != 1 {
 				t.Errorf("reserve called %d times, want 1", n)
 			}
-			// “已释放”的拒绝无需再调 Release；另外两种拒绝在线上路径里已经 Release 过一次并结清。
-			// 无论哪种，后台任务都不会再去释放。
-			wantReleases := 1
-			if tc.reason == errx.ReasonReservationReleased {
-				wantReleases = 0
-			}
+			// 不论哪种拒绝都恰好一条 failed 事件，带上原因；释放交给库存服务（不再同步调用 Release）。
+			// 重复请求、后台任务、再次尝试置为失败都不会多写。
 			e.clock.Advance(time.Hour)
 			e.sweeper.RunOnce(t.Context())
-			if n := e.inv.callCount("Release"); n != wantReleases {
-				t.Errorf("release called %d times, want %d", n, wantReleases)
+			ok, err := e.svc.failCreating(t.Context(), store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}, "AGAIN", e.svc.now())
+			if err != nil || ok {
+				t.Errorf("second failCreating = %v, %v; want false, nil", ok, err)
+			}
+			e.wantEvents(t, o.OrderID, "failed")
+			if got := e.allEvents(t)[0].GetFailed().GetReason(); got != tc.reason {
+				t.Errorf("failed event reason = %q, want %q", got, tc.reason)
 			}
 		})
 	}
@@ -229,7 +231,7 @@ func TestCreateOrderReservationMismatchKeepsCreating(t *testing.T) {
 	if errx.Code(err) != codes.Internal {
 		t.Fatalf("err = %v, want Internal", err)
 	}
-	wantStatus(t, e.loadByKey(t, 1, "k"), orderv1.OrderStatus_ORDER_STATUS_CREATING, false)
+	wantStatus(t, e.loadByKey(t, 1, "k"), orderv1.OrderStatus_ORDER_STATUS_CREATING)
 }
 
 func TestCreateOrderReserveTimeoutThenRetry(t *testing.T) {
@@ -248,7 +250,7 @@ func TestCreateOrderReserveTimeoutThenRetry(t *testing.T) {
 			if errx.Code(err) != codes.Unavailable {
 				t.Fatalf("err = %v, want Unavailable", err)
 			}
-			wantStatus(t, e.loadByKey(t, 1, "k"), orderv1.OrderStatus_ORDER_STATUS_CREATING, false)
+			wantStatus(t, e.loadByKey(t, 1, "k"), orderv1.OrderStatus_ORDER_STATUS_CREATING)
 
 			resp, err := e.svc.CreateOrder(t.Context(), req)
 			if err != nil {
@@ -285,18 +287,21 @@ func TestCreateOrderReserveTimeoutWithoutRetry(t *testing.T) {
 			// 未到创建时限不动它。
 			e.clock.Advance(DefaultCreateTimeout - time.Second)
 			e.sweeper.RunOnce(t.Context())
-			wantStatus(t, e.load(t, id), orderv1.OrderStatus_ORDER_STATUS_CREATING, false)
+			wantStatus(t, e.load(t, id), orderv1.OrderStatus_ORDER_STATUS_CREATING)
 
 			e.clock.Advance(2 * time.Second)
 			e.sweeper.RunOnce(t.Context())
 			o := e.load(t, id)
-			wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED, true)
+			wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED)
 			if o.FailReason != ReasonCreateTimeout {
 				t.Errorf("fail_reason = %q", o.FailReason)
 			}
-			if n := e.inv.callCount("Release"); n != 1 {
-				t.Errorf("release called %d times, want 1", n)
+			e.wantEvents(t, id, "failed")
+			if got := e.allEvents(t)[0].GetFailed().GetReason(); got != ReasonCreateTimeout {
+				t.Errorf("failed event reason = %q", got)
 			}
+			// 库存服务消费 failed 事件后：预占过的被释放，没预占过的留下“已释放”标记。
+			e.consumeEvents(t)
 			if e.inv.state(id) != resReleased {
 				t.Errorf("reservation state = %d, want released", e.inv.state(id))
 			}
@@ -312,41 +317,54 @@ func TestCreateOrderReserveTimeoutWithoutRetry(t *testing.T) {
 	}
 }
 
-// 在线路径的 Reserve 还在路上时，后台任务按超时把订单置为失败并释放；
-// 迟到的 Reserve 被空回滚标记挡住，库存不会泄漏。
+// 在线路径的 Reserve 还在路上时，后台任务按超时把订单置为失败并写 failed 事件。
+// 两种先后都不会泄漏库存：Reserve 先到，failed 事件把它释放；
+// failed 事件先被消费，留下的空回滚标记挡住迟到的 Reserve。
 func TestCreateOrderLateReserveAfterTimeout(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t)
-	e.inv.inject("Reserve", fault{before: func(int64) {
-		e.clock.Advance(DefaultCreateTimeout + time.Second)
-		e.sweeper.RunOnce(t.Context())
-	}})
-	_, err := e.svc.CreateOrder(t.Context(), createReq(1, "k", items(skuA, 2)))
-	wantErr(t, err, codes.Aborted, ReasonCreateTimeout)
-	wantStatus(t, e.loadByKey(t, 1, "k"), orderv1.OrderStatus_ORDER_STATUS_FAILED, true)
-	wantStock(t, e.inv, skuA, 1000, 0, 0)
+	for _, eventFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("eventFirst=%v", eventFirst), func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t)
+			e.inv.inject("Reserve", fault{before: func(int64) {
+				e.clock.Advance(DefaultCreateTimeout + time.Second)
+				e.sweeper.RunOnce(t.Context())
+				if eventFirst {
+					e.consumeEvents(t)
+				}
+			}})
+			// 两种先后下在线路径都看到订单已因创建超时失败（eventFirst 时 Reserve 本身被拒）。
+			_, err := e.svc.CreateOrder(t.Context(), createReq(1, "k", items(skuA, 2)))
+			wantErr(t, err, codes.Aborted, ReasonCreateTimeout)
+			o := e.loadByKey(t, 1, "k")
+			wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED)
+			e.wantEvents(t, o.OrderID, "failed")
+			e.consumeEvents(t)
+			wantStock(t, e.inv, skuA, 1000, 0, 0)
+		})
+	}
 }
 
-// 同一订单的两次推进并发：另一次因库存不足把订单置为 FAILED（未结清），
-// 还没来得及 Release 就崩溃了；随后本次的 Reserve 成功。
-// 这份预占必须由后台任务释放，不能泄漏。
+// 同一订单的两次推进并发：另一次因库存不足把订单置为 FAILED 并写了 failed 事件，
+// 随后本次的 Reserve 成功。本次不再写事件（条件更新不成立），
+// 这份预占由库存服务消费那条 failed 事件时释放，不能泄漏。
 func TestCreateOrderReserveSucceededOnFailedOrder(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.inv.inject("Reserve", fault{before: func(orderID int64) {
-		if _, err := e.store.MarkCreateFailed(t.Context(), orderID, errx.ReasonInsufficientStock, false, e.clock.Now()); err != nil {
+		ref := store.OrderRef{OrderID: orderID, UserID: 1}
+		if _, err := e.svc.failCreating(t.Context(), ref, errx.ReasonInsufficientStock, e.svc.now()); err != nil {
 			t.Error(err)
 		}
 	}})
 	_, err := e.svc.CreateOrder(t.Context(), createReq(1, "k", items(skuA, 2)))
 	wantErr(t, err, codes.FailedPrecondition, errx.ReasonInsufficientStock)
 	o := e.loadByKey(t, 1, "k")
-	wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED, false)
+	wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED)
 	wantStock(t, e.inv, skuA, 998, 2, 0)
+	e.wantEvents(t, o.OrderID, "failed")
 
-	e.clock.Advance(DefaultSettleGrace + time.Second)
-	e.sweeper.RunOnce(t.Context())
-	wantStatus(t, e.load(t, o.OrderID), orderv1.OrderStatus_ORDER_STATUS_FAILED, true)
+	e.consumeEvents(t)
 	wantStock(t, e.inv, skuA, 1000, 0, 0)
 }
 
@@ -358,7 +376,7 @@ func TestCreateOrderInvalidReserveResult(t *testing.T) {
 	if errx.Code(err) != codes.Internal {
 		t.Fatalf("overflow err = %v, want Internal", err)
 	}
-	wantStatus(t, e.loadByKey(t, 1, "overflow"), orderv1.OrderStatus_ORDER_STATUS_CREATING, false)
+	wantStatus(t, e.loadByKey(t, 1, "overflow"), orderv1.OrderStatus_ORDER_STATUS_CREATING)
 
 	// 求和溢出：2^62 + 2^62。
 	e.inv.addSKU(5, 1<<62, 10)
@@ -373,14 +391,17 @@ func TestCreateOrderInvalidReserveResult(t *testing.T) {
 	if errx.Code(err) != codes.Internal {
 		t.Fatalf("currency err = %v, want Internal", err)
 	}
-	wantStatus(t, e.loadByKey(t, 1, "currency"), orderv1.OrderStatus_ORDER_STATUS_CREATING, false)
+	wantStatus(t, e.loadByKey(t, 1, "currency"), orderv1.OrderStatus_ORDER_STATUS_CREATING)
 
-	// 这些订单最终由后台任务置为失败并释放库存。
+	// 这些订单最终由后台任务置为失败，各发一条 failed 事件，库存服务据此释放预占。
 	e.clock.Advance(DefaultCreateTimeout + time.Second)
 	e.sweeper.RunOnce(t.Context())
 	for _, key := range []string{"overflow", "sum", "currency"} {
-		wantStatus(t, e.loadByKey(t, 1, key), orderv1.OrderStatus_ORDER_STATUS_FAILED, true)
+		o := e.loadByKey(t, 1, key)
+		wantStatus(t, o, orderv1.OrderStatus_ORDER_STATUS_FAILED)
+		e.wantEvents(t, o.OrderID, "failed")
 	}
+	e.consumeEvents(t)
 	wantStock(t, e.inv, skuHuge, 1000, 0, 0)
 	wantStock(t, e.inv, skuB, 1000, 0, 0)
 }
