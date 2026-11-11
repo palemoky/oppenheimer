@@ -19,10 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	OrderService_CreateOrder_FullMethodName         = "/oppenheimer.order.v1.OrderService/CreateOrder"
-	OrderService_GetOrder_FullMethodName            = "/oppenheimer.order.v1.OrderService/GetOrder"
-	OrderService_CancelOrder_FullMethodName         = "/oppenheimer.order.v1.OrderService/CancelOrder"
-	OrderService_HandlePaymentResult_FullMethodName = "/oppenheimer.order.v1.OrderService/HandlePaymentResult"
+	OrderService_CreateOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/CreateOrder"
+	OrderService_GetOrder_FullMethodName    = "/oppenheimer.order.v1.OrderService/GetOrder"
+	OrderService_CancelOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/CancelOrder"
 )
 
 // OrderServiceClient is the client API for OrderService service.
@@ -54,14 +53,6 @@ type OrderServiceClient interface {
 	//   NOT_FOUND            reason=ORDER_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=ORDER_NOT_CANCELLABLE 订单不在待支付状态
 	CancelOrder(ctx context.Context, in *CancelOrderRequest, opts ...grpc.CallOption) (*CancelOrderResponse, error)
-	// HandlePaymentResult 由支付服务回调，通知一笔支付的最终结果。
-	//
-	// 以 payment_id 幂等，支付服务会重试直到收到成功响应。
-	//
-	// 错误：
-	//   NOT_FOUND            reason=ORDER_NOT_FOUND
-	//   FAILED_PRECONDITION  reason=AMOUNT_MISMATCH 支付金额与订单金额不一致
-	HandlePaymentResult(ctx context.Context, in *HandlePaymentResultRequest, opts ...grpc.CallOption) (*HandlePaymentResultResponse, error)
 }
 
 type orderServiceClient struct {
@@ -102,16 +93,6 @@ func (c *orderServiceClient) CancelOrder(ctx context.Context, in *CancelOrderReq
 	return out, nil
 }
 
-func (c *orderServiceClient) HandlePaymentResult(ctx context.Context, in *HandlePaymentResultRequest, opts ...grpc.CallOption) (*HandlePaymentResultResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(HandlePaymentResultResponse)
-	err := c.cc.Invoke(ctx, OrderService_HandlePaymentResult_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // OrderServiceServer is the server API for OrderService service.
 // All implementations must embed UnimplementedOrderServiceServer
 // for forward compatibility.
@@ -141,14 +122,6 @@ type OrderServiceServer interface {
 	//   NOT_FOUND            reason=ORDER_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=ORDER_NOT_CANCELLABLE 订单不在待支付状态
 	CancelOrder(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error)
-	// HandlePaymentResult 由支付服务回调，通知一笔支付的最终结果。
-	//
-	// 以 payment_id 幂等，支付服务会重试直到收到成功响应。
-	//
-	// 错误：
-	//   NOT_FOUND            reason=ORDER_NOT_FOUND
-	//   FAILED_PRECONDITION  reason=AMOUNT_MISMATCH 支付金额与订单金额不一致
-	HandlePaymentResult(context.Context, *HandlePaymentResultRequest) (*HandlePaymentResultResponse, error)
 	mustEmbedUnimplementedOrderServiceServer()
 }
 
@@ -167,9 +140,6 @@ func (UnimplementedOrderServiceServer) GetOrder(context.Context, *GetOrderReques
 }
 func (UnimplementedOrderServiceServer) CancelOrder(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CancelOrder not implemented")
-}
-func (UnimplementedOrderServiceServer) HandlePaymentResult(context.Context, *HandlePaymentResultRequest) (*HandlePaymentResultResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method HandlePaymentResult not implemented")
 }
 func (UnimplementedOrderServiceServer) mustEmbedUnimplementedOrderServiceServer() {}
 func (UnimplementedOrderServiceServer) testEmbeddedByValue()                      {}
@@ -246,24 +216,6 @@ func _OrderService_CancelOrder_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _OrderService_HandlePaymentResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(HandlePaymentResultRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(OrderServiceServer).HandlePaymentResult(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: OrderService_HandlePaymentResult_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(OrderServiceServer).HandlePaymentResult(ctx, req.(*HandlePaymentResultRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // OrderService_ServiceDesc is the grpc.ServiceDesc for OrderService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -282,10 +234,6 @@ var OrderService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelOrder",
 			Handler:    _OrderService_CancelOrder_Handler,
-		},
-		{
-			MethodName: "HandlePaymentResult",
-			Handler:    _OrderService_HandlePaymentResult_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

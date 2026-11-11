@@ -83,14 +83,15 @@
 
 公共库（派给子 Agent 并行实现，互不依赖，主会话评审后合并）：
 
-- [ ] `pkg/retry`、`pkg/worker`：重试与退避、周期任务（Sonnet）
-- [ ] `pkg/kafkax` 的生产者、消费者、延迟消费者，`pkg/testkafka`（Opus）
-- [ ] `pkg/lock`：加锁、Lua 解锁、看门狗续期、fencing token，含两个锁失效实验（Opus）
-- [ ] `pkg/outbox`：`Add` 与中继（Opus 实现，主会话逐行评审；依赖 `kafkax` 的生产者接口和 `worker`，在前两项合并后做）
+- [x] `pkg/retry`、`pkg/worker`：重试与退避、周期任务（Sonnet）
+- [x] `pkg/kafkax` 的生产者、消费者、延迟消费者，`pkg/testkafka`（Opus）
+- [x] `pkg/lock`：加锁、Lua 解锁、看门狗续期、fencing token，含两个锁失效实验（Opus）
+- [x] `pkg/outbox`：`Add` 与中继（主会话编写）
+- [ ] `pkg/outbox` 的测试（Sonnet）
 
 ### 步骤二：事件化（outbox 加 Kafka 替换同步调用与轮询）
 
-- [ ] `order.proto` 删除 `HandlePaymentResult`；各服务迁移 `00002`（主会话串行）
+- [x] `order.proto` 删除 `HandlePaymentResult`；事件编解码辅助包 `api/eventx`；本机脚本传入 Kafka 配置（主会话串行）。各服务的迁移 `00002` 由各自的子 Agent 按设计文档添加
 - [ ] order：状态转换写事件、消费 `payment.events`、删除结清逻辑（Fable 编写或逐行评审）
 - [ ] payment：出结果写事件、消费 `order.events` 的答复、删除回调轮询
 - [ ] inventory：消费 `order.events` 做 Confirm、Release

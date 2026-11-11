@@ -90,57 +90,6 @@ func (OrderStatus) EnumDescriptor() ([]byte, []int) {
 	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{0}
 }
 
-type PaymentDisposition int32
-
-const (
-	PaymentDisposition_PAYMENT_DISPOSITION_UNSPECIFIED PaymentDisposition = 0
-	// 订单已按该支付结果处理（或此前已处理过）。
-	PaymentDisposition_PAYMENT_DISPOSITION_ACCEPTED PaymentDisposition = 1
-	// 支付成功，但订单已不能接受这笔钱（已取消、已关闭，或已被另一笔支付付清），需要退款。
-	PaymentDisposition_PAYMENT_DISPOSITION_REFUND_REQUIRED PaymentDisposition = 2
-)
-
-// Enum value maps for PaymentDisposition.
-var (
-	PaymentDisposition_name = map[int32]string{
-		0: "PAYMENT_DISPOSITION_UNSPECIFIED",
-		1: "PAYMENT_DISPOSITION_ACCEPTED",
-		2: "PAYMENT_DISPOSITION_REFUND_REQUIRED",
-	}
-	PaymentDisposition_value = map[string]int32{
-		"PAYMENT_DISPOSITION_UNSPECIFIED":     0,
-		"PAYMENT_DISPOSITION_ACCEPTED":        1,
-		"PAYMENT_DISPOSITION_REFUND_REQUIRED": 2,
-	}
-)
-
-func (x PaymentDisposition) Enum() *PaymentDisposition {
-	p := new(PaymentDisposition)
-	*p = x
-	return p
-}
-
-func (x PaymentDisposition) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (PaymentDisposition) Descriptor() protoreflect.EnumDescriptor {
-	return file_oppenheimer_order_v1_order_proto_enumTypes[1].Descriptor()
-}
-
-func (PaymentDisposition) Type() protoreflect.EnumType {
-	return &file_oppenheimer_order_v1_order_proto_enumTypes[1]
-}
-
-func (x PaymentDisposition) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use PaymentDisposition.Descriptor instead.
-func (PaymentDisposition) EnumDescriptor() ([]byte, []int) {
-	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{1}
-}
-
 type OrderItem struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SkuId         int64                  `protobuf:"varint,1,opt,name=sku_id,json=skuId,proto3" json:"sku_id,omitempty"`
@@ -654,120 +603,6 @@ func (x *CancelOrderResponse) GetOrder() *Order {
 	return nil
 }
 
-type HandlePaymentResultRequest struct {
-	state     protoimpl.MessageState `protogen:"open.v1"`
-	OrderId   int64                  `protobuf:"varint,1,opt,name=order_id,json=orderId,proto3" json:"order_id,omitempty"`
-	PaymentId int64                  `protobuf:"varint,2,opt,name=payment_id,json=paymentId,proto3" json:"payment_id,omitempty"`
-	// 是否支付成功。
-	Succeeded bool `protobuf:"varint,3,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
-	// 实际支付金额。
-	Amount        *v1.Money `protobuf:"bytes,4,opt,name=amount,proto3" json:"amount,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *HandlePaymentResultRequest) Reset() {
-	*x = HandlePaymentResultRequest{}
-	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[9]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *HandlePaymentResultRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*HandlePaymentResultRequest) ProtoMessage() {}
-
-func (x *HandlePaymentResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[9]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use HandlePaymentResultRequest.ProtoReflect.Descriptor instead.
-func (*HandlePaymentResultRequest) Descriptor() ([]byte, []int) {
-	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{9}
-}
-
-func (x *HandlePaymentResultRequest) GetOrderId() int64 {
-	if x != nil {
-		return x.OrderId
-	}
-	return 0
-}
-
-func (x *HandlePaymentResultRequest) GetPaymentId() int64 {
-	if x != nil {
-		return x.PaymentId
-	}
-	return 0
-}
-
-func (x *HandlePaymentResultRequest) GetSucceeded() bool {
-	if x != nil {
-		return x.Succeeded
-	}
-	return false
-}
-
-func (x *HandlePaymentResultRequest) GetAmount() *v1.Money {
-	if x != nil {
-		return x.Amount
-	}
-	return nil
-}
-
-type HandlePaymentResultResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Disposition   PaymentDisposition     `protobuf:"varint,1,opt,name=disposition,proto3,enum=oppenheimer.order.v1.PaymentDisposition" json:"disposition,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *HandlePaymentResultResponse) Reset() {
-	*x = HandlePaymentResultResponse{}
-	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[10]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *HandlePaymentResultResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*HandlePaymentResultResponse) ProtoMessage() {}
-
-func (x *HandlePaymentResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[10]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use HandlePaymentResultResponse.ProtoReflect.Descriptor instead.
-func (*HandlePaymentResultResponse) Descriptor() ([]byte, []int) {
-	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{10}
-}
-
-func (x *HandlePaymentResultResponse) GetDisposition() PaymentDisposition {
-	if x != nil {
-		return x.Disposition
-	}
-	return PaymentDisposition_PAYMENT_DISPOSITION_UNSPECIFIED
-}
-
 var File_oppenheimer_order_v1_order_proto protoreflect.FileDescriptor
 
 const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
@@ -807,15 +642,7 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\border_id\x18\x01 \x01(\x03R\aorderId\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\x03R\x06userId\"H\n" +
 	"\x13CancelOrderResponse\x121\n" +
-	"\x05order\x18\x01 \x01(\v2\x1b.oppenheimer.order.v1.OrderR\x05order\"\xaa\x01\n" +
-	"\x1aHandlePaymentResultRequest\x12\x19\n" +
-	"\border_id\x18\x01 \x01(\x03R\aorderId\x12\x1d\n" +
-	"\n" +
-	"payment_id\x18\x02 \x01(\x03R\tpaymentId\x12\x1c\n" +
-	"\tsucceeded\x18\x03 \x01(\bR\tsucceeded\x124\n" +
-	"\x06amount\x18\x04 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\x06amount\"i\n" +
-	"\x1bHandlePaymentResultResponse\x12J\n" +
-	"\vdisposition\x18\x01 \x01(\x0e2(.oppenheimer.order.v1.PaymentDispositionR\vdisposition*\xcd\x01\n" +
+	"\x05order\x18\x01 \x01(\v2\x1b.oppenheimer.order.v1.OrderR\x05order*\xcd\x01\n" +
 	"\vOrderStatus\x12\x1c\n" +
 	"\x18ORDER_STATUS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15ORDER_STATUS_CREATING\x10\x01\x12 \n" +
@@ -823,16 +650,11 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\x11ORDER_STATUS_PAID\x10\x03\x12\x1a\n" +
 	"\x16ORDER_STATUS_CANCELLED\x10\x04\x12\x17\n" +
 	"\x13ORDER_STATUS_CLOSED\x10\x05\x12\x17\n" +
-	"\x13ORDER_STATUS_FAILED\x10\x06*\x84\x01\n" +
-	"\x12PaymentDisposition\x12#\n" +
-	"\x1fPAYMENT_DISPOSITION_UNSPECIFIED\x10\x00\x12 \n" +
-	"\x1cPAYMENT_DISPOSITION_ACCEPTED\x10\x01\x12'\n" +
-	"#PAYMENT_DISPOSITION_REFUND_REQUIRED\x10\x022\xad\x03\n" +
+	"\x13ORDER_STATUS_FAILED\x10\x062\xb1\x02\n" +
 	"\fOrderService\x12b\n" +
 	"\vCreateOrder\x12(.oppenheimer.order.v1.CreateOrderRequest\x1a).oppenheimer.order.v1.CreateOrderResponse\x12Y\n" +
 	"\bGetOrder\x12%.oppenheimer.order.v1.GetOrderRequest\x1a&.oppenheimer.order.v1.GetOrderResponse\x12b\n" +
-	"\vCancelOrder\x12(.oppenheimer.order.v1.CancelOrderRequest\x1a).oppenheimer.order.v1.CancelOrderResponse\x12z\n" +
-	"\x13HandlePaymentResult\x120.oppenheimer.order.v1.HandlePaymentResultRequest\x1a1.oppenheimer.order.v1.HandlePaymentResultResponseB\xde\x01\n" +
+	"\vCancelOrder\x12(.oppenheimer.order.v1.CancelOrderRequest\x1a).oppenheimer.order.v1.CancelOrderResponseB\xde\x01\n" +
 	"\x18com.oppenheimer.order.v1B\n" +
 	"OrderProtoP\x01ZDgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1;orderv1\xa2\x02\x03OOX\xaa\x02\x14Oppenheimer.Order.V1\xca\x02\x14Oppenheimer\\Order\\V1\xe2\x02 Oppenheimer\\Order\\V1\\GPBMetadata\xea\x02\x16Oppenheimer::Order::V1b\x06proto3"
 
@@ -848,52 +670,45 @@ func file_oppenheimer_order_v1_order_proto_rawDescGZIP() []byte {
 	return file_oppenheimer_order_v1_order_proto_rawDescData
 }
 
-var file_oppenheimer_order_v1_order_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_oppenheimer_order_v1_order_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_oppenheimer_order_v1_order_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_oppenheimer_order_v1_order_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_oppenheimer_order_v1_order_proto_goTypes = []any{
-	(OrderStatus)(0),                    // 0: oppenheimer.order.v1.OrderStatus
-	(PaymentDisposition)(0),             // 1: oppenheimer.order.v1.PaymentDisposition
-	(*OrderItem)(nil),                   // 2: oppenheimer.order.v1.OrderItem
-	(*Order)(nil),                       // 3: oppenheimer.order.v1.Order
-	(*CreateOrderItem)(nil),             // 4: oppenheimer.order.v1.CreateOrderItem
-	(*CreateOrderRequest)(nil),          // 5: oppenheimer.order.v1.CreateOrderRequest
-	(*CreateOrderResponse)(nil),         // 6: oppenheimer.order.v1.CreateOrderResponse
-	(*GetOrderRequest)(nil),             // 7: oppenheimer.order.v1.GetOrderRequest
-	(*GetOrderResponse)(nil),            // 8: oppenheimer.order.v1.GetOrderResponse
-	(*CancelOrderRequest)(nil),          // 9: oppenheimer.order.v1.CancelOrderRequest
-	(*CancelOrderResponse)(nil),         // 10: oppenheimer.order.v1.CancelOrderResponse
-	(*HandlePaymentResultRequest)(nil),  // 11: oppenheimer.order.v1.HandlePaymentResultRequest
-	(*HandlePaymentResultResponse)(nil), // 12: oppenheimer.order.v1.HandlePaymentResultResponse
-	(*v1.Money)(nil),                    // 13: oppenheimer.common.v1.Money
-	(*timestamppb.Timestamp)(nil),       // 14: google.protobuf.Timestamp
+	(OrderStatus)(0),              // 0: oppenheimer.order.v1.OrderStatus
+	(*OrderItem)(nil),             // 1: oppenheimer.order.v1.OrderItem
+	(*Order)(nil),                 // 2: oppenheimer.order.v1.Order
+	(*CreateOrderItem)(nil),       // 3: oppenheimer.order.v1.CreateOrderItem
+	(*CreateOrderRequest)(nil),    // 4: oppenheimer.order.v1.CreateOrderRequest
+	(*CreateOrderResponse)(nil),   // 5: oppenheimer.order.v1.CreateOrderResponse
+	(*GetOrderRequest)(nil),       // 6: oppenheimer.order.v1.GetOrderRequest
+	(*GetOrderResponse)(nil),      // 7: oppenheimer.order.v1.GetOrderResponse
+	(*CancelOrderRequest)(nil),    // 8: oppenheimer.order.v1.CancelOrderRequest
+	(*CancelOrderResponse)(nil),   // 9: oppenheimer.order.v1.CancelOrderResponse
+	(*v1.Money)(nil),              // 10: oppenheimer.common.v1.Money
+	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
 }
 var file_oppenheimer_order_v1_order_proto_depIdxs = []int32{
-	13, // 0: oppenheimer.order.v1.OrderItem.unit_price:type_name -> oppenheimer.common.v1.Money
+	10, // 0: oppenheimer.order.v1.OrderItem.unit_price:type_name -> oppenheimer.common.v1.Money
 	0,  // 1: oppenheimer.order.v1.Order.status:type_name -> oppenheimer.order.v1.OrderStatus
-	13, // 2: oppenheimer.order.v1.Order.total:type_name -> oppenheimer.common.v1.Money
-	2,  // 3: oppenheimer.order.v1.Order.items:type_name -> oppenheimer.order.v1.OrderItem
-	14, // 4: oppenheimer.order.v1.Order.create_time:type_name -> google.protobuf.Timestamp
-	14, // 5: oppenheimer.order.v1.Order.expire_time:type_name -> google.protobuf.Timestamp
-	14, // 6: oppenheimer.order.v1.Order.pay_time:type_name -> google.protobuf.Timestamp
-	4,  // 7: oppenheimer.order.v1.CreateOrderRequest.items:type_name -> oppenheimer.order.v1.CreateOrderItem
-	3,  // 8: oppenheimer.order.v1.CreateOrderResponse.order:type_name -> oppenheimer.order.v1.Order
-	3,  // 9: oppenheimer.order.v1.GetOrderResponse.order:type_name -> oppenheimer.order.v1.Order
-	3,  // 10: oppenheimer.order.v1.CancelOrderResponse.order:type_name -> oppenheimer.order.v1.Order
-	13, // 11: oppenheimer.order.v1.HandlePaymentResultRequest.amount:type_name -> oppenheimer.common.v1.Money
-	1,  // 12: oppenheimer.order.v1.HandlePaymentResultResponse.disposition:type_name -> oppenheimer.order.v1.PaymentDisposition
-	5,  // 13: oppenheimer.order.v1.OrderService.CreateOrder:input_type -> oppenheimer.order.v1.CreateOrderRequest
-	7,  // 14: oppenheimer.order.v1.OrderService.GetOrder:input_type -> oppenheimer.order.v1.GetOrderRequest
-	9,  // 15: oppenheimer.order.v1.OrderService.CancelOrder:input_type -> oppenheimer.order.v1.CancelOrderRequest
-	11, // 16: oppenheimer.order.v1.OrderService.HandlePaymentResult:input_type -> oppenheimer.order.v1.HandlePaymentResultRequest
-	6,  // 17: oppenheimer.order.v1.OrderService.CreateOrder:output_type -> oppenheimer.order.v1.CreateOrderResponse
-	8,  // 18: oppenheimer.order.v1.OrderService.GetOrder:output_type -> oppenheimer.order.v1.GetOrderResponse
-	10, // 19: oppenheimer.order.v1.OrderService.CancelOrder:output_type -> oppenheimer.order.v1.CancelOrderResponse
-	12, // 20: oppenheimer.order.v1.OrderService.HandlePaymentResult:output_type -> oppenheimer.order.v1.HandlePaymentResultResponse
-	17, // [17:21] is the sub-list for method output_type
-	13, // [13:17] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	10, // 2: oppenheimer.order.v1.Order.total:type_name -> oppenheimer.common.v1.Money
+	1,  // 3: oppenheimer.order.v1.Order.items:type_name -> oppenheimer.order.v1.OrderItem
+	11, // 4: oppenheimer.order.v1.Order.create_time:type_name -> google.protobuf.Timestamp
+	11, // 5: oppenheimer.order.v1.Order.expire_time:type_name -> google.protobuf.Timestamp
+	11, // 6: oppenheimer.order.v1.Order.pay_time:type_name -> google.protobuf.Timestamp
+	3,  // 7: oppenheimer.order.v1.CreateOrderRequest.items:type_name -> oppenheimer.order.v1.CreateOrderItem
+	2,  // 8: oppenheimer.order.v1.CreateOrderResponse.order:type_name -> oppenheimer.order.v1.Order
+	2,  // 9: oppenheimer.order.v1.GetOrderResponse.order:type_name -> oppenheimer.order.v1.Order
+	2,  // 10: oppenheimer.order.v1.CancelOrderResponse.order:type_name -> oppenheimer.order.v1.Order
+	4,  // 11: oppenheimer.order.v1.OrderService.CreateOrder:input_type -> oppenheimer.order.v1.CreateOrderRequest
+	6,  // 12: oppenheimer.order.v1.OrderService.GetOrder:input_type -> oppenheimer.order.v1.GetOrderRequest
+	8,  // 13: oppenheimer.order.v1.OrderService.CancelOrder:input_type -> oppenheimer.order.v1.CancelOrderRequest
+	5,  // 14: oppenheimer.order.v1.OrderService.CreateOrder:output_type -> oppenheimer.order.v1.CreateOrderResponse
+	7,  // 15: oppenheimer.order.v1.OrderService.GetOrder:output_type -> oppenheimer.order.v1.GetOrderResponse
+	9,  // 16: oppenheimer.order.v1.OrderService.CancelOrder:output_type -> oppenheimer.order.v1.CancelOrderResponse
+	14, // [14:17] is the sub-list for method output_type
+	11, // [11:14] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_oppenheimer_order_v1_order_proto_init() }
@@ -906,8 +721,8 @@ func file_oppenheimer_order_v1_order_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_oppenheimer_order_v1_order_proto_rawDesc), len(file_oppenheimer_order_v1_order_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   11,
+			NumEnums:      1,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

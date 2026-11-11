@@ -18,6 +18,13 @@ MYSQL_PORT="${MYSQL_PORT:-3306}"
 
 dsn() { echo "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/${DB_PREFIX}$1"; }
 
+# Kafka 和 Redis 的地址对所有服务相同，直接导出，子进程会继承。
+# KAFKA_PREFIX、REDIS_PREFIX 默认为空；端到端测试会设置它们，与手动运行的环境隔离。
+export KAFKA_BROKERS="${KAFKA_BROKERS:-127.0.0.1:${KAFKA_PORT:-9092}}"
+export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:${REDIS_PORT:-6379}}"
+export KAFKA_PREFIX="${KAFKA_PREFIX:-}"
+export REDIS_PREFIX="${REDIS_PREFIX:-}"
+
 mkdir -p "$LOG_DIR"
 pids=()
 

@@ -32,15 +32,6 @@ service OrderService {
   //   NOT_FOUND            reason=ORDER_NOT_FOUND
   //   FAILED_PRECONDITION  reason=ORDER_NOT_CANCELLABLE 订单不在待支付状态
   rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
-
-  // HandlePaymentResult 由支付服务回调，通知一笔支付的最终结果。
-  //
-  // 以 payment_id 幂等，支付服务会重试直到收到成功响应。
-  //
-  // 错误：
-  //   NOT_FOUND            reason=ORDER_NOT_FOUND
-  //   FAILED_PRECONDITION  reason=AMOUNT_MISMATCH 支付金额与订单金额不一致
-  rpc HandlePaymentResult(HandlePaymentResultRequest) returns (HandlePaymentResultResponse);
 }
 
 enum OrderStatus {
@@ -112,25 +103,4 @@ message CancelOrderRequest {
 
 message CancelOrderResponse {
   Order order = 1;
-}
-
-enum PaymentDisposition {
-  PAYMENT_DISPOSITION_UNSPECIFIED = 0;
-  // 订单已按该支付结果处理（或此前已处理过）。
-  PAYMENT_DISPOSITION_ACCEPTED = 1;
-  // 支付成功，但订单已不能接受这笔钱（已取消、已关闭，或已被另一笔支付付清），需要退款。
-  PAYMENT_DISPOSITION_REFUND_REQUIRED = 2;
-}
-
-message HandlePaymentResultRequest {
-  int64 order_id = 1;
-  int64 payment_id = 2;
-  // 是否支付成功。
-  bool succeeded = 3;
-  // 实际支付金额。
-  oppenheimer.common.v1.Money amount = 4;
-}
-
-message HandlePaymentResultResponse {
-  PaymentDisposition disposition = 1;
 }

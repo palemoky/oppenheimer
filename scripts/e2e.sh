@@ -21,6 +21,13 @@ else
 fi
 
 export DB_PREFIX=e2e_
+
+# 每次运行用不同的 topic 和消费者组前缀。数据库每次都重建，上一次运行留在 topic 里的消息
+# 对不上新的数据，不能让这次的消费者读到。顺手删掉以前运行留下的 topic，失败不影响测试。
+"${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 \
+  --delete --topic 'e2e-.*' >/dev/null 2>&1 || true
+export KAFKA_PREFIX="e2e-$(date +%s)."
+export REDIS_PREFIX="e2e-$(date +%s):"
 export LOG_DIR="$ROOT/tmp/e2e-logs"
 # 缩短各时限，让超时关单这类场景能在几秒内测完。
 export PAYMENT_TIMEOUT=3s
