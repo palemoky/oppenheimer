@@ -61,9 +61,18 @@ func Add(ctx context.Context, tx *sql.Tx, msgs ...Message) error {
 		if m.Topic == "" {
 			return errors.New("outbox: empty topic")
 		}
+		// 驱动把 nil 的 []byte 写成 NULL，而这两列是 NOT NULL。没有 key（由客户端挑分区）
+		// 和空消息体都是合法的消息，所以统一存成空串；fetch 再把空 key 还原成 nil。
+		key, payload := m.Key, m.Payload
+		if key == nil {
+			key = []byte{}
+		}
+		if payload == nil {
+			payload = []byte{}
+		}
 		if _, err := tx.ExecContext(ctx,
 			"INSERT INTO outbox (topic, msg_key, payload) VALUES (?, ?, ?)",
-			m.Topic, m.Key, m.Payload,
+			m.Topic, key, payload,
 		); err != nil {
 			return fmt.Errorf("outbox: insert: %w", err)
 		}
@@ -237,11 +246,19 @@ func (r *Relay) Flush(ctx context.Context) (published int, err error) {
 		}
 
 		sent := make([]int64, 0, len(rows))
+		failed := 0
 		for i, rw := range rows {
 			// errs 与 recs 一一对应；Sender 违反约定少返回了，就按失败处理，宁可重发。
 			if i < len(errs) && errs[i] == nil {
 				sent = append(sent, rw.id)
+			} else {
+				failed++
 			}
+		}
+		if failed > 0 && err == nil {
+			// Sender 只在 errs 里报了失败（或少返回了），汇总错误却是 nil。
+			// 不能因此向调用方报告成功：有消息留在表里就必须让这一轮以错误结束。
+			sendErr = errors.Join(sendErr, fmt.Errorf("%d of %d records not acknowledged", failed, len(rows)))
 		}
 		// 消息已经发出去了，标记不应该因为调用方的 ctx 取消而被放弃（那样只会平白多一次重发）。
 		// 标记失败不影响正确性：下一轮会重发，消费者是幂等的。
@@ -281,6 +298,11 @@ func (r *Relay) fetch(ctx context.Context, afterID int64) ([]row, error) {
 		var rw row
 		if err := rs.Scan(&rw.id, &rw.topic, &rw.key, &rw.payload); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
+		}
+		if len(rw.key) == 0 {
+			// 空 key 表示“没有 key”（见 Add）。还原成 nil，让生产者自己挑分区，
+			// 而不是把所有无 key 的消息按空串哈希到同一个分区。
+			rw.key = nil
 		}
 		rows = append(rows, rw)
 	}

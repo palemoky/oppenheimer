@@ -266,24 +266,24 @@ func TestAddRejectsEmptyTopic(t *testing.T) {
 	}
 }
 
-// kafkax.Record 明确允许 Key 为 nil（由客户端挑分区），Add 也应该接受没有 key 的消息。
-// 但 msg_key 是 NOT NULL，驱动会把 nil []byte 当成 NULL 写入，所以 Add 会失败。
+// 防止：没有 key 的消息插入失败。kafkax.Record 允许 Key 为 nil（由客户端挑分区），
+// 而 msg_key 是 NOT NULL，驱动会把 nil []byte 当成 NULL 写入。
 func TestAddAcceptsNilKey(t *testing.T) {
-	t.Skip("已知缺陷：Add 不接受 nil Key（msg_key NOT NULL）。修复实现后删掉这行 Skip")
 	db := newDB(t)
-	tx, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := Add(t.Context(), tx, Message{Topic: "t", Payload: []byte("p")}); err != nil {
-		t.Errorf("Add with nil Key: %v", err)
+	s := newFakeSender()
+	r := newRelay(t, db, s)
+	commitAdd(t, db, Message{Topic: "t", Payload: []byte("p")})
+	mustFlush(t, r)
+
+	// 发出去时必须还是 nil：空串 key 会让所有无 key 的消息哈希到同一个分区。
+	got := s.received()
+	if len(got) != 1 || got[0].Key != nil || string(got[0].Value) != "p" {
+		t.Fatalf("sent %+v, want one record with nil key", got)
 	}
 }
 
-// 同上，Payload 为 nil（例如空事件）也会被写成 NULL。
+// 防止：空消息体（例如所有字段都是零值的 proto）插入失败，原因同上。
 func TestAddAcceptsNilPayload(t *testing.T) {
-	t.Skip("已知缺陷：Add 不接受 nil Payload（payload NOT NULL）。修复实现后删掉这行 Skip")
 	db := newDB(t)
 	tx, err := db.BeginTx(t.Context(), nil)
 	if err != nil {
@@ -461,9 +461,10 @@ func TestFlushShortErrsTreatedAsFailure(t *testing.T) {
 	}
 	s.set(func(f *fakeSender) { f.shortTo = 1 })
 
-	n, _ := r.Flush(t.Context())
-	if n != 1 {
-		t.Fatalf("published = %d, want 1", n)
+	// 假 Sender 这时的汇总错误是 nil：Flush 仍然必须报错，不能把“有消息没发出去”说成成功。
+	n, err := r.Flush(t.Context())
+	if err == nil || n != 1 {
+		t.Fatalf("Flush = (%d, %v), want (1, error)", n, err)
 	}
 	if left := payloadsWhere(t, db, "published_at IS NULL"); !slices.Equal(left, []string{"b", "c"}) {
 		t.Fatalf("unpublished = %v, want [b c]", left)
