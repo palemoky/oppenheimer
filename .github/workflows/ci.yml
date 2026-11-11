@@ -61,7 +61,8 @@ jobs:
           cache-dependency-path: '**/go.sum'
       - name: Build
         working-directory: ${{ matrix.module }}
-        run: go build ./...
+        # -o /dev/null：只检查能否编译，不在源码目录里留下二进制
+        run: go build -o /dev/null ./...
       - name: Vet
         working-directory: ${{ matrix.module }}
         run: go vet ./...
@@ -71,3 +72,31 @@ jobs:
       - name: Coverage summary
         working-directory: ${{ matrix.module }}
         run: go tool cover -func=coverage.out | tail -n 1
+
+  # proto 的格式与规范检查，并确认入库的生成代码与 proto 定义一致。
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: '**/go.sum'
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: 1.75.0
+      - name: Install protoc plugins
+        run: make proto-plugins
+      - name: Lint
+        run: make proto-lint
+      - name: Generate
+        run: make proto
+      - name: Check generated code is up to date
+        run: |
+          if [ -n "$(git status --porcelain -- api/gen)" ]; then
+            git status --short -- api/gen
+            git diff -- api/gen
+            echo "::error::api/gen 与 proto 定义不一致，请运行 make proto 并提交"
+            exit 1
+          fi
