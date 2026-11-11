@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 找出仓库里所有 go module。还没有 Go 代码时列表为空，后面的任务自动跳过。
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: find
+        run: |
+          modules=$(find . -name go.mod -not -path './.git/*' -exec dirname {} \; | sort | jq -R . | jq -sc .)
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "发现的模块：$modules"
+
+  lint:
+    needs: detect
+    if: needs.detect.outputs.modules != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.detect.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: '**/go.sum'
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          working-directory: ${{ matrix.module }}
+
+  test:
+    needs: detect
+    if: needs.detect.outputs.modules != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.detect.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: '**/go.sum'
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        # -o /dev/null：只检查能否编译，不在源码目录里留下二进制
+        run: go build -o /dev/null ./...
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        working-directory: ${{ matrix.module }}
+        run: go tool cover -func=coverage.out | tail -n 1
+
+  # proto 的格式与规范检查，并确认入库的生成代码与 proto 定义一致。
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: '**/go.sum'
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: 1.75.0
+      - name: Install protoc plugins
+        run: make proto-plugins
+      - name: Lint
+        run: make proto-lint
+      - name: Generate
+        run: make proto
+      - name: Check generated code is up to date
+        run: |
+          if [ -n "$(git status --porcelain -- api/gen)" ]; then
+            git status --short -- api/gen
+            git diff -- api/gen
+            echo "::error::api/gen 与 proto 定义不一致，请运行 make proto 并提交"
+            exit 1
+          fi

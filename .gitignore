@@ -1,0 +1,66 @@
+# 构建产物
+/bin/
+/dist/
+# 在服务模块目录里直接 go build 产生的二进制
+/services/*/gateway
+/services/*/order
+/services/*/inventory
+/services/*/payment
+*.exe
+*.test
+*.out
+*.prof
+*.pprof
+__debug_bin*
+
+# 测试与覆盖率
+coverage.*
+*.coverprofile
+
+# 生成代码的缓存（生成的 .pb.go 文件本身入库）
+.buf/
+
+# 密钥与本地配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+kubeconfig
+*.kubeconfig
+secrets.yaml
+*-secret.yaml
+*.secret.yaml
+
+# 本地数据卷
+/data/
+/deploy/compose/data/
+*.sql.gz
+*.dump
+
+# Helm
+charts/*.tgz
+**/charts/*.tgz
+
+# 压测输出
+/test/k6/results/
+*.k6.json
+
+# 故障盲测的密封答案
+/chaos/.sealed/
+
+# Rust（阶段 8）
+target/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI 工具的本地状态
+.claude/settings.local.json
+.claude/worktrees/

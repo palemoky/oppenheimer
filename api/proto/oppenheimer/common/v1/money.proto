@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package oppenheimer.common.v1;
+
+// Money 表示一笔金额。金额一律用最小货币单位的整数表示，不使用浮点数。
+message Money {
+  // 金额，单位为最小货币单位（人民币为分）。
+  int64 amount = 1;
+  // ISO 4217 货币代码，例如 "CNY"。
+  string currency = 2;
+}
