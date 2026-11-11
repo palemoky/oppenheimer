@@ -322,25 +322,31 @@ Confirm 返回 `RESERVATION_RELEASED` 或 `RESERVATION_NOT_FOUND`，或 Release 
 
 对外 HTTP（gin），内部 gRPC。1a 没有真实鉴权，用请求头 `X-User-Id` 代表已登录用户。
 
-| 方法与路径 | 说明 | 下游 |
-|---|---|---|
-| `POST /api/v1/orders` | 下单。头 `Idempotency-Key` 必填。体 `{"items":[{"sku_id":"1","quantity":2}]}`。成功 201 | `order.CreateOrder` |
-| `GET /api/v1/orders/:order_id` | 查询订单 | `order.GetOrder` |
-| `POST /api/v1/orders/:order_id/cancel` | 取消订单 | `order.CancelOrder` |
-| `POST /api/v1/orders/:order_id/pay` | 发起支付。体可选 `{"outcome":"success"｜"failure"}`。成功 202 | `payment.CreatePayment` |
-| `GET /api/v1/orders/:order_id/payment` | 查询支付单 | `payment.GetPayment` |
-| `GET /api/v1/skus/:sku_id/stock` | 查询库存 | `inventory.GetStock` |
-| `GET /healthz` | 健康检查 | — |
+**接口契约以 [`api/openapi/gateway.yaml`](../../api/openapi/gateway.yaml) 为准**（见 ADR-0005）：路径、请求头、请求和响应的结构、ID 与金额的表示、枚举取值、错误结构、各接口的状态码都在规范里，这里不再重复。类型和路由注册由 `make openapi` 生成到 `services/gateway/internal/httpapi/oas/`，handler 实现生成的 `ServerInterface`。
 
-约定：
+规范表达不了的部分记在这里。
 
-- **所有 64 位 ID 在 JSON 里用字符串**。JavaScript 的数字是双精度浮点，超过 2^53 的整数会丢精度，订单号正好在这个范围之外。入参同时接受字符串。
-- 金额用整数分加币种：`{"amount":1999,"currency":"CNY"}`。
-- 枚举用小写字符串：`"pending_payment"`、`"paid"` 等。时间用 RFC 3339。
-- 错误响应：`{"error":{"code":"INSUFFICIENT_STOCK","message":"..."}}`，`code` 取自 `errx.Reason`，没有原因码时用 gRPC 状态码的名字。
+各接口调用的下游：
+
+| 接口（operationId） | 下游 |
+|---|---|
+| `createOrder` | `order.CreateOrder` |
+| `getOrder` | `order.GetOrder` |
+| `cancelOrder` | `order.CancelOrder` |
+| `payOrder` | `payment.CreatePayment` |
+| `getPayment` | `payment.GetPayment` |
+| `getStock` | `inventory.GetStock` |
+
+`GET /healthz` 由 `pkg/app` 统一提供，挂在单独的路由上，不属于规范。
+
+实现约定：
+
+- 错误响应的 `code` 取自 `errx.Reason`，没有原因码时用 gRPC 状态码的名字。
 - gRPC 状态码到 HTTP 的映射：`INVALID_ARGUMENT` 400，`NOT_FOUND` 404，`ALREADY_EXISTS` 409，`FAILED_PRECONDITION` 409（其中 `INSUFFICIENT_STOCK` 也是 409），`UNAVAILABLE` 503，`DEADLINE_EXCEEDED` 504，其余 500。500 的响应不透出内部错误消息。
-- 缺少或非法的 `X-User-Id` 返回 401。
-- JSON 的编解码用 `encoding/json/v2`，不用 gin 自带的绑定和渲染。
+- 缺少或非法的 `X-User-Id` 返回 401。它在规范里是安全方案而不是普通请求头参数，由中间件校验，先于参数绑定。
+- 请求体里的 ID 除了字符串也接受 JSON 整数（规范只写字符串，这是服务端的宽容处理）。由手写的 `oas.ID` 类型实现，规范通过 `x-go-type` 引用它。
+- 路径里的 ID 在规范里是字符串，是否为正整数由 handler 校验。
+- JSON 的编解码用 `encoding/json/v2`，不用 gin 自带的绑定和渲染，也不用生成代码的 strict 模式。请求体拒绝未知字段。
 - 每个请求给下游调用设置总超时（默认 5 秒）。
 - 请求日志用 `slog`，记录方法、路径模板、状态码、耗时。
 
