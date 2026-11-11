@@ -275,8 +275,8 @@ func TestCreatePaymentDownstreamErrors(t *testing.T) {
 		wantReason string
 	}{
 		{"business error passes through", errx.New(codes.NotFound, errx.ReasonOrderNotFound, "gone"), codes.NotFound, errx.ReasonOrderNotFound},
-		{"unavailable", status.Error(codes.Unavailable, "connection refused"), codes.Internal, ""},
-		{"timeout", status.Error(codes.DeadlineExceeded, "deadline exceeded"), codes.Internal, ""},
+		{"unavailable", status.Error(codes.Unavailable, "connection refused"), codes.Unavailable, ""},
+		{"timeout", status.Error(codes.DeadlineExceeded, "deadline exceeded"), codes.Unavailable, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -69,7 +69,15 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 		if errx.Reason(err) != "" {
 			return nil, err
 		}
-		return nil, s.internal(ctx, "get order", err)
+		// 订单服务暂时不可用不是本服务的内部错误：如实告诉调用方可以稍后重试，
+		// 网关才能返回 503 而不是 500。
+		switch status.Code(err) {
+		case codes.Unavailable, codes.DeadlineExceeded:
+			s.logger.WarnContext(ctx, "order service unavailable", "error", err)
+			return nil, status.Error(codes.Unavailable, "order service unavailable")
+		default:
+			return nil, s.internal(ctx, "get order", err)
+		}
 	}
 	order := resp.GetOrder()
 	// 订单服务已按 user_id 过滤；这里再核对一次，防止下游实现有误时把别人的订单当成自己的支付。
