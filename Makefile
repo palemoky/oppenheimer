@@ -72,6 +72,24 @@ tidy: ## 对所有模块执行 go mod tidy，并同步 workspace
 	@for m in $(MODULES); do (cd $$m && go mod tidy) || exit 1; done
 	go work sync
 
+## ---------- 运行 ----------
+
+.PHONY: run
+run: build ## 在本机启动四个服务（需要先 make up），Ctrl-C 停止
+	scripts/run-local.sh
+
+.PHONY: e2e
+e2e: build ## 端到端测试：在独立的 e2e_* 库上启动四个服务并对网关跑测试（需要先 make up）
+	scripts/e2e.sh
+
+.PHONY: seed
+seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次、表已建好之后）
+	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) inventory_db -e \
+		"INSERT INTO sku_stock (sku_id, name, unit_price, available) VALUES \
+		 (1001, 'Mechanical Keyboard', 39900, 100), (1002, 'Wireless Mouse', 12900, 500), (1003, 'Limited Figure', 99900, 10) \
+		 ON DUPLICATE KEY UPDATE name = VALUES(name);" 2>/dev/null
+	@echo "seeded sku 1001, 1002, 1003"
+
 ## ---------- 本地依赖 ----------
 
 .PHONY: up

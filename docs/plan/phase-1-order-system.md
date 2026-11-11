@@ -23,17 +23,18 @@
 
 服务（派给子 Agent 在各自的 worktree 并行实现，主会话评审后合并）：
 
-- [ ] inventory：Reserve、Confirm、Release（含空回滚与防悬挂）、GetStock
-- [ ] order：CreateOrder（幂等、可推进）、GetOrder、CancelOrder、HandlePaymentResult、结清与后台任务
-- [ ] payment：CreatePayment、GetPayment、出结果与回调重试的后台任务
-- [ ] gateway：HTTP 路由、JSON 约定、错误映射
+- [x] inventory：Reserve、Confirm、Release（含空回滚与防悬挂）、GetStock
+- [x] order：CreateOrder（幂等、可推进）、GetOrder、CancelOrder、HandlePaymentResult、结清与后台任务
+- [x] payment：CreatePayment、GetPayment、出结果与回调重试的后台任务
+- [x] gateway：HTTP 路由、JSON 约定、错误映射
 
 集成（主会话）：
 
-- [ ] 合并四个服务，`make lint test` 通过
-- [ ] `make seed` 准备示例 SKU；`make run` 或等价方式一键启动四个服务
-- [ ] 端到端测试：主流程、并发抢购零超卖、幂等、超时关单、支付与取消并发
-- [ ] 把 1a 的面试考点整理到 `docs/notes/`
+- [x] 合并四个服务，`make lint test` 通过
+- [x] `make seed` 准备示例 SKU；`make run` 一键启动四个服务；`make e2e` 跑端到端测试
+- [x] 端到端测试：主流程、并发抢购零超卖、幂等、超时关单、支付与取消并发
+- [x] 把 1a 的面试考点整理到 [notes/1a-consistency.md](../notes/1a-consistency.md)
+- [ ] 推送并确认 CI 通过（新增的 MySQL 集成测试和端到端任务还没有在 GitHub 上跑过），合并到 `main`
 
 **验收**：并发测试在 `-race` 下稳定通过；重复请求、重复回调不产生副作用。
 
@@ -48,9 +49,10 @@
 - [ ] 异步下单：网关受理 → Kafka → order 消费落库，客户端轮询结果
 - [ ] 本地消息表（outbox）：订单落库与事件发布在同一事务，由中继进程投递 Kafka
 - [ ] 消费端幂等：去重表或业务唯一键，按至少一次投递设计
-- [ ] Saga 补偿：下单失败或取消时回补 Redis 与 MySQL 库存
+- [ ] Saga 补偿：下单失败或取消时回补 Redis 与 MySQL 库存（MySQL 侧的 Release、空回滚与防悬挂 1a 已实现，这里扩展到 Redis）
+- [ ] 把 1a 里三处重复的死锁重试、后台任务循环收敛到 `pkg/`（inventory 的事务重试、order 的 sweeper、payment 的 processor）
 - [ ] 超时未支付关单：延迟消息方案（Kafka 没有原生延迟，对比时间轮、Redis ZSET、分级延迟 topic 后选一种）
-- [ ] 支付成功与超时关单的并发冲突处理
+- [ ] 支付成功与超时关单的并发冲突：1a 已用条件更新加退款答复实现，这里在引入 Kafka 后复核消息乱序和延迟下是否仍然成立
 - [ ] 分布式锁（`pkg/lock`）：Redis 实现，`SET NX PX` 加锁、Lua 校验持有者后解锁、看门狗续期
   - 使用场景：缓存击穿时的重建互斥、同一用户的重复下单拦截、定时任务（outbox 中继、关单扫描、对账）的单实例执行
   - 不用在库存扣减主链路上：那里用 Lua 原子操作和条件更新，比加锁更快也更安全，写清楚为什么

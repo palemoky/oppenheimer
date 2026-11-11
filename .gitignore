@@ -33,6 +33,9 @@ secrets.yaml
 *-secret.yaml
 *.secret.yaml
 
+# 本地运行的日志
+/tmp/
+
 # 本地数据卷
 /data/
 /deploy/compose/data/

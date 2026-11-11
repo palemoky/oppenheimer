@@ -10,25 +10,23 @@
 
 ## 上次做到哪
 
-- 阶段 0 完成，PR #1 已合并到 `main`，CI 14 项检查通过。
-- 1a 的基础由主会话完成并提交在 `phase-1a`：三个服务的 proto 契约、表结构、`pkg/{idgen,errx,mysqlx,grpcx,testdb}`、设计文档 [design/1a-order-flow.md](design/1a-order-flow.md)。CI 的测试任务已加上 MySQL 服务（尚未在 GitHub 上跑过）。
-- 四个服务（inventory、order、payment、gateway）已派给子 Agent 在各自的 worktree 并行实现。**如果新会话看到这句话，说明派发后会话中断了**：用 `git worktree list` 和 `git branch -a` 找到它们的分支，检查各自是否已提交。
+1a 的代码、测试和文档全部完成，提交在本地分支 `phase-1a`，**尚未推送**。
+
+- 四个服务由子 Agent 并行实现，主会话逐个评审后合入。评审和实现过程中发现并修复了两个设计缺陷（Release 的锁升级死锁、Reserve 被拒后的库存泄漏），详见 [notes/1a-consistency.md](notes/1a-consistency.md) 第 7 节。
+- 本机验证：`make lint` 0 问题，`make test` 全过，`make e2e` 的 7 个场景连续 8 轮通过，服务日志零 error。
+- CI 新增了测试任务的 MySQL 服务和端到端任务，**还没有在 GitHub 上跑过**。
 
 ## 下一步
 
-1. 逐个验收子 Agent 的结果：读 diff，对照设计文档逐条核对算法，跑 `make lint test`。inventory 和 order 涉及库存与订单状态，要逐行评审。
-2. 合并到 `phase-1a`（`go.work.sum` 冲突直接重新生成），全量 `make lint test`。
-3. 加 `make seed`（示例 SKU）和一键启动四个服务的方式。
-4. 写端到端测试，见设计文档第 7 节。
-5. 整理 1a 面试考点到 `docs/notes/`，推送并开 PR，CI 通过后合并。
-
-任务清单见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1a 一节。
+1. 主人确认后推送 `phase-1a`，开 PR，确认 CI 通过（重点看两个新任务），合并到 `main`。
+2. 进入 1b。先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1b 任务并写设计文档，顺序建议：Redis 预扣库存 → outbox 加 Kafka 替换轮询 → 异步下单 → 延迟关单 → 分布式锁 → 杀进程对账测试。
 
 ## 本机开发环境
 
 - `make tools` 安装 buf 和 proto 插件到 `./bin`（已装）。
 - `make up` 启动依赖并建好三个库，`make down` 停止并保留数据。当前依赖处于**运行**状态。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
+- `make run` 启动四个服务，`make seed` 写入示例 SKU，`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
 
 ## 阻塞项与待确认
 
@@ -55,6 +53,8 @@
 | 2026-11-11 | 阶段 4 增加 Go 代码缺陷类故障，细化 MySQL 和 Redis 故障 | 覆盖常见生产故障 |
 | 2026-11-11 | 版本选择规则：LTS 优先，其次最新稳定版 | 见 `docs/infra/versions.md` |
 | 2026-11-11 | 1a 就实现了支付与关单的并发处理（条件更新加退款答复）和 Release 的空回滚 | 这两点是主流程正确性的一部分，无法推迟到 1b；1b 的对应任务改为在引入 Kafka 后复核 |
+| 2026-11-11 | 设计修正：Release 改用 `ON DUPLICATE KEY UPDATE` 加锁并增加死锁重试；Reserve 被业务拒绝后一律 Release | 原设计在并发下死锁、泄漏库存，由测试和子 Agent 的评审发现 |
+| 2026-11-11 | `app.Run` 传给组件的 context 不再随退出信号取消 | 原行为与“优雅停止时做完在途工作”矛盾 |
 
 ## 会话日志
 
@@ -62,4 +62,4 @@
 
 制定规划并落成文档。本机工具现状：Go 1.27.3、kubectl 1.33、Docker 29.8（OrbStack）已装；helm 未装，阶段 2 前安装。
 
-同日完成阶段 0 并合并；开始 1a，完成契约、表结构、公共库和设计文档，四个服务派给子 Agent 并行实现。
+同日完成阶段 0 并合并；开始 1a，完成契约、表结构、公共库和设计文档，四个服务派给子 Agent 并行实现；评审、合入、端到端测试和笔记全部完成，待推送。

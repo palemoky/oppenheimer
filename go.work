@@ -7,4 +7,5 @@ use (
 	./services/inventory
 	./services/order
 	./services/payment
+	./test/e2e
 )
