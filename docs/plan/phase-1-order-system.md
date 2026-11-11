@@ -96,7 +96,7 @@
 - [x] payment：出结果写事件、消费 `order.events` 的答复、删除回调轮询
 - [x] inventory：消费 `order.events` 做 Confirm、Release
 - [x] 三处重复的死锁重试、后台循环换成 `pkg/retry`、`pkg/worker`
-- [x] 本机脚本、CI 接入 Kafka；端到端 7 个场景不改断言通过（本机通过；CI 的改动**还没在 GitHub 上跑过**，推送后看 test 和 e2e 任务）
+- [x] 本机脚本、CI 接入 Kafka；端到端 7 个场景不改断言通过（本机和 CI 都通过，PR #5）
 - [x] 复核支付成功与超时关单的并发冲突在消息重复、延迟、乱序下仍然成立，结论写入设计文档（第 5.6 节）
 
 消费端幂等一律用业务唯一键，不建去重表，理由见 ADR-0008。
