@@ -34,7 +34,7 @@
 - [x] `make seed` 准备示例 SKU；`make run` 一键启动四个服务；`make e2e` 跑端到端测试
 - [x] 端到端测试：主流程、并发抢购零超卖、幂等、超时关单、支付与取消并发
 - [x] 把 1a 的面试考点整理到 [notes/1a-consistency.md](../notes/1a-consistency.md)
-- [ ] 推送并确认 CI 通过（新增的 MySQL 集成测试和端到端任务还没有在 GitHub 上跑过），合并到 `main`
+- [x] 推送并确认 CI 通过，合并到 `main`（PR #2，新增的 MySQL 集成测试和端到端任务首次运行即通过）
 
 **验收**：并发测试在 `-race` 下稳定通过；重复请求、重复回调不产生副作用。
 

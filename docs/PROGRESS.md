@@ -4,23 +4,21 @@
 
 ## 当前状态
 
-- **当前阶段**：1a（单库跑通下单主流程）
-- **当前分支**：`phase-1a`（本地，未推送）
+- **当前阶段**：1a 补充（对外接口契约 OpenAPI），1a 已完成
+- **当前分支**：`main`。1a 已通过 PR #2 合并；下一项工作从 `main` 新开分支
 - **最后更新**：2026-11-11
 
 ## 上次做到哪
 
-1a 的代码、测试和文档全部完成，提交在本地分支 `phase-1a`，**尚未推送**。
+1a 全部完成并合并到 `main`（PR #2）。CI 全部通过，包括首次在 GitHub 上运行的 MySQL 集成测试任务和端到端任务。
 
 - 四个服务由子 Agent 并行实现，主会话逐个评审后合入。评审和实现过程中发现并修复了两个设计缺陷（Release 的锁升级死锁、Reserve 被拒后的库存泄漏），详见 [notes/1a-consistency.md](notes/1a-consistency.md) 第 7 节。
-- 本机验证：`make lint` 0 问题，`make test` 全过，`make e2e` 的 7 个场景连续 8 轮通过，服务日志零 error。
-- CI 新增了测试任务的 MySQL 服务和端到端任务，**还没有在 GitHub 上跑过**。
+- 合并前补了两篇 ADR：[ADR-0005](adr/0005-openapi-spec-first.md)（对外接口 OpenAPI 规范先行，**只有决定和计划，还没有任何代码**）和 [ADR-0006](adr/0006-money-as-integer-minor-units.md)（金额用最小货币单位的整数，补记 1a 的既有决定）。
 
 ## 下一步
 
-1. 主人确认后推送 `phase-1a`，开 PR，确认 CI 通过（重点看两个新任务），合并到 `main`。
-2. 做「1a 补充：对外接口契约（OpenAPI）」，任务清单在 [plan/phase-1-order-system.md](plan/phase-1-order-system.md)，决定见 [ADR-0005](adr/0005-openapi-spec-first.md)。1a 合并后从 `main` 新开分支。先由主会话完成 `Makefile`、规范文件和 ADR 里四个待验证细节，再把 gateway 重构派给子 Agent。目前只写了 ADR 和计划，**没有任何代码改动**。
-3. 进入 1b。先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1b 任务并写设计文档，顺序建议：Redis 预扣库存 → outbox 加 Kafka 替换轮询 → 异步下单 → 延迟关单 → 分布式锁 → 杀进程对账测试。
+1. 做「1a 补充：对外接口契约（OpenAPI）」，任务清单在 [plan/phase-1-order-system.md](plan/phase-1-order-system.md)。从 `main` 新开分支（建议 `phase-1a-openapi`）。先由主会话串行完成 `Makefile`（安装 `oapi-codegen` v2.8.2、`make openapi`）、规范文件 `api/openapi/gateway.yaml` 和 ADR-0005 里四个待验证细节，再把 gateway 重构派给子 Agent，主会话评审。
+2. 进入 1b。先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1b 任务并写设计文档，顺序建议：Redis 预扣库存 → outbox 加 Kafka 替换轮询 → 异步下单 → 延迟关单 → 分布式锁 → 杀进程对账测试。
 
 ## 本机开发环境
 
@@ -32,7 +30,6 @@
 ## 阻塞项与待确认
 
 - 无。阶段 1 只需要 MacBook，其他设备不用开机。
-- `docs/design/1a-order-flow.md` 有一处主人自己做的未提交改动，提交时一并带上。
 
 ## 设备状态（上次已知）
 
@@ -69,3 +66,5 @@
 同日完成阶段 0 并合并；开始 1a，完成契约、表结构、公共库和设计文档，四个服务派给子 Agent 并行实现；评审、合入、端到端测试和笔记全部完成，待推送。
 
 同日讨论了金额用整数分的理由和对外接口是否用 OpenAPI。决定采用规范先行（`oapi-codegen`），写了 ADR-0005，在阶段 1 计划里加了「1a 补充」一节。另外补记了 ADR-0006（金额用最小货币单位的整数），这是 1a 已经执行的决定，不涉及代码和计划变更。本次只改文档。
+
+同日完成 1a 收尾：文档改动作为独立提交进入 1a 分支，推送、开 PR #2、CI 全绿后合并到 `main`。
