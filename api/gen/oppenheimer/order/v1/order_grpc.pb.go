@@ -40,6 +40,8 @@ type OrderServiceClient interface {
 	//   NOT_FOUND            reason=SKU_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
 	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
+	//   UNAVAILABLE                                       库存服务暂不可用，结果未知；用同一幂等键重试
+	//   ABORTED              reason=CREATE_TIMEOUT        订单长时间未能完成创建，已被置为失败；需换新的幂等键重新下单
 	CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error)
 	// GetOrder 查询订单。订单不属于该用户时等同于不存在。
 	//
@@ -125,6 +127,8 @@ type OrderServiceServer interface {
 	//   NOT_FOUND            reason=SKU_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
 	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
+	//   UNAVAILABLE                                       库存服务暂不可用，结果未知；用同一幂等键重试
+	//   ABORTED              reason=CREATE_TIMEOUT        订单长时间未能完成创建，已被置为失败；需换新的幂等键重新下单
 	CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error)
 	// GetOrder 查询订单。订单不属于该用户时等同于不存在。
 	//

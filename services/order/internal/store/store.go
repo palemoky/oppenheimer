@@ -233,14 +233,6 @@ func (s *Store) MarkCreateFailed(ctx context.Context, orderID int64, reason stri
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_CREATING))
 }
 
-// MarkFailedUnsettled 把已标记结清的 FAILED 订单改回未结清，让后台任务去释放库存。
-// 用于发现库存实际上被占用了的情况。
-func (s *Store) MarkFailedUnsettled(ctx context.Context, orderID int64, now time.Time) (bool, error) {
-	return s.exec(ctx, `UPDATE orders SET stock_settled = 0, updated_at = ?
-		WHERE order_id = ? AND status = ? AND stock_settled = 1`,
-		now, orderID, int32(orderv1.OrderStatus_ORDER_STATUS_FAILED))
-}
-
 // Cancel 把属于 userID 的 PENDING_PAYMENT 订单改为 CANCELLED。
 func (s *Store) Cancel(ctx context.Context, orderID, userID int64, now time.Time) (bool, error) {
 	return s.exec(ctx, `UPDATE orders SET status = ?, stock_settled = 0, updated_at = ?
@@ -255,6 +247,13 @@ func (s *Store) CloseExpired(ctx context.Context, orderID int64, now time.Time) 
 		WHERE order_id = ? AND status = ? AND expire_at < ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED), now,
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now)
+}
+
+// Touch 只更新 updated_at。补结清按 updated_at 从旧到新扫描，
+// 对暂时无法处理的订单调用它，使其排到队尾，不至于长期占住每一批的名额。
+func (s *Store) Touch(ctx context.Context, orderID int64, now time.Time) error {
+	_, err := s.exec(ctx, "UPDATE orders SET updated_at = ? WHERE order_id = ?", now, orderID)
+	return err
 }
 
 // MarkSettled 记录订单的库存已跟上订单状态。

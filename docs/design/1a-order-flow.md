@@ -75,7 +75,7 @@ services/<svc>/
 
 **可直接使用的公共库**（`pkg/`，用 `go doc` 查看接口）
 
-- `app`：生命周期。`app.Run` 管理组件，`app.ListenHTTP`、`app.HealthHandler` 提供健康检查。后台任务实现 `app.Component` 接口。
+- `app`：生命周期。`app.Run` 管理组件，`app.ListenHTTP`、`app.HealthHandler` 提供健康检查。后台任务实现 `app.Component` 接口。`Start` 收到的 context 不随退出信号取消，只在停止时限用尽后取消，所以在途工作可以直接用它做完。
 - `grpcx`：`grpcx.Listen` 建服务端（已带日志、panic 恢复、健康检查），`grpcx.Dial` 建客户端（已带默认超时）。
 - `mysqlx`：`Open`、`InTx`、`Migrate`、`IsDuplicateKey`、`IsDeadlock`。
 - `errx`：业务错误。`errx.New(code, reason, ...)` 构造，`errx.Is(err, reason)` 判断。原因码常量都在这个包里。
@@ -201,7 +201,9 @@ services/<svc>/
    - 状态不是 `CREATING`：直接按当前状态作答。`FAILED` 返回与 `fail_reason` 对应的错误；其他状态返回订单。
    - 状态是 `CREATING`：调用 `inventory.Reserve(order_id, items)`。
      - 成功：一个事务内 `UPDATE orders SET status = PENDING_PAYMENT, total_amount = ? WHERE order_id = ? AND status = CREATING`，并更新各 `order_items.unit_price`。受影响 0 行说明状态已被别人改变，重新读订单并按当前状态作答。
-     - 业务拒绝（`SKU_NOT_FOUND`、`INSUFFICIENT_STOCK`、`RESERVATION_RELEASED`）：`UPDATE orders SET status = FAILED, fail_reason = ?, stock_settled = 1 WHERE order_id = ? AND status = CREATING`，把该错误返回给调用方。这几种情况下库存一定没有被占用，所以直接标记已结清。
+     - 业务拒绝：`UPDATE orders SET status = FAILED, fail_reason = ?, stock_settled = ? WHERE order_id = ? AND status = CREATING`，把该错误返回给调用方。
+       - `RESERVATION_RELEASED`：库存侧已有“已释放”标记，记为已结清。
+       - `SKU_NOT_FOUND`、`INSUFFICIENT_STOCK`：记为**未结清**，并立即尽力调用一次 Release。原因见下文要点。
      - 其他错误（超时、不可达）：**结果未知**，预占可能成功也可能没有。保持 `CREATING` 不动，返回 `UNAVAILABLE`。客户端用同一个幂等键重试时会再次推进；一直没人重试的由后台任务按超时处理。
 
 总金额 = Σ 数量 × Reserve 返回的单价，检查溢出。同一订单内币种必须一致。
@@ -209,6 +211,7 @@ services/<svc>/
 要点：
 
 - 先落订单再预占，而不是反过来。这样任何时候库存里的一份预占都能对应到一条订单记录，后台任务总能找到它并做出处理。反过来的话，预占成功后进程崩溃会留下没有订单的预占，无从清理。
+- **“这次 Reserve 被拒绝”不等于“这个订单没有预占”**。本文最初写的是业务拒绝后直接记为已结清，评审时发现会泄漏库存：客户端重试使同一订单有两次推进并发进行，A 的 Reserve 因库存不足被拒；随后别的订单释放了库存，B 的 Reserve 成功；A 抢先把订单置为“失败且已结清”，B 的那份预占就再也没人释放。修正后拒绝时一律 Release 一次：有预占就释放，没有就留下标记挡住之后的 Reserve。结论不依赖两次推进的先后顺序，进程在任何一步崩溃也能由后台任务补上。
 - 推进步骤是幂等的：Reserve 以 `order_id` 幂等，状态更新带前置条件。所以重复请求、并发请求、崩溃后重试都走同一段代码，不需要为“上一个请求还在进行中”设计特殊分支。
 
 ### GetOrder
@@ -229,6 +232,7 @@ services/<svc>/
 1. `SELECT ... FROM orders WHERE order_id = ? FOR UPDATE`。不存在 → `NOT_FOUND / ORDER_NOT_FOUND`。锁住订单行使同一订单的并发回调串行。
 2. 查 `payment_results`：该 `payment_id` 已处理过则返回当时记录的答复（幂等）。
 3. 支付失败（`succeeded = false`）：记录答复 `ACCEPTED`，订单状态不变（仍可等到超时关闭）。
+   1a 的已知限制：一个订单只有一笔支付单，支付失败后不能再次发起支付，只能等订单超时关闭后重新下单。
 4. 支付成功：
    - 订单 `PENDING_PAYMENT`：
      - 金额或币种与订单不一致 → `FAILED_PRECONDITION / AMOUNT_MISMATCH`，不记录答复。
@@ -236,6 +240,8 @@ services/<svc>/
    - 其他任何状态（已取消、已关闭、创建失败、创建中，或已被另一笔支付付清）→ 记录并返回 `REFUND_REQUIRED`。
 
 提交后，若本次把订单改成了 `PAID`，尽力立即结清库存。
+
+不检查 `expire_at`：支付结果在截止时间之后、关单任务执行之前到达时仍然接受。钱已经付了，订单也还没关，接受比退款对用户更好；是否关单以状态转换为准，而不是以时钟为准。
 
 要点：用户在超时前一刻付款，而关单任务同时触发，这是真实系统里必然出现的竞争。两边都是以 `PENDING_PAYMENT` 为前置条件的转换，只有一个能成功。关单先成功时，钱已经付了但订单不能要，必须明确告诉支付方退款，而不是悄悄吞掉。
 
@@ -248,7 +254,7 @@ services/<svc>/
 
 成功后 `UPDATE orders SET stock_settled = 1 WHERE order_id = ? AND stock_settled = 0`。
 
-Confirm 返回 `RESERVATION_RELEASED` 或 `RESERVATION_NOT_FOUND`，或 Release 返回 `RESERVATION_CONFIRMED`，说明订单与库存的状态出现了不可能的组合。这是需要人工介入的不变量破坏：记 error 日志，保持未结清，不要自作主张修复。
+Confirm 返回 `RESERVATION_RELEASED` 或 `RESERVATION_NOT_FOUND`，或 Release 返回 `RESERVATION_CONFIRMED`，说明订单与库存的状态出现了不可能的组合。这是需要人工介入的不变量破坏：记 error 日志，保持未结清，不要自作主张修复。后台任务遇到这类订单时把它的 `updated_at` 刷新一下，让它排到扫描队列的末尾，否则这类订单积累到超过一批的数量后，正常订单就永远轮不到。
 
 ### 后台任务（sweeper）
 

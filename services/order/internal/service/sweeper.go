@@ -182,8 +182,16 @@ func (s *Sweeper) resettle(ctx context.Context, now time.Time) {
 }
 
 func (s *Sweeper) settleLogged(ctx context.Context, orderID int64, st orderv1.OrderStatus) {
-	// 不变量破坏已在 settle 里按 error 记过。
-	if err := s.svc.settle(ctx, orderID, st); err != nil && !errors.Is(err, ErrStockInvariant) {
+	err := s.svc.settle(ctx, orderID, st)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrStockInvariant):
+		// 已在 settle 里按 error 记过。这类订单要等人工处理，会一直未结清；
+		// 把它排到队尾，否则积累到超过一批的数量后，正常的订单就永远轮不到了。
+		if err := s.svc.store.Touch(ctx, orderID, s.svc.now()); err != nil {
+			s.logger.WarnContext(ctx, "touch unsettled order failed", "order_id", orderID, "error", err)
+		}
+	default:
 		s.logger.WarnContext(ctx, "settle stock failed, will retry", "order_id", orderID, "error", err)
 	}
 }

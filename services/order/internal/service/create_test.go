@@ -206,11 +206,16 @@ func TestCreateOrderRejected(t *testing.T) {
 			if n := e.inv.callCount("Reserve"); n != 1 {
 				t.Errorf("reserve called %d times, want 1", n)
 			}
-			// 已结清的失败订单不会被后台任务拿去释放。
+			// “已释放”的拒绝无需再调 Release；另外两种拒绝在线上路径里已经 Release 过一次并结清。
+			// 无论哪种，后台任务都不会再去释放。
+			wantReleases := 1
+			if tc.reason == errx.ReasonReservationReleased {
+				wantReleases = 0
+			}
 			e.clock.Advance(time.Hour)
 			e.sweeper.RunOnce(t.Context())
-			if n := e.inv.callCount("Release"); n != 0 {
-				t.Errorf("release called %d times, want 0", n)
+			if n := e.inv.callCount("Release"); n != wantReleases {
+				t.Errorf("release called %d times, want %d", n, wantReleases)
 			}
 		})
 	}
@@ -322,13 +327,14 @@ func TestCreateOrderLateReserveAfterTimeout(t *testing.T) {
 	wantStock(t, e.inv, skuA, 1000, 0, 0)
 }
 
-// Reserve 成功返回之前，并发的另一次推进已因业务拒绝把订单标成“失败且已结清”。
-// 本次成功的预占必须被重新交给后台任务释放。
+// 同一订单的两次推进并发：另一次因库存不足把订单置为 FAILED（未结清），
+// 还没来得及 Release 就崩溃了；随后本次的 Reserve 成功。
+// 这份预占必须由后台任务释放，不能泄漏。
 func TestCreateOrderReserveSucceededOnFailedOrder(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.inv.inject("Reserve", fault{before: func(orderID int64) {
-		if _, err := e.store.MarkCreateFailed(t.Context(), orderID, errx.ReasonInsufficientStock, true, e.clock.Now()); err != nil {
+		if _, err := e.store.MarkCreateFailed(t.Context(), orderID, errx.ReasonInsufficientStock, false, e.clock.Now()); err != nil {
 			t.Error(err)
 		}
 	}})

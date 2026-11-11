@@ -29,6 +29,7 @@ const (
 	ReasonOrderNotPayable      = "ORDER_NOT_PAYABLE"
 	ReasonIdempotencyKeyReused = "IDEMPOTENCY_KEY_REUSED"
 	ReasonAmountMismatch       = "AMOUNT_MISMATCH"
+	ReasonCreateTimeout        = "CREATE_TIMEOUT"
 
 	ReasonPaymentNotFound = "PAYMENT_NOT_FOUND"
 )

@@ -29,8 +29,7 @@ import (
 )
 
 // ReasonCreateTimeout 是订单因迟迟没能完成预占而被后台任务置为失败时的 fail_reason。
-// 它只在本服务内使用，所以不在 errx 里。
-const ReasonCreateTimeout = "CREATE_TIMEOUT"
+const ReasonCreateTimeout = errx.ReasonCreateTimeout
 
 // DefaultPaymentTimeout 是下单后等待支付的默认时限。
 const DefaultPaymentTimeout = 15 * time.Minute
@@ -233,27 +232,30 @@ func (s *Service) advance(ctx context.Context, o *store.Order) (*orderv1.CreateO
 	if err != nil {
 		return nil, s.internal(ctx, "reload order", err, "order_id", o.OrderID)
 	}
-	if cur.Status == orderv1.OrderStatus_ORDER_STATUS_FAILED && cur.StockSettled {
-		// 并发的另一次推进拿到了业务拒绝并把订单标成“失败且无需释放”，
-		// 但本次的 Reserve 确实成功了，库存里有一份预占没人会释放。改回未结清交给后台任务释放。
-		if _, err := s.store.MarkFailedUnsettled(ctx, cur.OrderID, s.now()); err != nil {
-			s.logger.ErrorContext(ctx, "reopen settlement of failed order failed", "order_id", cur.OrderID, "error", err)
-		} else {
-			s.logger.WarnContext(ctx, "reserve succeeded on a failed order, scheduled release", "order_id", cur.OrderID)
-		}
-	}
+	// 走到这里说明订单在 Reserve 期间被别人改了状态。若它已是 FAILED，本次成功的预占
+	// 不需要在这里处理：把订单置为 FAILED 的一方必然留下了未结清标记或“已释放”标记
+	// （见 handleReserveError），这份预占会被 Release 掉。
 	return answerCreate(cur)
 }
 
 func (s *Service) handleReserveError(ctx context.Context, o *store.Order, reserveErr error) (*orderv1.CreateOrderResponse, error) {
 	switch reason := errx.Reason(reserveErr); reason {
 	case errx.ReasonSKUNotFound, errx.ReasonInsufficientStock, errx.ReasonReservationReleased:
-		// 这几种拒绝下库存没有被本订单占用，直接记为已结清。
-		ok, err := s.store.MarkCreateFailed(ctx, o.OrderID, reason, true, s.now())
+		// RESERVATION_RELEASED 说明库存侧已有“已释放”标记，此后任何 Reserve 都会被拒，可以直接记为已结清。
+		//
+		// 另外两种拒绝只说明“这一次”Reserve 没有占到库存，不能推出“这个订单没有预占”：
+		// 同一订单可能有另一次推进在并发进行（客户端重试），库存恰好在两次之间被释放出来，
+		// 那一次的 Reserve 就会成功。所以这里记为未结清并调用一次 Release：
+		// 它释放可能存在的预占，没有预占时留下标记挡住之后的 Reserve。多一次幂等调用，换来不依赖时序的正确性。
+		settled := reason == errx.ReasonReservationReleased
+		ok, err := s.store.MarkCreateFailed(ctx, o.OrderID, reason, settled, s.now())
 		if err != nil {
 			return nil, s.internal(ctx, "mark order failed", err, "order_id", o.OrderID)
 		}
 		if ok {
+			if !settled {
+				s.settleBestEffort(ctx, o.OrderID, orderv1.OrderStatus_ORDER_STATUS_FAILED)
+			}
 			return nil, reserveErr
 		}
 		cur, err := s.store.GetOrder(ctx, o.OrderID)
