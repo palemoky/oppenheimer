@@ -1,0 +1,452 @@
+openapi: 3.1.0
+info:
+  title: Oppenheimer Gateway API
+  version: 1.0.0
+  description: |
+    Oppenheimer 订单系统的对外 HTTP 接口，由 gateway 服务提供。
+
+    本文件是对外接口的唯一事实来源。改接口时先改这里，运行 `make openapi` 重新生成，再改 handler。
+
+    通用约定：
+
+    - 64 位 ID 在 JSON 里一律是十进制字符串。JavaScript 的数字是双精度浮点，超过 2^53 的整数会丢精度。
+    - 金额是最小货币单位的整数，和币种一起出现，例如 `{"amount":1999,"currency":"CNY"}` 表示 19.99 元。
+    - 时间是 RFC 3339 格式的 UTC 时间。
+    - 请求体里出现未定义的字段会被拒绝（400）。
+    - 所有错误响应的结构相同，见 `Error`。500 的响应不透出内部错误消息。
+    - 存活探测 `GET /healthz` 由各服务统一提供，不属于本接口。
+servers:
+  - url: http://localhost:8080
+    description: 本机（make run）
+security:
+  - userId: []
+tags:
+  - name: orders
+    description: 订单
+  - name: payments
+    description: 支付
+  - name: inventory
+    description: 库存
+
+paths:
+  /api/v1/orders:
+    post:
+      operationId: createOrder
+      tags: [orders]
+      summary: 下单
+      description: |
+        幂等：同一用户用相同的 `Idempotency-Key` 重复提交，只产生一个订单，重复请求返回同一个订单。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: 订单已创建（或幂等重放返回已有订单）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: 商品不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: 库存不足（`INSUFFICIENT_STOCK`），或幂等键已被内容不同的请求使用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /api/v1/orders/{order_id}:
+    get:
+      operationId: getOrder
+      tags: [orders]
+      summary: 查询订单
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: 订单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      operationId: cancelOrder
+      tags: [orders]
+      summary: 取消订单
+      description: 只有待支付的订单可以取消。对已取消的订单重复调用是幂等的。
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: 取消后的订单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /api/v1/orders/{order_id}/pay:
+    post:
+      operationId: payOrder
+      tags: [payments]
+      summary: 发起支付
+      description: |
+        支付单受理后返回 202，支付结果异步产生，客户端通过查询支付单或订单轮询结果。
+        请求体可以省略。
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayOrderRequest'
+      responses:
+        '202':
+          description: 支付单已受理
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /api/v1/orders/{order_id}/payment:
+    get:
+      operationId: getPayment
+      tags: [payments]
+      summary: 查询订单的支付单
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: 支付单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /api/v1/skus/{sku_id}/stock:
+    get:
+      operationId: getStock
+      tags: [inventory]
+      summary: 查询库存
+      parameters:
+        - $ref: '#/components/parameters/SkuId'
+      responses:
+        '200':
+          description: 库存
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stock'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+
+components:
+  securitySchemes:
+    userId:
+      type: apiKey
+      in: header
+      name: X-User-Id
+      description: |
+        当前用户的 ID（正整数）。1a 没有真实鉴权，这个请求头就代表已登录用户。
+        缺少或非法时返回 401。
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 幂等键，由客户端生成，1 到 64 个字符。
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      description: 订单号（正整数的十进制字符串）
+      schema:
+        type: string
+        pattern: '^[1-9][0-9]*$'
+    SkuId:
+      name: sku_id
+      in: path
+      required: true
+      description: 商品 ID（正整数的十进制字符串）
+      schema:
+        type: string
+        pattern: '^[1-9][0-9]*$'
+
+  responses:
+    BadRequest:
+      description: 请求参数非法（`INVALID_ARGUMENT`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: 缺少或非法的 `X-User-Id`（`UNAUTHENTICATED`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 资源不存在，或不属于当前用户
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: 当前状态不允许这个操作（`FAILED_PRECONDITION` 或更具体的原因码）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: 请求体超过 1 MiB（`PAYLOAD_TOO_LARGE`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Error:
+      description: |
+        其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Id:
+      description: |
+        64 位 ID 的十进制字符串。
+        为兼容旧客户端，服务端在请求体里也接受 JSON 整数，但客户端应当始终发送字符串。
+      type: string
+      pattern: '^[1-9][0-9]*$'
+      examples: ['9007199254741994']
+      x-go-type: ID
+
+    Money:
+      description: 一笔金额。`amount` 的单位是该币种的最小货币单位（人民币为分）。
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          examples: [1999]
+        currency:
+          description: ISO 4217 货币代码
+          type: string
+          examples: [CNY]
+
+    CreateOrderRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreateOrderItem'
+
+    CreateOrderItem:
+      type: object
+      required: [sku_id, quantity]
+      properties:
+        sku_id:
+          $ref: '#/components/schemas/Id'
+        quantity:
+          type: integer
+          format: int32
+          minimum: 1
+
+    PayOrderRequest:
+      type: object
+      properties:
+        outcome:
+          $ref: '#/components/schemas/SimulatedOutcome'
+
+    SimulatedOutcome:
+      description: 指定模拟支付的结果，仅用于测试。省略时由支付服务决定。
+      type: string
+      enum: [success, failure]
+
+    OrderStatus:
+      description: |
+        订单状态。`creating` 是下单过程中的中间状态；`pending_payment` 待支付；`paid` 已支付；
+        `cancelled` 用户取消；`closed` 超时未支付关单；`failed` 下单失败。
+      type: string
+      enum: [unspecified, creating, pending_payment, paid, cancelled, closed, failed]
+
+    Order:
+      type: object
+      required: [order_id, user_id, status, total, items, create_time, expire_time]
+      properties:
+        order_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total:
+          $ref: '#/components/schemas/Money'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        create_time:
+          type: string
+          format: date-time
+        expire_time:
+          description: 支付截止时间，过期未支付的订单会被关闭
+          type: string
+          format: date-time
+        pay_time:
+          description: 支付成功的时间，未支付时不出现
+          type: string
+          format: date-time
+
+    OrderItem:
+      type: object
+      required: [sku_id, quantity, unit_price]
+      properties:
+        sku_id:
+          $ref: '#/components/schemas/Id'
+        quantity:
+          type: integer
+          format: int32
+        unit_price:
+          $ref: '#/components/schemas/Money'
+
+    PaymentStatus:
+      description: 支付单状态。`refunded` 表示支付成功后因订单已关闭或金额不符而退款。
+      type: string
+      enum: [unspecified, pending, succeeded, failed, refunded]
+
+    Payment:
+      type: object
+      required: [payment_id, order_id, user_id, status, amount, create_time, notified]
+      properties:
+        payment_id:
+          $ref: '#/components/schemas/Id'
+        order_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        create_time:
+          type: string
+          format: date-time
+        notified:
+          description: 支付结果是否已经通知到订单服务
+          type: boolean
+
+    Stock:
+      description: 三个数量之和在下单、支付、取消的过程中保持不变。
+      type: object
+      required: [sku_id, available, reserved, sold, unit_price]
+      properties:
+        sku_id:
+          $ref: '#/components/schemas/Id'
+        available:
+          description: 可售数量
+          type: integer
+          format: int64
+        reserved:
+          description: 已被订单预占、尚未支付的数量
+          type: integer
+          format: int64
+        sold:
+          description: 已售出的数量
+          type: integer
+          format: int64
+        unit_price:
+          $ref: '#/components/schemas/Money'
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+
+    ErrorDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          description: |
+            机器可读的错误码。优先是业务原因码（如 `INSUFFICIENT_STOCK`、`ORDER_NOT_FOUND`），
+            没有原因码时是 gRPC 状态码的名字（如 `INVALID_ARGUMENT`、`UNAVAILABLE`）。
+          type: string
+          examples: [INSUFFICIENT_STOCK]
+        message:
+          description: 给人看的说明，不要依赖它的内容做判断
+          type: string
