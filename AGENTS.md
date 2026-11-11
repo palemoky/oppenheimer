@@ -89,7 +89,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 **可观测**
 
-- 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0005。
+- 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0004。
 - 日志用 `slog` 输出 JSON，带 trace id。
 
 **版本选择**

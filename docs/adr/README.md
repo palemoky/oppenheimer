@@ -30,5 +30,6 @@
 | [0001](0001-k3s-on-kvm.md) | 在 KVM 虚拟机上用 k3s 搭集群 | 已采纳 |
 | [0002](0002-app-level-sharding.md) | 应用层实现分库分表 | 已采纳 |
 | [0003](0003-no-heavy-framework.md) | 不使用重型微服务框架 | 已采纳 |
-| [0004](0004-observability-before-chaos.md) | 可观测先于故障注入 | 已采纳 |
-| [0005](0005-opentelemetry.md) | 用 OpenTelemetry 做埋点标准 | 已采纳，细节待验证 |
+| [0004](0004-opentelemetry.md) | 用 OpenTelemetry 做埋点标准 | 已采纳，细节待验证 |
+| [0005](0005-openapi-spec-first.md) | 对外 HTTP 接口用 OpenAPI 规范先行 | 已采纳，细节待验证 |
+| [0006](0006-money-as-integer-minor-units.md) | 金额用最小货币单位的整数表示 | 已采纳 |
