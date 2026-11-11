@@ -7,26 +7,38 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/pkg/testdb"
+	"github.com/palemoky/Oppenheimer/pkg/testredis"
 	"github.com/palemoky/Oppenheimer/services/inventory"
 	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
 )
 
 type env struct {
-	db  *sql.DB
-	svc *Service
+	db   *sql.DB
+	svc  *Service
+	gate *stockgate.Gate
+	rdb  *redis.Client
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	db := testdb.New(t, inventory.Migrations, inventory.MigrationsDir)
-	return &env{db: db, svc: New(store.New(db), slog.New(slog.NewTextHandler(t.Output(), nil)))}
+	rdb, prefix := testredis.New(t)
+	gate := stockgate.New(rdb, prefix)
+	return &env{
+		db:   db,
+		svc:  New(store.New(db), gate, slog.New(slog.NewTextHandler(t.Output(), nil))),
+		gate: gate,
+		rdb:  rdb,
+	}
 }
 
 // noRetry 关掉死锁重试。并发测试用它证明场景本身不会死锁，而不是靠重试掩盖。

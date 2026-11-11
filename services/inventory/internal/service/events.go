@@ -26,6 +26,10 @@ const DefaultEventTimeout = 10 * time.Second
 // 同一事件处理多次与一次结果相同；failed 先于迟到的 Reserve 到达时，Release 留下的
 // 空回滚标记会挡住那次 Reserve。
 //
+// MySQL 那一步成功后再操作库存闸门：paid 结清占用，其余归还占用（见 confirmAndSettle、
+// releaseAndReturn）。闸门失败返回普通错误由消费者重试；重试时 MySQL 那一步是幂等重放，
+// 闸门再执行一次，同样幂等。进死信的组合在 MySQL 那一步就返回了，不会动闸门。
+//
 // 返回 nil 表示事件已处理（或无需处理）；返回 kafkax.Permanent 表示订单与库存出现了
 // 不可能的组合，重试没有意义，应进死信待人工处理；其他错误（数据库故障、超时等）由消费者重试。
 func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) error {
@@ -35,9 +39,9 @@ func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 	)
 	switch ev.GetBody().(type) {
 	case *eventv1.OrderEvent_Paid:
-		op, fn = "confirm", s.confirm
+		op, fn = "confirm", s.confirmAndSettle
 	case *eventv1.OrderEvent_Cancelled, *eventv1.OrderEvent_Closed, *eventv1.OrderEvent_Failed:
-		op, fn = "release", s.release
+		op, fn = "release", s.releaseAndReturn
 	default:
 		// payment_result_handled 和以后新增的事件与库存无关，直接确认跳过。
 		return nil

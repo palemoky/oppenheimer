@@ -17,6 +17,7 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/Oppenheimer/pkg/retry"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
 )
 
@@ -43,14 +44,15 @@ type Service struct {
 	inventoryv1.UnimplementedInventoryServiceServer
 
 	store  *store.Store
+	gate   *stockgate.Gate
 	logger *slog.Logger
 	// txRetry 的 MaxAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
 	txRetry retry.Policy
 }
 
-// New 返回使用 st 的 Service。
-func New(st *store.Store, logger *slog.Logger) *Service {
-	return &Service{store: st, logger: logger, txRetry: defaultTxRetry}
+// New 返回使用 st 和库存闸门 gate 的 Service。
+func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger) *Service {
+	return &Service{store: st, gate: gate, logger: logger, txRetry: defaultTxRetry}
 }
 
 // Reserve 实现 InventoryServiceServer。
@@ -175,12 +177,17 @@ func validateReserve(req *inventoryv1.ReserveRequest) ([]store.Item, error) {
 }
 
 // Confirm 实现 InventoryServiceServer。
+//
+// 和事件消费走同一条路径（确认后结清闸门里的占用）：排障时手工确认一个订单，
+// 闸门也应该得到同样的结果，否则这笔占用会一直挂着，held 偏大而对账看不出来
+// （Confirm 让 MySQL 一侧减少、占用不结清时 Redis 一侧不变，偏差会被对账当作
+// avail 偏大扣掉，占用本身却永远不会消失）。结清以订单号幂等，之后订单的 paid 事件再来也无害。
 func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) (*inventoryv1.ConfirmResponse, error) {
 	orderID := req.GetOrderId()
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
-	if err := s.confirm(ctx, orderID); err != nil {
+	if err := s.confirmAndSettle(ctx, orderID); err != nil {
 		return nil, s.toStatus(ctx, "confirm", err, "order_id", orderID)
 	}
 	return &inventoryv1.ConfirmResponse{}, nil
@@ -212,12 +219,15 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 }
 
 // Release 实现 InventoryServiceServer。
+//
+// 和 Confirm 一样走事件消费的同一条路径（释放后归还占用）。只释放 MySQL 而不归还的话，
+// 恒等式两边都不变，对账发现不了，闸门会永久少放这部分数量。
 func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) (*inventoryv1.ReleaseResponse, error) {
 	orderID := req.GetOrderId()
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
-	if err := s.release(ctx, orderID); err != nil {
+	if err := s.releaseAndReturn(ctx, orderID); err != nil {
 		return nil, s.toStatus(ctx, "release", err, "order_id", orderID)
 	}
 	return &inventoryv1.ReleaseResponse{}, nil
@@ -323,6 +333,10 @@ func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...a
 		return err
 	}
 	switch {
+	case errors.Is(err, errGate):
+		// MySQL 的那一步已经提交（或根本没开始，如 WarmUp），调用方重试即可补上。
+		s.logger.WarnContext(ctx, "stock gate operation failed", append([]any{"op", op, "error", err.Error()}, attrs...)...)
+		return status.Error(codes.Unavailable, "stock gate unavailable, retry later")
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, "request canceled")
 	case errors.Is(err, context.DeadlineExceeded):
