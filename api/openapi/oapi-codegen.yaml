@@ -1,0 +1,11 @@
+# oapi-codegen 的生成配置，由 make openapi 使用（在仓库根目录运行）。
+# 只生成类型和 gin 的服务端接口，不用 strict-server，理由见 docs/adr/0005-openapi-spec-first.md。
+package: oas
+output: services/gateway/internal/httpapi/oas/oas.gen.go
+generate:
+  models: true
+  gin-server: true
+compatibility:
+  # 枚举常量一律带类型名前缀（SimulatedOutcomeSuccess 而不是 Success），
+  # 否则只有重名时才加前缀，以后新增枚举可能让已有常量改名。
+  always-prefix-enum-values: true

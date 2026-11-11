@@ -149,3 +149,25 @@ jobs:
             echo "::error::api/gen 与 proto 定义不一致，请运行 make proto 并提交"
             exit 1
           fi
+
+  # 确认入库的生成代码与 OpenAPI 规范一致。
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: '**/go.sum'
+      - name: Install oapi-codegen
+        run: make openapi-tools
+      - name: Generate
+        run: make openapi
+      - name: Check generated code is up to date
+        run: |
+          if [ -n "$(git status --porcelain -- services/gateway/internal/httpapi/oas)" ]; then
+            git status --short -- services/gateway/internal/httpapi/oas
+            git diff -- services/gateway/internal/httpapi/oas
+            echo "::error::生成代码与 api/openapi/gateway.yaml 不一致，请运行 make openapi 并提交"
+            exit 1
+          fi

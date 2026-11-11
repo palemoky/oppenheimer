@@ -10,16 +10,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
 )
-
-type errorBody struct {
-	Error errorDetail `json:"error"`
-}
-
-type errorDetail struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
 
 // writeJSON 用 encoding/json/v2 输出响应。先序列化再写，失败时还能改成 500。
 func writeJSON(c *gin.Context, status int, v any) {
@@ -35,7 +27,7 @@ func writeJSON(c *gin.Context, status int, v any) {
 }
 
 func writeError(c *gin.Context, status int, code, message string) {
-	writeJSON(c, status, errorBody{Error: errorDetail{Code: code, Message: message}})
+	writeJSON(c, status, oas.Error{Error: oas.ErrorDetail{Code: code, Message: message}})
 }
 
 // writeGRPCError 把下游错误转成 HTTP 响应。

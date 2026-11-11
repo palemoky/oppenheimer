@@ -1,6 +1,6 @@
 # ADR-0005：对外 HTTP 接口用 OpenAPI 规范先行
 
-- 状态：已采纳，细节待验证
+- 状态：已采纳
 - 日期：2026-11-11
 
 ## 背景
@@ -57,12 +57,23 @@
 - 1a 的 gateway 要重构一次：handler 改成实现生成的接口，手写的 `dto.go` 换成生成的类型。
 - 规范只约束形状，不约束行为。状态码映射、幂等语义这些仍然要靠测试保证。
 
-实现时要验证的细节（验证后把结论补到本文，并把状态改为“已采纳”）：
+## 验证结论（2026-11-11，实现时补记）
 
-- 生成的类型能否被 `encoding/json/v2` 正确编解码，尤其是可选字段和可空字段的表示。
-- 现有约定“64 位 ID 出参是字符串，入参同时接受数字和字符串”在规范里怎么表达。如果表达出来的生成代码太别扭，就收紧为入参只接受字符串，并记为一次接口变更。
-- 生成的 gin 路由注册方式能否保留现有的中间件分组（`requireUser`、`withDeadline` 只作用于 `/api/v1`）和 404、405 的统一错误响应。
-- `oapi-codegen` 的 gin 模板对 gin v1.12 的兼容性。
+决定时留了四个待验证的细节，实现后的结论如下。四项都没有推翻方案。
+
+- **生成的类型与 `encoding/json/v2` 兼容**。生成的是普通结构体加 `json` 标签，不依赖 v1 的特有行为。可选字段生成为指针加 `omitempty`：v2 的 `omitempty` 按“编码结果是否为空的 JSON 值”判断，nil 指针编码为 `null`，会被省略，和重构前手写的 `omitzero` 效果相同。
+- **ID 的表达**：规范里 `Id` 是带正则的字符串，并用 `x-go-type: ID` 指向手写的 `oas.ID` 类型（`int64`，自带 JSON 编解码）。出参是字符串；入参除字符串外仍接受 JSON 整数，这是服务端的宽容处理，规范里只在描述中说明，不要求客户端依赖。没有收紧接口。
+- **中间件分组和 404、405 都能保留**。生成的 `RegisterHandlersWithOptions` 接受 `gin.IRouter`，传入一个前缀为空、挂了 `requireUser` 和 `withDeadline` 的分组即可。`X-User-Id` 在规范里建模为安全方案（apiKey）而不是请求头参数，这样生成代码不会去绑定它，仍由中间件返回 401。
+- **与 gin v1.12 兼容**，生成代码只用到 `gin.Context` 和 `gin.IRouter` 的基础接口。
+
+实现中另外确定的几点：
+
+- **生成位置**：`services/gateway/internal/httpapi/oas/oas.gen.go`，配置在 `api/openapi/oapi-codegen.yaml`。运行时依赖 `github.com/oapi-codegen/runtime` v1.9.0。
+- **路径参数按字符串生成**，是否为正整数由 handler 校验，错误消息和重构前一致。
+- **枚举常量一律带类型名前缀**（`always-prefix-enum-values`）。默认只在重名时加前缀，以后新增枚举可能让已有常量改名。
+- **参数绑定错误走统一的错误结构**：给生成代码传了自定义的 `ErrorHandler`，否则它会输出自己的 `{"msg":...}` 格式。
+- **唯一的对外行为差异**：缺少 `Idempotency-Key` 时，状态码（400）和错误码（`INVALID_ARGUMENT`）不变，但 `message` 的文字变成了生成代码的措辞（`Header parameter Idempotency-Key is required, but not found`）。规范里已写明客户端不应依赖 `message` 的内容。另外，同一个请求里重复出现多个 `Idempotency-Key` 头现在会被拒绝（400），以前是取第一个。
+- **`/healthz` 不进规范**：它由 `pkg/app` 给所有服务统一提供，不是 gateway 的业务接口。
 
 出现以下情况时重新评估：
 

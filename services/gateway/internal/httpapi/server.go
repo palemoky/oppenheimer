@@ -12,6 +12,7 @@ import (
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (
@@ -33,6 +34,9 @@ type Config struct {
 	Logger      *slog.Logger
 	CallTimeout time.Duration
 }
+
+// server 必须实现规范生成的接口。规范新增或修改了接口而这里没跟上时，编译失败。
+var _ oas.ServerInterface = (*server)(nil)
 
 type server struct {
 	deps   Deps
@@ -69,13 +73,10 @@ func New(deps Deps, cfg Config) http.Handler {
 	// 日志在最外层，才能记录到 recover 之后写出的 500。
 	r.Use(s.requestLog, s.recoverPanic)
 
-	api := r.Group("/api/v1", s.requireUser, s.withDeadline)
-	api.POST("/orders", s.createOrder)
-	api.GET("/orders/:order_id", s.getOrder)
-	api.POST("/orders/:order_id/cancel", s.cancelOrder)
-	api.POST("/orders/:order_id/pay", s.payOrder)
-	api.GET("/orders/:order_id/payment", s.getPayment)
-	api.GET("/skus/:sku_id/stock", s.getStock)
+	// 路由由规范生成的代码注册，路径和方法以 api/openapi/gateway.yaml 为准。
+	// 规范里的路径已经带 /api/v1 前缀，所以分组的前缀为空，分组只用来挂中间件。
+	api := r.Group("", s.requireUser, s.withDeadline)
+	oas.RegisterHandlersWithOptions(api, s, oas.GinServerOptions{ErrorHandler: bindError})
 	return r
 }
 

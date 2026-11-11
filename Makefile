@@ -9,6 +9,7 @@ export PATH := $(BIN):$(PATH)
 BUF_VERSION                := v1.75.0
 PROTOC_GEN_GO_VERSION      := v1.36.12
 PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+OAPI_CODEGEN_VERSION       := v2.8.2
 
 # go.work 里的所有模块目录
 MODULES  := $(shell go list -m -f '{{.Dir}}')
@@ -27,8 +28,12 @@ help: ## 显示可用目标
 ## ---------- 工具 ----------
 
 .PHONY: tools
-tools: proto-plugins ## 安装 buf 和 proto 插件到 ./bin
+tools: proto-plugins openapi-tools ## 安装 buf、proto 插件和 oapi-codegen 到 ./bin
 	GOWORK=off GOBIN=$(BIN) go install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+
+.PHONY: openapi-tools
+openapi-tools: ## 只安装 oapi-codegen
+	GOWORK=off GOBIN=$(BIN) go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
 
 .PHONY: proto-plugins
 proto-plugins: ## 只安装 proto 的 Go 插件（CI 里 buf 由 action 提供）
@@ -40,6 +45,10 @@ proto-plugins: ## 只安装 proto 的 Go 插件（CI 里 buf 由 action 提供�
 .PHONY: proto
 proto: ## 由 api/proto 生成 Go 代码到 api/gen
 	cd api && buf generate
+
+.PHONY: openapi
+openapi: ## 由 api/openapi/gateway.yaml 生成 gateway 的类型和服务端接口
+	$(BIN)/oapi-codegen -config api/openapi/oapi-codegen.yaml api/openapi/gateway.yaml
 
 .PHONY: proto-lint
 proto-lint: ## 检查 proto 的格式与规范

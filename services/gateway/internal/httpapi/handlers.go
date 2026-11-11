@@ -12,6 +12,7 @@ import (
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (
@@ -39,9 +40,16 @@ func badRequest(c *gin.Context, msg string) {
 	writeError(c, http.StatusBadRequest, "INVALID_ARGUMENT", msg)
 }
 
+// bindError 处理生成代码在绑定参数时报的错（目前只有缺少必填请求头这一种），
+// 保证这类错误也用统一的错误结构，而不是生成代码默认的格式。
+func bindError(c *gin.Context, err error, status int) {
+	writeError(c, status, "INVALID_ARGUMENT", err.Error())
+}
+
 // pathID 解析路径参数，失败时已写出 400。
-func pathID(c *gin.Context, name string) (int64, bool) {
-	n, ok := parseID(c.Param(name))
+// 生成代码按规范把路径里的 ID 作为字符串传进来，是否为正整数在这里校验。
+func pathID(c *gin.Context, name, value string) (int64, bool) {
+	n, ok := parseID(value)
 	if !ok {
 		badRequest(c, "invalid "+name)
 	}
@@ -71,13 +79,15 @@ func decodeBody(c *gin.Context, dst any, allowEmpty bool) bool {
 	return true
 }
 
-func (s *server) createOrder(c *gin.Context) {
-	key := c.GetHeader(idempotencyKeyHeader)
+// CreateOrder 实现 POST /api/v1/orders。
+func (s *server) CreateOrder(c *gin.Context, params oas.CreateOrderParams) {
+	// 请求头缺失已被生成代码拦下，这里再校验空值和长度。
+	key := params.IdempotencyKey
 	if key == "" || len(key) > maxIdempotencyKeyLen {
 		badRequest(c, idempotencyKeyHeader+" header is required and must be 1 to "+strconv.Itoa(maxIdempotencyKeyLen)+" characters")
 		return
 	}
-	var req createOrderRequest
+	var req oas.CreateOrderRequest
 	if !decodeBody(c, &req, false) {
 		return
 	}
@@ -87,11 +97,11 @@ func (s *server) createOrder(c *gin.Context) {
 	}
 	items := make([]*orderv1.CreateOrderItem, 0, len(req.Items))
 	for _, it := range req.Items {
-		if it.SKUID <= 0 || it.Quantity <= 0 {
+		if it.SkuId <= 0 || it.Quantity <= 0 {
 			badRequest(c, "each item needs a positive sku_id and quantity")
 			return
 		}
-		items = append(items, &orderv1.CreateOrderItem{SkuId: int64(it.SKUID), Quantity: it.Quantity})
+		items = append(items, &orderv1.CreateOrderItem{SkuId: int64(it.SkuId), Quantity: it.Quantity})
 	}
 
 	resp, err := s.deps.Order.CreateOrder(c.Request.Context(), &orderv1.CreateOrderRequest{
@@ -110,8 +120,9 @@ func (s *server) createOrder(c *gin.Context) {
 	writeJSON(c, http.StatusCreated, toOrder(resp.GetOrder()))
 }
 
-func (s *server) getOrder(c *gin.Context) {
-	orderID, ok := pathID(c, "order_id")
+// GetOrder 实现 GET /api/v1/orders/{order_id}。
+func (s *server) GetOrder(c *gin.Context, rawOrderID oas.OrderId) {
+	orderID, ok := pathID(c, "order_id", rawOrderID)
 	if !ok {
 		return
 	}
@@ -127,8 +138,9 @@ func (s *server) getOrder(c *gin.Context) {
 	writeJSON(c, http.StatusOK, toOrder(resp.GetOrder()))
 }
 
-func (s *server) cancelOrder(c *gin.Context) {
-	orderID, ok := pathID(c, "order_id")
+// CancelOrder 实现 POST /api/v1/orders/{order_id}/cancel。
+func (s *server) CancelOrder(c *gin.Context, rawOrderID oas.OrderId) {
+	orderID, ok := pathID(c, "order_id", rawOrderID)
 	if !ok {
 		return
 	}
@@ -144,22 +156,28 @@ func (s *server) cancelOrder(c *gin.Context) {
 	writeJSON(c, http.StatusOK, toOrder(resp.GetOrder()))
 }
 
-func (s *server) payOrder(c *gin.Context) {
-	orderID, ok := pathID(c, "order_id")
+// PayOrder 实现 POST /api/v1/orders/{order_id}/pay。
+func (s *server) PayOrder(c *gin.Context, rawOrderID oas.OrderId) {
+	orderID, ok := pathID(c, "order_id", rawOrderID)
 	if !ok {
 		return
 	}
-	var req payOrderRequest
+	var req oas.PayOrderRequest
 	if !decodeBody(c, &req, true) {
 		return
 	}
+	// 没有传 outcome 和传空字符串都表示不指定。
+	var requested oas.SimulatedOutcome
+	if req.Outcome != nil {
+		requested = *req.Outcome
+	}
 	var outcome paymentv1.SimulatedOutcome
-	switch req.Outcome {
+	switch requested {
 	case "":
 		outcome = paymentv1.SimulatedOutcome_SIMULATED_OUTCOME_UNSPECIFIED
-	case "success":
+	case oas.SimulatedOutcomeSuccess:
 		outcome = paymentv1.SimulatedOutcome_SIMULATED_OUTCOME_SUCCESS
-	case "failure":
+	case oas.SimulatedOutcomeFailure:
 		outcome = paymentv1.SimulatedOutcome_SIMULATED_OUTCOME_FAILURE
 	default:
 		badRequest(c, `outcome must be "success" or "failure"`)
@@ -183,8 +201,9 @@ func (s *server) payOrder(c *gin.Context) {
 	writeJSON(c, http.StatusAccepted, toPayment(resp.GetPayment()))
 }
 
-func (s *server) getPayment(c *gin.Context) {
-	orderID, ok := pathID(c, "order_id")
+// GetPayment 实现 GET /api/v1/orders/{order_id}/payment。
+func (s *server) GetPayment(c *gin.Context, rawOrderID oas.OrderId) {
+	orderID, ok := pathID(c, "order_id", rawOrderID)
 	if !ok {
 		return
 	}
@@ -200,8 +219,9 @@ func (s *server) getPayment(c *gin.Context) {
 	writeJSON(c, http.StatusOK, toPayment(resp.GetPayment()))
 }
 
-func (s *server) getStock(c *gin.Context) {
-	skuID, ok := pathID(c, "sku_id")
+// GetStock 实现 GET /api/v1/skus/{sku_id}/stock。
+func (s *server) GetStock(c *gin.Context, rawSKUID oas.SkuId) {
+	skuID, ok := pathID(c, "sku_id", rawSKUID)
 	if !ok {
 		return
 	}

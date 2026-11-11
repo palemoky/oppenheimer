@@ -44,22 +44,23 @@
 
 把 gateway 手写的 HTTP 接口改为规范先行，决定和理由见 [ADR-0005](../adr/0005-openapi-spec-first.md)。
 
-在 1a 合并到 `main` 之后、1b 开始之前做，从 `main` 新开分支。这是一次不改变对外行为的重构，不和 1a 的 PR 混在一起。gateway 不涉及资金、库存、订单状态，可以派给子 Agent，主会话评审。
+在 1a 合并到 `main` 之后、1b 开始之前做，从 `main` 新开分支。这是一次不改变对外行为的重构，不和 1a 的 PR 混在一起。原计划把 gateway 重构派给子 Agent。实际由主会话直接完成：验证 ADR 里的四个细节本身就需要把重构做出来，改动只有三个文件，再派出去是重复劳动。
 
 基础（主会话串行完成，属于共享部分）：
 
-- [ ] `Makefile`：`make tools` 安装 `oapi-codegen` v2.8.2；新增 `make openapi`；版本登记到 `docs/infra/versions.md`
-- [ ] 写 `api/openapi/gateway.yaml`（OpenAPI 3.1）：现有 6 个路由、`Idempotency-Key` 和 `X-User-Id` 请求头、统一的错误结构、各接口可能返回的状态码
-- [ ] 验证 ADR-0005 列出的四个待验证细节，把结论补进 ADR；结论影响方案时先改 ADR 和本计划
+- [x] `Makefile`：`make tools` 安装 `oapi-codegen` v2.8.2；新增 `make openapi`；版本登记到 `docs/infra/versions.md`
+- [x] 写 `api/openapi/gateway.yaml`（OpenAPI 3.1）：现有 6 个路由、`Idempotency-Key` 和 `X-User-Id` 请求头、统一的错误结构、各接口可能返回的状态码
+- [x] 验证 ADR-0005 列出的四个待验证细节，把结论补进 ADR；结论影响方案时先改 ADR 和本计划
 
 实现：
 
-- [ ] gateway 重构：handler 实现生成的服务端接口，`dto.go` 换成生成的类型；保留现有中间件分组和 404、405 的统一错误响应
-- [ ] `server_test.go` 的行为断言不改，全部通过（断言需要改动的地方逐条列出并说明原因）
-- [ ] CI 增加生成结果一致性检查：重新生成后 `git diff --exit-code`
-- [ ] `docs/design/1a-order-flow.md` 第 6 节的路由表改为指向规范文件，只保留规范表达不了的约定
-- [ ] `make lint test e2e` 通过
-- [ ] 可选：从规范生成客户端，替换端到端测试里手写的请求结构
+- [x] gateway 重构：handler 实现生成的服务端接口，`dto.go` 换成生成的类型；保留现有中间件分组和 404、405 的统一错误响应
+- [x] `server_test.go` 的行为断言不改，全部通过（实际没有任何断言需要改动，`server_test.go` 和端到端测试都未修改）
+- [x] CI 增加生成结果一致性检查（`openapi` 任务，**还没有在 GitHub 上跑过**）
+- [x] `docs/design/1a-order-flow.md` 第 6 节的路由表改为指向规范文件，只保留规范表达不了的约定
+- [x] `make lint test e2e` 通过
+- [x] 推送、开 PR，确认 CI 通过（含首次运行的 `openapi` 任务），合并到 `main`
+- 从规范生成客户端、替换端到端测试里手写的请求结构：没有在这里做，**已移到阶段 3b**（[phase-3-observability.md](phase-3-observability.md) 的第一项），和压测脚本一起评估
 
 **验收**：对外行为与重构前完全一致（现有 gateway 测试和端到端测试不改断言即通过）；改了规范不重新生成，或生成后 handler 没跟上，CI 或编译会失败。
 
