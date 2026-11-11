@@ -30,7 +30,7 @@ func newEnv(t *testing.T) *env {
 }
 
 // noRetry 关掉死锁重试。并发测试用它证明场景本身不会死锁，而不是靠重试掩盖。
-func (e *env) noRetry() { e.svc.txAttempts = 1 }
+func (e *env) noRetry() { e.svc.txRetry.MaxAttempts = 1 }
 
 // seed 入库一个 SKU，并在测试结束时断言它的三个量都不为负、总和等于入库量。
 // 每个测试都经由它准备数据，因此每个测试都会检查恒等式。

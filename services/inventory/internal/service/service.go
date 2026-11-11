@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"math/rand/v2"
 	"slices"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/Oppenheimer/pkg/retry"
 	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
 )
 
@@ -27,10 +27,16 @@ import (
 // 排队等它的重复请求在记录消失后都继承了同一个间隙锁，又都要插入，彼此的插入意向锁
 // 与对方的间隙锁冲突，InnoDB 会判定死锁并回滚其中一些。三个操作都幂等，整个事务重来
 // 是安全的；退避加随机抖动，让重来的请求错开，不再同时撞到同一个间隙上。
-const (
-	defaultTxAttempts = 5
-	txRetryBaseDelay  = 2 * time.Millisecond
-)
+//
+// 抖动比例取 1（间隔在 [0, 2d) 内均匀取值），接近 1a 的全抖动：这里要的是把
+// 同时撞上的几个请求尽量拉开，而不是让间隔稳定。只重试死锁，其他错误原样返回。
+var defaultTxRetry = retry.Policy{
+	MaxAttempts: 5,
+	Initial:     2 * time.Millisecond,
+	Max:         50 * time.Millisecond,
+	Jitter:      1,
+	Retryable:   mysqlx.IsDeadlock,
+}
 
 // Service 实现 inventoryv1.InventoryServiceServer。
 type Service struct {
@@ -38,13 +44,13 @@ type Service struct {
 
 	store  *store.Store
 	logger *slog.Logger
-	// txAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
-	txAttempts int
+	// txRetry 的 MaxAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
+	txRetry retry.Policy
 }
 
 // New 返回使用 st 的 Service。
 func New(st *store.Store, logger *slog.Logger) *Service {
-	return &Service{store: st, logger: logger, txAttempts: defaultTxAttempts}
+	return &Service{store: st, logger: logger, txRetry: defaultTxRetry}
 }
 
 // Reserve 实现 InventoryServiceServer。
@@ -174,8 +180,16 @@ func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) 
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
+	if err := s.confirm(ctx, orderID); err != nil {
+		return nil, s.toStatus(ctx, "confirm", err, "order_id", orderID)
+	}
+	return &inventoryv1.ConfirmResponse{}, nil
+}
 
-	err := s.inTx(ctx, func(tx *store.Tx) error {
+// confirm 把订单的预占转为已售，以 order_id 幂等。gRPC 和事件消费共用。
+// 返回业务错误（errx）或未经转换的内部错误，由调用方决定如何对外呈现。
+func (s *Service) confirm(ctx context.Context, orderID int64) error {
+	return s.inTx(ctx, func(tx *store.Tx) error {
 		// 记录应当已经存在，加排他锁不会落到间隙上；不存在就报错，不会接着插入。
 		st, found, err := tx.ReservationStatusForUpdate(ctx, orderID)
 		if err != nil {
@@ -195,10 +209,6 @@ func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) 
 			return errors.New("unknown reservation status")
 		}
 	})
-	if err != nil {
-		return nil, s.toStatus(ctx, "confirm", err, "order_id", orderID)
-	}
-	return &inventoryv1.ConfirmResponse{}, nil
 }
 
 // Release 实现 InventoryServiceServer。
@@ -207,8 +217,16 @@ func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) 
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
+	if err := s.release(ctx, orderID); err != nil {
+		return nil, s.toStatus(ctx, "release", err, "order_id", orderID)
+	}
+	return &inventoryv1.ReleaseResponse{}, nil
+}
 
-	err := s.inTx(ctx, func(tx *store.Tx) error {
+// release 释放订单的预占，以 order_id 幂等；预占不存在时留下空回滚标记。
+// gRPC 和事件消费共用，错误约定同 confirm。
+func (s *Service) release(ctx context.Context, orderID int64) error {
+	return s.inTx(ctx, func(tx *store.Tx) error {
 		// 没有预占记录时插入成功，这一行就是“已释放”标记（空回滚），
 		// 它让仍在路上的 Reserve 撞上唯一键而被拒绝，防止库存悬挂。
 		// 已有记录时这一步已对它加了排他锁，见 InsertReservationOrLock。
@@ -235,10 +253,6 @@ func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) 
 			return errors.New("unknown reservation status")
 		}
 	})
-	if err != nil {
-		return nil, s.toStatus(ctx, "release", err, "order_id", orderID)
-	}
-	return &inventoryv1.ReleaseResponse{}, nil
 }
 
 // settle 把 RESERVED 的预占转为 to，并对每一项按 sku_id 升序执行 move。
@@ -292,28 +306,14 @@ func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest
 	}, nil
 }
 
-// inTx 执行事务，遇到死锁时整体重试，原因见 defaultTxAttempts。
+// inTx 执行事务，遇到死锁时整体重试，原因见 defaultTxRetry。
 func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
-	var err error
-	for attempt := range s.txAttempts {
-		if attempt > 0 {
-			// 全抖动退避：在 [0, base·2^attempt) 内随机等待。
-			delay := rand.N(txRetryBaseDelay << attempt) //nolint:gosec // 抖动只为错开重试，不需要密码学随机
-			s.logger.WarnContext(ctx, "transaction deadlocked, retrying", "attempt", attempt, "delay_ms", delay.Milliseconds())
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
+	return retry.Do(ctx, s.txRetry, func(ctx context.Context, attempt int) error {
+		if attempt > 1 {
+			s.logger.WarnContext(ctx, "transaction deadlocked, retrying", "attempt", attempt)
 		}
-		err = s.store.InTx(ctx, fn)
-		if !mysqlx.IsDeadlock(err) {
-			return err
-		}
-	}
-	return err
+		return s.store.InTx(ctx, fn)
+	})
 }
 
 // toStatus 把 handler 的错误转换为返回给调用方的 gRPC 错误。
