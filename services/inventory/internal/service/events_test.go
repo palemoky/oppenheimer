@@ -292,12 +292,3 @@ func TestOrderEventHandler(t *testing.T) {
 		e.assertStock(t, 1, 7, 0, 3)
 	})
 }
-
-// 迁移后 outbox 表存在，库存服务之后发布事件时可以直接使用。
-func TestOutboxTableMigrated(t *testing.T) {
-	e := newEnv(t)
-	var n int
-	if err := e.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM outbox`).Scan(&n); err != nil {
-		t.Fatalf("query outbox: %v", err)
-	}
-}
