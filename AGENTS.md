@@ -43,6 +43,16 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 涉及资金、库存、订单状态的代码一律由 Fable 编写或评审，不下放。
 
+## 给子 Agent 派任务
+
+主会话负责规划、拆分和验收，具体任务按上表的分工派给子 Agent。为避免上下文污染和浪费 token，**只给子 Agent 当前任务需要的上下文**：
+
+- 任务说明自成一体：要做什么、完成标准、能改哪些目录、必须遵守的约束（从本文件里摘出相关的几条，不要让它通读全部文档）。
+- 给出它需要的接口和类型定义（proto、表结构、函数签名），或指明具体文件路径，不要让它自己在仓库里摸索。
+- 不传与任务无关的历史讨论、其他阶段的计划、其他服务的实现细节。
+- 要求它返回简短结果：改了哪些文件、测试是否通过、遇到的问题和没做完的部分。不要返回大段代码或日志。
+- 主会话验收后再合并：读 diff、跑 `make lint test`。涉及资金、库存、订单状态的代码由 Fable 逐行评审。
+
 ## 并行与 worktree
 
 互相没有依赖的任务可以派给多个子 Agent，各自在独立的 git worktree 里并行完成。
@@ -57,7 +67,8 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 **Go**
 
-- Go 1.27，多模块用 go workspace。
+- Go 1.27，多模块用 go workspace。模块间的依赖要在 `go.mod` 里加指向本地目录的 `replace`（`go mod tidy` 不读 `go.work`）。
+- 常用命令都在 `Makefile` 里，`make help` 查看。proto 改动后运行 `make proto` 并把 `api/gen` 一起提交。
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。

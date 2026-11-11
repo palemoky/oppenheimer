@@ -9,21 +9,20 @@
 
 ## 上次做到哪
 
-- 确定了整体规划、设备分配、技术选型和阶段顺序。
-- 写完了全部规划文档：`AGENTS.md`、`docs/GOALS.md`、`docs/ROADMAP.md`、各阶段计划、4 篇初始 ADR、设备文档、复盘模板。
-- 按主人的 11 条反馈修订了计划（见下方计划变更记录）。
-- 已加 `.gitignore` 和 GitHub Actions CI（`.github/workflows/ci.yml`）。CI 还没有实际跑过：仓库里没有 Go 代码，任务会被跳过。
-- 以上内容尚未提交到 git。
+- 规划文档、`.gitignore`、CI 已提交在分支 `phase-0-bootstrap`（两次提交）。
+- 阶段 0 的仓库骨架已写完并在本机全部验证通过，**尚未提交**：go workspace 与 6 个模块、`pkg/app` 和 `pkg/logx`、四个服务入口、proto 工具链与第一个 proto、Makefile、lint 配置、compose、CI 的 proto 任务。验证结果和实施中的决定记在 [plan/phase-0-bootstrap.md](plan/phase-0-bootstrap.md)。
+- `AGENTS.md` 增加了「尽可能使用 Go 新版特性」的规则。
 
 ## 下一步
 
-阶段 0 剩余任务，见 [plan/phase-0-bootstrap.md](plan/phase-0-bootstrap.md)：
+1. 主人确认后提交骨架代码，推送分支，确认 CI 在 GitHub 上跑通（阶段 0 唯一剩下的任务）。
+2. 合并到 `main`，把 `ROADMAP.md` 里阶段 0 标为完成。
+3. 进入阶段 1a，先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 里 1a 的任务，从数据模型和订单状态机开始。
 
-1. 搭仓库骨架：go workspace、目录结构、Makefile、golangci-lint 配置。
-2. 写本地 `docker-compose.yml`（MySQL、Redis、Kafka 单实例），确认在 OrbStack 上能起来。
-   版本先按 `docs/infra/versions.md` 的规则查证。
-3. 第一个 go module 入库并推送后，确认 CI 实际跑通。
-4. 完成后进入阶段 1a。
+## 本机开发环境
+
+- `make tools` 安装 buf 和 proto 插件到 `./bin`（已装）。
+- `make up` 启动依赖，`make down` 停止并保留数据。当前依赖处于停止状态。
 
 ## 阻塞项与待确认
 
@@ -55,3 +54,5 @@
 ### 2026-11-11
 
 制定规划并落成文档。本机工具现状：Go 1.27.3、kubectl 1.33、Docker 29.8（OrbStack）已装；helm 未装，阶段 2 前安装。
+
+同日完成阶段 0 的仓库骨架，本机验证通过，待提交和 CI 验证。

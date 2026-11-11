@@ -20,14 +20,18 @@
 | actions/setup-go | v7 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
+| MySQL | 9.7.4 | LTS | 2026-11-11 | Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
+| Redis | 8.10.3 | 稳定版 | 2026-11-11 | |
+| Kafka | 4.4.0 | 稳定版 | 2026-11-11 | `apache/kafka` 镜像，KRaft 模式 |
+| buf | v1.75.0 | 稳定版 | 2026-11-11 | 版本写在 `Makefile` 和 CI 里，升级时一起改 |
+| protoc-gen-go | v1.36.12 | 稳定版 | 2026-11-11 | 同上 |
+| protoc-gen-go-grpc | v1.6.2 | 稳定版 | 2026-11-11 | 同上 |
+| bufbuild/buf-action | v1 | 稳定版 | 2026-11-11 | CI |
 
 ## 待引入（引入时查证并移到上表）
 
 | 组件 | 阶段 | 是否有 LTS |
 |---|---|---|
-| MySQL | 0 | 有 |
-| Redis | 0 | 无 |
-| Kafka | 0 | 无 |
 | Ubuntu（虚拟机镜像） | 2 | 有 |
 | k3s / Kubernetes | 2 | 无，选当前受支持的最新小版本 |
 | Strimzi、MySQL Operator、Helm | 2 | 无 |
