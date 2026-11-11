@@ -49,6 +49,22 @@ jobs:
     needs: detect
     if: needs.detect.outputs.modules != '[]'
     runs-on: ubuntu-latest
+    # 集成测试用的 MySQL，版本与 deploy/compose 保持一致。每个测试自建临时库。
+    services:
+      mysql:
+        image: mysql:9.7.4
+        env:
+          MYSQL_ROOT_PASSWORD: oppenheimer
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -poppenheimer --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+          --health-start-period 20s
+    env:
+      OPPENHEIMER_TEST_MYSQL_DSN: root:oppenheimer@tcp(127.0.0.1:3306)/
     strategy:
       fail-fast: false
       matrix:

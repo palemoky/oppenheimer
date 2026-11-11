@@ -8,15 +8,32 @@
 
 用最简单的架构把业务做对，作为后面所有改造的对照基线。
 
-- [ ] 数据模型：订单、订单明细、库存、库存流水、支付单
-- [ ] 订单状态机：待支付 → 已支付 → 已取消 / 已关闭，更新 SQL 带状态前置条件
-- [ ] 订单号生成：雪花算法变体，预留分片基因位（为 1c 做准备）
-- [ ] inventory 服务：扣减、回补，`UPDATE ... SET stock = stock - ? WHERE stock >= ?` 防超卖，流水表保证幂等
-- [ ] order 服务：下单、查询、取消
-- [ ] payment 服务：模拟支付，异步回调 order，回调幂等
-- [ ] gateway：HTTP 入口，路由到各 gRPC 服务
-- [ ] 下单接口幂等：客户端幂等键 + 唯一索引
-- [ ] 并发测试：N 个并发抢 M 件库存，断言成交数等于 M、无超卖、无重复订单
+设计规格见 [design/1a-order-flow.md](../design/1a-order-flow.md)。
+
+基础（主会话串行完成）：
+
+- [x] 接口契约：`api/proto/oppenheimer/{inventory,order,payment}/v1/`
+- [x] 数据模型：各服务 `migrations/00001_init.sql`，每个服务独立的库
+- [x] `pkg/idgen`：雪花算法变体，低 6 位为分片基因，处理时钟回拨
+- [x] `pkg/errx`：gRPC 状态码加原因码的错误约定
+- [x] `pkg/mysqlx`：连接池、事务、迁移、错误分类
+- [x] `pkg/grpcx`：服务端（日志、panic 恢复、健康检查、优雅停止）与客户端（默认超时）
+- [x] `pkg/testdb`：每个测试一个隔离的库；CI 增加 MySQL 服务
+- [x] 设计文档
+
+服务（派给子 Agent 在各自的 worktree 并行实现，主会话评审后合并）：
+
+- [ ] inventory：Reserve、Confirm、Release（含空回滚与防悬挂）、GetStock
+- [ ] order：CreateOrder（幂等、可推进）、GetOrder、CancelOrder、HandlePaymentResult、结清与后台任务
+- [ ] payment：CreatePayment、GetPayment、出结果与回调重试的后台任务
+- [ ] gateway：HTTP 路由、JSON 约定、错误映射
+
+集成（主会话）：
+
+- [ ] 合并四个服务，`make lint test` 通过
+- [ ] `make seed` 准备示例 SKU；`make run` 或等价方式一键启动四个服务
+- [ ] 端到端测试：主流程、并发抢购零超卖、幂等、超时关单、支付与取消并发
+- [ ] 把 1a 的面试考点整理到 `docs/notes/`
 
 **验收**：并发测试在 `-race` 下稳定通过；重复请求、重复回调不产生副作用。
 

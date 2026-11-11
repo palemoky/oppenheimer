@@ -27,6 +27,10 @@
 | protoc-gen-go | v1.36.12 | 稳定版 | 2026-11-11 | 同上 |
 | protoc-gen-go-grpc | v1.6.2 | 稳定版 | 2026-11-11 | 同上 |
 | bufbuild/buf-action | v1 | 稳定版 | 2026-11-11 | CI |
+| google.golang.org/grpc | v1.85.0 | 稳定版 | 2026-11-11 | |
+| go-sql-driver/mysql | v1.10.1 | 稳定版 | 2026-11-11 | |
+| pressly/goose | v3.30.0 | 稳定版 | 2026-11-11 | 数据库迁移，作为库嵌入各服务 |
+| gin | v1.12.0 | 稳定版 | 2026-11-11 | 仅 gateway 使用 |
 
 ## 待引入（引入时查证并移到上表）
 

@@ -15,6 +15,11 @@ MODULES  := $(shell go list -m -f '{{.Dir}}')
 SERVICES := $(notdir $(wildcard services/*))
 COMPOSE  := docker compose -f deploy/compose/docker-compose.yml
 
+# 集成测试连接的 MySQL，默认是 make up 启动的那个。每个测试会自建并删除临时库。
+MYSQL_ROOT_PASSWORD ?= oppenheimer
+MYSQL_PORT          ?= 3306
+export OPPENHEIMER_TEST_MYSQL_DSN ?= root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:$(MYSQL_PORT))/
+
 .PHONY: help
 help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -50,8 +55,12 @@ lint: ## 对所有模块运行 golangci-lint
 	@for m in $(MODULES); do echo "==> lint $${m#$(ROOT)/}"; (cd $$m && golangci-lint run ./...) || exit 1; done
 
 .PHONY: test
-test: ## 对所有模块运行带竞态检测的测试
+test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
+
+.PHONY: test-unit
+test-unit: ## 只运行不依赖 MySQL 的测试
+	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= go test -race ./...) || exit 1; done
 
 .PHONY: build
 build: ## 编译所有模块，并把各服务的二进制输出到 ./bin
@@ -68,6 +77,9 @@ tidy: ## 对所有模块执行 go mod tidy，并同步 workspace
 .PHONY: up
 up: ## 启动 MySQL、Redis、Kafka 并等待就绪
 	$(COMPOSE) up -d --wait
+	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
+		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS order_db; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null
+	@echo "databases ready: inventory_db order_db payment_db"
 
 .PHONY: down
 down: ## 停止本地依赖，保留数据

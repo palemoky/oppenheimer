@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package oppenheimer.order.v1;
+
+import "google/protobuf/timestamp.proto";
+import "oppenheimer/common/v1/money.proto";
+
+// OrderService 管理订单的创建、查询、取消，以及支付结果的处理。
+service OrderService {
+  // CreateOrder 创建订单并预占库存。
+  //
+  // 以 (user_id, idempotency_key) 幂等：重复请求返回第一次创建的订单。
+  //
+  // 错误：
+  //   INVALID_ARGUMENT     reason=INVALID_ARGUMENT     参数不合法
+  //   NOT_FOUND            reason=SKU_NOT_FOUND
+  //   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
+  //   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+
+  // GetOrder 查询订单。订单不属于该用户时等同于不存在。
+  //
+  // 错误：
+  //   NOT_FOUND  reason=ORDER_NOT_FOUND
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+
+  // CancelOrder 取消待支付的订单。对已取消的订单重复调用返回成功。
+  //
+  // 错误：
+  //   NOT_FOUND            reason=ORDER_NOT_FOUND
+  //   FAILED_PRECONDITION  reason=ORDER_NOT_CANCELLABLE 订单不在待支付状态
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // HandlePaymentResult 由支付服务回调，通知一笔支付的最终结果。
+  //
+  // 以 payment_id 幂等，支付服务会重试直到收到成功响应。
+  //
+  // 错误：
+  //   NOT_FOUND            reason=ORDER_NOT_FOUND
+  //   FAILED_PRECONDITION  reason=AMOUNT_MISMATCH 支付金额与订单金额不一致
+  rpc HandlePaymentResult(HandlePaymentResultRequest) returns (HandlePaymentResultResponse);
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  // 订单已落库，库存尚未预占完成。对用户不可见的中间状态。
+  ORDER_STATUS_CREATING = 1;
+  // 库存已预占，等待支付。
+  ORDER_STATUS_PENDING_PAYMENT = 2;
+  // 已支付。终态。
+  ORDER_STATUS_PAID = 3;
+  // 用户取消。终态。
+  ORDER_STATUS_CANCELLED = 4;
+  // 超时未支付被系统关闭。终态。
+  ORDER_STATUS_CLOSED = 5;
+  // 创建失败（如库存不足）。终态。
+  ORDER_STATUS_FAILED = 6;
+}
+
+message OrderItem {
+  int64 sku_id = 1;
+  int32 quantity = 2;
+  oppenheimer.common.v1.Money unit_price = 3;
+}
+
+message Order {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  OrderStatus status = 3;
+  oppenheimer.common.v1.Money total = 4;
+  repeated OrderItem items = 5;
+  google.protobuf.Timestamp create_time = 6;
+  // 支付截止时间，过期未支付会被关闭。
+  google.protobuf.Timestamp expire_time = 7;
+  // 仅已支付的订单有值。
+  google.protobuf.Timestamp pay_time = 8;
+}
+
+message CreateOrderItem {
+  int64 sku_id = 1;
+  // 数量，必须大于 0。
+  int32 quantity = 2;
+}
+
+message CreateOrderRequest {
+  int64 user_id = 1;
+  // 客户端生成的幂等键，1 到 64 个字符。
+  string idempotency_key = 2;
+  // 同一请求内 sku_id 不能重复，至少一项。
+  repeated CreateOrderItem items = 3;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+}
+
+message GetOrderRequest {
+  int64 order_id = 1;
+  int64 user_id = 2;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message CancelOrderRequest {
+  int64 order_id = 1;
+  int64 user_id = 2;
+}
+
+message CancelOrderResponse {
+  Order order = 1;
+}
+
+enum PaymentDisposition {
+  PAYMENT_DISPOSITION_UNSPECIFIED = 0;
+  // 订单已按该支付结果处理（或此前已处理过）。
+  PAYMENT_DISPOSITION_ACCEPTED = 1;
+  // 支付成功，但订单已不能接受这笔钱（已取消、已关闭，或已被另一笔支付付清），需要退款。
+  PAYMENT_DISPOSITION_REFUND_REQUIRED = 2;
+}
+
+message HandlePaymentResultRequest {
+  int64 order_id = 1;
+  int64 payment_id = 2;
+  // 是否支付成功。
+  bool succeeded = 3;
+  // 实际支付金额。
+  oppenheimer.common.v1.Money amount = 4;
+}
+
+message HandlePaymentResultResponse {
+  PaymentDisposition disposition = 1;
+}
