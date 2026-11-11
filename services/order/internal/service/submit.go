@@ -379,8 +379,9 @@ var errNotYetExpired = errors.New("order not yet expired by local clock")
 // HandleOrderCloseDue 消费 order.close.delay 的一条到期提醒（ADR-0009）。
 //
 // 提醒只说明“到点了”，订单该不该关由它当时的状态决定：
-//   - 订单不存在或还在 CREATING：什么都不做。创建超时由 sweeper 处理；落库晚于到期的订单
-//     进入 PENDING_PAYMENT 时就已过期，由 sweeper 的超时关单兜底。
+//   - 订单不存在或还在 CREATING：什么都不做。创建超时由 sweeper 处理；落库时已过支付时限的订单
+//     由 HandleOrderSubmitted 直接置为 FAILED，不预占库存。落库时还没到期、但提醒先于它进入
+//     PENDING_PAYMENT 到达的订单，由 sweeper 的超时关单兜底。
 //   - 已不是 PENDING_PAYMENT（已支付、已取消、已关闭、已失败）：什么都不做。
 //   - PENDING_PAYMENT 但按本机时钟还没过期：返回错误，让消费者稍后重试。不能当作不需要关而跳过，
 //     否则只能等 sweeper。
