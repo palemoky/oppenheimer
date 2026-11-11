@@ -62,11 +62,7 @@ func TestCancelOrderNotCancellable(t *testing.T) {
 	wantStatus(t, e.load(t, paid.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PAID)
 	e.wantEvents(t, paid.GetOrderId(), "paid", "handled")
 
-	e.inv.inject("Reserve", fault{err: errTimeout})
-	if _, err := e.svc.CreateOrder(t.Context(), createReq(1, "creating", items(skuA, 1))); errx.Code(err) != codes.Unavailable {
-		t.Fatal(err)
-	}
-	creating := e.loadByKey(t, 1, "creating")
+	creating := e.mustCreating(t, 1, "creating")
 	_, err = e.svc.CancelOrder(t.Context(), cancelReq(creating.OrderID, 1))
 	wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderNotCancellable)
 	e.wantEvents(t, creating.OrderID)

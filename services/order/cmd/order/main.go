@@ -24,6 +24,8 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/logx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/Oppenheimer/pkg/outbox"
+	"github.com/palemoky/Oppenheimer/pkg/redisx"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/order"
 	"github.com/palemoky/Oppenheimer/services/order/internal/service"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
@@ -34,6 +36,14 @@ const serviceName = "order"
 // kafkaStartTimeout 是启动时连接 Kafka、建 topic 的时限。
 const kafkaStartTimeout = 30 * time.Second
 
+// redisStartTimeout 是启动时连接 Redis 的时限。
+const redisStartTimeout = 5 * time.Second
+
+// closeDelayMaxAttempts 是延迟关单消息的最大处理次数。到期消息到达时订单按本机时钟还没过期
+// （与发送方的时钟有偏差）会返回错误重试；默认的 5 次退避合计不到 2 秒，容不下秒级的时钟偏差。
+// 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
+const closeDelayMaxAttempts = 10
+
 type config struct {
 	httpAddr       string
 	grpcAddr       string
@@ -41,10 +51,14 @@ type config struct {
 	workerID       int64
 	inventoryAddr  string
 	paymentTimeout time.Duration
+	idempotencyTTL time.Duration
 	sweeper        service.SweeperConfig
+	reaper         service.ReaperConfig
 	kafkaBrokers   []string
 	kafkaPrefix    string
 	outboxInterval time.Duration
+	redisAddr      string
+	redisPrefix    string
 }
 
 func main() {
@@ -64,6 +78,8 @@ func loadConfig() (config, error) {
 		mysqlDSN:      cmp.Or(os.Getenv("MYSQL_DSN"), "root:oppenheimer@tcp(127.0.0.1:3306)/order_db"),
 		inventoryAddr: cmp.Or(os.Getenv("INVENTORY_ADDR"), "127.0.0.1:9082"),
 		kafkaPrefix:   os.Getenv("KAFKA_PREFIX"),
+		redisAddr:     cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
+		redisPrefix:   os.Getenv("REDIS_PREFIX"),
 	}
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
@@ -100,9 +116,19 @@ func loadConfig() (config, error) {
 	if cfg.sweeper.CreateTimeout, err = envDuration("CREATE_TIMEOUT", service.DefaultCreateTimeout); err != nil {
 		return cfg, err
 	}
-	// 创建时限必须给在线路径的一次 Reserve 留出余地，否则后台任务会和正常下单抢着处理。
-	if cfg.sweeper.CreateTimeout <= grpcx.DefaultCallTimeout {
-		return cfg, fmt.Errorf("CREATE_TIMEOUT must be longer than %s", grpcx.DefaultCallTimeout)
+	// 创建时限必须给落库时的一次推进（处理一条消息的时限内含 Reserve）留出余地，
+	// 否则后台任务会和正常落库抢着处理。
+	if cfg.sweeper.CreateTimeout <= service.DefaultEventTimeout {
+		return cfg, fmt.Errorf("CREATE_TIMEOUT must be longer than %s", service.DefaultEventTimeout)
+	}
+	if cfg.idempotencyTTL, err = envDuration("IDEMPOTENCY_TTL", service.DefaultIdempotencyTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.reaper.Grace, err = envDuration("HOLD_REAP_GRACE", service.DefaultReapGrace); err != nil {
+		return cfg, err
+	}
+	if cfg.reaper.Interval, err = envDuration("HOLD_REAP_INTERVAL", service.DefaultReapInterval); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
 }
@@ -160,13 +186,25 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
+	rctx, rcancel := context.WithTimeout(ctx, redisStartTimeout)
+	defer rcancel()
+	rdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.redisAddr})
+	if err != nil {
+		return err
+	}
+	// defer 在 app.Run 返回、所有组件都停下之后执行：受理、落库、回收都用它。
+	defer rdb.Close()
+	gate := stockgate.New(rdb, cfg.redisPrefix)
+
 	kcfg := kafkax.Config{Brokers: cfg.kafkaBrokers, ClientID: serviceName}
 	ordersTopic := eventx.Topic(cfg.kafkaPrefix, eventx.OrderEvents)
 	paymentsTopic := eventx.Topic(cfg.kafkaPrefix, eventx.PaymentEvents)
+	submitTopic := eventx.Topic(cfg.kafkaPrefix, eventx.OrderSubmit)
+	closeTopic := eventx.Topic(cfg.kafkaPrefix, eventx.OrderCloseDelay)
 	// 启动阶段连 Kafka（探活、建 topic、检查死信 topic）的总时限。这些 ctx 只在构造时使用。
 	kctx, kcancel := context.WithTimeout(ctx, kafkaStartTimeout)
 	defer kcancel()
-	if err := ensureTopics(kctx, kcfg, ordersTopic, paymentsTopic); err != nil {
+	if err := ensureTopics(kctx, kcfg, ordersTopic, paymentsTopic, submitTopic, closeTopic); err != nil {
 		return err
 	}
 
@@ -187,19 +225,55 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	svc := service.New(store.New(db), inventoryv1.NewInventoryServiceClient(conn), ids, logger,
-		service.Config{PaymentTimeout: cfg.paymentTimeout, OrderEventsTopic: ordersTopic, Relay: relay})
+	svc := service.New(service.Deps{
+		Store:     store.New(db),
+		Gate:      gate,
+		Sender:    producer,
+		Inventory: inventoryv1.NewInventoryServiceClient(conn),
+		IDs:       ids,
+		Logger:    logger,
+	}, service.Config{
+		PaymentTimeout:   cfg.paymentTimeout,
+		IdempotencyTTL:   cfg.idempotencyTTL,
+		OrderEventsTopic: ordersTopic,
+		SubmitTopic:      submitTopic,
+		CloseDelayTopic:  closeTopic,
+		Relay:            relay,
+	})
 	sweeper, err := service.NewSweeper(svc, cfg.sweeper)
 	if err != nil {
 		return err
 	}
+	reaper, err := service.NewReaper(svc, cfg.reaper)
+	if err != nil {
+		return err
+	}
 
-	consumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
+	paymentConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
 		Config: kcfg,
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderPaymentEvents),
 		Topics: []string{paymentsTopic},
 		Logger: logger,
 	}, svc.PaymentEventsHandler(service.DefaultEventTimeout))
+	if err != nil {
+		return err
+	}
+	submitConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
+		Config: kcfg,
+		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderSubmit),
+		Topics: []string{submitTopic},
+		Logger: logger,
+	}, svc.SubmitHandler(service.DefaultEventTimeout))
+	if err != nil {
+		return err
+	}
+	closeConsumer, err := kafkax.NewDelayConsumer(kctx, kafkax.DelayConsumerConfig{
+		Config:      kcfg,
+		Group:       eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderCloseDelay),
+		Topics:      []string{closeTopic},
+		Logger:      logger,
+		MaxAttempts: closeDelayMaxAttempts,
+	}, svc.CloseDueHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return err
 	}
@@ -216,10 +290,18 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
-	// 停止顺序与此相反：先停后台任务和消费者，再停 gRPC，然后停 outbox 中继，最后停健康检查。
-	// 中继排在所有会写 outbox 的组件之后停，让它们最后写入的事件尽量在退出前发出；
-	// 没发出的也不会丢，下次启动时中继会先跑一轮。
-	return app.Run(ctx, logger, httpServer, relay, grpcServer, consumer, sweeper)
+	// 停止顺序与列出的顺序相反：
+	//  1. sweeper、回收任务：纯后台扫描，随时可以停，下次启动接着扫。
+	//  2. gRPC：不再受理新请求，并等在途的 SubmitOrder 做完。受理是“Hold → 发消息”两步，
+	//     中途被打断会留下孤儿占用（只能等回收任务），所以让它们在 Redis 和生产者都还可用时走完。
+	//  3. 三个消费者：支付结果、延迟关单、落库。它们写 outbox，必须在中继之前停；
+	//     没处理完的消息不提交位点，下次启动（或别的副本）重新消费。
+	//  4. outbox 中继：排在所有会写 outbox 的组件之后，让最后写入的事件尽量在退出前发出；
+	//     没发出的也不会丢，下次启动时中继会先跑一轮。
+	//  5. 健康检查最后停。
+	// 生产者、Redis、数据库和库存的连接由 defer 在 app.Run 返回后关闭，此时已没有组件在用。
+	return app.Run(ctx, logger, httpServer, relay,
+		submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
 }
 
 // ensureTopics 创建本服务发布和消费的 topic 及其死信 topic。

@@ -13,18 +13,23 @@ import (
 
 // SweeperConfig 是后台任务的配置，零值字段使用默认值。
 type SweeperConfig struct {
-	// Interval 是两轮扫描之间的间隔，默认 1 秒。
+	// Interval 是两轮扫描之间的间隔，默认 30 秒。
 	Interval time.Duration
 	// BatchSize 是每类扫描每轮最多处理的订单数，默认 100。
 	BatchSize int
-	// CreateTimeout 是订单停留在 CREATING 的时限，超过后置为失败，默认 1 分钟。
-	// 应明显大于一次 Reserve 调用的超时，否则会和正常进行中的下单抢。
+	// CreateTimeout 是订单落库后停留在 CREATING 的时限，超过后置为失败，默认 1 分钟。
+	// 应明显大于一次 Reserve 调用的超时，否则会和正常进行中的落库抢。
+	//
+	// 从落库时刻（updated_at）算起，而不是从受理时刻（created_at）：消费积压时订单落库可能比受理晚
+	// 很多，按受理时刻算的话，积压超过这个时限的订单一落库就会被 sweeper 和消费者抢着处理，
+	// 恰好在削峰最需要的时候成批失败。CREATING 的行在落库之后不会再被更新，updated_at 就是落库时间。
 	CreateTimeout time.Duration
 }
 
 // 后台任务的默认配置。
 const (
-	DefaultSweepInterval  = time.Second
+	// 超时关单的主路径是延迟消息（ADR-0009），扫表只兜底延迟消息丢失、进死信的情况，所以间隔可以大。
+	DefaultSweepInterval  = 30 * time.Second
 	DefaultSweepBatchSize = 100
 	DefaultCreateTimeout  = time.Minute
 )

@@ -224,9 +224,9 @@ func (s *Store) ListExpired(ctx context.Context, now time.Time, limit int) ([]Or
 		int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now, limit)
 }
 
-// ListStaleCreating 返回创建时间早于 before 仍在 CREATING 的订单。
+// ListStaleCreating 返回落库时间（updated_at，CREATING 的行落库后不再更新）早于 before 仍在 CREATING 的订单。
 func (s *Store) ListStaleCreating(ctx context.Context, before time.Time, limit int) ([]OrderRef, error) {
-	return s.listRefs(ctx, "SELECT order_id, user_id FROM orders WHERE status = ? AND created_at < ? ORDER BY created_at LIMIT ?",
+	return s.listRefs(ctx, "SELECT order_id, user_id FROM orders WHERE status = ? AND updated_at < ? ORDER BY updated_at LIMIT ?",
 		int32(orderv1.OrderStatus_ORDER_STATUS_CREATING), before, limit)
 }
 

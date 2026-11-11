@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"slices"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 
 	"github.com/palemoky/Oppenheimer/api/eventx"
@@ -19,7 +22,10 @@ import (
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/idgen"
+	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/pkg/testdb"
+	"github.com/palemoky/Oppenheimer/pkg/testredis"
 	"github.com/palemoky/Oppenheimer/services/order"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
@@ -59,16 +65,99 @@ type fakeRelay struct{ kicks atomic.Int64 }
 func (r *fakeRelay) Kick() { r.kicks.Add(1) }
 
 // 测试用的 topic 名，带前缀以确认 Service 用的是配置的 topic 而不是默认值。
-const testEventsTopic = "test." + eventx.OrderEvents
+const (
+	testEventsTopic = "test." + eventx.OrderEvents
+	testSubmitTopic = "test." + eventx.OrderSubmit
+	testCloseTopic  = "test." + eventx.OrderCloseDelay
+)
+
+// sendFault 决定一次 Send 的结果。persist[i] 为 true 的记录照样“写进去”（被记下来），
+// 然后返回 errs。用来模拟“发送失败但消息其实到了”。
+type sendFault struct {
+	persist []bool
+	errs    []error
+	// after 在记录之后、返回之前调用，用来在“消息已到、发送方还没拿到结果”的窗口里制造并发。
+	after func(recs []kafkax.Record)
+}
+
+var errSend = errors.New("fake: produce failed")
+
+// fakeSender 是内存里的 Kafka：记下发出的每条记录，可以按顺序注入失败。
+type fakeSender struct {
+	mu     sync.Mutex
+	recs   []kafkax.Record
+	sends  int
+	faults []sendFault
+}
+
+func (f *fakeSender) inject(fs ...sendFault) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = append(f.faults, fs...)
+}
+
+func (f *fakeSender) Send(ctx context.Context, recs ...kafkax.Record) ([]error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.sends++
+	var ft *sendFault
+	if len(f.faults) > 0 {
+		ft = &f.faults[0]
+		f.faults = f.faults[1:]
+	}
+	if ft == nil {
+		f.recs = append(f.recs, recs...)
+		f.mu.Unlock()
+		return make([]error, len(recs)), nil
+	}
+	for i, r := range recs {
+		if i < len(ft.persist) && ft.persist[i] {
+			f.recs = append(f.recs, r)
+		}
+	}
+	f.mu.Unlock()
+	if ft.after != nil {
+		ft.after(recs)
+	}
+	errs := make([]error, len(recs))
+	copy(errs, ft.errs)
+	return errs, errors.Join(errs...)
+}
+
+func (f *fakeSender) sendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sends
+}
+
+// records 返回发往 topic 的全部记录。
+func (f *fakeSender) records(topic string) []kafkax.Record {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []kafkax.Record
+	for _, r := range f.recs {
+		if r.Topic == topic {
+			out = append(out, r)
+		}
+	}
+	return out
+}
 
 type env struct {
 	db      *sql.DB
 	store   *store.Store
+	rdb     *redis.Client
+	prefix  string
+	gate    *stockgate.Gate
+	sender  *fakeSender
 	inv     *fakeInventory
 	clock   *fakeClock
 	relay   *fakeRelay
 	svc     *Service
 	sweeper *Sweeper
+	reaper  *Reaper
 
 	// consumed 是 consumeEvents 已经处理到的 outbox 行数；simulated 是它代替库存服务发起的调用次数。
 	mu        sync.Mutex
@@ -79,7 +168,9 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	db := testdb.New(t, order.Migrations, order.MigrationsDir)
-	inv := newFakeInventory()
+	rdb, prefix := testredis.New(t)
+	gate := stockgate.New(rdb, prefix)
+	inv := newFakeInventory(gate)
 	inv.addSKU(skuA, priceA, 1000)
 	inv.addSKU(skuB, priceB, 1000)
 	inv.addSKU(skuScarce, 10, 1)
@@ -93,19 +184,35 @@ func newEnv(t *testing.T) *env {
 	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
 	st := store.New(db)
 	relay := &fakeRelay{}
-	svc := New(st, inv, ids, logger, Config{Clock: clock.Now, OrderEventsTopic: testEventsTopic, Relay: relay})
+	sender := &fakeSender{}
+	svc := New(Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger}, Config{
+		Clock:            clock.Now,
+		OrderEventsTopic: testEventsTopic,
+		SubmitTopic:      testSubmitTopic,
+		CloseDelayTopic:  testCloseTopic,
+		Relay:            relay,
+	})
 	sweeper, err := NewSweeper(svc, SweeperConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reaper, err := NewReaper(svc, ReaperConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &env{
 		db:        db,
 		store:     st,
+		rdb:       rdb,
+		prefix:    prefix,
+		gate:      gate,
+		sender:    sender,
 		inv:       inv,
 		clock:     clock,
 		relay:     relay,
 		svc:       svc,
 		sweeper:   sweeper,
+		reaper:    reaper,
 		simulated: map[string]int{},
 	}
 	// 1b 起订单服务只同步调用 Reserve，确认和释放全部交给库存服务消费事件完成。
@@ -123,7 +230,8 @@ func newEnv(t *testing.T) *env {
 }
 
 // consumeEvents 扮演库存服务：按顺序消费 outbox 里新增的事件，
-// paid 确认预占，cancelled、closed、failed 释放预占。用来验证“事件发出去之后库存不会泄漏”。
+// paid 确认预占后结清占用，cancelled、closed、failed 释放预占后归还占用（先 MySQL 后 Redis）。
+// 用来验证“事件发出去之后库存不会泄漏”。
 func (e *env) consumeEvents(t *testing.T) {
 	t.Helper()
 	evs := e.allEvents(t)
@@ -134,10 +242,14 @@ func (e *env) consumeEvents(t *testing.T) {
 		switch ev.GetBody().(type) {
 		case *eventv1.OrderEvent_Paid:
 			e.simulated["Confirm"]++
-			_, err = e.inv.Confirm(t.Context(), &inventoryv1.ConfirmRequest{OrderId: ev.GetOrderId()})
+			if _, err = e.inv.Confirm(t.Context(), &inventoryv1.ConfirmRequest{OrderId: ev.GetOrderId()}); err == nil {
+				_, err = e.gate.Settle(t.Context(), ev.GetOrderId())
+			}
 		case *eventv1.OrderEvent_Cancelled, *eventv1.OrderEvent_Closed, *eventv1.OrderEvent_Failed:
 			e.simulated["Release"]++
-			_, err = e.inv.Release(t.Context(), &inventoryv1.ReleaseRequest{OrderId: ev.GetOrderId()})
+			if _, err = e.inv.Release(t.Context(), &inventoryv1.ReleaseRequest{OrderId: ev.GetOrderId()}); err == nil {
+				_, err = e.gate.Return(t.Context(), ev.GetOrderId())
+			}
 		}
 		if err != nil {
 			t.Errorf("inventory rejected event for order %d: %v", ev.GetOrderId(), err)
@@ -146,29 +258,74 @@ func (e *env) consumeEvents(t *testing.T) {
 	e.consumed = len(evs)
 }
 
-func items(pairs ...int64) []*orderv1.CreateOrderItem {
-	var out []*orderv1.CreateOrderItem
+func items(pairs ...int64) []*orderv1.SubmitOrderItem {
+	var out []*orderv1.SubmitOrderItem
 	for i := 0; i+1 < len(pairs); i += 2 {
-		out = append(out, &orderv1.CreateOrderItem{SkuId: pairs[i], Quantity: int32(pairs[i+1])})
+		out = append(out, &orderv1.SubmitOrderItem{SkuId: pairs[i], Quantity: int32(pairs[i+1])})
 	}
 	return out
 }
 
-func createReq(userID int64, key string, it []*orderv1.CreateOrderItem) *orderv1.CreateOrderRequest {
-	return &orderv1.CreateOrderRequest{UserId: userID, IdempotencyKey: key, Items: it}
+func submitReq(userID int64, key string, it []*orderv1.SubmitOrderItem) *orderv1.SubmitOrderRequest {
+	return &orderv1.SubmitOrderRequest{UserId: userID, IdempotencyKey: key, Items: it}
 }
 
-// mustPending 下一个 skuA×2 的订单并确认它进入待支付。
-func (e *env) mustPending(t *testing.T, userID int64, key string) *orderv1.Order {
+// submit 受理一个下单请求，要求成功并返回 CREATING 的订单。
+func (e *env) submit(t *testing.T, userID int64, key string, it []*orderv1.SubmitOrderItem) *orderv1.Order {
 	t.Helper()
-	resp, err := e.svc.CreateOrder(t.Context(), createReq(userID, key, items(skuA, 2)))
+	resp, err := e.svc.SubmitOrder(t.Context(), submitReq(userID, key, it))
 	if err != nil {
-		t.Fatalf("CreateOrder: %v", err)
-	}
-	if got := resp.GetOrder().GetStatus(); got != orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT {
-		t.Fatalf("status = %s, want PENDING_PAYMENT", got)
+		t.Fatalf("SubmitOrder: %v", err)
 	}
 	return resp.GetOrder()
+}
+
+// submitMessage 返回受理时为 orderID 发出的 order.submit 消息（作为消费者收到的 kafkax.Message）。
+func (e *env) submitMessage(t *testing.T, orderID int64) kafkax.Message {
+	t.Helper()
+	for _, r := range e.sender.records(testSubmitTopic) {
+		if string(r.Key) == strconv.FormatInt(orderID, 10) {
+			return kafkax.Message{Topic: r.Topic, Key: r.Key, Value: r.Value, Headers: r.Headers}
+		}
+	}
+	t.Fatalf("no order.submit message for order %d", orderID)
+	return kafkax.Message{}
+}
+
+// land 扮演 order.submit 的消费者处理 orderID 的消息一次，经过 Kafka 适配层（解码、时限、死信判断）。
+func (e *env) land(t *testing.T, orderID int64) error {
+	t.Helper()
+	return e.svc.SubmitHandler(0)(t.Context(), e.submitMessage(t, orderID))
+}
+
+func (e *env) mustLand(t *testing.T, orderID int64) {
+	t.Helper()
+	if err := e.land(t, orderID); err != nil {
+		t.Fatalf("land order %d: %v", orderID, err)
+	}
+}
+
+// mustPending 下一个 skuA×2 的订单、落库，并确认它进入待支付。
+func (e *env) mustPending(t *testing.T, userID int64, key string) *orderv1.Order {
+	t.Helper()
+	o := e.submit(t, userID, key, items(skuA, 2))
+	e.mustLand(t, o.GetOrderId())
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
+	return toProto(stored)
+}
+
+// mustCreating 下一个 skuA×1 的订单并落库，但让 Reserve 超时，订单停在 CREATING。
+func (e *env) mustCreating(t *testing.T, userID int64, key string) *store.Order {
+	t.Helper()
+	o := e.submit(t, userID, key, items(skuA, 1))
+	e.inv.inject("Reserve", fault{err: errTimeout})
+	if err := e.land(t, o.GetOrderId()); !errors.Is(err, errReserveUnknown) {
+		t.Fatalf("land err = %v, want reserve outcome unknown", err)
+	}
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_CREATING)
+	return stored
 }
 
 func (e *env) load(t *testing.T, orderID int64) *store.Order {
@@ -180,15 +337,6 @@ func (e *env) load(t *testing.T, orderID int64) *store.Order {
 	return o
 }
 
-func (e *env) loadByKey(t *testing.T, userID int64, key string) *store.Order {
-	t.Helper()
-	o, err := e.store.GetOrderByIdempotencyKey(t.Context(), userID, key)
-	if err != nil {
-		t.Fatalf("load order by key: %v", err)
-	}
-	return o
-}
-
 func (e *env) count(t *testing.T, query string, args ...any) int {
 	t.Helper()
 	var n int
@@ -196,6 +344,61 @@ func (e *env) count(t *testing.T, query string, args ...any) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+func (e *env) orderRows(t *testing.T) int {
+	t.Helper()
+	return e.count(t, "SELECT COUNT(*) FROM orders")
+}
+
+// wantGate 断言闸门里 sku 的可放行数量和占用数量。
+func (e *env) wantGate(t *testing.T, sku, avail, held int64) {
+	t.Helper()
+	st, ok, err := e.gate.Stock(t.Context(), sku)
+	if err != nil || !ok {
+		t.Fatalf("gate stock of sku %d: loaded=%v err=%v", sku, ok, err)
+	}
+	if st.Avail != avail || st.Held != held {
+		t.Fatalf("gate sku %d = avail %d held %d, want avail %d held %d", sku, st.Avail, st.Held, avail, held)
+	}
+}
+
+// wantBalanced 断言稳定状态下的恒等式（设计文档 6.6）：闸门的 avail + held 等于库存的 available + reserved。
+func (e *env) wantBalanced(t *testing.T, sku int64) {
+	t.Helper()
+	st, ok, err := e.gate.Stock(t.Context(), sku)
+	if err != nil || !ok {
+		t.Fatalf("gate stock of sku %d: loaded=%v err=%v", sku, ok, err)
+	}
+	s := e.inv.stock(sku)
+	if st.Avail+st.Held != s.available+s.reserved {
+		t.Fatalf("sku %d unbalanced: gate avail %d + held %d != inventory available %d + reserved %d",
+			sku, st.Avail, st.Held, s.available, s.reserved)
+	}
+}
+
+// hold 读 orderID 的占用。
+func (e *env) hold(t *testing.T, orderID int64) (stockgate.HoldInfo, bool) {
+	t.Helper()
+	h, ok, err := e.gate.Get(t.Context(), orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h, ok
+}
+
+// expireIdempotencyKeys 删掉闸门里的全部幂等键，模拟它们过了保留时长。
+func (e *env) expireIdempotencyKeys(t *testing.T) {
+	t.Helper()
+	iter := e.rdb.Scan(t.Context(), 0, e.prefix+"gate:idem:*", 100).Iterator()
+	for iter.Next(t.Context()) {
+		if err := e.rdb.Del(t.Context(), iter.Val()).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func paymentEvent(orderID, paymentID, amount int64, succeeded bool) *eventv1.PaymentEvent {

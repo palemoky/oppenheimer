@@ -227,11 +227,7 @@ func TestHandlePaymentNotPayable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 创建中的订单（预占超时）。
-	e.inv.inject("Reserve", fault{err: errTimeout})
-	if _, err := e.svc.CreateOrder(t.Context(), createReq(1, "creating", items(skuA, 1))); errx.Code(err) != codes.Unavailable {
-		t.Fatalf("err = %v", err)
-	}
-	creating := e.loadByKey(t, 1, "creating")
+	creating := e.mustCreating(t, 1, "creating")
 
 	for i, id := range []int64{cancelled.GetOrderId(), creating.OrderID} {
 		reply, err := e.pay(t, id, int64(800+i), 200, true)

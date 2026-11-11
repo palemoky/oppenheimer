@@ -167,22 +167,5 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 // PaymentEventsHandler 把 HandlePaymentEvent 接到 Kafka 消费者上：解码消息、加上时限、
 // 把“重试也没用”的错误标记为 Permanent 送进死信。timeout <= 0 时取 DefaultEventTimeout。
 func (s *Service) PaymentEventsHandler(timeout time.Duration) kafkax.Handler {
-	if timeout <= 0 {
-		timeout = DefaultEventTimeout
-	}
-	return func(ctx context.Context, msg kafkax.Message) error {
-		ev, err := eventx.UnmarshalPaymentEvent(msg.Value)
-		if err != nil {
-			return kafkax.Permanent(err)
-		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		err = s.HandlePaymentEvent(ctx, ev)
-		if errors.Is(err, ErrInvalidEvent) {
-			s.logger.ErrorContext(ctx, "invalid payment event, sent to dead letter",
-				"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset, "error", err)
-			return kafkax.Permanent(err)
-		}
-		return err
-	}
+	return adapt(s, "payment event", timeout, eventx.UnmarshalPaymentEvent, s.HandlePaymentEvent)
 }
