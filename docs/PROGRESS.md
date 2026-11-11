@@ -10,26 +10,28 @@
 
 ## 上次做到哪
 
-1a 全部完成并合并到 `main`（PR #2）。CI 全部通过，包括首次在 GitHub 上运行的 MySQL 集成测试任务和端到端任务。
+1b 进行中，分四步（见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 和 [design/1b-high-concurrency.md](design/1b-high-concurrency.md)）。
 
-- 四个服务由子 Agent 并行实现，主会话逐个评审后合入。评审和实现过程中发现并修复了两个设计缺陷（Release 的锁升级死锁、Reserve 被拒后的库存泄漏），详见 [notes/1a-consistency.md](notes/1a-consistency.md) 第 7 节。
-- 合并前补了两篇 ADR：[ADR-0005](adr/0005-openapi-spec-first.md)（对外接口 OpenAPI 规范先行，**只有决定和计划，还没有任何代码**）和 [ADR-0006](adr/0006-money-as-integer-minor-units.md)（金额用最小货币单位的整数，补记 1a 的既有决定）。
+**步骤一（公共库）已完成并提交在本地 `phase-1b`**，只差 outbox 的测试：
 
-## 「1a 补充」做到哪
+- `pkg/retry`、`pkg/worker`、`pkg/kafkax`（生产者、消费者、延迟消费者）、`pkg/testkafka`、`pkg/lock`、`pkg/redisx`、`pkg/testredis`：子 Agent 实现，主会话评审后合入，`pkg` 模块 lint 和测试通过。
+- `pkg/outbox`：主会话编写，**还没有测试**。
+- 事件契约 `api/proto/oppenheimer/event/v1/events.proto`、辅助包 `api/eventx`、ADR-0007、ADR-0008。
 
-gateway 已改为规范先行，已合并到 `main`，CI 通过。
+**步骤二（事件化）刚开始就暂停了**（主人的 token 限额将尽）：
 
-- 规范：`api/openapi/gateway.yaml`（OpenAPI 3.1，6 个接口）；生成配置 `api/openapi/oapi-codegen.yaml`。
-- 生成代码：`services/gateway/internal/httpapi/oas/oas.gen.go`；同目录的 `id.go` 是规范通过 `x-go-type` 引用的手写 ID 类型。
-- gateway：`server` 实现生成的 `ServerInterface`，路由由生成代码注册，手写的 DTO 已删除，`dto.go` 只剩 proto 到对外类型的转换。
-- 工具链：`make tools` 会安装 `oapi-codegen` v2.8.2，`make openapi` 重新生成；CI 新增 `openapi` 任务检查生成代码是否与规范一致。
-- ADR-0005 的四个待验证细节都已验证并写回，状态改为“已采纳”。
-- 本机验证：`make lint` 0 问题，`make test` 全过，`make e2e` 7 个场景通过。`server_test.go` 和端到端测试没有改动。
-- 对外行为的差异只有两处，都记在 ADR-0005 里：缺少 `Idempotency-Key` 时错误消息的文字变了（状态码和错误码不变）；重复的 `Idempotency-Key` 头现在返回 400。
+- 已做：`order.proto` 删除了 `HandlePaymentResult`；`scripts/run-local.sh`、`scripts/e2e.sh`、CI 已接入 Kafka 和 Redis。
+- **当前 `services/order` 和 `services/payment` 编译不过**，这是预期的中间状态：它们还在引用已删除的 RPC，要等事件化改造完成。`make lint test e2e` 现在跑不通。
+- 第二批四个子 Agent（order、payment、inventory 的事件化改造，outbox 测试）派出后立即被停止，没有产出任何改动，worktree 已清理。
 
 ## 下一步
 
-1. 进入 1b。先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1b 任务并写设计文档，顺序建议：Redis 预扣库存 → outbox 加 Kafka 替换轮询 → 异步下单 → 延迟关单 → 分布式锁 → 杀进程对账测试。1b 新增或修改对外接口时（例如异步下单的结果轮询），先改规范再写实现。
+1. 重新派出第二批四个子 Agent（worktree 并行，基于 `phase-1b`）：
+   - order、payment、inventory 各一个（Opus）：规格是设计文档第 5 节的 5.1、5.2、5.3 加“通用要求”。每个 Agent 只能改自己的 `services/<svc>/`，各自添加迁移 `00002`，在 `main.go` 里装配 Kafka 生产者、outbox 中继、消费者。要求它们报告与设计不一致之处和怀疑的一致性窗口。
+   - outbox 测试一个（Sonnet）：只写 `pkg/outbox/*_test.go`，重点是“id 小的事务后提交时不丢消息”“队首失败不饿死后面”“发送成功但标记前崩溃会重发”。
+2. 主会话逐行评审三个服务的 diff（都涉及资金、库存、订单状态），cherry-pick 合入，跑 `make lint test e2e`。端到端 7 个场景不改断言必须通过。
+3. 复核支付成功与超时关单的并发在消息重复、延迟、乱序下仍然成立，结论写入设计文档；勾选计划；CI 改动还没在 GitHub 上跑过，推送后重点看 test 和 e2e 任务（改成了用 `make up` 启动依赖）。
+4. 之后是步骤三（Redis 预扣、异步下单、延迟关单）和步骤四，动工前先细化设计文档第 6、7 节。
 
 已推迟的任务（记在对应阶段的计划里，不会丢）：
 
@@ -87,3 +89,5 @@ gateway 已改为规范先行，已合并到 `main`，CI 通过。
 同日完成 1a 收尾：文档改动作为独立提交进入 1a 分支，推送、开 PR #2、CI 全绿后合并到 `main`。
 
 同日实施「1a 补充」：写了 OpenAPI 规范，引入 `oapi-codegen`，gateway 改为实现生成的接口，本机 lint、测试、端到端全部通过。随后提交、推送、开 PR 并合并到 `main`（git 操作派给 Haiku 子 Agent）。生成客户端的可选任务移到阶段 3b。
+
+同日开始 1b：写了设计文档和 ADR-0007、ADR-0008，完成步骤一的公共库（三个子 Agent 并行实现，主会话评审合入，outbox 由主会话编写）。步骤二改了 proto 和脚本后暂停，服务改造尚未开始。
