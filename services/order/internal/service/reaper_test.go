@@ -22,8 +22,8 @@ func TestReaperReturnsOrphans(t *testing.T) {
 	e.clock.Advance(2 * time.Second)
 
 	st := e.reaper.RunOnce(t.Context())
-	if st.Returned != 1 || st.Claimed != 1 {
-		t.Fatalf("stats = %+v, want 1 returned, 1 claimed", st)
+	if st.Returned != 1 || st.Claimed != 0 || st.Stuck != 0 {
+		t.Fatalf("stats = %+v, want 1 returned and nothing else", st)
 	}
 	if _, ok := e.hold(t, orphan.GetOrderId()); ok {
 		t.Error("orphan hold still exists")
@@ -114,33 +114,50 @@ func TestReaperRacesLanding(t *testing.T) {
 	e.wantBalanced(t, skuA)
 }
 
-// 一整批都是已认领的占用时记告警（后面的孤儿轮不到），见 RunOnce 的说明。
-func TestReaperBatchOfClaimed(t *testing.T) {
+// 防止：已认领的占用把孤儿挡在回收任务的一批之外。待支付订单的占用要活到支付时限结束，
+// 它们比孤儿更早受理、数量超过一批时，孤儿仍然必须被回收。
+func TestReaperNotStarvedByClaimedHolds(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	r, err := NewReaper(e.svc, ReaperConfig{BatchSize: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range 2 {
+	for i := range 3 {
 		e.mustPending(t, 1, strconv.Itoa(i))
 	}
 	orphan := e.submit(t, 1, "orphan", items(skuA, 1))
 	e.clock.Advance(DefaultReapGrace + time.Second)
-	if st := r.RunOnce(t.Context()); st.Claimed != 2 || st.Returned != 0 {
-		t.Fatalf("stats = %+v", st)
+
+	if st := r.RunOnce(t.Context()); st.Returned != 1 || st.Stuck != 0 {
+		t.Fatalf("stats = %+v, want the orphan returned", st)
 	}
-	if _, ok := e.hold(t, orphan.GetOrderId()); !ok {
-		t.Fatal("orphan behind a full batch of claimed holds should not be reached")
+	if _, ok := e.hold(t, orphan.GetOrderId()); ok {
+		t.Fatal("orphan behind claimed holds was not reaped")
 	}
-	// 待支付的订单关闭、占用归还之后，孤儿就能被回收。
-	e.clock.Advance(DefaultPaymentTimeout)
-	e.sweeper.RunOnce(t.Context())
-	e.consumeEvents(t)
-	if st := r.RunOnce(t.Context()); st.Returned != 1 {
-		t.Fatalf("stats = %+v, want 1 returned", st)
+}
+
+// 防止：认领之后卡住的占用无声无息地留在闸门里。超过支付时限两倍还没结束的已认领占用要被报告，
+// 但不能被自动归还（不知道 MySQL 里有没有预占）。
+func TestReaperReportsStuckClaimedHolds(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	o := e.submit(t, 1, "stuck", items(skuA, 2))
+	if _, ok, err := e.svc.gate.Claim(t.Context(), o.GetOrderId()); err != nil || !ok {
+		t.Fatalf("claim = %v, %v", ok, err)
 	}
-	e.wantGate(t, skuA, 1000, 0)
+
+	e.clock.Advance(2*DefaultPaymentTimeout - time.Second)
+	if st := e.reaper.RunOnce(t.Context()); st.Stuck != 0 {
+		t.Fatalf("stats = %+v, want nothing stuck yet", st)
+	}
+	e.clock.Advance(2 * time.Second)
+	if st := e.reaper.RunOnce(t.Context()); st.Stuck != 1 || st.Returned != 0 {
+		t.Fatalf("stats = %+v, want 1 stuck and none returned", st)
+	}
+	if h, ok := e.hold(t, o.GetOrderId()); !ok || !h.Claimed {
+		t.Fatal("stuck hold was touched")
+	}
 }
 
 func TestReaperStartStop(t *testing.T) {

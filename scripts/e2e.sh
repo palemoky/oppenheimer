@@ -31,7 +31,10 @@ export REDIS_PREFIX="e2e-$(date +%s):"
 export LOG_DIR="$ROOT/tmp/e2e-logs"
 # 缩短各时限，让超时关单这类场景能在几秒内测完。
 export PAYMENT_TIMEOUT=3s
-export SWEEP_INTERVAL=200ms
+# sweeper 故意设得比测试的等待时间长：超时关单必须由延迟消息触发才能在时限内完成，
+# 这样端到端测试覆盖的是延迟关单这条路径，而不是兜底的扫表。
+export SWEEP_INTERVAL=1m
+export GATE_RECONCILE_INTERVAL=1s
 export LOG_LEVEL=warn
 
 export E2E_GATEWAY_URL=http://127.0.0.1:8080

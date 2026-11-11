@@ -431,6 +431,29 @@ func TestHoldsBefore(t *testing.T) {
 	if got := must[[]int64](t)(e.gate.HoldsBefore(t.Context(), base.Add(time.Hour), 10)); !slices.Equal(got, []int64{2, 3}) {
 		t.Fatalf("HoldsBefore after return = %v, want [2 3]", got)
 	}
+
+	// 认领后从待回收的列表移到已认领的列表：已认领的占用要活到订单结束，
+	// 留在原列表里会一直排在最前面，把后面的孤儿挡在回收任务的一批之外。
+	for range 2 { // 重复认领不改变结果
+		if _, ok, err := e.gate.Claim(t.Context(), 2); err != nil || !ok {
+			t.Fatalf("Claim = %v, %v", ok, err)
+		}
+	}
+	if got := must[[]int64](t)(e.gate.HoldsBefore(t.Context(), base.Add(time.Hour), 10)); !slices.Equal(got, []int64{3}) {
+		t.Fatalf("HoldsBefore after claim = %v, want [3]", got)
+	}
+	if got := must[[]int64](t)(e.gate.ClaimedBefore(t.Context(), base.Add(time.Hour), 10)); !slices.Equal(got, []int64{2}) {
+		t.Fatalf("ClaimedBefore = %v, want [2]", got)
+	}
+	// 按受理时间而不是认领时间排：订单 2 是在 base+1m 受理的。
+	if got := must[[]int64](t)(e.gate.ClaimedBefore(t.Context(), base.Add(time.Minute), 10)); len(got) != 0 {
+		t.Fatalf("ClaimedBefore(base+1m) = %v, want none", got)
+	}
+	// 已认领的占用结束后，从已认领的列表里消失。
+	must[bool](t)(e.gate.Settle(t.Context(), 2))
+	if got := must[[]int64](t)(e.gate.ClaimedBefore(t.Context(), base.Add(time.Hour), 10)); len(got) != 0 {
+		t.Fatalf("ClaimedBefore after settle = %v, want none", got)
+	}
 }
 
 // 防止：重复装载用 MySQL 的值覆盖闸门里的数量，抹掉还没落到 MySQL 的占用。

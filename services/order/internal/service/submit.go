@@ -281,6 +281,21 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 		return fmt.Errorf("insert order %d: %w", o.OrderID, err)
 	}
 
+	// 落库时支付时限已经过了（消费积压超过了支付时限）：不再预占，直接置为失败。
+	// 继续推进的话订单会进入 PENDING_PAYMENT 然后立刻被关闭，用户没有任何时间支付，
+	// 库存却白白被占用一轮、再释放一轮。failed 事件让库存服务留下“已释放”标记并归还闸门里的占用。
+	if o.Status == orderv1.OrderStatus_ORDER_STATUS_CREATING {
+		if now := s.now(); !o.ExpireAt.After(now) {
+			ref := store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}
+			if _, err := s.failCreating(ctx, ref, ReasonCreateTimeout, now); err != nil {
+				return fmt.Errorf("fail expired order %d: %w", o.OrderID, err)
+			}
+			s.logger.WarnContext(ctx, "order landed after its payment deadline, failed without reserving",
+				"order_id", o.OrderID, "expire_at", o.ExpireAt.Format(time.RFC3339Nano))
+			return nil
+		}
+	}
+
 	// 4. 推进：同步 Reserve。被拒绝时 advance 已把订单置为 FAILED 并写了 failed 事件，
 	// 库存服务据此 Release 并归还占用，这里不用再做什么。
 	o, err = s.advance(ctx, o)

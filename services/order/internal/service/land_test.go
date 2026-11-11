@@ -182,6 +182,33 @@ func TestLandReplayAfterIdempotencyExpiry(t *testing.T) {
 
 // Reserve 被拒绝（闸门放进来了，MySQL 没有库存给它）：订单 FAILED 并写 failed 事件，消息处理成功。
 // 库存服务消费事件后释放预占（空回滚）并归还占用。
+// 防止：消费积压超过支付时限时，订单落库后进入待支付又立刻被关闭（用户没有时间支付，库存白占一轮）。
+// 这样的订单应当直接失败、不预占，占用由 failed 事件归还。
+func TestLandAfterPaymentDeadline(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	o := e.submit(t, 1, "late", items(skuA, 2))
+	e.clock.Advance(DefaultPaymentTimeout + time.Second)
+
+	e.mustLand(t, o.GetOrderId())
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_FAILED)
+	if stored.FailReason != ReasonCreateTimeout {
+		t.Errorf("fail_reason = %q, want %q", stored.FailReason, ReasonCreateTimeout)
+	}
+	if n := e.inv.callCount("Reserve"); n != 0 {
+		t.Errorf("reserve called %d times, want 0", n)
+	}
+	e.wantEvents(t, o.GetOrderId(), "failed")
+
+	// 重复投递不多写事件；库存服务消费 failed 事件后占用被归还，两边平衡。
+	e.mustLand(t, o.GetOrderId())
+	e.wantEvents(t, o.GetOrderId(), "failed")
+	e.consumeEvents(t)
+	e.wantGate(t, skuA, 1000, 0)
+	e.wantBalanced(t, skuA)
+}
+
 func TestLandReserveRejected(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

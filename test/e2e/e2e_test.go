@@ -182,14 +182,30 @@ func createOrderBody(skuID int64, quantity int) map[string]any {
 	return map[string]any{"items": []map[string]any{{"sku_id": strconv.FormatInt(skuID, 10), "quantity": quantity}}}
 }
 
+// mustCreateOrder 提交订单并等它落库。
+//
+// 下单是异步的：提交只表示请求通过了库存闸门并进入队列（202，状态 creating），
+// 订单随后才落库并在 MySQL 里预占库存。这里轮询到状态离开 creating，
+// 返回的是已经可以支付的订单，调用方不用关心中间状态。
 func mustCreateOrder(t testing.TB, userID, skuID int64, quantity int) order {
 	t.Helper()
 	r := mustCall(t, http.MethodPost, "/api/v1/orders", userID, newKey(), createOrderBody(skuID, quantity))
-	if r.status != http.StatusCreated {
+	if r.status != http.StatusAccepted {
 		t.Fatalf("create order: status %d: %s", r.status, r.body)
 	}
 	var o order
 	r.decode(t, &o)
+	if o.Status != "creating" {
+		t.Fatalf("accepted order status = %q, want creating", o.Status)
+	}
+	id := o.OrderID
+	eventually(t, 10*time.Second, "order "+id+" to leave creating", func() bool {
+		o = getOrder(t, userID, id)
+		return o.Status != "creating"
+	})
+	if o.Status != "pending_payment" {
+		t.Fatalf("order %s became %q, want pending_payment", id, o.Status)
+	}
 	return o
 }
 
@@ -254,6 +270,17 @@ func newSKU(t testing.TB, available int64) int64 {
 	return id
 }
 
+// newLimitedSKU 插入一个每人限购 limit 件的 SKU。
+func newLimitedSKU(t testing.TB, available, limit int64) int64 {
+	t.Helper()
+	id := newSKU(t, available)
+	if _, err := inventoryDB.ExecContext(t.Context(),
+		"UPDATE sku_stock SET purchase_limit = ? WHERE sku_id = ?", limit, id); err != nil {
+		t.Fatalf("set purchase limit: %v", err)
+	}
+	return id
+}
+
 // eventually 轮询直到 cond 返回 true。系统是最终一致的：
 // 支付结果、关单、库存结清都由后台任务异步完成，断言必须容忍这段延迟。
 func eventually(t testing.TB, timeout time.Duration, what string, cond func() bool) {
@@ -287,9 +314,6 @@ func TestOrderAndPay(t *testing.T) {
 	sku, user := newSKU(t, 10), newUser()
 
 	o := mustCreateOrder(t, user, sku, 3)
-	if o.Status != "pending_payment" {
-		t.Fatalf("status = %q, want pending_payment", o.Status)
-	}
 	if want := (money{Amount: 3 * unitPrice, Currency: "CNY"}); o.Total != want {
 		t.Errorf("total = %+v, want %+v", o.Total, want)
 	}
@@ -341,7 +365,7 @@ func TestFlashSaleNeverOversells(t *testing.T) {
 			switch {
 			case err != nil:
 				t.Errorf("create order: %v", err)
-			case r.status == http.StatusCreated:
+			case r.status == http.StatusAccepted:
 				created.Add(1)
 			case r.status == http.StatusConflict && r.errorCode() == "INSUFFICIENT_STOCK":
 				soldOut.Add(1)
@@ -379,7 +403,7 @@ func TestConcurrentDuplicateSubmitCreatesOneOrder(t *testing.T) {
 				t.Errorf("create order: %v", err)
 				return
 			}
-			if r.status != http.StatusCreated {
+			if r.status != http.StatusAccepted {
 				t.Errorf("attempt %d: status %d: %s", i, r.status, r.body)
 				return
 			}
@@ -549,4 +573,31 @@ func TestFailedPaymentLeavesOrderPendingUntilClosed(t *testing.T) {
 		return getOrder(t, user, o.OrderID).Status == "closed"
 	})
 	wantStock(t, sku, stock{Available: 4, Reserved: 0, Sold: 0})
+}
+
+// 限购：每人最多买 2 件。买满后再买被当场拒绝；取消后额度恢复；别的用户不受影响。
+func TestPurchaseLimit(t *testing.T) {
+	t.Parallel()
+	sku, user := newLimitedSKU(t, 10, 2), newUser()
+
+	first := mustCreateOrder(t, user, sku, 2)
+
+	r := mustCall(t, http.MethodPost, "/api/v1/orders", user, newKey(), createOrderBody(sku, 1))
+	if r.status != http.StatusConflict || r.errorCode() != "PURCHASE_LIMIT_EXCEEDED" {
+		t.Fatalf("over limit: status %d code %q, want 409 PURCHASE_LIMIT_EXCEEDED", r.status, r.errorCode())
+	}
+	// 被闸门拒绝的请求没有碰库存。
+	wantStock(t, sku, stock{Available: 8, Reserved: 2, Sold: 0})
+
+	mustCreateOrder(t, newUser(), sku, 2)
+
+	if r := mustCall(t, http.MethodPost, "/api/v1/orders/"+first.OrderID+"/cancel", user, "", nil); r.status != http.StatusOK {
+		t.Fatalf("cancel: status %d: %s", r.status, r.body)
+	}
+	// 额度的恢复是异步的：库存服务消费取消事件，先释放 MySQL 的预占，再归还闸门里的占用。
+	eventually(t, 10*time.Second, "purchase quota to be restored after cancel", func() bool {
+		r := mustCall(t, http.MethodPost, "/api/v1/orders", user, newKey(), createOrderBody(sku, 2))
+		return r.status == http.StatusAccepted
+	})
+	wantStock(t, sku, stock{Available: 6, Reserved: 4, Sold: 0})
 }

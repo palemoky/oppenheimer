@@ -229,6 +229,12 @@ func newOrderEventConsumer(ctx context.Context, logger *slog.Logger, cfg config,
 		Topics:    []string{topic},
 		Logger:    logger,
 		DLQSuffix: eventx.DLQSuffix,
+		// 重试次数远大于默认的 5 次。处理一条事件要先改 MySQL 再改 Redis，Redis 短暂不可用时
+		// MySQL 那一步已经提交；这时如果很快放弃、把消息送进死信，闸门里的占用就没人归还了，
+		// 而且对账看不出来（恒等式两边都没变）。所以宁可让分区停住等 Redis 恢复：
+		// 60 次、间隔上限 5 秒，大约能撑过 5 分钟的故障，之后才进死信等人工重放。
+		MaxAttempts: 60,
+		RetryMax:    5 * time.Second,
 	}, svc.OrderEventHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("new order event consumer: %w", err)

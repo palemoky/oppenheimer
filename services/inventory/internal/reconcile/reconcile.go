@@ -156,6 +156,16 @@ func (r *Reconciler) check(ctx context.Context, sku int64, next map[int64]streak
 		return nil
 	}
 
+	if gs.Limit != ms.PurchaseLimit {
+		// 限购数量是配置，以 MySQL 为准。订单服务只在 SKU 未装载时才触发装载，
+		// 之后在 MySQL 里改了限购，要靠这里同步过去。Load 对已装载的 SKU 只更新限购、不动数量。
+		if _, err := r.gate.Load(ctx, sku, ms.Available, ms.PurchaseLimit); err != nil {
+			return fmt.Errorf("reconcile sku %d: sync purchase limit: %w", sku, err)
+		}
+		r.logger.InfoContext(ctx, "purchase limit synced to stock gate",
+			"sku_id", sku, "from", gs.Limit, "to", ms.PurchaseLimit)
+	}
+
 	d := (gs.Avail + gs.Held) - (ms.Available + ms.Reserved)
 	if d == 0 {
 		return nil

@@ -233,14 +233,20 @@ type HoldInfo struct {
 }
 
 // claimScript 把占用标记为已认领并返回它的内容；mode 为 'get' 时只读不改。
+//
+// 认领时把订单号从 gate:holds 移到 gate:claimed。回收任务只扫 gate:holds：
+// 已认领的占用要活到订单结束（待支付的订单最长是整个支付时限），如果留在同一个列表里，
+// 它们会一直排在最前面，数量超过回收任务的一批之后，排在后面的孤儿就永远轮不到。
 var claimScript = redis.NewScript(`
 local hk = ARGV[1] .. 'gate:hold:' .. ARGV[2]
 local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'ts')
 if not h[1] then
   return {}
 end
-if ARGV[3] == 'claim' then
+if ARGV[3] == 'claim' and h[3] ~= '1' then
   redis.call('HSET', hk, 'claimed', '1')
+  redis.call('ZREM', ARGV[1] .. 'gate:holds', ARGV[2])
+  redis.call('ZADD', ARGV[1] .. 'gate:claimed', h[4], ARGV[2])
   h[3] = '1'
 end
 return h
@@ -326,6 +332,7 @@ for sku, q in string.gmatch(h[2], '(%d+):(%d+)') do
 end
 redis.call('DEL', hk)
 redis.call('ZREM', p .. 'gate:holds', order)
+redis.call('ZREM', p .. 'gate:claimed', order)
 if (mode == 'abort' or mode == 'unclaimed') and h[4] then
   local ik = p .. 'gate:idem:' .. h[1] .. ':' .. h[4]
   local cur = redis.call('GET', ik)
@@ -353,8 +360,11 @@ func (g *Gate) Return(ctx context.Context, orderID int64) (bool, error) {
 	return n == 1, err
 }
 
-// Abort 归还一个没有落库的订单的占用，并删除它的幂等键，让用户可以用同一个幂等键重新下单。
-// 订单服务在受理后发消息失败时调用。
+// Abort 归还一个不会落库的订单的占用，并删除它的幂等键，让用户可以用同一个幂等键重新下单。
+//
+// 它**不看认领状态**，只能由已经认领了这笔占用、并且确定不会把订单写进数据库的一方调用
+// （订单服务落库时发现幂等键早已有订单）。受理方发消息失败后不能用它：发送失败不代表消息没到，
+// 消费者可能已经认领并在落库，这时归还会让闸门比 MySQL 多出一份。受理方要用 ReturnIfUnclaimed。
 func (g *Gate) Abort(ctx context.Context, orderID int64) (bool, error) {
 	n, err := g.release(ctx, orderID, "abort")
 	return n == 1, err
@@ -373,8 +383,9 @@ const (
 	ReapClaimed
 )
 
-// ReturnIfUnclaimed 归还一笔没有被认领的占用，回收任务用它处理“受理了但消息没发出去”的孤儿占用。
-// 与 Claim 互斥，见 Claim 的说明。
+// ReturnIfUnclaimed 归还一笔没有被认领的占用，并删除它的幂等键。与 Claim 互斥，见 Claim 的说明。
+//
+// 两个调用方：回收任务处理“受理了但消息没发出去”的孤儿占用；受理方在发消息失败后撤销这次受理。
 func (g *Gate) ReturnIfUnclaimed(ctx context.Context, orderID int64) (ReapResult, error) {
 	n, err := g.release(ctx, orderID, "unclaimed")
 	if err != nil {
@@ -403,21 +414,32 @@ func (g *Gate) PointIdempotency(ctx context.Context, userID int64, key string, o
 	return nil
 }
 
-// HoldsBefore 返回受理时间早于 before 的占用的订单号，最多 limit 个，最早的在前。
+// HoldsBefore 返回受理时间早于 before、**尚未被认领**的占用的订单号，最多 limit 个，最早的在前。
+// 回收任务用它找孤儿占用。
 func (g *Gate) HoldsBefore(ctx context.Context, before time.Time, limit int) ([]int64, error) {
-	members, err := g.client.ZRangeByScore(ctx, g.prefix+"gate:holds", &redis.ZRangeBy{
+	return g.listBefore(ctx, "gate:holds", before, limit)
+}
+
+// ClaimedBefore 返回受理时间早于 before、已被认领而仍未结束的占用的订单号，最多 limit 个，最早的在前。
+// 正常情况下已认领的占用在订单进入终态时结束；长期不结束说明认领之后流程卡住了，需要人看。
+func (g *Gate) ClaimedBefore(ctx context.Context, before time.Time, limit int) ([]int64, error) {
+	return g.listBefore(ctx, "gate:claimed", before, limit)
+}
+
+func (g *Gate) listBefore(ctx context.Context, key string, before time.Time, limit int) ([]int64, error) {
+	members, err := g.client.ZRangeByScore(ctx, g.prefix+key, &redis.ZRangeBy{
 		Min:   "-inf",
 		Max:   "(" + strconv.FormatInt(before.UnixMilli(), 10),
 		Count: int64(limit),
 	}).Result()
 	if err != nil {
-		return nil, fmt.Errorf("stockgate: list holds: %w", err)
+		return nil, fmt.Errorf("stockgate: list %s: %w", key, err)
 	}
 	ids := make([]int64, 0, len(members))
 	for _, m := range members {
 		id, err := strconv.ParseInt(m, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("stockgate: list holds: bad member %q", m)
+			return nil, fmt.Errorf("stockgate: list %s: bad member %q", key, m)
 		}
 		ids = append(ids, id)
 	}

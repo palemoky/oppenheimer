@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"time"
 
 	"github.com/palemoky/Oppenheimer/pkg/stockgate"
@@ -80,7 +79,9 @@ func (r *Reaper) Stop(ctx context.Context) error { return r.loop.Stop(ctx) }
 
 // ReapStats 是一轮回收的结果。
 type ReapStats struct {
-	Returned, Claimed int
+	// Returned 是归还的孤儿占用数；Claimed 是列出之后被消费者抢先认领的数量；
+	// Stuck 是已认领却长期没有结束、需要人工检查的数量。
+	Returned, Claimed, Stuck int
 }
 
 // RunOnce 执行一轮回收。单笔占用失败只记日志，不中断整轮。
@@ -92,10 +93,6 @@ func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 		r.logger.ErrorContext(ctx, "list holds failed", "error", err)
 		return stats
 	}
-	// 已认领却超过支付时限两倍还没结束的占用：认领后进程崩溃、消息又进了死信，没有订单行会去归还它。
-	// 不自动归还（不知道 MySQL 里有没有预占），记 error 等人工处理，数量偏差由对账修正。
-	var stuck []int64
-	stuckLoaded := false
 	for _, id := range ids {
 		res, err := r.returnIfUnclaimed(ctx, id)
 		if err != nil {
@@ -107,27 +104,31 @@ func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 			stats.Returned++
 			r.logger.WarnContext(ctx, "orphan hold returned", "order_id", id)
 		case stockgate.ReapClaimed:
+			// 列出之后刚被消费者认领：它赢了，占用由订单的终态归还。
 			stats.Claimed++
-			if !stuckLoaded {
-				stuckLoaded = true
-				if stuck, err = r.holdsBefore(ctx, now.Add(-2*r.svc.paymentTimeout)); err != nil {
-					r.logger.ErrorContext(ctx, "list stuck holds failed", "error", err)
-				}
-			}
-			if slices.Contains(stuck, id) {
-				r.logger.ErrorContext(ctx, "claimed hold outlived twice the payment timeout, needs manual check", "order_id", id)
-			}
 		case stockgate.ReapMissing:
-			// 列出之后被订单的终态归还了。
+			// 列出之后被归还了（受理方发消息失败后撤销）。
 		}
 	}
-	if len(ids) == r.cfg.BatchSize && stats.Returned == 0 {
-		// HoldsBefore 只能从最早的取起，已认领的占用（待支付的订单）一直留在列表里。
-		// 一整批都是已认领的，后面的孤儿就轮不到。根治要靠闸门支持按游标分页，或在认领时把占用移出这个列表。
-		r.logger.WarnContext(ctx, "reaper batch is full of claimed holds, orphans behind them may be starved",
-			"batch_size", r.cfg.BatchSize)
+
+	// 已认领却超过支付时限两倍还没结束的占用：认领之后流程卡住了（进程崩溃且消息进了死信），
+	// 没有订单的终态会去归还它。不自动归还（不知道 MySQL 里有没有预占），记 error 等人工处理。
+	stuck, err := r.claimedBefore(ctx, now.Add(-2*r.svc.paymentTimeout))
+	if err != nil {
+		r.logger.ErrorContext(ctx, "list stuck holds failed", "error", err)
+		return stats
+	}
+	stats.Stuck = len(stuck)
+	for _, id := range stuck {
+		r.logger.ErrorContext(ctx, "claimed hold outlived twice the payment timeout, needs manual check", "order_id", id)
 	}
 	return stats
+}
+
+func (r *Reaper) claimedBefore(ctx context.Context, before time.Time) ([]int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, reapCallTimeout)
+	defer cancel()
+	return r.svc.gate.ClaimedBefore(ctx, before, r.cfg.BatchSize)
 }
 
 func (r *Reaper) holdsBefore(ctx context.Context, before time.Time) ([]int64, error) {

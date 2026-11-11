@@ -128,11 +128,10 @@ func TestCloseDueNotLanded(t *testing.T) {
 		t.Errorf("outbox = %d, want 0", n)
 	}
 
-	// 落库晚于到期：订单进入待支付时已经过期，延迟消息早已处理过，由 sweeper 关闭。
+	// 落库晚于到期：延迟消息早已处理过，没有人会再来关它。落库时发现已过期就直接置为失败，
+	// 不会留下一个没人关的待支付订单（见 TestLandAfterPaymentDeadline）。
 	e.mustLand(t, notLanded.GetOrderId())
-	wantStatus(t, e.load(t, notLanded.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
-	e.sweeper.RunOnce(t.Context())
-	wantStatus(t, e.load(t, notLanded.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CLOSED)
+	wantStatus(t, e.load(t, notLanded.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_FAILED)
 }
 
 // 到期关单与支付并发：都以 PENDING_PAYMENT 为前置条件，只有一方得手；支付输了要退款。

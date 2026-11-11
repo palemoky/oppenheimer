@@ -293,3 +293,27 @@ func TestLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// 防止：在 MySQL 里改了限购数量，闸门却一直用旧值（订单服务只在 SKU 未装载时才触发装载）。
+// 同步限购不能动闸门里的数量。
+func TestPurchaseLimitSynced(t *testing.T) {
+	e := newEnv(t)
+	e.seed(1, 10)
+	if _, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+		OrderID: 7, UserID: 100, IdempotencyKey: "k", RequestHash: []byte("h"),
+		Items: []stockgate.Item{{SKUID: 1, Quantity: 4}}, Now: time.Now(), IdempotencyTTL: time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET purchase_limit = 3 WHERE sku_id = 1`)
+
+	e.round()
+	st, _, err := e.gate.Stock(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 占用还没落到 MySQL（available 仍是 10），闸门里是 avail=6 held=4：恒等式成立，数量不应被改动。
+	if st.Limit != 3 || st.Avail != 6 || st.Held != 4 {
+		t.Fatalf("gate stock = %+v, want limit=3 avail=6 held=4", st)
+	}
+}
