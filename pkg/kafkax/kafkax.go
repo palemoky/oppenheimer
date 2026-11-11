@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -70,5 +71,57 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, specs ...TopicSpec) e
 			return fmt.Errorf("kafkax: create topic %s: %w", spec.Name, err)
 		}
 	}
-	return nil
+	return waitTopicsVisible(ctx, adm, specs)
+}
+
+// topicPollInterval 是等待新建的 topic 出现在元数据里时的轮询间隔。
+const topicPollInterval = 50 * time.Millisecond
+
+// waitTopicsVisible 等到所有 topic 都能在元数据里查到，受 ctx 的时限约束。
+//
+// CreateTopics 返回成功只表示控制器接受了创建，broker 的元数据缓存是异步更新的。
+// 紧接着查询或订阅这个 topic，可能得到 UNKNOWN_TOPIC_OR_PARTITION。
+// 所以“确保存在”要等到真的查得到、并且每个分区都有 leader 才算完成，否则调用方下一步（例如消费者启动时检查死信 topic）
+// 会在慢一点的机器上偶发失败。这个问题在本机不出现，是 CI 上暴露的。
+func waitTopicsVisible(ctx context.Context, adm *kadm.Client, specs []TopicSpec) error {
+	names := make([]string, len(specs))
+	for i, spec := range specs {
+		names[i] = spec.Name
+	}
+	for {
+		missing := ""
+		details, err := adm.ListTopics(ctx, names...)
+		if err != nil {
+			return fmt.Errorf("kafkax: list topics: %w", err)
+		}
+		for _, name := range names {
+			d, ok := details[name]
+			switch {
+			case !ok, errors.Is(d.Err, kerr.UnknownTopicOrPartition):
+				missing = name
+			case d.Err != nil:
+				return fmt.Errorf("kafkax: topic %s: %w", name, d.Err)
+			case !leadersReady(d):
+				// topic 可见但分区还没选出 leader，这时生产和消费同样会失败。
+				missing = name
+			}
+		}
+		if missing == "" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("kafkax: topic %s not ready after creation: %w", missing, ctx.Err())
+		case <-time.After(topicPollInterval):
+		}
+	}
+}
+
+func leadersReady(d kadm.TopicDetail) bool {
+	for _, p := range d.Partitions {
+		if p.Err != nil || p.Leader < 0 {
+			return false
+		}
+	}
+	return len(d.Partitions) > 0
 }
