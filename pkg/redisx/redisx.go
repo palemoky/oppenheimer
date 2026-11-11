@@ -6,6 +6,7 @@ package redisx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,7 +29,7 @@ type Config struct {
 // Open 创建客户端并用 PING 确认可达。调用方负责 Close。
 func Open(ctx context.Context, cfg Config) (*redis.Client, error) {
 	if cfg.Addr == "" {
-		return nil, fmt.Errorf("redisx: empty address")
+		return nil, errors.New("redisx: empty address")
 	}
 	opts := &redis.Options{
 		Addr:         cfg.Addr,
