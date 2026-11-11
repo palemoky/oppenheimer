@@ -1,6 +1,11 @@
 # 构建产物
 /bin/
 /dist/
+# 在服务模块目录里直接 go build 产生的二进制
+/services/*/gateway
+/services/*/order
+/services/*/inventory
+/services/*/payment
 *.exe
 *.test
 *.out

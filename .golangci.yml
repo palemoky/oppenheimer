@@ -1,0 +1,67 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    # 正确性
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - makezero
+    - nilerr
+    - noctx
+    - recvcheck
+    - rowserrcheck
+    - sqlclosecheck
+    - spancheck
+    - protogetter
+    # 新版写法
+    - modernize
+    - copyloopvar
+    - intrange
+    - exptostd
+    - usetesting
+    # 风格与质量
+    - gocritic
+    - misspell
+    - perfsprint
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - wastedassign
+    # 安全
+    - gosec
+  settings:
+    sloglint:
+      static-msg: true
+      key-naming-case: snake
+    exhaustive:
+      default-signifies-exhaustive: true
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/palemoky/Oppenheimer
+  exclusions:
+    generated: lax

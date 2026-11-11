@@ -1,0 +1,86 @@
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+ROOT := $(CURDIR)
+BIN  := $(ROOT)/bin
+export PATH := $(BIN):$(PATH)
+
+# 工具版本登记在 docs/infra/versions.md，升级时两处一起改。
+BUF_VERSION                := v1.75.0
+PROTOC_GEN_GO_VERSION      := v1.36.12
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+
+# go.work 里的所有模块目录
+MODULES  := $(shell go list -m -f '{{.Dir}}')
+SERVICES := $(notdir $(wildcard services/*))
+COMPOSE  := docker compose -f deploy/compose/docker-compose.yml
+
+.PHONY: help
+help: ## 显示可用目标
+	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+
+## ---------- 工具 ----------
+
+.PHONY: tools
+tools: proto-plugins ## 安装 buf 和 proto 插件到 ./bin
+	GOWORK=off GOBIN=$(BIN) go install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+
+.PHONY: proto-plugins
+proto-plugins: ## 只安装 proto 的 Go 插件（CI 里 buf 由 action 提供）
+	GOWORK=off GOBIN=$(BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	GOWORK=off GOBIN=$(BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+
+## ---------- 代码 ----------
+
+.PHONY: proto
+proto: ## 由 api/proto 生成 Go 代码到 api/gen
+	cd api && buf generate
+
+.PHONY: proto-lint
+proto-lint: ## 检查 proto 的格式与规范
+	cd api && buf format --diff --exit-code && buf lint
+
+.PHONY: fmt
+fmt: ## 格式化 Go 和 proto
+	@for m in $(MODULES); do (cd $$m && golangci-lint fmt) || exit 1; done
+	cd api && buf format -w
+
+.PHONY: lint
+lint: ## 对所有模块运行 golangci-lint
+	@for m in $(MODULES); do echo "==> lint $${m#$(ROOT)/}"; (cd $$m && golangci-lint run ./...) || exit 1; done
+
+.PHONY: test
+test: ## 对所有模块运行带竞态检测的测试
+	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
+
+.PHONY: build
+build: ## 编译所有模块，并把各服务的二进制输出到 ./bin
+	@for m in $(MODULES); do (cd $$m && go build -o /dev/null ./...) || exit 1; done
+	go build -o $(BIN)/ $(foreach s,$(SERVICES),./services/$(s)/cmd/...)
+
+.PHONY: tidy
+tidy: ## 对所有模块执行 go mod tidy，并同步 workspace
+	@for m in $(MODULES); do (cd $$m && go mod tidy) || exit 1; done
+	go work sync
+
+## ---------- 本地依赖 ----------
+
+.PHONY: up
+up: ## 启动 MySQL、Redis、Kafka 并等待就绪
+	$(COMPOSE) up -d --wait
+
+.PHONY: down
+down: ## 停止本地依赖，保留数据
+	$(COMPOSE) down
+
+.PHONY: down-volumes
+down-volumes: ## 停止本地依赖并删除全部数据
+	$(COMPOSE) down --volumes
+
+.PHONY: ps
+ps: ## 查看本地依赖的状态
+	$(COMPOSE) ps
+
+.PHONY: logs
+logs: ## 跟踪本地依赖的日志
+	$(COMPOSE) logs -f --tail=100
