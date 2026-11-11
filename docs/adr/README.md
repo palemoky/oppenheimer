@@ -35,3 +35,4 @@
 | [0006](0006-money-as-integer-minor-units.md) | 金额用最小货币单位的整数表示 | 已采纳 |
 | [0007](0007-kafka-and-redis-clients.md) | Kafka 客户端用 franz-go，Redis 客户端用 go-redis | 已采纳 |
 | [0008](0008-outbox-and-events.md) | 用本地消息表（outbox）加 Kafka 做服务间的最终一致 | 已采纳 |
+| [0009](0009-delayed-close.md) | 超时关单用固定时长的延迟 topic，扫表兜底 | 已采纳 |

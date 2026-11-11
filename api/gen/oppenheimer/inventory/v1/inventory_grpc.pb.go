@@ -23,6 +23,7 @@ const (
 	InventoryService_Confirm_FullMethodName  = "/oppenheimer.inventory.v1.InventoryService/Confirm"
 	InventoryService_Release_FullMethodName  = "/oppenheimer.inventory.v1.InventoryService/Release"
 	InventoryService_GetStock_FullMethodName = "/oppenheimer.inventory.v1.InventoryService/GetStock"
+	InventoryService_WarmUp_FullMethodName   = "/oppenheimer.inventory.v1.InventoryService/WarmUp"
 )
 
 // InventoryServiceClient is the client API for InventoryService service.
@@ -63,6 +64,11 @@ type InventoryServiceClient interface {
 	// 错误：
 	//   NOT_FOUND  reason=SKU_NOT_FOUND
 	GetStock(ctx context.Context, in *GetStockRequest, opts ...grpc.CallOption) (*GetStockResponse, error)
+	// WarmUp 把指定 SKU 的可售数量和限购数量装载进库存闸门（Redis）。
+	//
+	// 只在 SKU 尚未装载时写入数量，所以重复调用、并发调用都是安全的。
+	// 订单服务受理下单时遇到未装载的 SKU 才调用它。不存在的 SKU 不报错，列在 missing 里。
+	WarmUp(ctx context.Context, in *WarmUpRequest, opts ...grpc.CallOption) (*WarmUpResponse, error)
 }
 
 type inventoryServiceClient struct {
@@ -113,6 +119,16 @@ func (c *inventoryServiceClient) GetStock(ctx context.Context, in *GetStockReque
 	return out, nil
 }
 
+func (c *inventoryServiceClient) WarmUp(ctx context.Context, in *WarmUpRequest, opts ...grpc.CallOption) (*WarmUpResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WarmUpResponse)
+	err := c.cc.Invoke(ctx, InventoryService_WarmUp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InventoryServiceServer is the server API for InventoryService service.
 // All implementations must embed UnimplementedInventoryServiceServer
 // for forward compatibility.
@@ -151,6 +167,11 @@ type InventoryServiceServer interface {
 	// 错误：
 	//   NOT_FOUND  reason=SKU_NOT_FOUND
 	GetStock(context.Context, *GetStockRequest) (*GetStockResponse, error)
+	// WarmUp 把指定 SKU 的可售数量和限购数量装载进库存闸门（Redis）。
+	//
+	// 只在 SKU 尚未装载时写入数量，所以重复调用、并发调用都是安全的。
+	// 订单服务受理下单时遇到未装载的 SKU 才调用它。不存在的 SKU 不报错，列在 missing 里。
+	WarmUp(context.Context, *WarmUpRequest) (*WarmUpResponse, error)
 	mustEmbedUnimplementedInventoryServiceServer()
 }
 
@@ -172,6 +193,9 @@ func (UnimplementedInventoryServiceServer) Release(context.Context, *ReleaseRequ
 }
 func (UnimplementedInventoryServiceServer) GetStock(context.Context, *GetStockRequest) (*GetStockResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStock not implemented")
+}
+func (UnimplementedInventoryServiceServer) WarmUp(context.Context, *WarmUpRequest) (*WarmUpResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WarmUp not implemented")
 }
 func (UnimplementedInventoryServiceServer) mustEmbedUnimplementedInventoryServiceServer() {}
 func (UnimplementedInventoryServiceServer) testEmbeddedByValue()                          {}
@@ -266,6 +290,24 @@ func _InventoryService_GetStock_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _InventoryService_WarmUp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WarmUpRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InventoryServiceServer).WarmUp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InventoryService_WarmUp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InventoryServiceServer).WarmUp(ctx, req.(*WarmUpRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // InventoryService_ServiceDesc is the grpc.ServiceDesc for InventoryService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -288,6 +330,10 @@ var InventoryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStock",
 			Handler:    _InventoryService_GetStock_Handler,
+		},
+		{
+			MethodName: "WarmUp",
+			Handler:    _InventoryService_WarmUp_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

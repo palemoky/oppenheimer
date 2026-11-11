@@ -86,3 +86,31 @@ message PaymentCompleted {
   bool succeeded = 1;
   oppenheimer.common.v1.Money amount = 2;
 }
+
+// OrderSubmitted 是 topic order.submit 的消息：一笔已被库存闸门放行、等待落库的下单请求。
+// 由订单服务在受理时直接发出（不经过 outbox，见设计文档 6.3），再由订单服务自己消费。
+message OrderSubmitted {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  string idempotency_key = 3;
+  // 请求内容（商品与数量）的 SHA-256，与 orders.request_hash 相同。
+  bytes request_hash = 4;
+  repeated SubmittedItem items = 5;
+  // 受理时间，作为订单的创建时间。
+  google.protobuf.Timestamp accept_time = 6;
+  // 支付截止时间 = 受理时间 + 支付时限。
+  google.protobuf.Timestamp expire_time = 7;
+}
+
+message SubmittedItem {
+  int64 sku_id = 1;
+  int32 quantity = 2;
+}
+
+// OrderCloseDue 是 topic order.close.delay 的消息：到期（消息头 due-at）时检查订单是否仍未支付。
+// 它只是一个“到点了”的提醒，订单该不该关由订单当时的状态决定。
+message OrderCloseDue {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  google.protobuf.Timestamp expire_time = 3;
+}

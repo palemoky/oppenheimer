@@ -613,6 +613,217 @@ func (x *PaymentCompleted) GetAmount() *v1.Money {
 	return nil
 }
 
+// OrderSubmitted 是 topic order.submit 的消息：一笔已被库存闸门放行、等待落库的下单请求。
+// 由订单服务在受理时直接发出（不经过 outbox，见设计文档 6.3），再由订单服务自己消费。
+type OrderSubmitted struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OrderId        int64                  `protobuf:"varint,1,opt,name=order_id,json=orderId,proto3" json:"order_id,omitempty"`
+	UserId         int64                  `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	// 请求内容（商品与数量）的 SHA-256，与 orders.request_hash 相同。
+	RequestHash []byte           `protobuf:"bytes,4,opt,name=request_hash,json=requestHash,proto3" json:"request_hash,omitempty"`
+	Items       []*SubmittedItem `protobuf:"bytes,5,rep,name=items,proto3" json:"items,omitempty"`
+	// 受理时间，作为订单的创建时间。
+	AcceptTime *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=accept_time,json=acceptTime,proto3" json:"accept_time,omitempty"`
+	// 支付截止时间 = 受理时间 + 支付时限。
+	ExpireTime    *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=expire_time,json=expireTime,proto3" json:"expire_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OrderSubmitted) Reset() {
+	*x = OrderSubmitted{}
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OrderSubmitted) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OrderSubmitted) ProtoMessage() {}
+
+func (x *OrderSubmitted) ProtoReflect() protoreflect.Message {
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OrderSubmitted.ProtoReflect.Descriptor instead.
+func (*OrderSubmitted) Descriptor() ([]byte, []int) {
+	return file_oppenheimer_event_v1_events_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *OrderSubmitted) GetOrderId() int64 {
+	if x != nil {
+		return x.OrderId
+	}
+	return 0
+}
+
+func (x *OrderSubmitted) GetUserId() int64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *OrderSubmitted) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *OrderSubmitted) GetRequestHash() []byte {
+	if x != nil {
+		return x.RequestHash
+	}
+	return nil
+}
+
+func (x *OrderSubmitted) GetItems() []*SubmittedItem {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+func (x *OrderSubmitted) GetAcceptTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AcceptTime
+	}
+	return nil
+}
+
+func (x *OrderSubmitted) GetExpireTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpireTime
+	}
+	return nil
+}
+
+type SubmittedItem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SkuId         int64                  `protobuf:"varint,1,opt,name=sku_id,json=skuId,proto3" json:"sku_id,omitempty"`
+	Quantity      int32                  `protobuf:"varint,2,opt,name=quantity,proto3" json:"quantity,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmittedItem) Reset() {
+	*x = SubmittedItem{}
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmittedItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmittedItem) ProtoMessage() {}
+
+func (x *SubmittedItem) ProtoReflect() protoreflect.Message {
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmittedItem.ProtoReflect.Descriptor instead.
+func (*SubmittedItem) Descriptor() ([]byte, []int) {
+	return file_oppenheimer_event_v1_events_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *SubmittedItem) GetSkuId() int64 {
+	if x != nil {
+		return x.SkuId
+	}
+	return 0
+}
+
+func (x *SubmittedItem) GetQuantity() int32 {
+	if x != nil {
+		return x.Quantity
+	}
+	return 0
+}
+
+// OrderCloseDue 是 topic order.close.delay 的消息：到期（消息头 due-at）时检查订单是否仍未支付。
+// 它只是一个“到点了”的提醒，订单该不该关由订单当时的状态决定。
+type OrderCloseDue struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	OrderId       int64                  `protobuf:"varint,1,opt,name=order_id,json=orderId,proto3" json:"order_id,omitempty"`
+	UserId        int64                  `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	ExpireTime    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=expire_time,json=expireTime,proto3" json:"expire_time,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OrderCloseDue) Reset() {
+	*x = OrderCloseDue{}
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OrderCloseDue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OrderCloseDue) ProtoMessage() {}
+
+func (x *OrderCloseDue) ProtoReflect() protoreflect.Message {
+	mi := &file_oppenheimer_event_v1_events_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OrderCloseDue.ProtoReflect.Descriptor instead.
+func (*OrderCloseDue) Descriptor() ([]byte, []int) {
+	return file_oppenheimer_event_v1_events_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *OrderCloseDue) GetOrderId() int64 {
+	if x != nil {
+		return x.OrderId
+	}
+	return 0
+}
+
+func (x *OrderCloseDue) GetUserId() int64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *OrderCloseDue) GetExpireTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpireTime
+	}
+	return nil
+}
+
 var File_oppenheimer_event_v1_events_proto protoreflect.FileDescriptor
 
 const file_oppenheimer_event_v1_events_proto_rawDesc = "" +
@@ -655,7 +866,25 @@ const file_oppenheimer_event_v1_events_proto_rawDesc = "" +
 	"\x04body\"f\n" +
 	"\x10PaymentCompleted\x12\x1c\n" +
 	"\tsucceeded\x18\x01 \x01(\bR\tsucceeded\x124\n" +
-	"\x06amount\x18\x02 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\x06amount*\x84\x01\n" +
+	"\x06amount\x18\x02 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\x06amount\"\xc5\x02\n" +
+	"\x0eOrderSubmitted\x12\x19\n" +
+	"\border_id\x18\x01 \x01(\x03R\aorderId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\x03R\x06userId\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x12!\n" +
+	"\frequest_hash\x18\x04 \x01(\fR\vrequestHash\x129\n" +
+	"\x05items\x18\x05 \x03(\v2#.oppenheimer.event.v1.SubmittedItemR\x05items\x12;\n" +
+	"\vaccept_time\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"acceptTime\x12;\n" +
+	"\vexpire_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"expireTime\"B\n" +
+	"\rSubmittedItem\x12\x15\n" +
+	"\x06sku_id\x18\x01 \x01(\x03R\x05skuId\x12\x1a\n" +
+	"\bquantity\x18\x02 \x01(\x05R\bquantity\"\x80\x01\n" +
+	"\rOrderCloseDue\x12\x19\n" +
+	"\border_id\x18\x01 \x01(\x03R\aorderId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\x03R\x06userId\x12;\n" +
+	"\vexpire_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"expireTime*\x84\x01\n" +
 	"\x12PaymentDisposition\x12#\n" +
 	"\x1fPAYMENT_DISPOSITION_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPAYMENT_DISPOSITION_ACCEPTED\x10\x01\x12'\n" +
@@ -675,7 +904,7 @@ func file_oppenheimer_event_v1_events_proto_rawDescGZIP() []byte {
 }
 
 var file_oppenheimer_event_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_oppenheimer_event_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_oppenheimer_event_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_oppenheimer_event_v1_events_proto_goTypes = []any{
 	(PaymentDisposition)(0),       // 0: oppenheimer.event.v1.PaymentDisposition
 	(*OrderEvent)(nil),            // 1: oppenheimer.event.v1.OrderEvent
@@ -686,25 +915,32 @@ var file_oppenheimer_event_v1_events_proto_goTypes = []any{
 	(*PaymentResultHandled)(nil),  // 6: oppenheimer.event.v1.PaymentResultHandled
 	(*PaymentEvent)(nil),          // 7: oppenheimer.event.v1.PaymentEvent
 	(*PaymentCompleted)(nil),      // 8: oppenheimer.event.v1.PaymentCompleted
-	(*timestamppb.Timestamp)(nil), // 9: google.protobuf.Timestamp
-	(*v1.Money)(nil),              // 10: oppenheimer.common.v1.Money
+	(*OrderSubmitted)(nil),        // 9: oppenheimer.event.v1.OrderSubmitted
+	(*SubmittedItem)(nil),         // 10: oppenheimer.event.v1.SubmittedItem
+	(*OrderCloseDue)(nil),         // 11: oppenheimer.event.v1.OrderCloseDue
+	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
+	(*v1.Money)(nil),              // 13: oppenheimer.common.v1.Money
 }
 var file_oppenheimer_event_v1_events_proto_depIdxs = []int32{
-	9,  // 0: oppenheimer.event.v1.OrderEvent.occur_time:type_name -> google.protobuf.Timestamp
+	12, // 0: oppenheimer.event.v1.OrderEvent.occur_time:type_name -> google.protobuf.Timestamp
 	2,  // 1: oppenheimer.event.v1.OrderEvent.paid:type_name -> oppenheimer.event.v1.OrderPaid
 	3,  // 2: oppenheimer.event.v1.OrderEvent.cancelled:type_name -> oppenheimer.event.v1.OrderCancelled
 	4,  // 3: oppenheimer.event.v1.OrderEvent.closed:type_name -> oppenheimer.event.v1.OrderClosed
 	5,  // 4: oppenheimer.event.v1.OrderEvent.failed:type_name -> oppenheimer.event.v1.OrderFailed
 	6,  // 5: oppenheimer.event.v1.OrderEvent.payment_result_handled:type_name -> oppenheimer.event.v1.PaymentResultHandled
 	0,  // 6: oppenheimer.event.v1.PaymentResultHandled.disposition:type_name -> oppenheimer.event.v1.PaymentDisposition
-	9,  // 7: oppenheimer.event.v1.PaymentEvent.occur_time:type_name -> google.protobuf.Timestamp
+	12, // 7: oppenheimer.event.v1.PaymentEvent.occur_time:type_name -> google.protobuf.Timestamp
 	8,  // 8: oppenheimer.event.v1.PaymentEvent.completed:type_name -> oppenheimer.event.v1.PaymentCompleted
-	10, // 9: oppenheimer.event.v1.PaymentCompleted.amount:type_name -> oppenheimer.common.v1.Money
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	13, // 9: oppenheimer.event.v1.PaymentCompleted.amount:type_name -> oppenheimer.common.v1.Money
+	10, // 10: oppenheimer.event.v1.OrderSubmitted.items:type_name -> oppenheimer.event.v1.SubmittedItem
+	12, // 11: oppenheimer.event.v1.OrderSubmitted.accept_time:type_name -> google.protobuf.Timestamp
+	12, // 12: oppenheimer.event.v1.OrderSubmitted.expire_time:type_name -> google.protobuf.Timestamp
+	12, // 13: oppenheimer.event.v1.OrderCloseDue.expire_time:type_name -> google.protobuf.Timestamp
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_oppenheimer_event_v1_events_proto_init() }
@@ -728,7 +964,7 @@ func file_oppenheimer_event_v1_events_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_oppenheimer_event_v1_events_proto_rawDesc), len(file_oppenheimer_event_v1_events_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

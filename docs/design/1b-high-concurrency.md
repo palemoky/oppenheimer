@@ -15,7 +15,7 @@
 | 三 | 削峰：Redis 库存预扣、异步下单、延迟关单 | 下单改为 202 加轮询 |
 | 四 | 加固：分布式锁的使用、缓存三大问题、杀进程对账测试 | 不变 |
 
-第三、四步的细节在动工前补到本文（第 6、7 节目前只有方案要点）。
+第四步的细节在动工前补到本文（第 7 节目前只有方案要点）。
 
 ## 2. 步骤二之后的总体结构
 
@@ -292,16 +292,176 @@ gRPC 的 Confirm、Release 保留（测试和排障用），订单服务不再�
 - 订单侧不再有库存的兜底：1a 的 `stock_settled` 加补结清没有了，库存是否跟上完全取决于事件被消费。消费卡住（死信发不出去、分区停住）时只能靠积压告警发现，对账在 1d。
 - 迁移 `00002` 直接删除 `stock_settled`。升级时库里若还有未结清的终态订单，它们不会再被补结清，也没有事件。本项目只有开发库，没有处理；真实系统要先排空再升级。
 - outbox 中继没有配分布式锁，多副本时会重复发送（正确，只是浪费），步骤四处理。
-- 库存服务对 Confirm 遇到“预占不存在”直接进死信，前提是“订单存在就说明 Reserve 已提交”。步骤三改成异步下单后这个前提不再成立，见第 6 节。
+- 库存服务对 Confirm 遇到“预占不存在”直接进死信，前提是“订单进入 `PENDING_PAYMENT` 就说明 Reserve 已提交”。步骤三保持了这个前提（见 6.3）。
 
-## 6. 步骤三方案要点（动工前细化）
+## 6. 步骤三：削峰
 
-- **Redis 预扣**：Redis 里保存每个 SKU 的可售数量，作为进入系统的闸门。一段 Lua 脚本原子地完成：幂等检查（同一幂等键返回已有订单号）、各 SKU 库存检查、用户限购检查、扣减、记录本次占用（hold）。MySQL 仍是库存的唯一事实来源，Redis 的数量允许偏小（少卖），不允许偏大（超卖由 MySQL 的条件更新兜底）。
-- **占用记录**让归还幂等：归还时先看 hold 是否存在，存在才加回并删除。订单失败、取消、关闭的事件触发归还。
-- **预热与同步**：启动或上架时从 MySQL 装载；定期对账，Redis 数量应等于 MySQL 可售数量减去“已占用但尚未在 MySQL 预占”的数量，偏差超过阈值告警并修正。
-- **异步下单**：gateway 调 order 的受理接口，预扣成功后把下单请求写入 topic `order.submit` 并立即返回 202 和订单号；order 的消费者落库并走 1a 的“推进”流程；客户端轮询订单状态。受理成功但消息没发出去（进程崩溃）的占用由对账归还。
-- **Confirm 遇到预占不存在**：异步下单后 `paid` 可能先于预占落库到达，库存服务要把 `RESERVATION_NOT_FOUND` 从“进死信”改成可重试，或者保证订单进入 `PENDING_PAYMENT` 之前预占已提交。细化时二选一。
-- **延迟关单**：倾向于固定时长的延迟 topic（`DelayConsumer`），保留低频的 sweeper 扫描兜底。动工时与时间轮、Redis ZSET 对比并写 ADR。
+步骤二之后，下单请求仍然同步完成“写订单库、调库存服务、库存服务写库”才返回。秒杀时绝大多数请求注定买不到，却都要走完这条路才知道。步骤三做三件事：
+
+1. **在入口挡住买不到的请求**：Redis 里的库存闸门，一段 Lua 脚本决定这个请求能不能进。
+2. **进来的请求排队慢慢处理**：受理后写入 Kafka 立即返回，订单服务按自己的速度消费落库。
+3. **超时关单不再靠扫表**：延迟消息到期触发，扫表降为低频兜底（见 [ADR-0009](../adr/0009-delayed-close.md)）。
+
+### 6.1 总体流程
+
+```
+客户端 ─POST /orders─▶ gateway ─gRPC SubmitOrder─▶ order
+                                                    │ ① Lua：幂等、库存、限购、扣减、记占用
+                                                    ▼
+                                                  Redis（库存闸门）
+                                                    │ ② 发 order.submit 和 order.close.delay
+                                                    ▼
+   ◀──────────── 202 + order_id ──────────────── Kafka
+                                                    │ ③ order 消费 order.submit
+                                                    ▼
+                                    认领占用 → 写订单行(CREATING) → Reserve(同步 gRPC) → PENDING_PAYMENT
+客户端 ─GET /orders/{id} 轮询─▶ 看到 CREATING → PENDING_PAYMENT（或 FAILED）
+```
+
+之后的支付、取消、关单与步骤二相同。订单进入终态后，库存服务消费 `order.events`，先改 MySQL（Confirm 或 Release），再改 Redis（结清或归还占用）。
+
+**MySQL 仍是库存的唯一事实来源。** Redis 的数量只决定“放不放进来”，允许偏小（少放，表现为少卖），不允许偏大。偏大时不会超卖（MySQL 的条件更新兜底），但会放进来一批注定在 Reserve 时失败的订单。所有涉及两边的操作都按“会让 Redis 变小的先做 Redis，会让 Redis 变大的后做 Redis”的顺序：扣减先扣 Redis 再扣 MySQL，归还先还 MySQL 再还 Redis。
+
+### 6.2 库存闸门 `pkg/stockgate`
+
+闸门的 key 约定和 Lua 脚本被两个服务使用（order 受理时扣减，inventory 预热、归还、对账），所以和 `api/eventx` 一样放在一处，避免两边各写各的。所有 key 带 `REDIS_PREFIX`。
+
+| key | 类型 | 内容 |
+|---|---|---|
+| `gate:sku:<sku_id>` | hash | `avail` 可放行数量；`held` 现有占用的数量之和；`limit` 每个用户的限购数量，0 表示不限 |
+| `gate:skus` | set | 已装载进闸门的 sku_id，对账任务遍历它 |
+| `gate:bought:<sku_id>` | hash | `user_id → 数量`，该用户占用中和已买到的数量 |
+| `gate:hold:<order_id>` | hash | 一笔占用：`user`、`items`（`sku:qty,sku:qty`）、`claimed`、`ts` |
+| `gate:holds` | zset | `order_id → 受理时间`，回收任务按时间找旧的占用 |
+| `gate:idem:<user_id>:<幂等键>` | string | `order_id:请求哈希`，带过期时间（默认 24 小时） |
+
+**占用（hold）是整套设计的核心。** 它是一条以订单号为主键的记录，表示“闸门为这个订单扣过这些数量”。它存在，归还才生效；归还时删除它。所以归还天然幂等：同一个订单的归还执行多少次，只有第一次加回数量。占用从受理一直活到订单进入终态，而不是在 MySQL 预占成功后就删除，原因是之后的取消和关单还要靠它做幂等归还和限购回退。
+
+脚本（每个都是一次原子执行）：
+
+| 脚本 | 调用方 | 行为 |
+|---|---|---|
+| `Hold` | order 受理 | 幂等键已存在：返回已有订单号（请求哈希不同则报幂等键被复用）。否则逐个 SKU 检查已装载、数量够、不超限购，全部通过后扣 `avail`、加 `held`、加用户已购、写占用、写幂等键 |
+| `Claim` | order 消费 `order.submit` | 占用存在则置 `claimed = 1` 并返回占用内容；不存在返回“没有” |
+| `Return` | inventory（Release 之后）；order（受理后发消息失败） | 占用存在：加回 `avail`、减 `held`、减用户已购、删除占用。不存在：什么都不做 |
+| `ReturnIfUnclaimed` | order 的回收任务 | 同 `Return`，但只对 `claimed` 不为 1 的占用生效 |
+| `Settle` | inventory（Confirm 之后） | 占用存在：减 `held`、删除占用。`avail` 和用户已购不动（已经卖掉了） |
+| `Load` | inventory 预热 | SKU 未装载时写入 `avail`、`limit`，`held = 0`；已装载时只更新 `limit` |
+| `Adjust` | inventory 对账 | 把 `avail` 加上一个增量（可为负），见 6.6 |
+
+`Hold` 的几种拒绝都发生在任何写入之前，所以一个订单的多个 SKU 要么全部扣到，要么都不扣。
+
+限制（写代码时必须记住）：
+
+- 脚本在内部用前缀拼出 key 名，没有全部通过 `KEYS` 声明。这在单实例上没有问题，在 Redis Cluster 上不行（集群要求脚本访问的 key 都在同一个槽）。上集群时要么只支持单 SKU 下单并用 hash tag 把相关 key 放进同一个槽，要么把闸门按 SKU 分片。本项目步骤三只用单实例，这一点记入面试考点。
+- 占用没有过期时间。让它自己过期等于不归还就丢掉记录，数量永远少一块。孤儿占用由回收任务处理（6.4），整体偏差由对账处理（6.6）。
+- 幂等键过期之后，同一个幂等键会被当作新请求放进来。这时订单库的唯一键 `(user_id, idempotency_key)` 是最后一道防线，见 6.3 的第 3 步。
+
+### 6.3 受理与落库
+
+**受理** `SubmitOrder`（gRPC，替换 `CreateOrder`）：
+
+1. 校验请求，生成订单号，算出支付截止时间 `expire_at = 受理时间 + 支付时限`。
+2. 执行 `Hold`。
+   - SKU 未装载：调 inventory 的 `WarmUp`（6.5）后重试一次，仍未装载则返回 `SKU_NOT_FOUND`。
+   - 数量不够返回 `INSUFFICIENT_STOCK`，超出限购返回 `PURCHASE_LIMIT_EXCEEDED`，幂等键被复用返回 `IDEMPOTENCY_KEY_REUSED`。
+   - 幂等键重复：返回已有的订单号，不再发消息。
+3. 一次 `Send` 发出两条消息：`order.submit`（下单请求）和 `order.close.delay`（到期时间为 `expire_at` 的延迟消息）。
+   - 发送失败：执行 `Return` 归还占用，返回 `UNAVAILABLE`。注意发送失败不代表没写进去（`kafkax` 的已知限制），消息可能还是到了。这时占用已经没了，消费者在 `Claim` 这一步会发现并丢弃它。
+4. 返回订单号。网关答复 202。
+
+**为什么这里不用 outbox。** outbox 要求在受理时写一次 MySQL，而受理路径不碰 MySQL 正是削峰的目的。代价是“Redis 扣了、消息没发出去就崩溃”的窗口没有本地事务兜底，留下一笔孤儿占用，由 6.4 的回收任务处理。这是有意的取舍：受理路径只碰内存和顺序写的日志，换来的不一致窗口只会让库存暂时偏小，并且有任务收敛它。
+
+**落库**：订单服务消费 `order.submit`（消费者组 `order.order-submit`），消息体是 `OrderSubmitted`。
+
+1. `Claim`。占用不存在就丢弃消息：它要么已被回收，要么订单早已走到终态（重复投递）。
+2. 写订单行，状态 `CREATING`。订单号已存在说明是重复投递，读出来继续。
+3. 幂等键唯一键冲突而订单号不同（幂等键在 Redis 里过期后的重放）：这笔订单不成立，执行 `Return`，丢弃消息。这个订单号从未到过库存服务，不存在需要释放的预占。
+4. 走 1a 的“推进”：同步调用 `Reserve`，成功则转 `PENDING_PAYMENT`；被拒绝则转 `FAILED` 并写 `failed` 事件（库存服务据此 Release 并归还占用）；结果未知（超时）则返回错误，由消费者原地重试。重试耗尽进死信，订单留在 `CREATING`，由 sweeper 的“创建超时”置为失败。
+
+`Claim` 和回收任务的 `ReturnIfUnclaimed` 在 Redis 里互斥，这是它存在的理由，见 6.4。
+
+**订单进入 `PENDING_PAYMENT` 之前预占一定已经提交**（`Reserve` 仍是同步调用）。所以 5.6 里提到的隐患没有出现：`paid` 不可能先于预占到达，库存服务对“预占不存在”仍然进死信，不用改。
+
+**查询**。受理后、落库前，订单库里还没有这一行。`GetOrder` 查不到订单行时再查占用：占用存在且属于该用户，返回一个状态为 `CREATING` 的订单（只有商品和数量，没有价格）。两边都没有才是 404。
+
+**对外接口**（先改 OpenAPI 规范）：`POST /api/v1/orders` 成功时返回 202 和订单（状态 `CREATING`），带 `Location` 头；客户端轮询 `GET /api/v1/orders/{order_id}` 直到状态离开 `CREATING`。库存不足、超出限购、SKU 不存在仍然同步返回错误，因为闸门当场就能判断。闸门放行后才在 MySQL 失败的订单（只在 Redis 偏大时出现），客户端通过轮询看到 `FAILED`。
+
+### 6.4 孤儿占用的回收
+
+受理成功但消息没发出去（进程在第 2、3 步之间崩溃），占用就没人认领。订单服务的回收任务定期处理：取 `gate:holds` 里早于宽限期（默认 1 分钟）的占用，对每一个执行 `ReturnIfUnclaimed`。
+
+宽限期解决不了的问题是消费积压：消息还在 Kafka 里排队，只是超过了宽限期没被消费。如果回收任务这时把占用还了，稍后消费者又把订单建出来并在 MySQL 预占成功，Redis 就比 MySQL 多出一份，而且不会自己恢复。所以要让“回收”和“落库”二选一：
+
+- 消费者落库前先 `Claim`，回收任务只还未认领的。两个脚本在 Redis 里原子执行，同一笔占用只有一方得手。
+- 回收先得手：消费者 `Claim` 失败，丢弃消息。用户看到的是订单消失（404），库存已归还。
+- 认领先得手：回收任务跳过它，占用由订单的终态事件归还。
+
+已认领却长期没有对应订单行的占用（认领后进程崩溃且消息进了死信）不会被自动归还，回收任务对超过支付时限两倍的已认领占用记 error 日志，数量偏差由对账修正。
+
+### 6.5 预热
+
+闸门里的数量从 MySQL 装载。inventory 新增 gRPC `WarmUp(sku_ids)`：对每个 SKU 读出 `available` 和限购数量，执行 `Load`。`Load` 只在未装载时写入数量，所以重复调用、多个实例并发调用都是安全的。
+
+- 按需装载：order 受理时遇到未装载的 SKU 才调用。不做启动时全量装载，SKU 很多时启动会很慢，而且绝大多数用不到。
+- 限购数量放在 `sku_stock.purchase_limit`（迁移新增，0 表示不限）。
+
+未装载的 SKU 没有任何占用（占用必须先有 SKU 的 key），所以装载时直接取 MySQL 的 `available` 是准确的。唯一的例外是 Redis 丢了数据，见 6.6。
+
+### 6.6 对账与修正
+
+稳定状态下有一个恒等式：
+
+```
+Redis: avail + held  ==  MySQL: available + reserved
+```
+
+两边都等于“还没卖掉的数量”。逐个操作看：受理时 `avail` 减、`held` 加，左边不变；MySQL 预占时 `available` 减、`reserved` 加，右边不变；释放和归还同理；支付确认时右边减少（`reserved` 转 `sold`），随后 `Settle` 让左边减少同样的数量。只有“Confirm 已提交、Settle 还没执行”的瞬间两边不等。
+
+inventory 的对账任务（默认每 5 秒）遍历 `gate:skus`，算偏差 `d = (avail + held) - (available + reserved)`：
+
+- `d == 0`：正常。
+- `d != 0`：可能只是瞬时的。同一个 SKU 连续 3 轮得到相同的非零 `d` 才认定为真实偏差，记 error 日志并用 `Adjust` 修正。
+- 修正用增量（`avail += -d`）而不是把 `avail` 设成某个值：读 MySQL 和读 Redis 不是同一时刻，直接覆盖会抹掉期间发生的扣减。
+- 修正后的 `avail` 不超过 MySQL 的 `available`。Redis 比 MySQL 可售还大一定是错的。
+
+最后一条让“Redis 丢了全部数据”也能收敛：重新装载后 `avail = available`、`held = 0`，而 MySQL 里还有丢失了占用的在途订单（`reserved > 0`），`d` 为负。不设上限的话对账会把 `avail` 调高到 `available + reserved`，放进来一批注定失败的订单。设了上限，`avail` 保持等于 `available`；在途订单取消或关闭时 MySQL 的 `available` 增加，对账再跟着调高。
+
+Redis 丢数据的另一个后果：已受理但还没落库的订单，占用没了，`Claim` 失败，订单消失。这是把受理状态只放在 Redis 里的代价，要靠 Redis 的持久化配置（AOF）缩小窗口，放到阶段 4 的故障实验里验证。
+
+### 6.7 延迟关单
+
+方案对比和选择见 [ADR-0009](../adr/0009-delayed-close.md)。实现：
+
+- topic `order.close.delay`，消息体 `OrderCloseDue{order_id, user_id, expire_time}`，用 `kafkax.NewDelayRecord` 带上到期时间。同一个 topic 里延迟时长相同（都是支付时限），满足 `DelayConsumer` 的前提。
+- 受理时和 `order.submit` 一起发出。这条消息丢了（两条消息不是原子的）也没关系，sweeper 兜底。
+- 订单服务用 `DelayConsumer` 消费（消费者组 `order.order-close-delay`）。到期后执行和 sweeper 相同的“关单”：以 `PENDING_PAYMENT` 且已过期为前置条件的条件更新，成功则同事务写 `closed` 事件。
+  - 订单已不是 `PENDING_PAYMENT`（已支付、已取消）：什么都不做。
+  - 订单还在 `CREATING` 或还不存在：什么都不做，创建超时由 sweeper 处理。
+  - 订单是 `PENDING_PAYMENT` 但按本机时钟还没过期（到期时间以发送方的时钟为准，两台机器的时钟有偏差）：返回错误，让消费者稍后重试。
+- sweeper 的“超时关单”保留，间隔调大（默认 30 秒）。它处理延迟消息丢失、进死信的情况。
+
+### 6.8 新增的 topic、消费者组和配置
+
+| topic | 发布方 | 消息类型 | key | 消费方（消费者组） |
+|---|---|---|---|---|
+| `order.submit` | order（受理） | `OrderSubmitted` | `order_id` | order（`order.order-submit`） |
+| `order.close.delay` | order（受理） | `OrderCloseDue` | `order_id` | order（`order.order-close-delay`，延迟消费） |
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `IDEMPOTENCY_TTL` | 幂等键在 Redis 里的保留时长 | `24h` |
+| `HOLD_REAP_GRACE` | 占用多久没被认领就回收 | `1m` |
+| `HOLD_REAP_INTERVAL` | 回收任务的间隔 | `10s` |
+| `GATE_RECONCILE_INTERVAL` | 对账任务的间隔 | `5s` |
+| `SWEEP_INTERVAL` | sweeper 的间隔，默认值从 1 秒调到 30 秒 | `30s` |
+
+### 6.9 测试重点
+
+- `stockgate`：并发 `Hold` 不超扣（总量恒定）；多 SKU 订单有一个不够时一个都不扣；限购；幂等键重复返回同一订单号、内容不同报复用；`Return` 执行两次只加回一次；`Claim` 与 `ReturnIfUnclaimed` 并发只有一方得手；`Settle` 之后 `Return` 不加回。
+- order：受理后发送失败会归还；消费 `order.submit` 两次只有一个订单；占用被回收后消费者丢弃消息；幂等键过期后的重放不产生第二个订单且占用被归还；落库前 `GetOrder` 返回 `CREATING`；延迟关单的各个分支。
+- inventory：Release 之后归还、Confirm 之后结清，各自重复执行结果相同；Redis 失败时事件处理返回错误（重试）而 MySQL 的结果不变；对账的三条规则（瞬时偏差不修、稳定偏差按增量修、不超过 `available`）。
+- 端到端：现有场景改为“提交后轮询到 `PENDING_PAYMENT`”；新增限购场景；秒杀场景的断言不变（不超卖，卖出数量等于库存）。
 
 ## 7. 步骤四方案要点（动工前细化）
 

@@ -20,6 +20,11 @@ const (
 	OrderEvents = "order.events"
 	// PaymentEvents 由支付服务发布，消息类型是 PaymentEvent。
 	PaymentEvents = "payment.events"
+	// OrderSubmit 是已受理、等待落库的下单请求，消息类型是 OrderSubmitted。
+	OrderSubmit = "order.submit"
+	// OrderCloseDelay 是延迟关单的提醒，消息类型是 OrderCloseDue。
+	// 这是一个固定延迟的 topic：里面所有消息的延迟时长都等于支付时限（见 ADR-0009）。
+	OrderCloseDelay = "order.close.delay"
 )
 
 // Partitions 是本机创建 topic 时使用的分区数。
@@ -41,6 +46,8 @@ const (
 	GroupInventoryOrderEvents = "inventory.order-events"
 	GroupPaymentOrderEvents   = "payment.order-events"
 	GroupOrderPaymentEvents   = "order.payment-events"
+	GroupOrderSubmit          = "order.order-submit"
+	GroupOrderCloseDelay      = "order.order-close-delay"
 )
 
 // OrderKey 返回以订单号为准的消息 key。
@@ -91,4 +98,46 @@ func UnmarshalPaymentEvent(value []byte) (*eventv1.PaymentEvent, error) {
 		return nil, fmt.Errorf("eventx: unmarshal payment event: %w", err)
 	}
 	return ev, nil
+}
+
+// MarshalOrderSubmitted 序列化 OrderSubmitted，返回消息的 key 和 value。
+func MarshalOrderSubmitted(m *eventv1.OrderSubmitted) (key, value []byte, err error) {
+	if m.GetOrderId() <= 0 {
+		return nil, nil, errors.New("eventx: order submitted without order_id")
+	}
+	value, err = proto.Marshal(m)
+	if err != nil {
+		return nil, nil, fmt.Errorf("eventx: marshal order submitted: %w", err)
+	}
+	return OrderKey(m.GetOrderId()), value, nil
+}
+
+// UnmarshalOrderSubmitted 反序列化 OrderSubmitted。
+func UnmarshalOrderSubmitted(value []byte) (*eventv1.OrderSubmitted, error) {
+	m := &eventv1.OrderSubmitted{}
+	if err := proto.Unmarshal(value, m); err != nil {
+		return nil, fmt.Errorf("eventx: unmarshal order submitted: %w", err)
+	}
+	return m, nil
+}
+
+// MarshalOrderCloseDue 序列化 OrderCloseDue，返回消息的 key 和 value。
+func MarshalOrderCloseDue(m *eventv1.OrderCloseDue) (key, value []byte, err error) {
+	if m.GetOrderId() <= 0 {
+		return nil, nil, errors.New("eventx: order close due without order_id")
+	}
+	value, err = proto.Marshal(m)
+	if err != nil {
+		return nil, nil, fmt.Errorf("eventx: marshal order close due: %w", err)
+	}
+	return OrderKey(m.GetOrderId()), value, nil
+}
+
+// UnmarshalOrderCloseDue 反序列化 OrderCloseDue。
+func UnmarshalOrderCloseDue(value []byte) (*eventv1.OrderCloseDue, error) {
+	m := &eventv1.OrderCloseDue{}
+	if err := proto.Unmarshal(value, m); err != nil {
+		return nil, fmt.Errorf("eventx: unmarshal order close due: %w", err)
+	}
+	return m, nil
 }

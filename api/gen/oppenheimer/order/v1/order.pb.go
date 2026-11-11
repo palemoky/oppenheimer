@@ -252,7 +252,7 @@ func (x *Order) GetPayTime() *timestamppb.Timestamp {
 	return nil
 }
 
-type CreateOrderItem struct {
+type SubmitOrderItem struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	SkuId int64                  `protobuf:"varint,1,opt,name=sku_id,json=skuId,proto3" json:"sku_id,omitempty"`
 	// 数量，必须大于 0。
@@ -261,20 +261,20 @@ type CreateOrderItem struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *CreateOrderItem) Reset() {
-	*x = CreateOrderItem{}
+func (x *SubmitOrderItem) Reset() {
+	*x = SubmitOrderItem{}
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *CreateOrderItem) String() string {
+func (x *SubmitOrderItem) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*CreateOrderItem) ProtoMessage() {}
+func (*SubmitOrderItem) ProtoMessage() {}
 
-func (x *CreateOrderItem) ProtoReflect() protoreflect.Message {
+func (x *SubmitOrderItem) ProtoReflect() protoreflect.Message {
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -286,50 +286,50 @@ func (x *CreateOrderItem) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use CreateOrderItem.ProtoReflect.Descriptor instead.
-func (*CreateOrderItem) Descriptor() ([]byte, []int) {
+// Deprecated: Use SubmitOrderItem.ProtoReflect.Descriptor instead.
+func (*SubmitOrderItem) Descriptor() ([]byte, []int) {
 	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *CreateOrderItem) GetSkuId() int64 {
+func (x *SubmitOrderItem) GetSkuId() int64 {
 	if x != nil {
 		return x.SkuId
 	}
 	return 0
 }
 
-func (x *CreateOrderItem) GetQuantity() int32 {
+func (x *SubmitOrderItem) GetQuantity() int32 {
 	if x != nil {
 		return x.Quantity
 	}
 	return 0
 }
 
-type CreateOrderRequest struct {
+type SubmitOrderRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	UserId int64                  `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
 	// 客户端生成的幂等键，1 到 64 个字符。
 	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// 同一请求内 sku_id 不能重复，至少一项。
-	Items         []*CreateOrderItem `protobuf:"bytes,3,rep,name=items,proto3" json:"items,omitempty"`
+	Items         []*SubmitOrderItem `protobuf:"bytes,3,rep,name=items,proto3" json:"items,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *CreateOrderRequest) Reset() {
-	*x = CreateOrderRequest{}
+func (x *SubmitOrderRequest) Reset() {
+	*x = SubmitOrderRequest{}
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *CreateOrderRequest) String() string {
+func (x *SubmitOrderRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*CreateOrderRequest) ProtoMessage() {}
+func (*SubmitOrderRequest) ProtoMessage() {}
 
-func (x *CreateOrderRequest) ProtoReflect() protoreflect.Message {
+func (x *SubmitOrderRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -341,53 +341,53 @@ func (x *CreateOrderRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use CreateOrderRequest.ProtoReflect.Descriptor instead.
-func (*CreateOrderRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use SubmitOrderRequest.ProtoReflect.Descriptor instead.
+func (*SubmitOrderRequest) Descriptor() ([]byte, []int) {
 	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *CreateOrderRequest) GetUserId() int64 {
+func (x *SubmitOrderRequest) GetUserId() int64 {
 	if x != nil {
 		return x.UserId
 	}
 	return 0
 }
 
-func (x *CreateOrderRequest) GetIdempotencyKey() string {
+func (x *SubmitOrderRequest) GetIdempotencyKey() string {
 	if x != nil {
 		return x.IdempotencyKey
 	}
 	return ""
 }
 
-func (x *CreateOrderRequest) GetItems() []*CreateOrderItem {
+func (x *SubmitOrderRequest) GetItems() []*SubmitOrderItem {
 	if x != nil {
 		return x.Items
 	}
 	return nil
 }
 
-type CreateOrderResponse struct {
+type SubmitOrderResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Order         *Order                 `protobuf:"bytes,1,opt,name=order,proto3" json:"order,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *CreateOrderResponse) Reset() {
-	*x = CreateOrderResponse{}
+func (x *SubmitOrderResponse) Reset() {
+	*x = SubmitOrderResponse{}
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *CreateOrderResponse) String() string {
+func (x *SubmitOrderResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*CreateOrderResponse) ProtoMessage() {}
+func (*SubmitOrderResponse) ProtoMessage() {}
 
-func (x *CreateOrderResponse) ProtoReflect() protoreflect.Message {
+func (x *SubmitOrderResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_oppenheimer_order_v1_order_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -399,12 +399,12 @@ func (x *CreateOrderResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use CreateOrderResponse.ProtoReflect.Descriptor instead.
-func (*CreateOrderResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use SubmitOrderResponse.ProtoReflect.Descriptor instead.
+func (*SubmitOrderResponse) Descriptor() ([]byte, []int) {
 	return file_oppenheimer_order_v1_order_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *CreateOrderResponse) GetOrder() *Order {
+func (x *SubmitOrderResponse) GetOrder() *Order {
 	if x != nil {
 		return x.Order
 	}
@@ -624,14 +624,14 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\vexpire_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"expireTime\x125\n" +
 	"\bpay_time\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\apayTime\"D\n" +
-	"\x0fCreateOrderItem\x12\x15\n" +
+	"\x0fSubmitOrderItem\x12\x15\n" +
 	"\x06sku_id\x18\x01 \x01(\x03R\x05skuId\x12\x1a\n" +
 	"\bquantity\x18\x02 \x01(\x05R\bquantity\"\x93\x01\n" +
-	"\x12CreateOrderRequest\x12\x17\n" +
+	"\x12SubmitOrderRequest\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\x03R\x06userId\x12'\n" +
 	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\x12;\n" +
-	"\x05items\x18\x03 \x03(\v2%.oppenheimer.order.v1.CreateOrderItemR\x05items\"H\n" +
-	"\x13CreateOrderResponse\x121\n" +
+	"\x05items\x18\x03 \x03(\v2%.oppenheimer.order.v1.SubmitOrderItemR\x05items\"H\n" +
+	"\x13SubmitOrderResponse\x121\n" +
 	"\x05order\x18\x01 \x01(\v2\x1b.oppenheimer.order.v1.OrderR\x05order\"E\n" +
 	"\x0fGetOrderRequest\x12\x19\n" +
 	"\border_id\x18\x01 \x01(\x03R\aorderId\x12\x17\n" +
@@ -652,7 +652,7 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\x13ORDER_STATUS_CLOSED\x10\x05\x12\x17\n" +
 	"\x13ORDER_STATUS_FAILED\x10\x062\xb1\x02\n" +
 	"\fOrderService\x12b\n" +
-	"\vCreateOrder\x12(.oppenheimer.order.v1.CreateOrderRequest\x1a).oppenheimer.order.v1.CreateOrderResponse\x12Y\n" +
+	"\vSubmitOrder\x12(.oppenheimer.order.v1.SubmitOrderRequest\x1a).oppenheimer.order.v1.SubmitOrderResponse\x12Y\n" +
 	"\bGetOrder\x12%.oppenheimer.order.v1.GetOrderRequest\x1a&.oppenheimer.order.v1.GetOrderResponse\x12b\n" +
 	"\vCancelOrder\x12(.oppenheimer.order.v1.CancelOrderRequest\x1a).oppenheimer.order.v1.CancelOrderResponseB\xde\x01\n" +
 	"\x18com.oppenheimer.order.v1B\n" +
@@ -676,9 +676,9 @@ var file_oppenheimer_order_v1_order_proto_goTypes = []any{
 	(OrderStatus)(0),              // 0: oppenheimer.order.v1.OrderStatus
 	(*OrderItem)(nil),             // 1: oppenheimer.order.v1.OrderItem
 	(*Order)(nil),                 // 2: oppenheimer.order.v1.Order
-	(*CreateOrderItem)(nil),       // 3: oppenheimer.order.v1.CreateOrderItem
-	(*CreateOrderRequest)(nil),    // 4: oppenheimer.order.v1.CreateOrderRequest
-	(*CreateOrderResponse)(nil),   // 5: oppenheimer.order.v1.CreateOrderResponse
+	(*SubmitOrderItem)(nil),       // 3: oppenheimer.order.v1.SubmitOrderItem
+	(*SubmitOrderRequest)(nil),    // 4: oppenheimer.order.v1.SubmitOrderRequest
+	(*SubmitOrderResponse)(nil),   // 5: oppenheimer.order.v1.SubmitOrderResponse
 	(*GetOrderRequest)(nil),       // 6: oppenheimer.order.v1.GetOrderRequest
 	(*GetOrderResponse)(nil),      // 7: oppenheimer.order.v1.GetOrderResponse
 	(*CancelOrderRequest)(nil),    // 8: oppenheimer.order.v1.CancelOrderRequest
@@ -694,14 +694,14 @@ var file_oppenheimer_order_v1_order_proto_depIdxs = []int32{
 	11, // 4: oppenheimer.order.v1.Order.create_time:type_name -> google.protobuf.Timestamp
 	11, // 5: oppenheimer.order.v1.Order.expire_time:type_name -> google.protobuf.Timestamp
 	11, // 6: oppenheimer.order.v1.Order.pay_time:type_name -> google.protobuf.Timestamp
-	3,  // 7: oppenheimer.order.v1.CreateOrderRequest.items:type_name -> oppenheimer.order.v1.CreateOrderItem
-	2,  // 8: oppenheimer.order.v1.CreateOrderResponse.order:type_name -> oppenheimer.order.v1.Order
+	3,  // 7: oppenheimer.order.v1.SubmitOrderRequest.items:type_name -> oppenheimer.order.v1.SubmitOrderItem
+	2,  // 8: oppenheimer.order.v1.SubmitOrderResponse.order:type_name -> oppenheimer.order.v1.Order
 	2,  // 9: oppenheimer.order.v1.GetOrderResponse.order:type_name -> oppenheimer.order.v1.Order
 	2,  // 10: oppenheimer.order.v1.CancelOrderResponse.order:type_name -> oppenheimer.order.v1.Order
-	4,  // 11: oppenheimer.order.v1.OrderService.CreateOrder:input_type -> oppenheimer.order.v1.CreateOrderRequest
+	4,  // 11: oppenheimer.order.v1.OrderService.SubmitOrder:input_type -> oppenheimer.order.v1.SubmitOrderRequest
 	6,  // 12: oppenheimer.order.v1.OrderService.GetOrder:input_type -> oppenheimer.order.v1.GetOrderRequest
 	8,  // 13: oppenheimer.order.v1.OrderService.CancelOrder:input_type -> oppenheimer.order.v1.CancelOrderRequest
-	5,  // 14: oppenheimer.order.v1.OrderService.CreateOrder:output_type -> oppenheimer.order.v1.CreateOrderResponse
+	5,  // 14: oppenheimer.order.v1.OrderService.SubmitOrder:output_type -> oppenheimer.order.v1.SubmitOrderResponse
 	7,  // 15: oppenheimer.order.v1.OrderService.GetOrder:output_type -> oppenheimer.order.v1.GetOrderResponse
 	9,  // 16: oppenheimer.order.v1.OrderService.CancelOrder:output_type -> oppenheimer.order.v1.CancelOrderResponse
 	14, // [14:17] is the sub-list for method output_type

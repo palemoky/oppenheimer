@@ -19,6 +19,7 @@ const (
 
 	ReasonSKUNotFound          = "SKU_NOT_FOUND"
 	ReasonInsufficientStock    = "INSUFFICIENT_STOCK"
+	ReasonPurchaseLimit        = "PURCHASE_LIMIT_EXCEEDED"
 	ReasonReservationNotFound  = "RESERVATION_NOT_FOUND"
 	ReasonReservationReleased  = "RESERVATION_RELEASED"
 	ReasonReservationConfirmed = "RESERVATION_CONFIRMED"

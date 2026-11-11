@@ -102,8 +102,8 @@ func (o *Orders) GetOrder(_ context.Context, in *orderv1.GetOrderRequest, _ ...g
 	return &orderv1.GetOrderResponse{Order: proto.CloneOf(order)}, nil
 }
 
-// CreateOrder 实现 OrderServiceClient，payment 不会调用。
-func (o *Orders) CreateOrder(context.Context, *orderv1.CreateOrderRequest, ...grpc.CallOption) (*orderv1.CreateOrderResponse, error) {
+// SubmitOrder 实现 OrderServiceClient，payment 不会调用。
+func (o *Orders) SubmitOrder(context.Context, *orderv1.SubmitOrderRequest, ...grpc.CallOption) (*orderv1.SubmitOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 

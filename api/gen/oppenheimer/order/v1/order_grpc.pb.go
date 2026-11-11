@@ -19,7 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	OrderService_CreateOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/CreateOrder"
+	OrderService_SubmitOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/SubmitOrder"
 	OrderService_GetOrder_FullMethodName    = "/oppenheimer.order.v1.OrderService/GetOrder"
 	OrderService_CancelOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/CancelOrder"
 )
@@ -30,18 +30,21 @@ const (
 //
 // OrderService 管理订单的创建、查询、取消，以及支付结果的处理。
 type OrderServiceClient interface {
-	// CreateOrder 创建订单并预占库存。
+	// SubmitOrder 受理下单请求：在库存闸门（Redis）里扣减并记下占用，把请求写入 Kafka 后立即返回。
+	// 订单随后由订单服务异步落库并预占库存，调用方用 GetOrder 轮询，直到状态离开 CREATING。
 	//
-	// 以 (user_id, idempotency_key) 幂等：重复请求返回第一次创建的订单。
+	// 返回的订单状态是 CREATING，只有商品和数量，价格在预占成功后才有。
+	//
+	// 以 (user_id, idempotency_key) 幂等：重复请求返回第一次受理的订单（当前状态）。
 	//
 	// 错误：
-	//   INVALID_ARGUMENT     reason=INVALID_ARGUMENT     参数不合法
+	//   INVALID_ARGUMENT     reason=INVALID_ARGUMENT        参数不合法
 	//   NOT_FOUND            reason=SKU_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
-	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
-	//   UNAVAILABLE                                       库存服务暂不可用，结果未知；用同一幂等键重试
-	//   ABORTED              reason=CREATE_TIMEOUT        订单长时间未能完成创建，已被置为失败；需换新的幂等键重新下单
-	CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error)
+	//   FAILED_PRECONDITION  reason=PURCHASE_LIMIT_EXCEEDED 超出该 SKU 的每人限购数量
+	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED  同一幂等键对应的请求内容不同
+	//   UNAVAILABLE                                          Redis 或 Kafka 暂不可用，本次没有受理；用同一幂等键重试
+	SubmitOrder(ctx context.Context, in *SubmitOrderRequest, opts ...grpc.CallOption) (*SubmitOrderResponse, error)
 	// GetOrder 查询订单。订单不属于该用户时等同于不存在。
 	//
 	// 错误：
@@ -63,10 +66,10 @@ func NewOrderServiceClient(cc grpc.ClientConnInterface) OrderServiceClient {
 	return &orderServiceClient{cc}
 }
 
-func (c *orderServiceClient) CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error) {
+func (c *orderServiceClient) SubmitOrder(ctx context.Context, in *SubmitOrderRequest, opts ...grpc.CallOption) (*SubmitOrderResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CreateOrderResponse)
-	err := c.cc.Invoke(ctx, OrderService_CreateOrder_FullMethodName, in, out, cOpts...)
+	out := new(SubmitOrderResponse)
+	err := c.cc.Invoke(ctx, OrderService_SubmitOrder_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,18 +102,21 @@ func (c *orderServiceClient) CancelOrder(ctx context.Context, in *CancelOrderReq
 //
 // OrderService 管理订单的创建、查询、取消，以及支付结果的处理。
 type OrderServiceServer interface {
-	// CreateOrder 创建订单并预占库存。
+	// SubmitOrder 受理下单请求：在库存闸门（Redis）里扣减并记下占用，把请求写入 Kafka 后立即返回。
+	// 订单随后由订单服务异步落库并预占库存，调用方用 GetOrder 轮询，直到状态离开 CREATING。
 	//
-	// 以 (user_id, idempotency_key) 幂等：重复请求返回第一次创建的订单。
+	// 返回的订单状态是 CREATING，只有商品和数量，价格在预占成功后才有。
+	//
+	// 以 (user_id, idempotency_key) 幂等：重复请求返回第一次受理的订单（当前状态）。
 	//
 	// 错误：
-	//   INVALID_ARGUMENT     reason=INVALID_ARGUMENT     参数不合法
+	//   INVALID_ARGUMENT     reason=INVALID_ARGUMENT        参数不合法
 	//   NOT_FOUND            reason=SKU_NOT_FOUND
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
-	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
-	//   UNAVAILABLE                                       库存服务暂不可用，结果未知；用同一幂等键重试
-	//   ABORTED              reason=CREATE_TIMEOUT        订单长时间未能完成创建，已被置为失败；需换新的幂等键重新下单
-	CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error)
+	//   FAILED_PRECONDITION  reason=PURCHASE_LIMIT_EXCEEDED 超出该 SKU 的每人限购数量
+	//   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED  同一幂等键对应的请求内容不同
+	//   UNAVAILABLE                                          Redis 或 Kafka 暂不可用，本次没有受理；用同一幂等键重试
+	SubmitOrder(context.Context, *SubmitOrderRequest) (*SubmitOrderResponse, error)
 	// GetOrder 查询订单。订单不属于该用户时等同于不存在。
 	//
 	// 错误：
@@ -132,8 +138,8 @@ type OrderServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedOrderServiceServer struct{}
 
-func (UnimplementedOrderServiceServer) CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CreateOrder not implemented")
+func (UnimplementedOrderServiceServer) SubmitOrder(context.Context, *SubmitOrderRequest) (*SubmitOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitOrder not implemented")
 }
 func (UnimplementedOrderServiceServer) GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetOrder not implemented")
@@ -162,20 +168,20 @@ func RegisterOrderServiceServer(s grpc.ServiceRegistrar, srv OrderServiceServer)
 	s.RegisterService(&OrderService_ServiceDesc, srv)
 }
 
-func _OrderService_CreateOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateOrderRequest)
+func _OrderService_SubmitOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitOrderRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(OrderServiceServer).CreateOrder(ctx, in)
+		return srv.(OrderServiceServer).SubmitOrder(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: OrderService_CreateOrder_FullMethodName,
+		FullMethod: OrderService_SubmitOrder_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(OrderServiceServer).CreateOrder(ctx, req.(*CreateOrderRequest))
+		return srv.(OrderServiceServer).SubmitOrder(ctx, req.(*SubmitOrderRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -224,8 +230,8 @@ var OrderService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*OrderServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "CreateOrder",
-			Handler:    _OrderService_CreateOrder_Handler,
+			MethodName: "SubmitOrder",
+			Handler:    _OrderService_SubmitOrder_Handler,
 		},
 		{
 			MethodName: "GetOrder",

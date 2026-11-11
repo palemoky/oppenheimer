@@ -513,6 +513,95 @@ func (x *GetStockResponse) GetUnitPrice() *v1.Money {
 	return nil
 }
 
+type WarmUpRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SkuIds        []int64                `protobuf:"varint,1,rep,packed,name=sku_ids,json=skuIds,proto3" json:"sku_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WarmUpRequest) Reset() {
+	*x = WarmUpRequest{}
+	mi := &file_oppenheimer_inventory_v1_inventory_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WarmUpRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WarmUpRequest) ProtoMessage() {}
+
+func (x *WarmUpRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_oppenheimer_inventory_v1_inventory_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WarmUpRequest.ProtoReflect.Descriptor instead.
+func (*WarmUpRequest) Descriptor() ([]byte, []int) {
+	return file_oppenheimer_inventory_v1_inventory_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *WarmUpRequest) GetSkuIds() []int64 {
+	if x != nil {
+		return x.SkuIds
+	}
+	return nil
+}
+
+type WarmUpResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 库存服务里不存在的 SKU。
+	Missing       []int64 `protobuf:"varint,1,rep,packed,name=missing,proto3" json:"missing,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WarmUpResponse) Reset() {
+	*x = WarmUpResponse{}
+	mi := &file_oppenheimer_inventory_v1_inventory_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WarmUpResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WarmUpResponse) ProtoMessage() {}
+
+func (x *WarmUpResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_oppenheimer_inventory_v1_inventory_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WarmUpResponse.ProtoReflect.Descriptor instead.
+func (*WarmUpResponse) Descriptor() ([]byte, []int) {
+	return file_oppenheimer_inventory_v1_inventory_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *WarmUpResponse) GetMissing() []int64 {
+	if x != nil {
+		return x.Missing
+	}
+	return nil
+}
+
 var File_oppenheimer_inventory_v1_inventory_proto protoreflect.FileDescriptor
 
 const file_oppenheimer_inventory_v1_inventory_proto_rawDesc = "" +
@@ -545,12 +634,17 @@ const file_oppenheimer_inventory_v1_inventory_proto_rawDesc = "" +
 	"\breserved\x18\x03 \x01(\x03R\breserved\x12\x12\n" +
 	"\x04sold\x18\x04 \x01(\x03R\x04sold\x12;\n" +
 	"\n" +
-	"unit_price\x18\x05 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\tunitPrice2\x95\x03\n" +
+	"unit_price\x18\x05 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\tunitPrice\"(\n" +
+	"\rWarmUpRequest\x12\x17\n" +
+	"\asku_ids\x18\x01 \x03(\x03R\x06skuIds\"*\n" +
+	"\x0eWarmUpResponse\x12\x18\n" +
+	"\amissing\x18\x01 \x03(\x03R\amissing2\xf2\x03\n" +
 	"\x10InventoryService\x12^\n" +
 	"\aReserve\x12(.oppenheimer.inventory.v1.ReserveRequest\x1a).oppenheimer.inventory.v1.ReserveResponse\x12^\n" +
 	"\aConfirm\x12(.oppenheimer.inventory.v1.ConfirmRequest\x1a).oppenheimer.inventory.v1.ConfirmResponse\x12^\n" +
 	"\aRelease\x12(.oppenheimer.inventory.v1.ReleaseRequest\x1a).oppenheimer.inventory.v1.ReleaseResponse\x12a\n" +
-	"\bGetStock\x12).oppenheimer.inventory.v1.GetStockRequest\x1a*.oppenheimer.inventory.v1.GetStockResponseB\xfe\x01\n" +
+	"\bGetStock\x12).oppenheimer.inventory.v1.GetStockRequest\x1a*.oppenheimer.inventory.v1.GetStockResponse\x12[\n" +
+	"\x06WarmUp\x12'.oppenheimer.inventory.v1.WarmUpRequest\x1a(.oppenheimer.inventory.v1.WarmUpResponseB\xfe\x01\n" +
 	"\x1ccom.oppenheimer.inventory.v1B\x0eInventoryProtoP\x01ZLgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1;inventoryv1\xa2\x02\x03OIX\xaa\x02\x18Oppenheimer.Inventory.V1\xca\x02\x18Oppenheimer\\Inventory\\V1\xe2\x02$Oppenheimer\\Inventory\\V1\\GPBMetadata\xea\x02\x1aOppenheimer::Inventory::V1b\x06proto3"
 
 var (
@@ -565,7 +659,7 @@ func file_oppenheimer_inventory_v1_inventory_proto_rawDescGZIP() []byte {
 	return file_oppenheimer_inventory_v1_inventory_proto_rawDescData
 }
 
-var file_oppenheimer_inventory_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_oppenheimer_inventory_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_oppenheimer_inventory_v1_inventory_proto_goTypes = []any{
 	(*ReserveItem)(nil),      // 0: oppenheimer.inventory.v1.ReserveItem
 	(*ReservedItem)(nil),     // 1: oppenheimer.inventory.v1.ReservedItem
@@ -577,23 +671,27 @@ var file_oppenheimer_inventory_v1_inventory_proto_goTypes = []any{
 	(*ReleaseResponse)(nil),  // 7: oppenheimer.inventory.v1.ReleaseResponse
 	(*GetStockRequest)(nil),  // 8: oppenheimer.inventory.v1.GetStockRequest
 	(*GetStockResponse)(nil), // 9: oppenheimer.inventory.v1.GetStockResponse
-	(*v1.Money)(nil),         // 10: oppenheimer.common.v1.Money
+	(*WarmUpRequest)(nil),    // 10: oppenheimer.inventory.v1.WarmUpRequest
+	(*WarmUpResponse)(nil),   // 11: oppenheimer.inventory.v1.WarmUpResponse
+	(*v1.Money)(nil),         // 12: oppenheimer.common.v1.Money
 }
 var file_oppenheimer_inventory_v1_inventory_proto_depIdxs = []int32{
-	10, // 0: oppenheimer.inventory.v1.ReservedItem.unit_price:type_name -> oppenheimer.common.v1.Money
+	12, // 0: oppenheimer.inventory.v1.ReservedItem.unit_price:type_name -> oppenheimer.common.v1.Money
 	0,  // 1: oppenheimer.inventory.v1.ReserveRequest.items:type_name -> oppenheimer.inventory.v1.ReserveItem
 	1,  // 2: oppenheimer.inventory.v1.ReserveResponse.items:type_name -> oppenheimer.inventory.v1.ReservedItem
-	10, // 3: oppenheimer.inventory.v1.GetStockResponse.unit_price:type_name -> oppenheimer.common.v1.Money
+	12, // 3: oppenheimer.inventory.v1.GetStockResponse.unit_price:type_name -> oppenheimer.common.v1.Money
 	2,  // 4: oppenheimer.inventory.v1.InventoryService.Reserve:input_type -> oppenheimer.inventory.v1.ReserveRequest
 	4,  // 5: oppenheimer.inventory.v1.InventoryService.Confirm:input_type -> oppenheimer.inventory.v1.ConfirmRequest
 	6,  // 6: oppenheimer.inventory.v1.InventoryService.Release:input_type -> oppenheimer.inventory.v1.ReleaseRequest
 	8,  // 7: oppenheimer.inventory.v1.InventoryService.GetStock:input_type -> oppenheimer.inventory.v1.GetStockRequest
-	3,  // 8: oppenheimer.inventory.v1.InventoryService.Reserve:output_type -> oppenheimer.inventory.v1.ReserveResponse
-	5,  // 9: oppenheimer.inventory.v1.InventoryService.Confirm:output_type -> oppenheimer.inventory.v1.ConfirmResponse
-	7,  // 10: oppenheimer.inventory.v1.InventoryService.Release:output_type -> oppenheimer.inventory.v1.ReleaseResponse
-	9,  // 11: oppenheimer.inventory.v1.InventoryService.GetStock:output_type -> oppenheimer.inventory.v1.GetStockResponse
-	8,  // [8:12] is the sub-list for method output_type
-	4,  // [4:8] is the sub-list for method input_type
+	10, // 8: oppenheimer.inventory.v1.InventoryService.WarmUp:input_type -> oppenheimer.inventory.v1.WarmUpRequest
+	3,  // 9: oppenheimer.inventory.v1.InventoryService.Reserve:output_type -> oppenheimer.inventory.v1.ReserveResponse
+	5,  // 10: oppenheimer.inventory.v1.InventoryService.Confirm:output_type -> oppenheimer.inventory.v1.ConfirmResponse
+	7,  // 11: oppenheimer.inventory.v1.InventoryService.Release:output_type -> oppenheimer.inventory.v1.ReleaseResponse
+	9,  // 12: oppenheimer.inventory.v1.InventoryService.GetStock:output_type -> oppenheimer.inventory.v1.GetStockResponse
+	11, // 13: oppenheimer.inventory.v1.InventoryService.WarmUp:output_type -> oppenheimer.inventory.v1.WarmUpResponse
+	9,  // [9:14] is the sub-list for method output_type
+	4,  // [4:9] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -610,7 +708,7 @@ func file_oppenheimer_inventory_v1_inventory_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_oppenheimer_inventory_v1_inventory_proto_rawDesc), len(file_oppenheimer_inventory_v1_inventory_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
