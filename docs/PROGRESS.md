@@ -27,9 +27,14 @@
 - `test/load` 的 `run` 子命令（账本字段见 `test/load/internal/ledger/ledger.go`；用法 `make load LOAD_ARGS="-addr http://127.0.0.1:8080 -c 100 -duration 30s -skus 1001 ..."`）。**还没有对真实服务跑过**，只有 `httptest` 的测试。
 - 1b 面试笔记 `docs/notes/1b-high-concurrency.md`（Sonnet 写，主会话核对了 Redlock 一节）。压测数字待补。
 
+- `verify`、`wait-quiet`、`warmup` 子命令和 `scripts/chaos.sh`、`make chaos`（Opus 写，主会话读过 18 条检查的实现）。
+- 杀进程测试发现并修掉两个可用性问题（提交 `47cc960`，详见设计文档 7.3.4）：消费者会话超时 45 秒改为 10 秒（`pkg/kafkax` 的 `SessionTimeout`）；下单消费者重试 5 次改为 10 次。修复后 `make chaos` 连续 2 次 19 项检查全过、死信为零。
+
 仍在进行：
 
-- `verify`、`wait-quiet` 子命令和 `scripts/chaos.sh`、`make chaos`（Opus，一个 worktree，基于 `f9d1a25`）。它会启动真实服务并至少跑 3 次，被要求**只报告产品缺陷、不修、不放宽检查**。回来后主会话评审 verify 的 18 条检查，再决定缺陷怎么修。
+- 1a 与 1b 的吞吐对比（Opus，直接在主检出目录工作，会新建 `scripts/bench.sh`、`make bench`，把数字写进笔记并提交）。它会临时建 worktree `.claude/worktrees/bench-1a` 和 `bench_*`、`bench1a_*` 库。
+
+**未解决：`make e2e` 偶发失败（老问题）**。并发提交时个别请求得到 503，原因是某次 Redis 调用超过 1 秒读超时。在 `0bafdfb`（步骤四之前）上 30 次失败 8 次，不是步骤四引入的。证据、怀疑的原因和下一步写在设计文档 7.3.4 末尾。推送前要注意：CI 的 e2e 可能因此变红，重跑即可，但应当尽快查清。
 
 如果会话中断：用 `git worktree list` 和 `git branch` 找到子 Agent 的分支，读各自的 diff，按 AGENTS.md 的流程 cherry-pick 合入，再在主线跑 `make lint test e2e`。没有提交的 worktree 说明该任务没做完，重新派发即可。
 
@@ -67,9 +72,11 @@
    - 锁不可用时：对账停下；中继、sweeper、回收任务、支付处理器放行（`lock.FailOpen`）。
    - payment 连 Redis，配置方式和其他服务相同。
 3. 步骤四剩余的工作（顺序）：
-   - 验收并合入 `verify` 和 `scripts/chaos.sh`；修杀进程测试发现的缺陷（先记进设计文档 7.3.4 再修）。
-   - 用同一个工具量 1a 的基线（`main` 上合并 PR #2 的提交，单独的 worktree）。验收项“吞吐相对 1a 有数量级提升”在这里完成，报告要同时给出 1a 下单吞吐、1b 受理吞吐、1b 落库吞吐。
-4. 把压测结果补进 `docs/notes/1b-high-concurrency.md`（笔记里标了“压测结果待补”）。设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条还没标注已解决，顺手改掉。
+   - 验收吞吐对比的结果，勾掉阶段计划里步骤四最后一个 checkbox（“一致性测试升级”，杀进程部分已完成，只差基线对比）。
+   - 查清 e2e 偶发 503 的原因（见上）。
+   - 小问题：order、payment 把调用方取消记成 ERROR 和 `Internal`（设计文档 7.3.4 第 3 点）。
+   - worktree `agent-a97714952afd11fa3`（已合入的 payment 任务）被已结束的子 Agent 进程锁着，`git worktree remove -f -f` 需要主人同意后再删，或等锁自行失效。
+4. 设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条还没标注已解决，顺手改掉。
 
 已推迟的任务（记在对应阶段的计划里，不会丢）：
 
