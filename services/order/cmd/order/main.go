@@ -47,6 +47,18 @@ const redisStartTimeout = 5 * time.Second
 // 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
 const closeDelayMaxAttempts = 10
 
+// defaultAdmitMaxQueue 是 ADMIT_MAX_QUEUE 的默认值：等待落库的订单数上限。
+//
+// 它应当约等于“落库吞吐 × 允许的等待”，允许的等待要明显短于回收宽限期（默认 1 分钟）。
+// 本机实测落库约 400 单/秒（4 个分区串行处理），1 万单约排 25 秒。落库吞吐变了（加分区、
+// 换机器）这个值要跟着调；它是静态的，没有按实测速率自适应，理由见设计文档 6.4。
+const defaultAdmitMaxQueue = 10000
+
+// defaultAdmitMaxStale 是 ADMIT_MAX_STALE 的默认值：允许排队超时的占用个数。
+// 它用来容忍零星的孤儿占用（受理方在发消息前崩溃，要等宽限期才被回收），不让一两个孤儿挡住受理；
+// 真正的积压是成千上万个。
+const defaultAdmitMaxStale = 100
+
 // submitMaxAttempts 是下单消息的最大处理次数，理由见创建消费者的地方。
 const submitMaxAttempts = 10
 
@@ -75,6 +87,7 @@ type config struct {
 	idempotencyTTL time.Duration
 	sweeper        service.SweeperConfig
 	reaper         service.ReaperConfig
+	backlog        stockgate.BacklogLimit
 	kafkaBrokers   []string
 	kafkaPrefix    string
 	outboxInterval time.Duration
@@ -156,6 +169,31 @@ func loadConfig() (config, error) {
 	if cfg.reaper.Interval, err = envDuration("HOLD_REAP_INTERVAL", service.DefaultReapInterval); err != nil {
 		return cfg, err
 	}
+	// 受理端的背压，理由见 stockgate.BacklogLimit。0 表示关闭对应的一条。
+	queue, err := envInt("ADMIT_MAX_QUEUE", defaultAdmitMaxQueue)
+	if err != nil {
+		return cfg, err
+	}
+	if queue < 0 {
+		return cfg, errors.New("ADMIT_MAX_QUEUE must not be negative")
+	}
+	cfg.backlog.MaxQueue = queue
+	// 排队时长默认取回收宽限期的一半：落库停住之后，受理在半个宽限期内停下。
+	if cfg.backlog.MaxWait, err = envDurationOrZero("ADMIT_MAX_WAIT", cfg.reaper.Grace/2); err != nil {
+		return cfg, err
+	}
+	if cfg.backlog.MaxWait >= cfg.reaper.Grace {
+		return cfg, fmt.Errorf("ADMIT_MAX_WAIT (%s) must be shorter than HOLD_REAP_GRACE (%s), "+
+			"otherwise accepted orders can be reaped while still queued", cfg.backlog.MaxWait, cfg.reaper.Grace)
+	}
+	stale, err := envInt("ADMIT_MAX_STALE", defaultAdmitMaxStale)
+	if err != nil {
+		return cfg, err
+	}
+	if stale < 0 {
+		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
+	}
+	cfg.backlog.MaxStale = stale
 	cfg.cacheRedisAddr = cmp.Or(os.Getenv("CACHE_REDIS_ADDR"), cfg.redisAddr)
 	if cfg.orderCacheTTL, err = envDurationOrZero("ORDER_CACHE_TTL", service.DefaultOrderCacheTTL); err != nil {
 		return cfg, err
@@ -307,6 +345,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Relay:             relay,
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
+		Backlog:           cfg.backlog,
 	})
 	cfg.sweeper.Guard = lock.FailOpen(sweeperLeader, logger)
 	cfg.reaper.Guard = lock.FailOpen(reaperLeader, logger)

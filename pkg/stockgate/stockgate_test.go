@@ -549,3 +549,161 @@ func TestHoldValidates(t *testing.T) {
 		}
 	}
 }
+
+// 积压的背压：排队超过 MaxWait 的未认领占用多于 MaxStale 个时拒绝受理，闸门不变。
+func TestHoldBacklog(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	limit := stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 2}
+	hold := func(at time.Time, key string, backlog stockgate.BacklogLimit) stockgate.HoldResult {
+		t.Helper()
+		res, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: e.nextID.Add(1), UserID: 7, IdempotencyKey: key, RequestHash: []byte("h"),
+			Items: []stockgate.Item{{SKUID: 1, Quantity: 1}}, Now: at, IdempotencyTTL: ttl, Backlog: backlog,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	avail := func() int64 {
+		t.Helper()
+		st, _, err := e.gate.Stock(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Avail
+	}
+
+	// 三笔占用在 start 受理，之后一直没被认领。
+	var first stockgate.HoldResult
+	for i := range 3 {
+		res := hold(start, "old"+strconv.Itoa(i), limit)
+		if res.Outcome != stockgate.Held {
+			t.Fatalf("old %d: %v", i, res.Outcome)
+		}
+		if i == 0 {
+			first = res
+		}
+	}
+
+	// 排队时长恰好等于 MaxWait 不算超时（截止是开区间）。
+	if res := hold(start.Add(30*time.Second), "at-limit", limit); res.Outcome != stockgate.Held {
+		t.Fatalf("at the limit: %v, want HELD", res.Outcome)
+	}
+	// 再晚 1 毫秒，三笔都超时，多于 MaxStale=2。
+	late := start.Add(30*time.Second + time.Millisecond)
+	before := avail()
+	res := hold(late, "late", limit)
+	if res.Outcome != stockgate.Backlogged || res.Queued != 3 {
+		t.Fatalf("late: %+v, want BACKLOGGED with 3 stale", res)
+	}
+	if got := avail(); got != before {
+		t.Fatalf("avail changed from %d to %d on a backlogged hold", before, got)
+	}
+	// 被拒绝时没有写幂等键：同一个键稍后可以正常受理。
+	if res := hold(late, "late", stockgate.BacklogLimit{}); res.Outcome != stockgate.Held {
+		t.Fatalf("retry of a backlogged key without limit: %v, want HELD", res.Outcome)
+	}
+
+	// 已受理过的请求重试时仍然得到原来的订单，不会因为积压被拒绝。
+	if res := hold(late, "old0", limit); res.Outcome != stockgate.Duplicate || res.OrderID != first.OrderID {
+		t.Fatalf("duplicate while backlogged: %+v", res)
+	}
+	// 卖完的请求得到“卖完”，而不是“稍后重试”。
+	if res, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+		OrderID: e.nextID.Add(1), UserID: 7, IdempotencyKey: "huge", RequestHash: []byte("h"),
+		Items: []stockgate.Item{{SKUID: 1, Quantity: 1000}}, Now: late, IdempotencyTTL: ttl, Backlog: limit,
+	}); err != nil || res.Outcome != stockgate.Insufficient {
+		t.Fatalf("sold out while backlogged: %+v, %v", res, err)
+	}
+
+	// 认领之后不再算在队列里：认领一笔，剩下两笔超时，不多于 MaxStale。
+	if _, ok, err := e.gate.Claim(t.Context(), first.OrderID); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	if res := hold(late, "after-claim", limit); res.Outcome != stockgate.Held {
+		t.Fatalf("after claim: %v, want HELD", res.Outcome)
+	}
+}
+
+func TestHoldRejectsNegativeBacklogLimit(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	for _, b := range []stockgate.BacklogLimit{{MaxQueue: -1}, {MaxWait: -time.Second}, {MaxWait: time.Second, MaxStale: -1}} {
+		_, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: e.nextID.Add(1), UserID: 7, IdempotencyKey: "k", RequestHash: []byte("h"),
+			Items: []stockgate.Item{{SKUID: 1, Quantity: 1}}, Now: time.Now(), IdempotencyTTL: ttl, Backlog: b,
+		})
+		if err == nil {
+			t.Errorf("backlog %+v: want error", b)
+		}
+	}
+}
+
+// 队列长度上限：未认领的占用达到 MaxQueue 时拒绝，队列永远不超过 MaxQueue；认领一笔就空出一个位置。
+func TestHoldQueueLimit(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	limit := stockgate.BacklogLimit{MaxQueue: 3}
+	now := time.Now()
+	hold := func(key string) stockgate.HoldResult {
+		t.Helper()
+		res, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: e.nextID.Add(1), UserID: 7, IdempotencyKey: key, RequestHash: []byte("h"),
+			Items: []stockgate.Item{{SKUID: 1, Quantity: 1}}, Now: now, IdempotencyTTL: ttl, Backlog: limit,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	var first int64
+	for i := range 3 {
+		res := hold("q" + strconv.Itoa(i))
+		if res.Outcome != stockgate.Held {
+			t.Fatalf("hold %d: %v", i, res.Outcome)
+		}
+		if i == 0 {
+			first = res.OrderID
+		}
+	}
+	if res := hold("q3"); res.Outcome != stockgate.Backlogged || res.Queued != 3 {
+		t.Fatalf("4th hold: %+v, want BACKLOGGED with 3 queued", res)
+	}
+	if _, ok, err := e.gate.Claim(t.Context(), first); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	if res := hold("q3"); res.Outcome != stockgate.Held {
+		t.Fatalf("after claim: %v, want HELD", res.Outcome)
+	}
+}
+
+// 并发受理时队列长度上限仍然严格成立：脚本里的检查和写入是原子的。
+func TestHoldQueueLimitConcurrent(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 1000, 0)
+	const maxQueue = 50
+	var held atomic.Int64
+	parallel(300, func(i int) {
+		res, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: e.nextID.Add(1), UserID: int64(i + 1), IdempotencyKey: "c", RequestHash: []byte("h"),
+			Items: []stockgate.Item{{SKUID: 1, Quantity: 1}}, Now: time.Now(), IdempotencyTTL: ttl,
+			Backlog: stockgate.BacklogLimit{MaxQueue: maxQueue},
+		})
+		if err != nil {
+			t.Errorf("hold: %v", err)
+			return
+		}
+		if res.Outcome == stockgate.Held {
+			held.Add(1)
+		}
+	})
+	if n := held.Load(); n != maxQueue {
+		t.Fatalf("held %d, want exactly %d", n, maxQueue)
+	}
+	if n, err := e.rdb.ZCard(t.Context(), e.prefix+"gate:holds").Result(); err != nil || n != maxQueue {
+		t.Fatalf("queue length %d (%v), want %d", n, err, maxQueue)
+	}
+}

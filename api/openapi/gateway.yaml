@@ -289,6 +289,8 @@ components:
     Error:
       description: |
         其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+        下单时等待落库的订单积压过多返回 429，原因码 `BACKLOGGED`：请求没有产生任何效果，
+        稍后用同一个 `Idempotency-Key` 重试即可。
       content:
         application/json:
           schema:

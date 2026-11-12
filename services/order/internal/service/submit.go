@@ -62,6 +62,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		Items:          gateItems(items),
 		Now:            accepted,
 		IdempotencyTTL: s.idemTTL,
+		Backlog:        s.backlog,
 	}
 	res, err := s.hold(ctx, hreq)
 	if err != nil {
@@ -89,6 +90,13 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		return nil, errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "insufficient stock for sku %d", res.SKUID)
 	case stockgate.LimitExceeded:
 		return nil, errx.New(codes.FailedPrecondition, errx.ReasonPurchaseLimit, "purchase limit exceeded for sku %d", res.SKUID)
+	case stockgate.Backlogged:
+		// 闸门里什么都没改，幂等键也没写：稍后用同一个幂等键重试是安全的。
+		// 用 RESOURCE_EXHAUSTED 而不是 UNAVAILABLE：这是有意的削峰，不是故障。grpcx 把 UNAVAILABLE
+		// 记成 ERROR，积压时每秒上百条，会淹没真正的下游故障。网关把它映射为 429。
+		// 也不逐条记日志，积压本身由落库延迟和消费积压的监控发现（1d、阶段 3）。
+		return nil, errx.New(codes.ResourceExhausted, errx.ReasonBacklogged,
+			"too many orders are waiting to be processed, retry later")
 	default:
 		return nil, s.internal(ctx, "hold", fmt.Errorf("unexpected outcome %s", res.Outcome), "order_id", orderID)
 	}

@@ -428,3 +428,58 @@ func TestSubmitGateUnavailable(t *testing.T) {
 		t.Fatalf("GetOrder err = %v, want Unavailable", err)
 	}
 }
+
+// 等待落库的订单积压过多时拒绝受理：返回可重试的 RESOURCE_EXHAUSTED，不扣库存、不发消息；
+// 积压消化之后，同一个幂等键能正常受理。
+func TestSubmitBackpressure(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ids, err := idgen.New(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+		Config{
+			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
+			Backlog: stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1},
+		})
+	submit := func(user int64, key string) (*orderv1.Order, error) {
+		resp, err := svc.SubmitOrder(t.Context(), submitReq(user, key, items(skuA, 1)))
+		return resp.GetOrder(), err
+	}
+
+	// 两单受理之后一直没有落库。
+	first, err := submit(1, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submit(2, "b"); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(31 * time.Second)
+
+	sent := len(e.sender.records(testSubmitTopic))
+	_, err = submit(3, "c")
+	wantErr(t, err, codes.ResourceExhausted, errx.ReasonBacklogged)
+	e.wantGate(t, skuA, 998, 2)
+	if n := len(e.sender.records(testSubmitTopic)); n != sent {
+		t.Fatalf("submit messages %d → %d, a backlogged request must not be sent", sent, n)
+	}
+
+	// 已经受理过的请求重试时照常拿到自己的订单。
+	again, err := submit(1, "a")
+	if err != nil || again.GetOrderId() != first.GetOrderId() {
+		t.Fatalf("replay while backlogged: %v, %v", again.GetOrderId(), err)
+	}
+
+	// 落库一单之后只剩一个排队超时，不多于 MaxStale：被拒绝的请求用同一个幂等键重试成功。
+	e.mustLand(t, first.GetOrderId())
+	o, err := submit(3, "c")
+	if err != nil {
+		t.Fatalf("retry after the backlog drained: %v", err)
+	}
+	if o.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_CREATING {
+		t.Fatalf("status = %v, want CREATING", o.GetStatus())
+	}
+	e.wantGate(t, skuA, 997, 3)
+}

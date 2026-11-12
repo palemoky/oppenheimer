@@ -452,6 +452,7 @@ func TestErrorMapping(t *testing.T) {
 		{"not cancellable", errx.New(codes.FailedPrecondition, errx.ReasonOrderNotCancellable, "no"), 409, "ORDER_NOT_CANCELLABLE"},
 		{"insufficient stock", errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "no stock"), 409, "INSUFFICIENT_STOCK"},
 		{"unavailable", errx.New(codes.Unavailable, "", "down"), 503, "UNAVAILABLE"},
+		{"backlogged", errx.New(codes.ResourceExhausted, errx.ReasonBacklogged, "busy"), 429, "BACKLOGGED"},
 		{"deadline", status.Error(codes.DeadlineExceeded, "slow"), 504, "DEADLINE_EXCEEDED"},
 		{"plain failed precondition", status.Error(codes.FailedPrecondition, "x"), 409, "FAILED_PRECONDITION"},
 		{"plain already exists", status.Error(codes.AlreadyExists, "x"), 409, "ALREADY_EXISTS"},

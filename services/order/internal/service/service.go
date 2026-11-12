@@ -91,6 +91,9 @@ type Config struct {
 	OrderCacheTTL time.Duration
 	// OrderCacheNullTTL 是“订单不存在”在查询缓存里的保留时长，默认 DefaultOrderCacheNullTTL。
 	OrderCacheNullTTL time.Duration
+	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
+	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
+	Backlog stockgate.BacklogLimit
 }
 
 // Deps 是 Service 依赖的外部组件。
@@ -128,6 +131,7 @@ type Service struct {
 	orderCache     *cache.Cache[*orderv1.Order]
 	cacheTTL       time.Duration
 	cacheNullTTL   time.Duration
+	backlog        stockgate.BacklogLimit
 }
 
 // New 返回 Service。
@@ -158,6 +162,7 @@ func New(d Deps, cfg Config) *Service {
 		orderCache:     d.OrderCache,
 		cacheTTL:       cmp.Or(cfg.OrderCacheTTL, DefaultOrderCacheTTL),
 		cacheNullTTL:   cmp.Or(cfg.OrderCacheNullTTL, DefaultOrderCacheNullTTL),
+		backlog:        cfg.Backlog,
 	}
 }
 

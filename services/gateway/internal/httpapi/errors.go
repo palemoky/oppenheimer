@@ -62,6 +62,9 @@ func httpStatusOf(c codes.Code) int {
 		return http.StatusConflict
 	case codes.Unavailable:
 		return http.StatusServiceUnavailable
+	case codes.ResourceExhausted:
+		// 目前只有下单的削峰（BACKLOGGED）。429 告诉客户端“稍后重试”，和下游故障的 503 分开。
+		return http.StatusTooManyRequests
 	case codes.DeadlineExceeded:
 		return http.StatusGatewayTimeout
 	default:

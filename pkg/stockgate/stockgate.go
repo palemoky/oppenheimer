@@ -69,6 +69,8 @@ const (
 	Insufficient
 	// LimitExceeded：超出该 SKU 的每人限购数量。
 	LimitExceeded
+	// Backlogged：等待落库的订单积压过多，暂不受理，见 BacklogLimit。HoldResult.Queued 是触发拒绝的那个计数。
+	Backlogged
 )
 
 func (o Outcome) String() string {
@@ -85,6 +87,8 @@ func (o Outcome) String() string {
 		return "INSUFFICIENT"
 	case LimitExceeded:
 		return "LIMIT_EXCEEDED"
+	case Backlogged:
+		return "BACKLOGGED"
 	default:
 		return "UNKNOWN(" + strconv.Itoa(int(o)) + ")"
 	}
@@ -103,6 +107,35 @@ type HoldRequest struct {
 	Now time.Time
 	// IdempotencyTTL 是幂等键的保留时长，必须为正。
 	IdempotencyTTL time.Duration
+	// Backlog 可选，零值表示不限制。
+	Backlog BacklogLimit
+}
+
+// BacklogLimit 是受理端的背压。
+//
+// 受理之后、被认领之前，占用记在 gate:holds 里，按受理时间排序，它就是等待落库的队列。
+//
+// 为什么需要它：回收任务把超过宽限期仍未认领的占用当成孤儿还掉（设计文档 6.4）。
+// 受理比落库快得多时，积压一旦超过宽限期，排在后面的订单还没轮到落库就被回收，
+// 用户先拿到 202，之后查询变成 404。背压要让每个被受理的订单都能在宽限期内落库。
+//
+// 两个条件，任何一个成立就拒绝：
+//
+//   - 队列长度达到 MaxQueue。一个新订单要等多久，取决于排在它前面的有多少、落库有多快
+//     （利特尔定律：等待时间 = 队列长度 / 处理速率），所以限制长度才能限制新订单的等待。
+//     MaxQueue 应取“落库吞吐 × 允许的等待”，落库吞吐变了（例如加了分区）要跟着调。
+//   - 排队超过 MaxWait 的占用多于 MaxStale 个。这一条管的是落库变慢或停住（消费者崩溃、
+//     依赖方故障）：长度没到上限，但队列不动了，这时继续受理只是在制造会被回收的订单。
+//     只看“最老的那一个”不够：它衡量的是过去的等待，受理远快于落库时，最老的订单
+//     刚到 MaxWait，后面已经排了几分钟的量（压测里实际发生过）。按个数而不是看最老的一个，
+//     是为了容忍真正的孤儿（受理方在发消息前崩溃，要留到宽限期才被回收）：孤儿是零星的。
+type BacklogLimit struct {
+	// MaxQueue 是等待落库的占用数上限，0 表示不限制。
+	MaxQueue int64
+	// MaxWait 是允许的排队时长，0 表示不检查。
+	MaxWait time.Duration
+	// MaxStale 是允许超过 MaxWait 的占用个数。
+	MaxStale int64
 }
 
 // HoldResult 是 Hold 的结果。
@@ -112,12 +145,18 @@ type HoldResult struct {
 	OrderID int64
 	// SKUID：NotLoaded、Insufficient、LimitExceeded 时是不满足条件的 SKU。
 	SKUID int64
+	// Queued：Backlogged 时是触发拒绝的计数（队列长度，或排队超时的占用数）。
+	Queued int64
 }
 
 // holdScript 先做完所有检查，再做所有修改：任何一个 SKU 不满足条件都在写入之前返回，
 // 所以一个订单的多个 SKU 要么全部扣到，要么都不扣，不需要回滚。
 //
-// ARGV: 前缀, 订单号, 用户, 幂等键, 请求哈希, 幂等键保留毫秒数, 受理时间毫秒, items 编码, 然后是成对的 sku, 数量。
+// 积压检查放在库存和限购的检查之后：卖完了的请求应当得到“卖完”，而不是“稍后重试”，
+// 否则用户会对一个注定买不到的商品反复重试。它也只读不写，仍在所有修改之前。
+//
+// ARGV: 前缀, 订单号, 用户, 幂等键, 请求哈希, 幂等键保留毫秒数, 受理时间毫秒, items 编码,
+// 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查）, 允许的超时个数, 然后是成对的 sku, 数量。
 var holdScript = redis.NewScript(`
 local p, order, user, idem, hash = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local idemKey = p .. 'gate:idem:' .. user .. ':' .. idem
@@ -132,9 +171,9 @@ if prev then
   return {'DUP', prevOrder}
 end
 
-local n = (#ARGV - 8) / 2
+local n = (#ARGV - 11) / 2
 for i = 0, n - 1 do
-  local sku, qty = ARGV[9 + 2 * i], tonumber(ARGV[10 + 2 * i])
+  local sku, qty = ARGV[12 + 2 * i], tonumber(ARGV[13 + 2 * i])
   local v = redis.call('HMGET', p .. 'gate:sku:' .. sku, 'avail', 'limit')
   if not v[1] then
     return {'NOT_LOADED', sku}
@@ -151,8 +190,21 @@ for i = 0, n - 1 do
   end
 end
 
+if ARGV[9] ~= '0' then
+  local queued = redis.call('ZCARD', p .. 'gate:holds')
+  if queued >= tonumber(ARGV[9]) then
+    return {'BACKLOG', tostring(queued)}
+  end
+end
+if ARGV[10] ~= '0' then
+  local stale = redis.call('ZCOUNT', p .. 'gate:holds', '-inf', '(' .. ARGV[10])
+  if stale > tonumber(ARGV[11]) then
+    return {'BACKLOG', tostring(stale)}
+  end
+end
+
 for i = 0, n - 1 do
-  local sku, qty = ARGV[9 + 2 * i], tonumber(ARGV[10 + 2 * i])
+  local sku, qty = ARGV[12 + 2 * i], tonumber(ARGV[13 + 2 * i])
   redis.call('HINCRBY', p .. 'gate:sku:' .. sku, 'avail', -qty)
   redis.call('HINCRBY', p .. 'gate:sku:' .. sku, 'held', qty)
   redis.call('HINCRBY', p .. 'gate:bought:' .. sku, user, qty)
@@ -178,15 +230,21 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 		return HoldResult{}, errors.New("stockgate: items must not be empty")
 	case req.IdempotencyTTL < time.Millisecond:
 		return HoldResult{}, errors.New("stockgate: idempotency ttl must be positive")
+	case req.Backlog.MaxQueue < 0 || req.Backlog.MaxWait < 0 || req.Backlog.MaxStale < 0:
+		return HoldResult{}, errors.New("stockgate: backlog limit must not be negative")
+	}
+	var cutoff int64 // 0 表示不检查积压
+	if req.Backlog.MaxWait > 0 {
+		cutoff = max(req.Now.Add(-req.Backlog.MaxWait).UnixMilli(), 1)
 	}
 	encoded, err := encodeItems(req.Items)
 	if err != nil {
 		return HoldResult{}, err
 	}
 
-	args := make([]any, 0, 8+2*len(req.Items))
+	args := make([]any, 0, 11+2*len(req.Items))
 	args = append(args, g.prefix, req.OrderID, req.UserID, req.IdempotencyKey, hex.EncodeToString(req.RequestHash),
-		req.IdempotencyTTL.Milliseconds(), req.Now.UnixMilli(), encoded)
+		req.IdempotencyTTL.Milliseconds(), req.Now.UnixMilli(), encoded, req.Backlog.MaxQueue, cutoff, req.Backlog.MaxStale)
 	for _, it := range req.Items {
 		args = append(args, it.SKUID, it.Quantity)
 	}
@@ -214,6 +272,8 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 		return HoldResult{Outcome: Insufficient, SKUID: id}, nil
 	case "LIMIT":
 		return HoldResult{Outcome: LimitExceeded, SKUID: id}, nil
+	case "BACKLOG":
+		return HoldResult{Outcome: Backlogged, Queued: id}, nil
 	default:
 		return HoldResult{}, fmt.Errorf("stockgate: hold: unexpected reply %v", res)
 	}
