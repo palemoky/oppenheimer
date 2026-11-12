@@ -1,7 +1,9 @@
 // Command load 是订单系统的压测工具。
 //
 //	load run [flags]      对网关压测，输出指标和客户端账本
-//	load verify [flags]   用账本和服务端数据对账（未实现）
+//	load verify [flags]       用账本和服务端数据对账（7.3.3 节）
+//	load wait-quiet [flags]   等系统静止（7.3.2 节第 3 步）
+//	load warmup [flags]       通过库存服务把 SKU 装载进闸门
 //
 // 设计见 docs/design/1b-high-concurrency.md 的 7.3.1 节。
 package main
@@ -34,7 +36,9 @@ const usage = `usage: load <command> [flags]
 
 commands:
   run      run the load test against the gateway
-  verify   reconcile a ledger against server data (not implemented)
+  verify       reconcile a ledger against server data (design 7.3.3)
+  wait-quiet   wait until outboxes, consumer lag, unfinished orders and gate holds are all zero
+  warmup       load skus into the stock gate through the inventory service
 
 run "load <command> -h" for the flags of a command.
 `
@@ -48,8 +52,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "run":
 		return runCmd(args[1:], stdout, stderr)
 	case "verify":
-		fmt.Fprintln(stderr, "verify: not implemented")
-		return 2
+		return verifyCmd(args[1:], stdout, stderr)
+	case "wait-quiet":
+		return waitQuietCmd(args[1:], stdout, stderr)
+	case "warmup":
+		return warmupCmd(args[1:], stdout, stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -83,6 +90,7 @@ func runCmd(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&cfg.RequestTimeout, "req-timeout", 5*time.Second, "timeout of a single HTTP request")
 	fs.IntVar(&cfg.SubmitAttempts, "submit-attempts", 5, "max submit requests per order, retries reuse the idempotency key")
 	fs.DurationVar(&cfg.RetryBackoff, "retry-backoff", 200*time.Millisecond, "wait between submit retries")
+	fs.DurationVar(&cfg.RejectBackoff, "reject-backoff", 0, "wait after a rejected submit before the next order")
 	fs.Int64Var(&cfg.Users, "users", 100000, "user ids are drawn from [1, users]")
 	fs.Uint64Var(&cfg.Seed, "seed", 0, "random seed, 0 picks one")
 	fs.StringVar(&cfg.RunID, "run-id", "", "idempotency key prefix (default derived from start time)")

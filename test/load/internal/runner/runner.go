@@ -304,6 +304,7 @@ func (r *runner) submit(ctx context.Context, f *flow) bool {
 			if !f.accepted {
 				r.agg.rejectedOrder(e.ErrorCode)
 			}
+			sleep(ctx, r.cfg.RejectBackoff)
 			return false
 		case !retry || f.attempts >= r.cfg.SubmitAttempts || ctx.Err() != nil:
 			if !f.accepted {

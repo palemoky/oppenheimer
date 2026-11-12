@@ -41,6 +41,9 @@ type Config struct {
 	SubmitAttempts int
 	// RetryBackoff 是两次提交重试之间的等待。
 	RetryBackoff time.Duration
+	// RejectBackoff 是提交被业务拒绝（库存不足、超出限购）之后、开始下一个订单之前的等待。
+	// 0 表示不等：卖完之后每个虚拟用户会以网络往返的速度连续提交。
+	RejectBackoff time.Duration
 	// Users 是 user_id 的取值范围 [1, Users]，用来分散限购。
 	Users int64
 	// Seed 是随机种子，为 0 时随机生成。相同的种子产生相同的用户、商品和动作序列
@@ -100,6 +103,9 @@ func (c *Config) Validate() error {
 	}
 	if c.SubmitAttempts < 1 {
 		errs = append(errs, errors.New("submit attempts must be >= 1"))
+	}
+	if c.RejectBackoff < 0 {
+		errs = append(errs, errors.New("reject backoff must not be negative"))
 	}
 	if c.RetryBackoff < 0 {
 		errs = append(errs, errors.New("retry backoff must not be negative"))

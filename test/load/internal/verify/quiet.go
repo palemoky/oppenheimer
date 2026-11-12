@@ -1,0 +1,189 @@
+package verify
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kadm"
+
+	"github.com/palemoky/Oppenheimer/api/eventx"
+)
+
+// QuietState 是 7.3.2 第 3 步的各项静止条件的当前值。全部为零才算静止。
+type QuietState struct {
+	// OutboxPending 是各服务 outbox 未发布的行数。
+	OutboxPending map[string]int64
+	// Lag 是各消费者组（带前缀的组名）在其 topic 上的积压之和；LagErr 是算不出积压的原因。
+	Lag    map[string]int64
+	LagErr map[string]string
+	// CreatingOrders、PendingPaymentOrders、PendingPayments 是处于非终态的订单和支付单数。
+	CreatingOrders       int64
+	PendingPaymentOrders int64
+	PendingPayments      int64
+	// UnclaimedHolds、ClaimedHolds 是 gate:holds、gate:claimed 的成员数。
+	UnclaimedHolds int64
+	ClaimedHolds   int64
+}
+
+// Problems 列出没有归零的项，全部归零时返回空。
+func (q QuietState) Problems() []string {
+	var out []string
+	for _, svc := range slices.Sorted(maps.Keys(q.OutboxPending)) {
+		if n := q.OutboxPending[svc]; n != 0 {
+			out = append(out, fmt.Sprintf("%s outbox has %d unpublished rows", svc, n))
+		}
+	}
+	for _, g := range slices.Sorted(maps.Keys(q.LagErr)) {
+		out = append(out, fmt.Sprintf("consumer group %s lag unknown: %s", g, q.LagErr[g]))
+	}
+	for _, g := range slices.Sorted(maps.Keys(q.Lag)) {
+		if n := q.Lag[g]; n != 0 {
+			out = append(out, fmt.Sprintf("consumer group %s lag %d", g, n))
+		}
+	}
+	add := func(n int64, what string) {
+		if n != 0 {
+			out = append(out, fmt.Sprintf("%d %s", n, what))
+		}
+	}
+	add(q.CreatingOrders, "orders in CREATING")
+	add(q.PendingPaymentOrders, "orders in PENDING_PAYMENT")
+	add(q.PendingPayments, "payments in PENDING")
+	add(q.UnclaimedHolds, "holds in gate:holds")
+	add(q.ClaimedHolds, "holds in gate:claimed")
+	return out
+}
+
+// Probe 读一次各项静止条件。
+func Probe(ctx context.Context, src Sources) (QuietState, error) {
+	q := QuietState{OutboxPending: map[string]int64{}, Lag: map[string]int64{}, LagErr: map[string]string{}}
+	var err error
+	for svc, db := range map[string]*sql.DB{"order": src.OrderDB, "payment": src.PaymentDB} {
+		if q.OutboxPending[svc], err = countPendingOutbox(ctx, db); err != nil {
+			return q, fmt.Errorf("%s: %w", svc, err)
+		}
+	}
+	if err := src.OrderDB.QueryRowContext(ctx,
+		"SELECT COALESCE(SUM(status = ?), 0), COALESCE(SUM(status = ?), 0) FROM orders WHERE status IN (?, ?)",
+		OrderCreating, OrderPendingPayment, OrderCreating, OrderPendingPayment,
+	).Scan(&q.CreatingOrders, &q.PendingPaymentOrders); err != nil {
+		return q, fmt.Errorf("count unfinished orders: %w", err)
+	}
+	if err := src.PaymentDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM payments WHERE status = ?", PaymentPending).
+		Scan(&q.PendingPayments); err != nil {
+		return q, fmt.Errorf("count pending payments: %w", err)
+	}
+	if q.UnclaimedHolds, err = src.Redis.ZCard(ctx, src.RedisPrefix+"gate:holds").Result(); err != nil {
+		return q, fmt.Errorf("count gate:holds: %w", err)
+	}
+	if q.ClaimedHolds, err = src.Redis.ZCard(ctx, src.RedisPrefix+"gate:claimed").Result(); err != nil {
+		return q, fmt.Errorf("count gate:claimed: %w", err)
+	}
+	if src.Kafka != nil {
+		if err := probeLag(ctx, src, &q); err != nil {
+			return q, err
+		}
+	}
+	return q, nil
+}
+
+// probeLag 按“已知的组 → topic”算积压：组还没有提交过某个分区时，从该分区的起始位置算起。
+// 不用 kadm 的 Lag：组不存在（消费者一次都没提交过）时它不知道这个组该消费哪些 topic，会算成零。
+func probeLag(ctx context.Context, src Sources, q *QuietState) error {
+	adm := kadm.NewClient(src.Kafka)
+	topics := make([]string, 0, len(ConsumedTopics))
+	for _, t := range ConsumedTopics {
+		topics = append(topics, eventx.Topic(src.KafkaPrefix, t))
+	}
+	starts, err := adm.ListStartOffsets(ctx, topics...)
+	if err != nil {
+		return fmt.Errorf("list start offsets: %w", err)
+	}
+	ends, err := adm.ListEndOffsets(ctx, topics...)
+	if err != nil {
+		return fmt.Errorf("list end offsets: %w", err)
+	}
+	for base, topicBase := range ConsumerGroups {
+		group := eventx.Group(src.KafkaPrefix, base)
+		topic := eventx.Topic(src.KafkaPrefix, topicBase)
+		commits, err := adm.FetchOffsets(ctx, group)
+		if err != nil {
+			q.LagErr[group] = err.Error()
+			continue
+		}
+		parts, ok := ends[topic]
+		if !ok {
+			q.LagErr[group] = "topic " + topic + " not found"
+			continue
+		}
+		var lag int64
+		var errs []string
+		for p, end := range parts {
+			if end.Err != nil {
+				errs = append(errs, fmt.Sprintf("end offset of partition %d: %v", p, end.Err))
+				continue
+			}
+			from := int64(-1)
+			if c, ok := commits.Lookup(topic, p); ok && c.Err == nil && c.At >= 0 {
+				from = c.At
+			}
+			if from < 0 {
+				st, ok := starts.Lookup(topic, p)
+				if !ok || st.Err != nil {
+					errs = append(errs, fmt.Sprintf("no start offset of partition %d", p))
+					continue
+				}
+				from = st.Offset
+			}
+			lag += max(end.Offset-from, 0)
+		}
+		if len(errs) > 0 {
+			q.LagErr[group] = strings.Join(errs, "; ")
+			continue
+		}
+		q.Lag[group] = lag
+	}
+	return nil
+}
+
+// WaitQuiet 每隔 interval 读一次静止条件，直到全部归零或超过 timeout。
+// 返回等待的时长和最后一次读到的状态；超时返回错误，调用方用 last.Problems() 打印没有归零的项。
+func WaitQuiet(ctx context.Context, src Sources, timeout, interval time.Duration, logger *slog.Logger) (time.Duration, QuietState, error) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var last QuietState
+	lastLog := time.Time{}
+	for {
+		pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+		q, err := Probe(pctx, src)
+		pcancel()
+		switch {
+		case err == nil:
+			last = q
+			problems := q.Problems()
+			if len(problems) == 0 {
+				return time.Since(start), q, nil
+			}
+			if time.Since(lastLog) >= 10*time.Second {
+				logger.Info("waiting for quiet", "elapsed", time.Since(start).Round(time.Second).String(), "pending", problems)
+				lastLog = time.Now()
+			}
+		case ctx.Err() == nil:
+			logger.Warn("probe failed, retrying", "error", err)
+		}
+		t := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return time.Since(start), last, fmt.Errorf("system not quiet after %s: %w", timeout, ctx.Err())
+		case <-t.C:
+		}
+	}
+}
