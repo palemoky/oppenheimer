@@ -97,6 +97,10 @@ run: build ## 在本机启动四个服务（需要先 make up），Ctrl-C 停止
 e2e: build ## 端到端测试：在独立的 e2e_* 库上启动四个服务并对网关跑测试（需要先 make up）
 	scripts/e2e.sh
 
+.PHONY: load
+load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"
+	go run ./test/load run $(LOAD_ARGS)
+
 .PHONY: seed
 seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次、表已建好之后）
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) inventory_db -e \
