@@ -56,6 +56,9 @@ type Config struct {
 	TopicPrefix string
 	// Now 是时钟，默认 time.Now。
 	Now func() time.Time
+	// Guard 可选。传入分布式锁可以让多个实例里只有一个在处理；为 nil 时每个实例都处理。
+	// 互斥只是为了省去重复的工作：正确性由条件更新保证。
+	Guard worker.Guard
 }
 
 func (c Config) withDefaults() Config {
@@ -89,6 +92,7 @@ func New(st *store.Store, kicker Kicker, logger *slog.Logger, cfg Config) (*Proc
 		Name:       "payment-processor",
 		Interval:   p.cfg.Interval,
 		Logger:     logger,
+		Guard:      p.cfg.Guard,
 		RunOnStart: true,
 	}, p.RunOnce)
 	if err != nil {

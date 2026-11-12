@@ -1,6 +1,7 @@
 package processor_test
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"strconv"
@@ -341,5 +342,58 @@ func TestBatchSizeLimitsEachRound(t *testing.T) {
 	e.wantEvents(t, 3)
 	for _, id := range orders {
 		e.want(t, id, succeeded)
+	}
+}
+
+// guard 是可切换的 worker.Guard，同时记录被问了多少次。
+type guard struct {
+	allow atomic.Bool
+	calls atomic.Int32
+}
+
+func (g *guard) Allow(context.Context) (bool, error) {
+	g.calls.Add(1)
+	return g.allow.Load(), nil
+}
+
+func TestGuardGatesProcessing(t *testing.T) {
+	g := &guard{}
+	e := newEnv(t, processor.Config{Interval: 10 * time.Millisecond, Guard: g})
+	orderID := e.create(t, success)
+	e.clock.Advance(delay)
+
+	// Start 阻塞到 Stop，放进 goroutine；Cleanup 里 Stop 并等它退出。
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := e.proc.Start(t.Context()); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := e.proc.Stop(context.WithoutCancel(t.Context())); err != nil {
+			t.Error(err)
+		}
+		wg.Wait()
+	})
+
+	// Guard 拒绝时：确认它被问过好几轮，支付单仍是待处理，没有事件。
+	waitFor(t, "guard asked 3 times", func() bool { return g.calls.Load() >= 3 })
+	e.want(t, orderID, pending)
+	e.wantEvents(t, 0)
+
+	g.allow.Store(true)
+	waitFor(t, "payment processed", func() bool { return e.get(t, orderID).Status == succeeded })
+	e.want(t, orderID, succeeded)
+	e.wantEvents(t, 1)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

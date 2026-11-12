@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	"github.com/palemoky/Oppenheimer/api/eventx"
@@ -20,9 +21,11 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/grpcx"
 	"github.com/palemoky/Oppenheimer/pkg/idgen"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/Oppenheimer/pkg/lock"
 	"github.com/palemoky/Oppenheimer/pkg/logx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/Oppenheimer/pkg/outbox"
+	"github.com/palemoky/Oppenheimer/pkg/redisx"
 	"github.com/palemoky/Oppenheimer/services/payment"
 	"github.com/palemoky/Oppenheimer/services/payment/internal/consumer"
 	"github.com/palemoky/Oppenheimer/services/payment/internal/processor"
@@ -35,6 +38,18 @@ const serviceName = "payment"
 // kafkaStartTimeout 是启动时连接 Kafka、建 topic 的时限。
 const kafkaStartTimeout = 30 * time.Second
 
+// redisSetupTimeout 是启动时连接 Redis 的时限。
+const redisSetupTimeout = 10 * time.Second
+
+// 两个周期任务的 leader 锁。锁名固定，TTL 比各自的轮询间隔长：持有者崩溃后最多这么久由别的副本接手。
+const (
+	relayLockName      = "payment:outbox-relay"
+	relayLockTTL       = 5 * time.Second
+	processorLockName  = "payment:processor"
+	processorLockTTL   = 15 * time.Second
+	leaderCloseTimeout = 2 * time.Second
+)
+
 type config struct {
 	httpAddr  string
 	grpcAddr  string
@@ -44,6 +59,8 @@ type config struct {
 	// Kafka 与 outbox，见设计文档第 4 节。
 	kafkaBrokers   []string
 	kafkaPrefix    string
+	redisAddr      string
+	redisPrefix    string
 	outboxInterval time.Duration
 	processor      processor.Config
 }
@@ -67,6 +84,8 @@ func loadConfig() (config, error) {
 		kafkaBrokers: strings.FieldsFunc(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"),
 			func(r rune) bool { return r == ',' || r == ' ' }),
 		kafkaPrefix: os.Getenv("KAFKA_PREFIX"),
+		redisAddr:   cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
+		redisPrefix: os.Getenv("REDIS_PREFIX"),
 	}
 
 	var err error
@@ -125,6 +144,34 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
+	rctx, cancelRedis := context.WithTimeout(ctx, redisSetupTimeout)
+	rdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.redisAddr})
+	cancelRedis()
+	if err != nil {
+		return fmt.Errorf("open redis: %w", err)
+	}
+	// 只有锁用 Redis。defer 逆序执行：它在 leader.Close 之后关闭。
+	defer rdb.Close()
+
+	relayLeader, err := newLeader(logger, cfg, rdb, relayLockName, relayLockTTL)
+	if err != nil {
+		return err
+	}
+	procLeader, err := newLeader(logger, cfg, rdb, processorLockName, processorLockTTL)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// 所有组件停止之后主动释放锁，让别的副本马上接手，而不是等锁过期。
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderCloseTimeout)
+		defer cancel()
+		for name, l := range map[string]*lock.Leader{relayLockName: relayLeader, processorLockName: procLeader} {
+			if err := l.Close(ctx); err != nil {
+				logger.Warn("release leader lock", "lock", name, "error", err)
+			}
+		}
+	}()
+
 	orderConn, err := grpcx.Dial(cfg.orderAddr)
 	if err != nil {
 		return fmt.Errorf("dial order service: %w", err)
@@ -150,6 +197,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Sender:   producer,
 		Logger:   logger,
 		Interval: cfg.outboxInterval,
+		Guard:    lock.FailOpen(relayLeader, logger),
 	})
 	if err != nil {
 		return fmt.Errorf("create outbox relay: %w", err)
@@ -159,6 +207,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	st := store.New(db)
 	svc := service.New(st, orders, ids, now, logger)
 	cfg.processor.Now = now
+	cfg.processor.Guard = lock.FailOpen(procLeader, logger)
 	proc, err := processor.New(st, relay, logger, cfg.processor)
 	if err != nil {
 		return err
@@ -188,6 +237,15 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// app.Run 按相反顺序停止：先停 gRPC 不再受理新支付，再停 processor（不再产生新事件），
 	// 再停消费者，然后停中继（它最后一轮会把 processor 刚写的事件发出去），健康检查最后停。
 	return app.Run(ctx, logger, httpServer, relay, orderEvents, proc, grpcServer)
+}
+
+// newLeader 创建一把按 name 竞争的 leader 锁。
+func newLeader(logger *slog.Logger, cfg config, rdb redis.Scripter, name string, ttl time.Duration) (*lock.Leader, error) {
+	locker, err := lock.New(rdb, lock.Options{TTL: ttl, KeyPrefix: cfg.redisPrefix, Logger: logger})
+	if err != nil {
+		return nil, fmt.Errorf("new locker for %s: %w", name, err)
+	}
+	return locker.Leader(name), nil
 }
 
 // ensureTopics 创建本服务发布和消费的 topic 及其死信 topic。
