@@ -20,6 +20,8 @@ type ReaperConfig struct {
 	Grace time.Duration
 	// BatchSize 是每轮最多检查的占用数，默认 1000。
 	BatchSize int
+	// Guard 可选，决定这一轮是否运行。多副本时用分布式锁让只有一个副本在回收（设计文档 7.1）。
+	Guard worker.Guard
 }
 
 // 回收任务的默认配置。
@@ -40,6 +42,7 @@ const reapCallTimeout = time.Second
 // 所以即使消费积压超过了宽限期，也不会出现“占用还了、订单又在 MySQL 里预占成功”。
 //
 // 多个副本同时运行是安全的：每笔占用的归还在 Redis 里原子执行，只有第一次生效。
+// 所以 Guard 只是为了省事，锁不可用时应当放行（lock.FailOpen）。
 type Reaper struct {
 	svc    *Service
 	cfg    ReaperConfig
@@ -57,6 +60,7 @@ func NewReaper(svc *Service, cfg ReaperConfig) (*Reaper, error) {
 		Name:     "hold-reaper",
 		Interval: cfg.Interval,
 		Logger:   r.logger,
+		Guard:    cfg.Guard,
 	}, func(ctx context.Context) error {
 		r.RunOnce(ctx)
 		return nil

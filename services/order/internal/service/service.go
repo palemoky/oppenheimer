@@ -17,8 +17,10 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -28,6 +30,7 @@ import (
 	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
@@ -83,6 +86,11 @@ type Config struct {
 	CloseDelayTopic string
 	// Relay 可选。为空时事件只靠中继的兜底轮询发出，正确性不受影响，只是延迟变大。
 	Relay Kicker
+	// OrderCacheTTL 是终态订单在查询缓存里的保留时长，默认 DefaultOrderCacheTTL。
+	// 只在 Deps.OrderCache 非空时有意义。
+	OrderCacheTTL time.Duration
+	// OrderCacheNullTTL 是“订单不存在”在查询缓存里的保留时长，默认 DefaultOrderCacheNullTTL。
+	OrderCacheNullTTL time.Duration
 }
 
 // Deps 是 Service 依赖的外部组件。
@@ -94,6 +102,9 @@ type Deps struct {
 	IDs       IDGenerator
 	// Logger 为空时用 slog.Default()。
 	Logger *slog.Logger
+	// OrderCache 可选，GetOrder 的查询缓存（设计文档 7.2.3），用 NewOrderCache 创建。
+	// 为空时 GetOrder 每次都读库。
+	OrderCache *cache.Cache[*orderv1.Order]
 }
 
 // Service 实现 orderv1.OrderServiceServer。
@@ -114,6 +125,9 @@ type Service struct {
 	submitTopic    string
 	closeTopic     string
 	relay          Kicker
+	orderCache     *cache.Cache[*orderv1.Order]
+	cacheTTL       time.Duration
+	cacheNullTTL   time.Duration
 }
 
 // New 返回 Service。
@@ -141,6 +155,9 @@ func New(d Deps, cfg Config) *Service {
 		submitTopic:    cmp.Or(cfg.SubmitTopic, eventx.OrderSubmit),
 		closeTopic:     cmp.Or(cfg.CloseDelayTopic, eventx.OrderCloseDelay),
 		relay:          cfg.Relay,
+		orderCache:     d.OrderCache,
+		cacheTTL:       cmp.Or(cfg.OrderCacheTTL, DefaultOrderCacheTTL),
+		cacheNullTTL:   cmp.Or(cfg.OrderCacheNullTTL, DefaultOrderCacheNullTTL),
 	}
 }
 
@@ -392,55 +409,163 @@ func toProto(o *store.Order) *orderv1.Order {
 	return p
 }
 
+// cacheable 判断某个状态的订单能否放进查询缓存（设计文档 7.2.3）：只有终态可以。
+// 终态不会再变，缓存永远不会和数据库不一致，所以不需要任何失效逻辑。
+//
+// 以后如果终态之后还能变（发货、退款），这里必须跟着改，否则缓存会返回旧状态。
+// 测试要求枚举里每个状态都在这里明确归类，新增状态时测试失败，逼着做决定。
+func cacheable(st orderv1.OrderStatus) bool {
+	switch st {
+	case orderv1.OrderStatus_ORDER_STATUS_PAID,
+		orderv1.OrderStatus_ORDER_STATUS_CANCELLED,
+		orderv1.OrderStatus_ORDER_STATUS_CLOSED,
+		orderv1.OrderStatus_ORDER_STATUS_FAILED:
+		return true
+	case orderv1.OrderStatus_ORDER_STATUS_UNSPECIFIED,
+		orderv1.OrderStatus_ORDER_STATUS_CREATING,
+		orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT:
+		return false
+	default:
+		return false
+	}
+}
+
 // ---------- GetOrder ----------
 
+// 查询缓存的默认保留时长。
+const (
+	DefaultOrderCacheTTL     = 10 * time.Minute
+	DefaultOrderCacheNullTTL = 2 * time.Second
+)
+
+// NewOrderCache 创建 GetOrder 用的查询缓存。client 应当是允许淘汰的缓存实例，prefix 遵守 redisx 的前缀约定。
+//
+// 不做进程间的重建互斥：按订单号的 key 没有热点，而非终态订单的回源结果又不写缓存，
+// 互斥多出的两次 Redis 往返换不来东西（设计文档 7.2.5）。
+func NewOrderCache(client redis.Cmdable, prefix string, logger *slog.Logger) (*cache.Cache[*orderv1.Order], error) {
+	c, err := cache.New(cache.Config{
+		Client:      client,
+		KeyPrefix:   prefix,
+		DisableLock: true,
+		Logger:      logger,
+	}, cache.ProtoCodec[*orderv1.Order]{})
+	if err != nil {
+		return nil, fmt.Errorf("new order cache: %w", err)
+	}
+	return c, nil
+}
+
+func orderCacheKey(orderID int64) string {
+	return "cache:order:" + strconv.FormatInt(orderID, 10)
+}
+
 // GetOrder 实现 OrderServiceServer。
+//
+// 只有这条读路径走缓存。写路径、状态机和内部决策（例如 CancelOrder 之后的复查）都直接读库：
+// 缓存里只有终态订单，读到它们本身不会出错，但没有理由让决策依赖一个可选组件。
 func (s *Service) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*orderv1.GetOrderResponse, error) {
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, invalidArgument("order_id and user_id must be positive")
 	}
-	o, err := s.lookup(ctx, req.GetOrderId(), req.GetUserId())
+	var (
+		o   *orderv1.Order
+		ok  bool
+		err error
+	)
+	if s.orderCache == nil {
+		o, ok, err = s.fetch(ctx, req.GetOrderId())
+	} else {
+		o, ok, err = s.fetchCached(ctx, req.GetOrderId())
+	}
 	if err != nil {
 		return nil, err
 	}
+	// 缓存的内容与请求方无关，归属在拿到结果之后核对（命中和未命中两条路径一样）。
+	if !ok || o.GetUserId() != req.GetUserId() {
+		return nil, orderNotFound(req.GetOrderId())
+	}
+	// o 可能是缓存或 singleflight 里与其他调用共享的对象，这里只读不改。
 	return &orderv1.GetOrderResponse{Order: o}, nil
 }
 
+// fetchCached 是带查询缓存的 fetch。回源结果按内容决定是否缓存：
+//   - 终态订单：缓存 cacheTTL。
+//   - 非终态订单（包括从占用合成的 CREATING）：不缓存。
+//   - 不存在（行和占用都没有，且复查仍没有）：缓存空值 cacheNullTTL。
+//
+// 已受理未落库的订单在 fetch 里从占用合成，Found 为 true，所以不会被写成空值。
+func (s *Service) fetchCached(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	o, ok, err := s.orderCache.Get(ctx, orderCacheKey(orderID), func(ctx context.Context) (cache.Loaded[*orderv1.Order], error) {
+		o, ok, err := s.fetch(ctx, orderID)
+		if err != nil {
+			return cache.Loaded[*orderv1.Order]{}, err
+		}
+		if !ok {
+			return cache.Loaded[*orderv1.Order]{TTL: s.cacheNullTTL}, nil
+		}
+		l := cache.Loaded[*orderv1.Order]{Value: o, Found: true}
+		if cacheable(o.GetStatus()) {
+			l.TTL = s.cacheTTL
+		}
+		return l, nil
+	})
+	if err != nil {
+		// fetch 的错误已经是对外的 gRPC 状态；缓存层在调用方 ctx 结束时返回裸的 context 错误，
+		// 转成对应的状态码（Canceled、DeadlineExceeded），否则 gRPC 会把它报成 Unknown。
+		if _, isStatus := status.FromError(err); !isStatus {
+			return nil, false, status.FromContextError(err).Err()
+		}
+		return nil, false, err
+	}
+	return o, ok, nil
+}
+
 // lookup 返回属于 userID 的订单的当前状态。不属于该用户时与不存在一样返回 NOT_FOUND，不泄露订单是否存在。
+// 它不读缓存，给需要读库的路径（CancelOrder）用。
+func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.Order, error) {
+	o, ok, err := s.fetch(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || o.GetUserId() != userID {
+		return nil, orderNotFound(orderID)
+	}
+	return o, nil
+}
+
+// fetch 按 order_id 返回订单的当前状态，不核对归属。ok 为 false 表示订单不存在。
+// 返回的错误已经是对外的 gRPC 状态。
 //
 // 受理之后、落库之前，订单库里还没有这一行，这时以闸门里的占用为准，合成一个 CREATING 的订单
 // （只有商品和数量）。占用从受理一直活到订单进入终态，所以“行不存在且占用也不存在”只有两种可能：
 // 订单从未受理过或已被回收；或者在两次读之间订单落库、走完了终态、占用被归还。
 // 后一种用再读一次订单行排除。
-func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.Order, error) {
-	o, err := s.loadOwned(ctx, orderID, userID)
-	if err == nil || errx.Reason(err) != errx.ReasonOrderNotFound {
-		return o, err
+func (s *Service) fetch(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	o, ok, err := s.loadRow(ctx, orderID)
+	if err != nil || ok {
+		return o, ok, err
 	}
 	hold, ok, err := s.gate.Get(ctx, orderID)
 	if err != nil {
 		s.logger.WarnContext(ctx, "read hold failed", "order_id", orderID, "error", err)
-		return nil, status.Error(codes.Unavailable, "stock gate unavailable, retry later")
+		return nil, false, status.Error(codes.Unavailable, "stock gate unavailable, retry later")
 	}
 	if ok {
-		if hold.UserID != userID {
-			return nil, orderNotFound(orderID)
-		}
-		return s.creatingProto(orderID, userID, holdItems(hold.Items), hold.At), nil
+		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
 	}
-	return s.loadOwned(ctx, orderID, userID)
+	return s.loadRow(ctx, orderID)
 }
 
-// loadOwned 读属于 userID 的已落库订单，转成对外的形式。
-func (s *Service) loadOwned(ctx context.Context, orderID, userID int64) (*orderv1.Order, error) {
+// loadRow 读已落库的订单，转成对外的形式。ok 为 false 表示没有这一行。
+func (s *Service) loadRow(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
 	o, err := s.store.GetOrder(ctx, orderID)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && o.UserID != userID) {
-		return nil, orderNotFound(orderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, s.internal(ctx, "load order", err, "order_id", orderID)
+		return nil, false, s.internal(ctx, "load order", err, "order_id", orderID)
 	}
-	return toProto(o), nil
+	return toProto(o), true, nil
 }
 
 // creatingProto 构造一个还没落库的订单的对外形式：只有商品和数量，没有价格。

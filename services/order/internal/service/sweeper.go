@@ -24,6 +24,8 @@ type SweeperConfig struct {
 	// 很多，按受理时刻算的话，积压超过这个时限的订单一落库就会被 sweeper 和消费者抢着处理，
 	// 恰好在削峰最需要的时候成批失败。CREATING 的行在落库之后不会再被更新，updated_at 就是落库时间。
 	CreateTimeout time.Duration
+	// Guard 可选，决定这一轮是否运行。多副本时用分布式锁让只有一个副本在扫（设计文档 7.1）。
+	Guard worker.Guard
 }
 
 // 后台任务的默认配置。
@@ -41,6 +43,7 @@ const (
 // 1a 的“补结清”随之删除——事件和状态变更在同一个事务里提交，不存在“状态变了、通知没发”的窗口。
 //
 // 多个副本同时运行是安全的：所有转换都是条件更新，只有完成转换的一方写事件，重复执行只是多做无用功。
+// 所以 Guard 只是为了省事，锁不可用时应当放行（lock.FailOpen）。
 type Sweeper struct {
 	svc    *Service
 	cfg    SweeperConfig
@@ -62,6 +65,7 @@ func NewSweeper(svc *Service, cfg SweeperConfig) (*Sweeper, error) {
 		Name:     "sweeper",
 		Interval: cfg.Interval,
 		Logger:   s.logger,
+		Guard:    cfg.Guard,
 	}, func(ctx context.Context) error {
 		s.RunOnce(ctx)
 		return nil

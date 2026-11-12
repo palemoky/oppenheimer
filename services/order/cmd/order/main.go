@@ -12,15 +12,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	"github.com/palemoky/Oppenheimer/api/eventx"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/Oppenheimer/pkg/app"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/grpcx"
 	"github.com/palemoky/Oppenheimer/pkg/idgen"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/Oppenheimer/pkg/lock"
 	"github.com/palemoky/Oppenheimer/pkg/logx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/Oppenheimer/pkg/outbox"
@@ -44,6 +47,21 @@ const redisStartTimeout = 5 * time.Second
 // 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
 const closeDelayMaxAttempts = 10
 
+// 周期任务的 leader 锁（设计文档 7.1）。持有者崩溃后锁要等 TTL 过期才能被别的副本接手，
+// 这段时间任务没人跑：中继的空窗直接表现为事件延迟，取得短；其余任务本来就是低频兜底，取 15 秒。
+// 正常退出时主动释放，没有空窗。
+const (
+	relayLockTTL = 5 * time.Second
+	taskLockTTL  = 15 * time.Second
+
+	relayLockName  = "order:outbox-relay"
+	sweeperLock    = "order:sweeper"
+	holdReaperLock = "order:hold-reaper"
+)
+
+// leaderReleaseTimeout 是退出时主动释放一把 leader 锁的时限。
+const leaderReleaseTimeout = 2 * time.Second
+
 type config struct {
 	httpAddr       string
 	grpcAddr       string
@@ -59,6 +77,11 @@ type config struct {
 	outboxInterval time.Duration
 	redisAddr      string
 	redisPrefix    string
+	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
+	cacheRedisAddr string
+	// orderCacheTTL 为 0 表示关闭订单查询缓存。
+	orderCacheTTL     time.Duration
+	orderCacheNullTTL time.Duration
 }
 
 func main() {
@@ -130,6 +153,13 @@ func loadConfig() (config, error) {
 	if cfg.reaper.Interval, err = envDuration("HOLD_REAP_INTERVAL", service.DefaultReapInterval); err != nil {
 		return cfg, err
 	}
+	cfg.cacheRedisAddr = cmp.Or(os.Getenv("CACHE_REDIS_ADDR"), cfg.redisAddr)
+	if cfg.orderCacheTTL, err = envDurationOrZero("ORDER_CACHE_TTL", service.DefaultOrderCacheTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.orderCacheNullTTL, err = envDuration("ORDER_CACHE_NULL_TTL", service.DefaultOrderCacheNullTTL); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
 }
 
@@ -158,6 +188,14 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be positive", key)
 	}
 	return d, nil
+}
+
+// envDurationOrZero 与 envDuration 相同，但允许显式设为 0（表示关闭某个功能）。
+func envDurationOrZero(key string, def time.Duration) (time.Duration, error) {
+	if os.Getenv(key) == "0" {
+		return 0, nil
+	}
+	return envDuration(key, def)
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
@@ -196,6 +234,29 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer rdb.Close()
 	gate := stockgate.New(rdb, cfg.redisPrefix)
 
+	orderCache, closeCache, err := openOrderCache(ctx, logger, cfg, rdb)
+	if err != nil {
+		return err
+	}
+	// 和 rdb 一样在 app.Run 返回、gRPC 停下之后关闭。
+	defer closeCache()
+
+	// 锁放在闸门那个实例上（noeviction），不放缓存实例：锁的 key 被淘汰等于凭空释放。
+	relayLeader, taskLockers, err := newLockers(logger, cfg, rdb)
+	if err != nil {
+		return err
+	}
+	sweeperLeader := taskLockers.Leader(sweeperLock)
+	reaperLeader := taskLockers.Leader(holdReaperLock)
+	// 主动释放 leader 锁，让别的副本马上接手，而不是等锁过期。defer 在 app.Run 返回、
+	// 所有 Loop 都停下之后执行（停下之前释放，Loop 的下一轮 Allow 会把锁重新抢回来），
+	// 并且在 rdb.Close 之前（defer 后进先出）。
+	defer releaseLeaders(ctx, logger, map[string]*lock.Leader{
+		relayLockName:  relayLeader,
+		sweeperLock:    sweeperLeader,
+		holdReaperLock: reaperLeader,
+	})
+
 	kcfg := kafkax.Config{Brokers: cfg.kafkaBrokers, ClientID: serviceName}
 	ordersTopic := eventx.Topic(cfg.kafkaPrefix, eventx.OrderEvents)
 	paymentsTopic := eventx.Topic(cfg.kafkaPrefix, eventx.PaymentEvents)
@@ -220,26 +281,32 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Sender:   producer,
 		Logger:   logger,
 		Interval: cfg.outboxInterval,
+		Guard:    lock.FailOpen(relayLeader, logger),
 	})
 	if err != nil {
 		return err
 	}
 
 	svc := service.New(service.Deps{
-		Store:     store.New(db),
-		Gate:      gate,
-		Sender:    producer,
-		Inventory: inventoryv1.NewInventoryServiceClient(conn),
-		IDs:       ids,
-		Logger:    logger,
+		Store:      store.New(db),
+		Gate:       gate,
+		Sender:     producer,
+		Inventory:  inventoryv1.NewInventoryServiceClient(conn),
+		IDs:        ids,
+		Logger:     logger,
+		OrderCache: orderCache,
 	}, service.Config{
-		PaymentTimeout:   cfg.paymentTimeout,
-		IdempotencyTTL:   cfg.idempotencyTTL,
-		OrderEventsTopic: ordersTopic,
-		SubmitTopic:      submitTopic,
-		CloseDelayTopic:  closeTopic,
-		Relay:            relay,
+		PaymentTimeout:    cfg.paymentTimeout,
+		IdempotencyTTL:    cfg.idempotencyTTL,
+		OrderEventsTopic:  ordersTopic,
+		SubmitTopic:       submitTopic,
+		CloseDelayTopic:   closeTopic,
+		Relay:             relay,
+		OrderCacheTTL:     cfg.orderCacheTTL,
+		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 	})
+	cfg.sweeper.Guard = lock.FailOpen(sweeperLeader, logger)
+	cfg.reaper.Guard = lock.FailOpen(reaperLeader, logger)
 	sweeper, err := service.NewSweeper(svc, cfg.sweeper)
 	if err != nil {
 		return err
@@ -300,8 +367,62 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	//     没发出的也不会丢，下次启动时中继会先跑一轮。
 	//  5. 健康检查最后停。
 	// 生产者、Redis、数据库和库存的连接由 defer 在 app.Run 返回后关闭，此时已没有组件在用。
+	// 三把 leader 锁也在 app.Run 返回后释放（先于 Redis 连接关闭）：此时中继、sweeper、回收任务都已停下。
 	return app.Run(ctx, logger, httpServer, relay,
 		submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
+}
+
+// openOrderCache 按配置创建订单查询缓存。ORDER_CACHE_TTL=0 时缓存为 nil（关闭）。
+// 缓存实例与闸门是同一个地址时复用 rdb，不另开连接池；否则新开一个客户端，由返回的 closeFn 关闭。
+func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb redis.Cmdable) (
+	c *cache.Cache[*orderv1.Order], closeFn func(), err error,
+) {
+	closeFn = func() {}
+	if cfg.orderCacheTTL == 0 {
+		logger.Info("order query cache disabled")
+		return nil, closeFn, nil
+	}
+	client := rdb
+	if cfg.cacheRedisAddr != cfg.redisAddr {
+		rctx, cancel := context.WithTimeout(ctx, redisStartTimeout)
+		defer cancel()
+		cdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.cacheRedisAddr})
+		if err != nil {
+			return nil, closeFn, fmt.Errorf("open cache redis: %w", err)
+		}
+		closeFn = func() { _ = cdb.Close() }
+		client = cdb
+	}
+	c, err = service.NewOrderCache(client, cfg.redisPrefix, logger)
+	if err != nil {
+		closeFn()
+		return nil, func() {}, err
+	}
+	return c, closeFn, nil
+}
+
+// newLockers 创建两个 Locker：中继一个（TTL 短），其余周期任务共用一个。
+func newLockers(logger *slog.Logger, cfg config, rdb redis.Scripter) (*lock.Leader, *lock.Locker, error) {
+	relayLocker, err := lock.New(rdb, lock.Options{TTL: relayLockTTL, KeyPrefix: cfg.redisPrefix, Logger: logger})
+	if err != nil {
+		return nil, nil, fmt.Errorf("new relay locker: %w", err)
+	}
+	taskLocker, err := lock.New(rdb, lock.Options{TTL: taskLockTTL, KeyPrefix: cfg.redisPrefix, Logger: logger})
+	if err != nil {
+		return nil, nil, fmt.Errorf("new task locker: %w", err)
+	}
+	return relayLocker.Leader(relayLockName), taskLocker, nil
+}
+
+// releaseLeaders 主动释放各 leader 锁。ctx 已结束（进程在退出），释放用独立的时限。
+func releaseLeaders(ctx context.Context, logger *slog.Logger, leaders map[string]*lock.Leader) {
+	for name, ld := range leaders {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderReleaseTimeout)
+		if err := ld.Close(rctx); err != nil {
+			logger.Warn("release leader lock failed", "lock", name, "error", err)
+		}
+		cancel()
+	}
 }
 
 // ensureTopics 创建本服务发布和消费的 topic 及其死信 topic。
