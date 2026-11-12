@@ -35,7 +35,15 @@ paths:
       tags: [orders]
       summary: 下单
       description: |
-        幂等：同一用户用相同的 `Idempotency-Key` 重复提交，只产生一个订单，重复请求返回同一个订单。
+        下单是异步的：请求先经过库存闸门，放行后进入队列，立即返回 202 和状态为 `creating` 的订单
+        （这时只有商品和数量，价格和总额在订单落库并预占库存之后才有）。
+        客户端轮询 `GET /api/v1/orders/{order_id}`，直到状态离开 `creating`：
+        `pending_payment` 表示下单成功，`failed` 表示失败。极少数情况下（受理后系统故障）订单会消失，
+        查询返回 404，这时用同一个 `Idempotency-Key` 重新提交。
+
+        库存不足、超出限购、商品不存在在提交时就能判断，直接返回错误，不会进入队列。
+
+        幂等：同一用户用相同的 `Idempotency-Key` 重复提交，只产生一个订单，重复请求返回同一个订单（当前状态）。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -45,8 +53,13 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateOrderRequest'
       responses:
-        '201':
-          description: 订单已创建（或幂等重放返回已有订单）
+        '202':
+          description: 下单请求已受理（或幂等重放返回已有订单）
+          headers:
+            Location:
+              description: 查询这个订单的地址
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -62,7 +75,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: 库存不足（`INSUFFICIENT_STOCK`），或幂等键已被内容不同的请求使用
+          description: |
+            库存不足（`INSUFFICIENT_STOCK`）、超出每人限购数量（`PURCHASE_LIMIT_EXCEEDED`），
+            或幂等键已被内容不同的请求使用（`IDEMPOTENCY_KEY_REUSED`）
           content:
             application/json:
               schema:
@@ -274,6 +289,8 @@ components:
     Error:
       description: |
         其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+        下单时等待落库的订单积压过多返回 429，原因码 `BACKLOGGED`：请求没有产生任何效果，
+        稍后用同一个 `Idempotency-Key` 重试即可。
       content:
         application/json:
           schema:

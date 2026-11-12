@@ -33,3 +33,8 @@
 | [0004](0004-opentelemetry.md) | 用 OpenTelemetry 做埋点标准 | 已采纳，细节待验证 |
 | [0005](0005-openapi-spec-first.md) | 对外 HTTP 接口用 OpenAPI 规范先行 | 已采纳 |
 | [0006](0006-money-as-integer-minor-units.md) | 金额用最小货币单位的整数表示 | 已采纳 |
+| [0007](0007-kafka-and-redis-clients.md) | Kafka 客户端用 franz-go，Redis 客户端用 go-redis | 已采纳 |
+| [0008](0008-outbox-and-events.md) | 用本地消息表（outbox）加 Kafka 做服务间的最终一致 | 已采纳 |
+| [0009](0009-delayed-close.md) | 超时关单用固定时长的延迟 topic，扫表兜底 | 已采纳 |
+| [0010](0010-query-cache.md) | 查询缓存用旁路模式，只缓存不会再变或旧了也无所谓的数据 | 已采纳 |
+| [0011](0011-admission-backpressure.md) | 异步下单的受理端按队列长度做背压 | 已采纳 |

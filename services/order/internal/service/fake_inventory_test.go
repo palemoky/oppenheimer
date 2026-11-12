@@ -12,6 +12,7 @@ import (
 	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 )
 
 // errTimeout 模拟调用超时：调用方无法知道下游是否执行了。
@@ -39,6 +40,7 @@ type fakeSKU struct {
 	price                     int64
 	currency                  string
 	available, reserved, sold int64
+	limit                     int64
 }
 
 type fakeReservation struct {
@@ -47,9 +49,10 @@ type fakeReservation struct {
 }
 
 // fakeInventory 是按 inventory.proto 契约实现的内存版库存服务，
-// 并能对每个方法按调用顺序注入故障。
+// 并能对每个方法按调用顺序注入故障。WarmUp 把数量装载进真实的闸门（Redis）。
 type fakeInventory struct {
 	mu     sync.Mutex
+	gate   *stockgate.Gate
 	skus   map[int64]*fakeSKU
 	res    map[int64]*fakeReservation
 	faults map[string][]fault
@@ -58,8 +61,9 @@ type fakeInventory struct {
 	applied map[string]int
 }
 
-func newFakeInventory() *fakeInventory {
+func newFakeInventory(gate *stockgate.Gate) *fakeInventory {
 	return &fakeInventory{
+		gate:    gate,
 		skus:    map[int64]*fakeSKU{},
 		res:     map[int64]*fakeReservation{},
 		faults:  map[string][]fault{},
@@ -72,6 +76,19 @@ func (f *fakeInventory) addSKU(id, price, available int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.skus[id] = &fakeSKU{price: price, currency: "CNY", available: available}
+}
+
+func (f *fakeInventory) setLimit(id, limit int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.skus[id].limit = limit
+}
+
+// setAvailable 直接改 MySQL 一侧的可售数量，用来制造“闸门比 MySQL 大”。
+func (f *fakeInventory) setAvailable(id, available int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.skus[id].available = available
 }
 
 func (f *fakeInventory) setCurrency(id int64, currency string) {
@@ -249,6 +266,38 @@ func (f *fakeInventory) GetStock(_ context.Context, in *inventoryv1.GetStockRequ
 		SkuId: in.GetSkuId(), Available: sku.available, Reserved: sku.reserved, Sold: sku.sold,
 		UnitPrice: &commonv1.Money{Amount: sku.price, Currency: sku.currency},
 	}, nil
+}
+
+// WarmUp 按契约把 SKU 装载进闸门：avail 取当前可售数量，已装载时只更新限购。
+func (f *fakeInventory) WarmUp(ctx context.Context, in *inventoryv1.WarmUpRequest, _ ...grpc.CallOption) (*inventoryv1.WarmUpResponse, error) {
+	ft := f.begin("WarmUp")
+	if ft.before != nil {
+		ft.before(0)
+	}
+	if ft.err != nil {
+		return nil, ft.err
+	}
+	type load struct{ sku, avail, limit int64 }
+	var (
+		loads []load
+		resp  = &inventoryv1.WarmUpResponse{}
+	)
+	f.mu.Lock()
+	for _, id := range in.GetSkuIds() {
+		sku, ok := f.skus[id]
+		if !ok {
+			resp.Missing = append(resp.Missing, id)
+			continue
+		}
+		loads = append(loads, load{id, sku.available, sku.limit})
+	}
+	f.mu.Unlock()
+	for _, l := range loads {
+		if _, err := f.gate.Load(ctx, l.sku, l.avail, l.limit); err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+	}
+	return resp, nil
 }
 
 var _ inventoryv1.InventoryServiceClient = (*fakeInventory)(nil)

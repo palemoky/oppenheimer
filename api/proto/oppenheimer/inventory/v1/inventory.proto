@@ -40,6 +40,12 @@ service InventoryService {
   // 错误：
   //   NOT_FOUND  reason=SKU_NOT_FOUND
   rpc GetStock(GetStockRequest) returns (GetStockResponse);
+
+  // WarmUp 把指定 SKU 的可售数量和限购数量装载进库存闸门（Redis）。
+  //
+  // 只在 SKU 尚未装载时写入数量，所以重复调用、并发调用都是安全的。
+  // 订单服务受理下单时遇到未装载的 SKU 才调用它。不存在的 SKU 不报错，列在 missing 里。
+  rpc WarmUp(WarmUpRequest) returns (WarmUpResponse);
 }
 
 message ReserveItem {
@@ -87,4 +93,13 @@ message GetStockResponse {
   int64 reserved = 3;
   int64 sold = 4;
   oppenheimer.common.v1.Money unit_price = 5;
+}
+
+message WarmUpRequest {
+  repeated int64 sku_ids = 1;
+}
+
+message WarmUpResponse {
+  // 库存服务里不存在的 SKU。
+  repeated int64 missing = 1;
 }

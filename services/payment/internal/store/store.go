@@ -24,17 +24,17 @@ var (
 
 // Payment 是 payments 表的一行。Status、Outcome 的数值与 proto 枚举一致，直接用枚举类型承载。
 type Payment struct {
-	PaymentID      int64
-	OrderID        int64
-	UserID         int64
-	Status         paymentv1.PaymentStatus
-	Amount         int64
-	Currency       string
-	Outcome        paymentv1.SimulatedOutcome
-	Notified       bool
-	NotifyAttempts int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	PaymentID int64
+	OrderID   int64
+	UserID    int64
+	Status    paymentv1.PaymentStatus
+	Amount    int64
+	Currency  string
+	Outcome   paymentv1.SimulatedOutcome
+	// Notified 表示订单服务已经答复了这笔支付的结果（order.events 的 payment_result_handled）。
+	Notified  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Store 访问 payments 表。
@@ -47,7 +47,7 @@ func New(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-const columns = "payment_id, order_id, user_id, status, amount, currency, outcome, notified, notify_attempts, created_at, updated_at"
+const columns = "payment_id, order_id, user_id, status, amount, currency, outcome, notified, created_at, updated_at"
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -59,7 +59,7 @@ func scanPayment(row scanner) (Payment, error) {
 		status, outcome int32
 	)
 	err := row.Scan(&p.PaymentID, &p.OrderID, &p.UserID, &status, &p.Amount, &p.Currency,
-		&outcome, &p.Notified, &p.NotifyAttempts, &p.CreatedAt, &p.UpdatedAt)
+		&outcome, &p.Notified, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return Payment{}, err
 	}
@@ -67,6 +67,19 @@ func scanPayment(row scanner) (Payment, error) {
 	p.Outcome = paymentv1.SimulatedOutcome(outcome)
 	p.CreatedAt = p.CreatedAt.UTC()
 	p.UpdatedAt = p.UpdatedAt.UTC()
+	return p, nil
+}
+
+// GetByID 按支付单号查询支付单，不存在时返回 ErrNotFound。
+func (s *Store) GetByID(ctx context.Context, paymentID int64) (Payment, error) {
+	row := s.db.QueryRowContext(ctx, "SELECT "+columns+" FROM payments WHERE payment_id = ?", paymentID)
+	p, err := scanPayment(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Payment{}, ErrNotFound
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("get payment %d: %w", paymentID, err)
+	}
 	return p, nil
 }
 
@@ -88,8 +101,8 @@ func (s *Store) GetByOrderID(ctx context.Context, orderID int64) (Payment, error
 // 同一订单已有支付单时返回 ErrDuplicate。
 func (s *Store) Insert(ctx context.Context, p Payment) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO payments (payment_id, order_id, user_id, status, amount, currency, outcome, notified, notify_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+		`INSERT INTO payments (payment_id, order_id, user_id, status, amount, currency, outcome, notified, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 		p.PaymentID, p.OrderID, p.UserID, int32(p.Status), p.Amount, p.Currency, int32(p.Outcome), p.CreatedAt, p.CreatedAt)
 	if mysqlx.IsDuplicateKey(err) {
 		return ErrDuplicate
@@ -104,26 +117,9 @@ func (s *Store) Insert(ctx context.Context, p Payment) error {
 func (s *Store) ListPendingCreatedBefore(ctx context.Context, before time.Time, limit int) ([]Payment, error) {
 	return s.list(ctx,
 		"SELECT "+columns+` FROM payments
-		 WHERE status = ? AND notified = 0 AND created_at <= ?
+		 WHERE status = ? AND created_at <= ?
 		 ORDER BY created_at LIMIT ?`,
 		int32(paymentv1.PaymentStatus_PAYMENT_STATUS_PENDING), before, limit)
-}
-
-// ListUnnotifiedDue 返回已出结果（SUCCEEDED 或 FAILED）、尚未回调成功、且已到重试时间的支付单，最多 limit 条。
-//
-// 从未尝试过的（notify_attempts = 0）立即到期；尝试过 n 次的，在 updated_at 之后
-// min(base × 2^n, maxDelay) 到期。退避在 SQL 里算，是为了让 LIMIT 只截取真正到期的行：
-// 若在 Go 里过滤，一批里可能全是未到期的行，把到期的挤出去。
-// 移位次数封顶，避免 notify_attempts 很大时溢出；封顶后的值远大于 maxDelay，不影响结果。
-func (s *Store) ListUnnotifiedDue(ctx context.Context, now time.Time, base, maxDelay time.Duration, limit int) ([]Payment, error) {
-	return s.list(ctx,
-		"SELECT "+columns+` FROM payments
-		 WHERE status IN (?, ?) AND notified = 0
-		   AND (notify_attempts = 0
-		        OR TIMESTAMPADD(MICROSECOND, LEAST(? << LEAST(notify_attempts, 32), ?), updated_at) <= ?)
-		 ORDER BY updated_at LIMIT ?`,
-		int32(paymentv1.PaymentStatus_PAYMENT_STATUS_SUCCEEDED), int32(paymentv1.PaymentStatus_PAYMENT_STATUS_FAILED),
-		base.Microseconds(), maxDelay.Microseconds(), now, limit)
 }
 
 func (s *Store) list(ctx context.Context, query string, args ...any) ([]Payment, error) {
@@ -147,40 +143,48 @@ func (s *Store) list(ctx context.Context, query string, args ...any) ([]Payment,
 	return out, nil
 }
 
-// CompletePending 把 PENDING 的支付单改为 to（SUCCEEDED 或 FAILED）。
-func (s *Store) CompletePending(ctx context.Context, paymentID int64, to paymentv1.PaymentStatus, now time.Time) (bool, error) {
-	return s.exec(ctx, "complete payment",
+// InTx 在一个事务里执行 fn，供需要把状态变更和 outbox 写在一起的调用方使用。
+func (s *Store) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return mysqlx.InTx(ctx, s.db, fn)
+}
+
+// CompletePending 在事务 tx 里把 PENDING 的支付单改为 to（SUCCEEDED 或 FAILED）。
+//
+// 只接受 *sql.Tx：出结果必须和 PaymentEvent 写进同一个事务（见 processor），
+// 从类型上避免有人在事务外改了状态却忘了写事件。
+func (s *Store) CompletePending(ctx context.Context, tx *sql.Tx, paymentID int64, to paymentv1.PaymentStatus, now time.Time) (bool, error) {
+	return exec(ctx, tx, "complete payment",
 		"UPDATE payments SET status = ?, updated_at = ? WHERE payment_id = ? AND status = ?",
 		int32(to), now, paymentID, int32(paymentv1.PaymentStatus_PAYMENT_STATUS_PENDING))
 }
 
-// MarkNotified 在状态仍为 status 且尚未标记时，把支付单标记为订单服务已确认收到。
+// MarkNotified 在状态仍为 status 且尚未标记时，把支付单标记为订单服务已答复。
+//
+// 以 status 为前置条件：答复针对的是读到的那个状态。若期间状态变了（例如被退款），这次标记不生效。
 func (s *Store) MarkNotified(ctx context.Context, paymentID int64, status paymentv1.PaymentStatus, now time.Time) (bool, error) {
-	return s.exec(ctx, "mark payment notified",
+	return exec(ctx, s.db, "mark payment notified",
 		"UPDATE payments SET notified = 1, updated_at = ? WHERE payment_id = ? AND status = ? AND notified = 0",
 		now, paymentID, int32(status))
 }
 
-// RefundAndMarkNotified 把 SUCCEEDED 且尚未标记的支付单改为 REFUNDED 并标记已回调。
+// RefundAndMarkNotified 把 SUCCEEDED 且尚未标记的支付单改为 REFUNDED 并标记已答复。
 // 两件事在同一条语句里完成，不存在“退了款却没标记”而被再次处理的中间状态。
+//
+// 前置条件带 notified = 0：订单服务对同一笔支付的第一次答复为准。
+// 已经被答复“接受”的支付（订单已付清）不能再因为一条矛盾的答复被退款。
 func (s *Store) RefundAndMarkNotified(ctx context.Context, paymentID int64, now time.Time) (bool, error) {
-	return s.exec(ctx, "refund payment",
+	return exec(ctx, s.db, "refund payment",
 		"UPDATE payments SET status = ?, notified = 1, updated_at = ? WHERE payment_id = ? AND status = ? AND notified = 0",
 		int32(paymentv1.PaymentStatus_PAYMENT_STATUS_REFUNDED), now, paymentID,
 		int32(paymentv1.PaymentStatus_PAYMENT_STATUS_SUCCEEDED))
 }
 
-// IncrNotifyAttempts 记录一次失败的回调。以读到的 attempts 为前置条件，
-// 两个处理者同时回调失败时只记一次，退避不会被重复放大。
-func (s *Store) IncrNotifyAttempts(ctx context.Context, paymentID int64, status paymentv1.PaymentStatus, attempts int, now time.Time) (bool, error) {
-	return s.exec(ctx, "increment notify attempts",
-		`UPDATE payments SET notify_attempts = notify_attempts + 1, updated_at = ?
-		 WHERE payment_id = ? AND status = ? AND notified = 0 AND notify_attempts = ?`,
-		now, paymentID, int32(status), attempts)
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func (s *Store) exec(ctx context.Context, op, query string, args ...any) (bool, error) {
-	res, err := s.db.ExecContext(ctx, query, args...)
+func exec(ctx context.Context, db execer, op, query string, args ...any) (bool, error) {
+	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", op, err)
 	}

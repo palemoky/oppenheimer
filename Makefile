@@ -21,6 +21,12 @@ MYSQL_ROOT_PASSWORD ?= oppenheimer
 MYSQL_PORT          ?= 3306
 export OPPENHEIMER_TEST_MYSQL_DSN ?= root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:$(MYSQL_PORT))/
 
+# 集成测试连接的 Redis 和 Kafka，同样是 make up 启动的。测试各自用随机前缀和临时 topic 隔离。
+REDIS_PORT ?= 6379
+KAFKA_PORT ?= 9092
+export OPPENHEIMER_TEST_REDIS_ADDR    ?= 127.0.0.1:$(REDIS_PORT)
+export OPPENHEIMER_TEST_KAFKA_BROKERS ?= 127.0.0.1:$(KAFKA_PORT)
+
 .PHONY: help
 help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -68,8 +74,8 @@ test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
 
 .PHONY: test-unit
-test-unit: ## 只运行不依赖 MySQL 的测试
-	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= go test -race ./...) || exit 1; done
+test-unit: ## 只运行不依赖 MySQL、Redis、Kafka 的测试
+	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
 
 .PHONY: build
 build: ## 编译所有模块，并把各服务的二进制输出到 ./bin
@@ -91,6 +97,18 @@ run: build ## 在本机启动四个服务（需要先 make up），Ctrl-C 停止
 e2e: build ## 端到端测试：在独立的 e2e_* 库上启动四个服务并对网关跑测试（需要先 make up）
 	scripts/e2e.sh
 
+.PHONY: chaos
+chaos: build ## 杀进程对账测试：压测期间随机 kill -9 服务，静止后对账（需要先 make up，CHAOS_* 变量见脚本）
+	scripts/chaos.sh
+
+.PHONY: bench
+bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本）
+	scripts/bench.sh
+
+.PHONY: load
+load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"
+	go run ./test/load run $(LOAD_ARGS)
+
 .PHONY: seed
 seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次、表已建好之后）
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) inventory_db -e \
@@ -102,7 +120,7 @@ seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次�
 ## ---------- 本地依赖 ----------
 
 .PHONY: up
-up: ## 启动 MySQL、Redis、Kafka 并等待就绪
+up: ## 启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪
 	$(COMPOSE) up -d --wait
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
 		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS order_db; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null

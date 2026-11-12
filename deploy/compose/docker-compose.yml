@@ -1,4 +1,4 @@
-# 本地开发依赖：单实例的 MySQL、Redis、Kafka。
+# 本地开发依赖：单实例的 MySQL、Redis（另有一个缓存专用实例）、Kafka。
 # 版本登记在 docs/infra/versions.md。端口只绑定到 127.0.0.1。
 name: oppenheimer
 
@@ -42,6 +42,29 @@ services:
       - 127.0.0.1:${REDIS_PORT:-6379}:6379
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 查询缓存专用的实例，配置与上面的 redis 正相反：内存满了淘汰旧 key，不持久化。
+  # 两者不能合并：缓存涨满内存会让 noeviction 的实例拒绝写入，库存闸门跟着不可用
+  # （设计文档 1b 的 7.2.5）。锁和闸门留在 redis，这里只放丢了可以重建的数据。
+  redis-cache:
+    image: redis:8.10.3
+    command:
+      - redis-server
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - 127.0.0.1:${CACHE_REDIS_PORT:-6380}:6379
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

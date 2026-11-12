@@ -1,11 +1,13 @@
-// Package service 实现 OrderService 的业务逻辑与后台任务。
+// Package service 实现 OrderService 的业务逻辑、事件消费与后台任务。
 //
-// 一致性的基本做法：先在本地事务里完成订单自己的状态转换，再调用库存服务；
-// 库存接口都以 order_id 幂等，调用失败的由后台任务重试。
+// 一致性的基本做法：订单的每个状态转换和描述它的 OrderEvent 写在同一个本地事务里（outbox），
+// 由 outbox 中继发到 Kafka，库存和支付服务消费事件跟上订单状态。
+//
+// 下单分两段（设计文档 6.3）：受理（SubmitOrder）只碰 Redis 里的库存闸门和 Kafka，立即返回；
+// 落库（HandleOrderSubmitted）消费 order.submit，写订单行并同步 Reserve。Reserve 以 order_id 幂等。
 package service
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -15,16 +17,27 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/palemoky/Oppenheimer/api/eventx"
 	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
+	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/Oppenheimer/pkg/outbox"
+	"github.com/palemoky/Oppenheimer/pkg/retry"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
 
@@ -33,6 +46,13 @@ const ReasonCreateTimeout = errx.ReasonCreateTimeout
 
 // DefaultPaymentTimeout 是下单后等待支付的默认时限。
 const DefaultPaymentTimeout = 15 * time.Minute
+
+// DefaultIdempotencyTTL 是幂等键在 Redis 里的默认保留时长。
+const DefaultIdempotencyTTL = 24 * time.Hour
+
+// DefaultSubmitTimeout 是受理一个下单请求的时限（闸门、按需预热、发消息合计）。
+// 调用方给的 deadline 更短时以调用方为准。
+const DefaultSubmitTimeout = 3 * time.Second
 
 // 预占成功前写入的币种占位，与表的默认值一致，预占成功后改为库存服务给出的币种。
 const placeholderCurrency = "CNY"
@@ -44,39 +64,108 @@ type IDGenerator interface {
 	Next(shardKey int64) (int64, error)
 }
 
+// Kicker 在事务提交后被调用，让 outbox 中继立即发送。*outbox.Relay 满足此接口。
+type Kicker interface {
+	Kick()
+}
+
 // Config 是 Service 的可选配置，零值字段使用默认值。
 type Config struct {
 	// PaymentTimeout 是下单后等待支付的时限，默认 DefaultPaymentTimeout。
 	PaymentTimeout time.Duration
+	// IdempotencyTTL 是幂等键在闸门里的保留时长，默认 DefaultIdempotencyTTL。
+	IdempotencyTTL time.Duration
+	// SubmitTimeout 是受理一个请求的时限，默认 DefaultSubmitTimeout。
+	SubmitTimeout time.Duration
 	// Clock 返回当前时间，默认 time.Now。测试里注入以控制超时。
 	Clock func() time.Time
+	// OrderEventsTopic 是 OrderEvent 写入 outbox 时的 topic（已带环境前缀），默认 eventx.OrderEvents。
+	OrderEventsTopic string
+	// SubmitTopic、CloseDelayTopic 是受理时发出的两条消息的 topic（已带环境前缀），
+	// 默认 eventx.OrderSubmit、eventx.OrderCloseDelay。
+	SubmitTopic     string
+	CloseDelayTopic string
+	// Relay 可选。为空时事件只靠中继的兜底轮询发出，正确性不受影响，只是延迟变大。
+	Relay Kicker
+	// OrderCacheTTL 是终态订单在查询缓存里的保留时长，默认 DefaultOrderCacheTTL。
+	// 只在 Deps.OrderCache 非空时有意义。
+	OrderCacheTTL time.Duration
+	// OrderCacheNullTTL 是“订单不存在”在查询缓存里的保留时长，默认 DefaultOrderCacheNullTTL。
+	OrderCacheNullTTL time.Duration
+	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
+	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
+	Backlog stockgate.BacklogLimit
+}
+
+// Deps 是 Service 依赖的外部组件。
+type Deps struct {
+	Store     *store.Store
+	Gate      *stockgate.Gate
+	Sender    kafkax.Sender
+	Inventory inventoryv1.InventoryServiceClient
+	IDs       IDGenerator
+	// Logger 为空时用 slog.Default()。
+	Logger *slog.Logger
+	// OrderCache 可选，GetOrder 的查询缓存（设计文档 7.2.3），用 NewOrderCache 创建。
+	// 为空时 GetOrder 每次都读库。
+	OrderCache *cache.Cache[*orderv1.Order]
 }
 
 // Service 实现 orderv1.OrderServiceServer。
 type Service struct {
 	orderv1.UnimplementedOrderServiceServer
 
-	store          *store.Store
-	inventory      inventoryv1.InventoryServiceClient
+	store     *store.Store
+	gate      *stockgate.Gate
+	sender    kafkax.Sender
+	inventory inventoryv1.InventoryServiceClient
+	// warmUps 合并对同一组 SKU 的并发预热，见 warmUp。
+	warmUps        singleflight.Group
 	ids            IDGenerator
 	logger         *slog.Logger
 	paymentTimeout time.Duration
+	idemTTL        time.Duration
+	submitTimeout  time.Duration
 	clock          func() time.Time
+	eventsTopic    string
+	submitTopic    string
+	closeTopic     string
+	relay          Kicker
+	orderCache     *cache.Cache[*orderv1.Order]
+	cacheTTL       time.Duration
+	cacheNullTTL   time.Duration
+	backlog        stockgate.BacklogLimit
 }
 
 // New 返回 Service。
-func New(st *store.Store, inventory inventoryv1.InventoryServiceClient, ids IDGenerator, logger *slog.Logger, cfg Config) *Service {
+func New(d Deps, cfg Config) *Service {
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
 	}
+	logger := d.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Service{
-		store:          st,
-		inventory:      inventory,
-		ids:            ids,
+		store:          d.Store,
+		gate:           d.Gate,
+		sender:         d.Sender,
+		inventory:      d.Inventory,
+		ids:            d.IDs,
 		logger:         logger,
 		paymentTimeout: cmp.Or(cfg.PaymentTimeout, DefaultPaymentTimeout),
+		idemTTL:        cmp.Or(cfg.IdempotencyTTL, DefaultIdempotencyTTL),
+		submitTimeout:  cmp.Or(cfg.SubmitTimeout, DefaultSubmitTimeout),
 		clock:          clock,
+		eventsTopic:    cmp.Or(cfg.OrderEventsTopic, eventx.OrderEvents),
+		submitTopic:    cmp.Or(cfg.SubmitTopic, eventx.OrderSubmit),
+		closeTopic:     cmp.Or(cfg.CloseDelayTopic, eventx.OrderCloseDelay),
+		relay:          cfg.Relay,
+		orderCache:     d.OrderCache,
+		cacheTTL:       cmp.Or(cfg.OrderCacheTTL, DefaultOrderCacheTTL),
+		cacheNullTTL:   cmp.Or(cfg.OrderCacheNullTTL, DefaultOrderCacheNullTTL),
+		backlog:        cfg.Backlog,
 	}
 }
 
@@ -103,54 +192,10 @@ func (s *Service) internal(ctx context.Context, op string, err error, attrs ...a
 	return errInternal
 }
 
-// ---------- CreateOrder ----------
+// ---------- 校验与请求哈希 ----------
 
-// CreateOrder 实现 OrderServiceServer。
-func (s *Service) CreateOrder(ctx context.Context, req *orderv1.CreateOrderRequest) (*orderv1.CreateOrderResponse, error) {
-	items, err := validateCreate(req)
-	if err != nil {
-		return nil, err
-	}
-	hash := requestHash(items)
-
-	orderID, err := s.ids.Next(req.GetUserId())
-	if err != nil {
-		return nil, s.internal(ctx, "generate order id", err)
-	}
-	now := s.now()
-	o := &store.Order{
-		OrderID:        orderID,
-		UserID:         req.GetUserId(),
-		Status:         orderv1.OrderStatus_ORDER_STATUS_CREATING,
-		Currency:       placeholderCurrency,
-		IdempotencyKey: req.GetIdempotencyKey(),
-		RequestHash:    hash,
-		ExpireAt:       now.Add(s.paymentTimeout),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Items:          items,
-	}
-	err = s.store.InsertOrder(ctx, o)
-	switch {
-	case errors.Is(err, store.ErrDuplicate):
-		existing, err := s.store.GetOrderByIdempotencyKey(ctx, req.GetUserId(), req.GetIdempotencyKey())
-		if err != nil {
-			// 唯一键冲突却按幂等键找不到，只可能是 order_id 本身重复，属于 idgen 的问题。
-			return nil, s.internal(ctx, "load order by idempotency key", err, "user_id", req.GetUserId())
-		}
-		if !bytes.Equal(existing.RequestHash, hash) {
-			return nil, errx.New(codes.AlreadyExists, errx.ReasonIdempotencyKeyReused,
-				"idempotency key was used for a different request")
-		}
-		o = existing
-	case err != nil:
-		return nil, s.internal(ctx, "insert order", err, "user_id", req.GetUserId())
-	}
-	return s.advance(ctx, o)
-}
-
-// validateCreate 校验请求，返回按 sku_id 排序的明细。
-func validateCreate(req *orderv1.CreateOrderRequest) ([]store.Item, error) {
+// validateSubmit 校验请求，返回按 sku_id 排序的明细。
+func validateSubmit(req *orderv1.SubmitOrderRequest) ([]store.Item, error) {
 	if req.GetUserId() <= 0 {
 		return nil, invalidArgument("user_id must be positive")
 	}
@@ -170,13 +215,17 @@ func validateCreate(req *orderv1.CreateOrderRequest) ([]store.Item, error) {
 		}
 		items = append(items, store.Item{SKUID: it.GetSkuId(), Quantity: it.GetQuantity()})
 	}
-	slices.SortFunc(items, func(a, b store.Item) int { return cmp.Compare(a.SKUID, b.SKUID) })
+	sortItems(items)
 	for i := 1; i < len(items); i++ {
 		if items[i].SKUID == items[i-1].SKUID {
 			return nil, invalidArgument("duplicate sku_id %d", items[i].SKUID)
 		}
 	}
 	return items, nil
+}
+
+func sortItems(items []store.Item) {
+	slices.SortFunc(items, func(a, b store.Item) int { return cmp.Compare(a.SKUID, b.SKUID) })
 }
 
 // requestHash 对排好序的 (sku_id, quantity) 序列做 SHA-256。
@@ -192,11 +241,25 @@ func requestHash(sorted []store.Item) []byte {
 	return h.Sum(nil)
 }
 
-// advance 把一个已落库的订单往前推进一步，对任意状态的订单都可以安全地重复调用：
+// ---------- 推进：Reserve ----------
+
+// ErrUnrecoverable 表示订单卡在了重试也解决不了的状态（预占结果不可用、预占明细不一致），
+// 需要人工介入。订单保持 CREATING，由 sweeper 按创建超时置为失败并释放库存。
+// Kafka 适配层把它转成 kafkax.Permanent。
+var ErrUnrecoverable = errors.New("unrecoverable")
+
+// errReserveUnknown 表示 Reserve 的结果未知（超时、不可达），预占可能成功也可能没有。
+// 订单保持 CREATING，原地重试即可：Reserve 以 order_id 幂等。
+var errReserveUnknown = errors.New("reserve outcome unknown")
+
+// advance 把一个已落库的订单往前推进一步，返回推进后的订单。对任意状态的订单都可以安全地重复调用：
 // Reserve 以 order_id 幂等，状态更新都带前置条件。
-func (s *Service) advance(ctx context.Context, o *store.Order) (*orderv1.CreateOrderResponse, error) {
+//
+// 被库存拒绝不是错误：订单置为 FAILED（同事务写 failed 事件）后正常返回。
+// 返回错误时订单保持 CREATING：errReserveUnknown 和数据库错误可以重试，ErrUnrecoverable 不行。
+func (s *Service) advance(ctx context.Context, o *store.Order) (*store.Order, error) {
 	if o.Status != orderv1.OrderStatus_ORDER_STATUS_CREATING {
-		return answerCreate(o)
+		return o, nil
 	}
 
 	reserveItems := make([]*inventoryv1.ReserveItem, 0, len(o.Items))
@@ -212,12 +275,12 @@ func (s *Service) advance(ctx context.Context, o *store.Order) (*orderv1.CreateO
 	if err != nil {
 		// 预占已成功但结果不可用，且重试也会得到同样的结果。保持 CREATING，
 		// 由后台任务按创建超时置为失败并释放库存。
-		return nil, s.internal(ctx, "invalid reserve response", err, "order_id", o.OrderID)
+		return nil, fmt.Errorf("%w: invalid reserve response for order %d: %w", ErrUnrecoverable, o.OrderID, err)
 	}
 	now := s.now()
 	ok, err := s.store.MarkReserved(ctx, o.OrderID, total, currency, priced, now)
 	if err != nil {
-		return nil, s.internal(ctx, "mark order reserved", err, "order_id", o.OrderID)
+		return nil, fmt.Errorf("mark order %d reserved: %w", o.OrderID, err)
 	}
 	if ok {
 		o.Status = orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT
@@ -225,51 +288,49 @@ func (s *Service) advance(ctx context.Context, o *store.Order) (*orderv1.CreateO
 		o.Currency = currency
 		o.Items = priced
 		o.UpdatedAt = now
-		return answerCreate(o)
+		return o, nil
 	}
 
-	cur, err := s.store.GetOrder(ctx, o.OrderID)
-	if err != nil {
-		return nil, s.internal(ctx, "reload order", err, "order_id", o.OrderID)
-	}
 	// 走到这里说明订单在 Reserve 期间被别人改了状态。若它已是 FAILED，本次成功的预占
-	// 不需要在这里处理：把订单置为 FAILED 的一方必然留下了未结清标记或“已释放”标记
-	// （见 handleReserveError），这份预占会被 Release 掉。
-	return answerCreate(cur)
+	// 不需要在这里处理：把订单置为 FAILED 的一方在同一个事务里写了 failed 事件，
+	// 库存服务消费它时会 Release 掉这份预占（或留下“已释放”标记挡住还在路上的 Reserve）。
+	return s.reload(ctx, o.OrderID)
 }
 
-func (s *Service) handleReserveError(ctx context.Context, o *store.Order, reserveErr error) (*orderv1.CreateOrderResponse, error) {
+func (s *Service) reload(ctx context.Context, orderID int64) (*store.Order, error) {
+	cur, err := s.store.GetOrder(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("reload order %d: %w", orderID, err)
+	}
+	return cur, nil
+}
+
+func (s *Service) handleReserveError(ctx context.Context, o *store.Order, reserveErr error) (*store.Order, error) {
 	switch reason := errx.Reason(reserveErr); reason {
 	case errx.ReasonSKUNotFound, errx.ReasonInsufficientStock, errx.ReasonReservationReleased:
-		// RESERVATION_RELEASED 说明库存侧已有“已释放”标记，此后任何 Reserve 都会被拒，可以直接记为已结清。
-		//
-		// 另外两种拒绝只说明“这一次”Reserve 没有占到库存，不能推出“这个订单没有预占”：
-		// 同一订单可能有另一次推进在并发进行（客户端重试），库存恰好在两次之间被释放出来，
-		// 那一次的 Reserve 就会成功。所以这里记为未结清并调用一次 Release：
-		// 它释放可能存在的预占，没有预占时留下标记挡住之后的 Reserve。多一次幂等调用，换来不依赖时序的正确性。
-		settled := reason == errx.ReasonReservationReleased
-		ok, err := s.store.MarkCreateFailed(ctx, o.OrderID, reason, settled, s.now())
+		// 拒绝只说明“这一次”Reserve 没有占到库存，不能推出“这个订单没有预占”：
+		// 同一订单可能有另一次推进在并发进行（同一条消息被重复投递），库存恰好在两次之间被释放出来，
+		// 那一次的 Reserve 就会成功。所以不区分原因，一律置为 FAILED 并发 failed 事件，
+		// 由库存服务 Release：它释放可能存在的预占，没有预占时留下标记挡住之后的 Reserve，
+		// 之后再归还闸门里的占用。Release 幂等，多一次无害；这条路径上没有对库存的同步写调用。
+		now := s.now()
+		ok, err := s.failCreating(ctx, store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}, reason, now)
 		if err != nil {
-			return nil, s.internal(ctx, "mark order failed", err, "order_id", o.OrderID)
+			return nil, fmt.Errorf("mark order %d failed: %w", o.OrderID, err)
 		}
-		if ok {
-			if !settled {
-				s.settleBestEffort(ctx, o.OrderID, orderv1.OrderStatus_ORDER_STATUS_FAILED)
-			}
-			return nil, reserveErr
+		if !ok {
+			return s.reload(ctx, o.OrderID)
 		}
-		cur, err := s.store.GetOrder(ctx, o.OrderID)
-		if err != nil {
-			return nil, s.internal(ctx, "reload order", err, "order_id", o.OrderID)
-		}
-		return answerCreate(cur)
+		o.Status = orderv1.OrderStatus_ORDER_STATUS_FAILED
+		o.FailReason = reason
+		o.UpdatedAt = now
+		return o, nil
 	case errx.ReasonReservationMismatch:
 		// 每次推进发出的明细都来自同一份落库数据，不可能不一致。不自作主张修复。
-		return nil, s.internal(ctx, "reservation mismatch, needs manual intervention", reserveErr, "order_id", o.OrderID)
+		return nil, fmt.Errorf("%w: reservation mismatch for order %d: %w", ErrUnrecoverable, o.OrderID, reserveErr)
 	default:
-		// 超时、不可达等：预占可能成功也可能没有。保持 CREATING，让客户端用同一幂等键重试。
-		s.logger.WarnContext(ctx, "reserve outcome unknown", "order_id", o.OrderID, "error", reserveErr)
-		return nil, status.Error(codes.Unavailable, "inventory unavailable, retry with the same idempotency key")
+		// 超时、不可达等：预占可能成功也可能没有。保持 CREATING，由调用方重试。
+		return nil, fmt.Errorf("order %d: %w: %w", o.OrderID, errReserveUnknown, reserveErr)
 	}
 }
 
@@ -332,31 +393,6 @@ func addAmount(a, b int64) (int64, bool) {
 	return a + b, true
 }
 
-// answerCreate 按订单当前状态给出 CreateOrder 的答复。
-func answerCreate(o *store.Order) (*orderv1.CreateOrderResponse, error) {
-	if o.Status == orderv1.OrderStatus_ORDER_STATUS_FAILED {
-		return nil, failError(o.FailReason)
-	}
-	return &orderv1.CreateOrderResponse{Order: toProto(o)}, nil
-}
-
-// failError 把 fail_reason 还原成第一次失败时返回给调用方的错误类别，使重复请求得到相同的错误。
-func failError(reason string) error {
-	switch reason {
-	case errx.ReasonSKUNotFound:
-		return errx.New(codes.NotFound, reason, "sku not found")
-	case errx.ReasonInsufficientStock:
-		return errx.New(codes.FailedPrecondition, reason, "insufficient stock")
-	case errx.ReasonReservationReleased:
-		return errx.New(codes.FailedPrecondition, reason, "reservation already released")
-	case ReasonCreateTimeout:
-		// 同一幂等键重试也不会再成功，所以不用 UNAVAILABLE。
-		return errx.New(codes.Aborted, reason, "order creation timed out, use a new idempotency key")
-	default:
-		return errInternal
-	}
-}
-
 func toProto(o *store.Order) *orderv1.Order {
 	items := make([]*orderv1.OrderItem, 0, len(o.Items))
 	for _, it := range o.Items {
@@ -381,30 +417,190 @@ func toProto(o *store.Order) *orderv1.Order {
 	return p
 }
 
+// cacheable 判断某个状态的订单能否放进查询缓存（设计文档 7.2.3）：只有终态可以。
+// 终态不会再变，缓存永远不会和数据库不一致，所以不需要任何失效逻辑。
+//
+// 以后如果终态之后还能变（发货、退款），这里必须跟着改，否则缓存会返回旧状态。
+// 测试要求枚举里每个状态都在这里明确归类，新增状态时测试失败，逼着做决定。
+func cacheable(st orderv1.OrderStatus) bool {
+	switch st {
+	case orderv1.OrderStatus_ORDER_STATUS_PAID,
+		orderv1.OrderStatus_ORDER_STATUS_CANCELLED,
+		orderv1.OrderStatus_ORDER_STATUS_CLOSED,
+		orderv1.OrderStatus_ORDER_STATUS_FAILED:
+		return true
+	case orderv1.OrderStatus_ORDER_STATUS_UNSPECIFIED,
+		orderv1.OrderStatus_ORDER_STATUS_CREATING,
+		orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT:
+		return false
+	default:
+		return false
+	}
+}
+
 // ---------- GetOrder ----------
 
+// 查询缓存的默认保留时长。
+const (
+	DefaultOrderCacheTTL     = 10 * time.Minute
+	DefaultOrderCacheNullTTL = 2 * time.Second
+)
+
+// NewOrderCache 创建 GetOrder 用的查询缓存。client 应当是允许淘汰的缓存实例，prefix 遵守 redisx 的前缀约定。
+//
+// 不做进程间的重建互斥：按订单号的 key 没有热点，而非终态订单的回源结果又不写缓存，
+// 互斥多出的两次 Redis 往返换不来东西（设计文档 7.2.5）。
+func NewOrderCache(client redis.Cmdable, prefix string, logger *slog.Logger) (*cache.Cache[*orderv1.Order], error) {
+	c, err := cache.New(cache.Config{
+		Client:      client,
+		KeyPrefix:   prefix,
+		DisableLock: true,
+		Logger:      logger,
+	}, cache.ProtoCodec[*orderv1.Order]{})
+	if err != nil {
+		return nil, fmt.Errorf("new order cache: %w", err)
+	}
+	return c, nil
+}
+
+func orderCacheKey(orderID int64) string {
+	return "cache:order:" + strconv.FormatInt(orderID, 10)
+}
+
 // GetOrder 实现 OrderServiceServer。
+//
+// 只有这条读路径走缓存。写路径、状态机和内部决策（例如 CancelOrder 之后的复查）都直接读库：
+// 缓存里只有终态订单，读到它们本身不会出错，但没有理由让决策依赖一个可选组件。
 func (s *Service) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*orderv1.GetOrderResponse, error) {
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, invalidArgument("order_id and user_id must be positive")
 	}
-	o, err := s.loadOwned(ctx, req.GetOrderId(), req.GetUserId())
+	var (
+		o   *orderv1.Order
+		ok  bool
+		err error
+	)
+	if s.orderCache == nil {
+		o, ok, err = s.fetch(ctx, req.GetOrderId())
+	} else {
+		o, ok, err = s.fetchCached(ctx, req.GetOrderId())
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &orderv1.GetOrderResponse{Order: toProto(o)}, nil
+	// 缓存的内容与请求方无关，归属在拿到结果之后核对（命中和未命中两条路径一样）。
+	if !ok || o.GetUserId() != req.GetUserId() {
+		return nil, orderNotFound(req.GetOrderId())
+	}
+	// o 可能是缓存或 singleflight 里与其他调用共享的对象，这里只读不改。
+	return &orderv1.GetOrderResponse{Order: o}, nil
 }
 
-// loadOwned 读属于 userID 的订单。不属于该用户时与不存在一样返回 NOT_FOUND，不泄露订单是否存在。
-func (s *Service) loadOwned(ctx context.Context, orderID, userID int64) (*store.Order, error) {
-	o, err := s.store.GetOrder(ctx, orderID)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && o.UserID != userID) {
+// fetchCached 是带查询缓存的 fetch。回源结果按内容决定是否缓存：
+//   - 终态订单：缓存 cacheTTL。
+//   - 非终态订单（包括从占用合成的 CREATING）：不缓存。
+//   - 不存在（行和占用都没有，且复查仍没有）：缓存空值 cacheNullTTL。
+//
+// 已受理未落库的订单在 fetch 里从占用合成，Found 为 true，所以不会被写成空值。
+func (s *Service) fetchCached(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	o, ok, err := s.orderCache.Get(ctx, orderCacheKey(orderID), func(ctx context.Context) (cache.Loaded[*orderv1.Order], error) {
+		o, ok, err := s.fetch(ctx, orderID)
+		if err != nil {
+			return cache.Loaded[*orderv1.Order]{}, err
+		}
+		if !ok {
+			return cache.Loaded[*orderv1.Order]{TTL: s.cacheNullTTL}, nil
+		}
+		l := cache.Loaded[*orderv1.Order]{Value: o, Found: true}
+		if cacheable(o.GetStatus()) {
+			l.TTL = s.cacheTTL
+		}
+		return l, nil
+	})
+	if err != nil {
+		// fetch 的错误已经是对外的 gRPC 状态；缓存层在调用方 ctx 结束时返回裸的 context 错误，
+		// 转成对应的状态码（Canceled、DeadlineExceeded），否则 gRPC 会把它报成 Unknown。
+		if _, isStatus := status.FromError(err); !isStatus {
+			return nil, false, status.FromContextError(err).Err()
+		}
+		return nil, false, err
+	}
+	return o, ok, nil
+}
+
+// lookup 返回属于 userID 的订单的当前状态。不属于该用户时与不存在一样返回 NOT_FOUND，不泄露订单是否存在。
+// 它不读缓存，给需要读库的路径（CancelOrder）用。
+func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.Order, error) {
+	o, ok, err := s.fetch(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || o.GetUserId() != userID {
 		return nil, orderNotFound(orderID)
 	}
-	if err != nil {
-		return nil, s.internal(ctx, "load order", err, "order_id", orderID)
-	}
 	return o, nil
+}
+
+// fetch 按 order_id 返回订单的当前状态，不核对归属。ok 为 false 表示订单不存在。
+// 返回的错误已经是对外的 gRPC 状态。
+//
+// 受理之后、落库之前，订单库里还没有这一行，这时以闸门里的占用为准，合成一个 CREATING 的订单
+// （只有商品和数量）。占用从受理一直活到订单进入终态，所以“行不存在且占用也不存在”只有两种可能：
+// 订单从未受理过或已被回收；或者在两次读之间订单落库、走完了终态、占用被归还。
+// 后一种用再读一次订单行排除。
+func (s *Service) fetch(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	o, ok, err := s.loadRow(ctx, orderID)
+	if err != nil || ok {
+		return o, ok, err
+	}
+	hold, ok, err := s.gate.Get(ctx, orderID)
+	if err != nil {
+		s.logger.WarnContext(ctx, "read hold failed", "order_id", orderID, "error", err)
+		return nil, false, status.Error(codes.Unavailable, "stock gate unavailable, retry later")
+	}
+	if ok {
+		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
+	}
+	return s.loadRow(ctx, orderID)
+}
+
+// loadRow 读已落库的订单，转成对外的形式。ok 为 false 表示没有这一行。
+func (s *Service) loadRow(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	o, err := s.store.GetOrder(ctx, orderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, s.internal(ctx, "load order", err, "order_id", orderID)
+	}
+	return toProto(o), true, nil
+}
+
+// creatingProto 构造一个还没落库的订单的对外形式：只有商品和数量，没有价格。
+// expire_time 由受理时间加支付时限算出。受理时间截断到毫秒（与占用里记的精度一致），
+// 所以从占用合成的值与受理时返回、写进消息的值相同。
+func (s *Service) creatingProto(orderID, userID int64, items []store.Item, acceptedAt time.Time) *orderv1.Order {
+	out := make([]*orderv1.OrderItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, &orderv1.OrderItem{SkuId: it.SKUID, Quantity: it.Quantity})
+	}
+	return &orderv1.Order{
+		OrderId:    orderID,
+		UserId:     userID,
+		Status:     orderv1.OrderStatus_ORDER_STATUS_CREATING,
+		Items:      out,
+		CreateTime: timestamppb.New(acceptedAt),
+		ExpireTime: timestamppb.New(acceptedAt.Add(s.paymentTimeout)),
+	}
+}
+
+func holdItems(items []stockgate.Item) []store.Item {
+	out := make([]store.Item, 0, len(items))
+	for _, it := range items {
+		out = append(out, store.Item{SKUID: it.SKUID, Quantity: it.Quantity})
+	}
+	sortItems(out)
+	return out
 }
 
 // ---------- CancelOrder ----------
@@ -414,148 +610,117 @@ func (s *Service) CancelOrder(ctx context.Context, req *orderv1.CancelOrderReque
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, invalidArgument("order_id and user_id must be positive")
 	}
-	cancelled, err := s.store.Cancel(ctx, req.GetOrderId(), req.GetUserId(), s.now())
-	if err != nil {
+	// 不先查后改：直接做带前置条件的更新，并发的取消、支付、关单里只有一个能完成转换。
+	// 订单不属于该用户时更新不到任何行，下面按不存在作答。
+	ref := store.OrderRef{OrderID: req.GetOrderId(), UserID: req.GetUserId()}
+	now := s.now()
+	ev := newEvent(ref, now)
+	ev.Body = &eventv1.OrderEvent_Cancelled{Cancelled: &eventv1.OrderCancelled{}}
+	if _, err := s.transition(ctx, ev, func(ctx context.Context, tx *store.Tx) (bool, error) {
+		return tx.Cancel(ctx, ref.OrderID, ref.UserID, now)
+	}); err != nil {
 		return nil, s.internal(ctx, "cancel order", err, "order_id", req.GetOrderId())
 	}
-	if cancelled {
-		s.settleBestEffort(ctx, req.GetOrderId(), orderv1.OrderStatus_ORDER_STATUS_CANCELLED)
-	}
-	o, err := s.loadOwned(ctx, req.GetOrderId(), req.GetUserId())
+	// 与 GetOrder 用同一套查询：还没落库的订单在 GetOrder 里是 CREATING，
+	// 这里也按 CREATING 答“不可取消”而不是“不存在”，两个接口对同一个订单的说法一致。
+	o, err := s.lookup(ctx, req.GetOrderId(), req.GetUserId())
 	if err != nil {
 		return nil, err
 	}
-	if o.Status != orderv1.OrderStatus_ORDER_STATUS_CANCELLED {
+	if o.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_CANCELLED {
 		return nil, errx.New(codes.FailedPrecondition, errx.ReasonOrderNotCancellable,
-			"order %d is %s", o.OrderID, o.Status)
+			"order %d is %s", o.GetOrderId(), o.GetStatus())
 	}
-	return &orderv1.CancelOrderResponse{Order: toProto(o)}, nil
+	return &orderv1.CancelOrderResponse{Order: o}, nil
 }
 
-// ---------- HandlePaymentResult ----------
+// ---------- 状态转换与事件 ----------
 
-// errRollback 让事务回滚，真正要返回的业务错误另行保存。
-var errRollback = errors.New("rollback")
+// txRetry 是事务遇到死锁时的重试策略。InnoDB 检测到死锁会回滚其中一个事务，整个事务重做即可。
+var txRetry = retry.Policy{
+	MaxAttempts: 3,
+	Initial:     10 * time.Millisecond,
+	Max:         200 * time.Millisecond,
+	Retryable:   mysqlx.IsDeadlock,
+}
 
-// HandlePaymentResult 实现 OrderServiceServer。
-func (s *Service) HandlePaymentResult(ctx context.Context, req *orderv1.HandlePaymentResultRequest) (*orderv1.HandlePaymentResultResponse, error) {
-	if req.GetOrderId() <= 0 || req.GetPaymentId() <= 0 {
-		return nil, invalidArgument("order_id and payment_id must be positive")
+// inTx 在事务里执行 fn，遇到死锁时整个重做。fn 可能执行多次，不能在外部变量里累积结果。
+func (s *Service) inTx(ctx context.Context, p retry.Policy, fn func(tx *store.Tx) error) error {
+	return retry.Do(ctx, p, func(ctx context.Context, _ int) error {
+		return s.store.InTx(ctx, fn)
+	})
+}
+
+// kick 在事务提交后通知中继立即发送。提交前调用没有意义：中继看不到未提交的行。
+func (s *Service) kick() {
+	if s.relay != nil {
+		s.relay.Kick()
 	}
-	if req.GetSucceeded() && (req.GetAmount() == nil || req.GetAmount().GetAmount() < 0 || req.GetAmount().GetCurrency() == "") {
-		return nil, invalidArgument("amount is required for a succeeded payment")
-	}
+}
 
-	var (
-		disposition orderv1.PaymentDisposition
-		paid        bool
-		bizErr      error
-	)
-	now := s.now()
-	err := s.store.InTx(ctx, func(tx *store.Tx) error {
-		// 先锁订单行：同一订单的并发回调在此排队，与取消、关单的条件更新也互斥。
-		o, err := tx.LockOrder(ctx, req.GetOrderId())
-		if errors.Is(err, store.ErrNotFound) {
-			bizErr = orderNotFound(req.GetOrderId())
-			return errRollback
-		}
+// newEvent 构造一条 OrderEvent。occur_time 用状态变更时写入库里的同一个时间。
+func newEvent(ref store.OrderRef, now time.Time) *eventv1.OrderEvent {
+	return &eventv1.OrderEvent{OrderId: ref.OrderID, UserId: ref.UserID, OccurTime: timestamppb.New(now)}
+}
+
+// addEvents 把事件序列化后写入本事务的 outbox。
+func (s *Service) addEvents(ctx context.Context, tx *store.Tx, evs ...*eventv1.OrderEvent) error {
+	msgs := make([]outbox.Message, 0, len(evs))
+	for _, ev := range evs {
+		key, value, err := eventx.MarshalOrderEvent(ev)
 		if err != nil {
 			return err
 		}
-
-		prev, err := tx.GetPaymentResult(ctx, req.GetPaymentId())
-		switch {
-		case err == nil:
-			if prev.OrderID != req.GetOrderId() {
-				bizErr = invalidArgument("payment %d belongs to another order", req.GetPaymentId())
-				return errRollback
-			}
-			disposition = prev.Disposition
-			return nil
-		case !errors.Is(err, store.ErrNotFound):
-			return err
-		}
-
-		disposition = orderv1.PaymentDisposition_PAYMENT_DISPOSITION_ACCEPTED
-		if req.GetSucceeded() {
-			if o.Status == orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT {
-				if req.GetAmount().GetAmount() != o.TotalAmount || req.GetAmount().GetCurrency() != o.Currency {
-					// 不记录答复：金额不符是请求方的错误，修正后的同一 payment_id 仍应能被处理。
-					bizErr = errx.New(codes.FailedPrecondition, errx.ReasonAmountMismatch,
-						"payment amount does not match order %d", o.OrderID)
-					return errRollback
-				}
-				ok, err := tx.MarkPaid(ctx, o.OrderID, req.GetPaymentId(), now)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					// 行已被本事务锁住且状态刚读过，不应发生。
-					return fmt.Errorf("mark paid affected no rows for order %d", o.OrderID)
-				}
-				paid = true
-			} else {
-				// 已取消、已关闭、创建失败、创建中，或已被另一笔支付付清：钱收了但订单不能要。
-				disposition = orderv1.PaymentDisposition_PAYMENT_DISPOSITION_REFUND_REQUIRED
-			}
-		}
-		return tx.InsertPaymentResult(ctx, &store.PaymentResult{
-			PaymentID:   req.GetPaymentId(),
-			OrderID:     req.GetOrderId(),
-			Succeeded:   req.GetSucceeded(),
-			Amount:      req.GetAmount().GetAmount(),
-			Disposition: disposition,
-		}, now)
-	})
-	if bizErr != nil {
-		return nil, bizErr
+		msgs = append(msgs, outbox.Message{Topic: s.eventsTopic, Key: key, Payload: value})
 	}
-	if err != nil {
-		return nil, s.internal(ctx, "handle payment result", err,
-			"order_id", req.GetOrderId(), "payment_id", req.GetPaymentId())
-	}
-	if paid {
-		s.settleBestEffort(ctx, req.GetOrderId(), orderv1.OrderStatus_ORDER_STATUS_PAID)
-	}
-	return &orderv1.HandlePaymentResultResponse{Disposition: disposition}, nil
-}
-
-// ---------- 结清 ----------
-
-// ErrStockInvariant 表示订单与库存的状态出现了不可能的组合，需要人工介入。
-var ErrStockInvariant = errors.New("order and stock states are inconsistent")
-
-// settle 让库存跟上订单的终态：PAID 确认预占，其他终态释放预占。成功后标记已结清。
-// 重复执行无害：库存接口幂等，标记是条件更新。
-func (s *Service) settle(ctx context.Context, orderID int64, st orderv1.OrderStatus) error {
-	var err error
-	switch st {
-	case orderv1.OrderStatus_ORDER_STATUS_PAID:
-		_, err = s.inventory.Confirm(ctx, &inventoryv1.ConfirmRequest{OrderId: orderID})
-	case orderv1.OrderStatus_ORDER_STATUS_CANCELLED, orderv1.OrderStatus_ORDER_STATUS_CLOSED, orderv1.OrderStatus_ORDER_STATUS_FAILED:
-		_, err = s.inventory.Release(ctx, &inventoryv1.ReleaseRequest{OrderId: orderID})
-	default:
-		return fmt.Errorf("order %d in status %s cannot be settled", orderID, st)
-	}
-	if err != nil {
-		switch errx.Reason(err) {
-		case errx.ReasonReservationReleased, errx.ReasonReservationNotFound, errx.ReasonReservationConfirmed:
-			// 保持未结清，留给人工处理；后台任务会反复遇到它并持续报警。
-			s.logger.ErrorContext(ctx, "stock invariant violated, needs manual intervention",
-				"order_id", orderID, "status", st.String(), "error", err)
-			return fmt.Errorf("settle order %d: %w: %w", orderID, ErrStockInvariant, err)
-		}
-		return fmt.Errorf("settle order %d: %w", orderID, err)
-	}
-	if _, err := s.store.MarkSettled(ctx, orderID, s.now()); err != nil {
-		return fmt.Errorf("mark order %d settled: %w", orderID, err)
+	if err := tx.AddOutbox(ctx, msgs...); err != nil {
+		return fmt.Errorf("add order events: %w", err)
 	}
 	return nil
 }
 
-// settleBestEffort 在线路径上尽力立即结清，失败只记日志，留给后台任务。
-func (s *Service) settleBestEffort(ctx context.Context, orderID int64, st orderv1.OrderStatus) {
-	if err := s.settle(ctx, orderID, st); err != nil && !errors.Is(err, ErrStockInvariant) {
-		s.logger.WarnContext(ctx, "settle stock failed, left to sweeper", "order_id", orderID, "error", err)
+// transition 在一个事务里执行一次带前置条件的状态更新，并且只在它真的完成了转换（影响 1 行）时
+// 写入对应的事件。这样“事件存在”与“转换由本事务完成”严格等价：
+// 并发的几方里只有赢的那一方发事件，输的一方什么都不写。
+func (s *Service) transition(ctx context.Context, ev *eventv1.OrderEvent,
+	update func(ctx context.Context, tx *store.Tx) (bool, error),
+) (bool, error) {
+	var done bool
+	err := s.inTx(ctx, txRetry, func(tx *store.Tx) error {
+		done = false
+		ok, err := update(ctx, tx)
+		if err != nil || !ok {
+			return err
+		}
+		if err := s.addEvents(ctx, tx, ev); err != nil {
+			return err
+		}
+		done = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
+	if done {
+		s.kick()
+	}
+	return done, nil
+}
+
+// failCreating 把 CREATING 的订单置为 FAILED 并发 failed 事件。返回是否由本次完成了转换。
+func (s *Service) failCreating(ctx context.Context, ref store.OrderRef, reason string, now time.Time) (bool, error) {
+	ev := newEvent(ref, now)
+	ev.Body = &eventv1.OrderEvent_Failed{Failed: &eventv1.OrderFailed{Reason: reason}}
+	return s.transition(ctx, ev, func(ctx context.Context, tx *store.Tx) (bool, error) {
+		return tx.MarkCreateFailed(ctx, ref.OrderID, reason, now)
+	})
+}
+
+// closeExpired 关闭超时未支付的订单并发 closed 事件。返回是否由本次完成了转换。
+func (s *Service) closeExpired(ctx context.Context, ref store.OrderRef, now time.Time) (bool, error) {
+	ev := newEvent(ref, now)
+	ev.Body = &eventv1.OrderEvent_Closed{Closed: &eventv1.OrderClosed{}}
+	return s.transition(ctx, ev, func(ctx context.Context, tx *store.Tx) (bool, error) {
+		return tx.CloseExpired(ctx, ref.OrderID, now)
+	})
 }

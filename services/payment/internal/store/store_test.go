@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"database/sql"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,17 @@ func TestInsertAndGetRoundTrip(t *testing.T) {
 	if _, err := st.GetByOrderID(t.Context(), 999); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("GetByOrderID(missing) = %v, want ErrNotFound", err)
 	}
+
+	byID, err := st.GetByID(t.Context(), want.PaymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byID != want {
+		t.Errorf("GetByID = %+v, want %+v", byID, want)
+	}
+	if _, err := st.GetByID(t.Context(), 999); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetByID(missing) = %v, want ErrNotFound", err)
+	}
 }
 
 func TestInsertSameOrderIsDuplicate(t *testing.T) {
@@ -115,7 +127,12 @@ func TestCompletePendingConcurrentOnlyOneWins(t *testing.T) {
 		if i%2 == 1 {
 			to = failed
 		}
-		ok, err := st.CompletePending(t.Context(), p.PaymentID, to, t0.Add(time.Second))
+		var ok bool
+		err := st.InTx(t.Context(), func(tx *sql.Tx) error {
+			var err error
+			ok, err = st.CompletePending(t.Context(), tx, p.PaymentID, to, t0.Add(time.Second))
+			return err
+		})
 		if ok {
 			winner.Store(int32(to))
 		}
@@ -171,22 +188,6 @@ func TestMarkNotifiedVersusRefundOnlyOneWins(t *testing.T) {
 	}
 }
 
-func TestIncrNotifyAttemptsConcurrentCountsOnce(t *testing.T) {
-	st, _ := newStore(t)
-	p := insert(t, st, 1, failed)
-
-	// 多个处理者基于同一次读取各自失败了一次，只应记一次。
-	wins := runConcurrently(t, 16, func(int) (bool, error) {
-		return st.IncrNotifyAttempts(t.Context(), p.PaymentID, failed, 0, t0)
-	})
-	if wins != 1 {
-		t.Fatalf("%d callers incremented, want 1", wins)
-	}
-	if got := get(t, st, p.OrderID); got.NotifyAttempts != 1 {
-		t.Errorf("notify_attempts = %d, want 1", got.NotifyAttempts)
-	}
-}
-
 func TestListPendingCreatedBefore(t *testing.T) {
 	st, exec := newStore(t)
 	early := insert(t, st, 1, pending)
@@ -203,59 +204,54 @@ func TestListPendingCreatedBefore(t *testing.T) {
 	}
 }
 
-func TestListUnnotifiedDueBackoff(t *testing.T) {
-	const (
-		base = 200 * time.Millisecond
-		maxD = 30 * time.Second
-	)
-	tests := []struct {
-		attempts int
-		delay    time.Duration
-	}{
-		{0, 0},
-		{1, 400 * time.Millisecond},
-		{2, 800 * time.Millisecond},
-		{7, 25600 * time.Millisecond},
-		{8, maxD},
-		{1000, maxD},
-	}
-	for _, tt := range tests {
-		st, exec := newStore(t)
-		p := insert(t, st, 1, succeeded)
-		exec("UPDATE payments SET notify_attempts = ?, updated_at = ? WHERE payment_id = ?", tt.attempts, t0, p.PaymentID)
+func TestCompletePendingRolledBackWithTx(t *testing.T) {
+	st, _ := newStore(t)
+	p := insert(t, st, 1, pending)
 
-		if tt.delay > 0 {
-			got, err := st.ListUnnotifiedDue(t.Context(), t0.Add(tt.delay-time.Microsecond), base, maxD, 10)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != 0 {
-				t.Errorf("attempts=%d: due before %v", tt.attempts, tt.delay)
-			}
+	// 状态变更跟随事务：事务回滚（例如写 outbox 失败）时支付单仍是 PENDING，下一轮会重做。
+	boom := errors.New("boom")
+	err := st.InTx(t.Context(), func(tx *sql.Tx) error {
+		ok, err := st.CompletePending(t.Context(), tx, p.PaymentID, succeeded, t0)
+		if err != nil || !ok {
+			t.Fatalf("CompletePending = (%v, %v), want (true, nil)", ok, err)
 		}
-		got, err := st.ListUnnotifiedDue(t.Context(), t0.Add(tt.delay), base, maxD, 10)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) != 1 {
-			t.Errorf("attempts=%d: not due at %v", tt.attempts, tt.delay)
-		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("InTx = %v, want boom", err)
+	}
+	if got := get(t, st, p.OrderID); got.Status != pending {
+		t.Errorf("status = %v after rollback, want PENDING", got.Status)
 	}
 }
 
-func TestListUnnotifiedDueSkipsOthers(t *testing.T) {
-	st, exec := newStore(t)
-	insert(t, st, 1, pending)
-	insert(t, st, 2, refunded)
-	done := insert(t, st, 3, succeeded)
-	exec("UPDATE payments SET notified = 1 WHERE payment_id = ?", done.PaymentID)
-	want := insert(t, st, 4, failed)
+func TestMarkNotifiedRequiresStatus(t *testing.T) {
+	st, _ := newStore(t)
+	p := insert(t, st, 1, failed)
 
-	got, err := st.ListUnnotifiedDue(t.Context(), t0, time.Millisecond, time.Second, 10)
-	if err != nil {
-		t.Fatal(err)
+	// 答复针对的是读到的状态；状态对不上时不标记。
+	if ok, err := st.MarkNotified(t.Context(), p.PaymentID, succeeded, t0); err != nil || ok {
+		t.Errorf("MarkNotified(wrong status) = (%v, %v), want (false, nil)", ok, err)
 	}
-	if len(got) != 1 || got[0].PaymentID != want.PaymentID {
-		t.Errorf("got %+v, want only payment %d", got, want.PaymentID)
+	if ok, err := st.MarkNotified(t.Context(), p.PaymentID, failed, t0); err != nil || !ok {
+		t.Errorf("MarkNotified = (%v, %v), want (true, nil)", ok, err)
+	}
+	if ok, err := st.MarkNotified(t.Context(), p.PaymentID, failed, t0); err != nil || ok {
+		t.Errorf("MarkNotified(again) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+func TestRefundAfterNotifiedIsNoop(t *testing.T) {
+	st, _ := newStore(t)
+	p := insert(t, st, 1, succeeded)
+	if ok, err := st.MarkNotified(t.Context(), p.PaymentID, succeeded, t0); err != nil || !ok {
+		t.Fatalf("MarkNotified = (%v, %v)", ok, err)
+	}
+	// 已被订单服务接受的支付不能再被退款。
+	if ok, err := st.RefundAndMarkNotified(t.Context(), p.PaymentID, t0); err != nil || ok {
+		t.Errorf("refund after accepted = (%v, %v), want (false, nil)", ok, err)
+	}
+	if got := get(t, st, p.OrderID); got.Status != succeeded {
+		t.Errorf("status = %v, want SUCCEEDED", got.Status)
 	}
 }

@@ -8,4 +8,5 @@ use (
 	./services/order
 	./services/payment
 	./test/e2e
+	./test/load
 )

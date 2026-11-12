@@ -57,6 +57,8 @@ type Stock struct {
 	Reserved  int64
 	Sold      int64
 	UnitPrice Price
+	// PurchaseLimit 是每人限购数量，0 表示不限。
+	PurchaseLimit int64
 }
 
 // Store 持有连接池，提供事务入口和事务外的只读查询。
@@ -79,8 +81,9 @@ func (s *Store) InTx(ctx context.Context, fn func(*Tx) error) error {
 // GetStock 读取一个 SKU 的库存。不存在时 found 为 false。
 func (s *Store) GetStock(ctx context.Context, skuID int64) (stock Stock, found bool, err error) {
 	err = s.db.QueryRowContext(ctx,
-		`SELECT sku_id, available, reserved, sold, unit_price, currency FROM sku_stock WHERE sku_id = ?`, skuID,
-	).Scan(&stock.SKUID, &stock.Available, &stock.Reserved, &stock.Sold, &stock.UnitPrice.Amount, &stock.UnitPrice.Currency)
+		`SELECT sku_id, available, reserved, sold, unit_price, currency, purchase_limit FROM sku_stock WHERE sku_id = ?`, skuID,
+	).Scan(&stock.SKUID, &stock.Available, &stock.Reserved, &stock.Sold, &stock.UnitPrice.Amount, &stock.UnitPrice.Currency,
+		&stock.PurchaseLimit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Stock{}, false, nil
 	}

@@ -19,6 +19,7 @@ const (
 
 	ReasonSKUNotFound          = "SKU_NOT_FOUND"
 	ReasonInsufficientStock    = "INSUFFICIENT_STOCK"
+	ReasonPurchaseLimit        = "PURCHASE_LIMIT_EXCEEDED"
 	ReasonReservationNotFound  = "RESERVATION_NOT_FOUND"
 	ReasonReservationReleased  = "RESERVATION_RELEASED"
 	ReasonReservationConfirmed = "RESERVATION_CONFIRMED"
@@ -30,6 +31,9 @@ const (
 	ReasonIdempotencyKeyReused = "IDEMPOTENCY_KEY_REUSED"
 	ReasonAmountMismatch       = "AMOUNT_MISMATCH"
 	ReasonCreateTimeout        = "CREATE_TIMEOUT"
+	// ReasonBacklogged：等待落库的订单积压过多，暂不受理（RESOURCE_EXHAUSTED，HTTP 429）。
+	// 什么都没有发生，可以稍后用同一个幂等键重试。
+	ReasonBacklogged = "BACKLOGGED"
 
 	ReasonPaymentNotFound = "PAYMENT_NOT_FOUND"
 )

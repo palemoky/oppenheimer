@@ -6,8 +6,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"math/rand/v2"
 	"slices"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -15,8 +15,11 @@ import (
 
 	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/Oppenheimer/pkg/retry"
+	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
 )
 
@@ -27,24 +30,53 @@ import (
 // 排队等它的重复请求在记录消失后都继承了同一个间隙锁，又都要插入，彼此的插入意向锁
 // 与对方的间隙锁冲突，InnoDB 会判定死锁并回滚其中一些。三个操作都幂等，整个事务重来
 // 是安全的；退避加随机抖动，让重来的请求错开，不再同时撞到同一个间隙上。
-const (
-	defaultTxAttempts = 5
-	txRetryBaseDelay  = 2 * time.Millisecond
-)
+//
+// 抖动比例取 1（间隔在 [0, 2d) 内均匀取值），接近 1a 的全抖动：这里要的是把
+// 同时撞上的几个请求尽量拉开，而不是让间隔稳定。只重试死锁，其他错误原样返回。
+var defaultTxRetry = retry.Policy{
+	MaxAttempts: 5,
+	Initial:     2 * time.Millisecond,
+	Max:         50 * time.Millisecond,
+	Jitter:      1,
+	Retryable:   mysqlx.IsDeadlock,
+}
 
 // Service 实现 inventoryv1.InventoryServiceServer。
 type Service struct {
 	inventoryv1.UnimplementedInventoryServiceServer
 
 	store  *store.Store
+	gate   *stockgate.Gate
 	logger *slog.Logger
-	// txAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
-	txAttempts int
+	// txRetry 的 MaxAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
+	txRetry retry.Policy
+
+	// stockCache 和 stockCacheTTL 只用于 gRPC GetStock 的读路径；stockCache 为 nil 表示不缓存。
+	// 写路径和所有内部决策（Reserve、Confirm、Release、对账、闸门）一律读库，不经过它。
+	stockCache    *cache.Cache[*inventoryv1.GetStockResponse]
+	stockCacheTTL time.Duration
 }
 
-// New 返回使用 st 的 Service。
-func New(st *store.Store, logger *slog.Logger) *Service {
-	return &Service{store: st, logger: logger, txAttempts: defaultTxAttempts}
+// Option 是 New 的可选配置。
+type Option func(*Service)
+
+// WithStockCache 让 GetStock 经过缓存 c，结果（包括 SKU 不存在）缓存 ttl。
+// 写库存时不失效缓存，读到的数据最多落后 ttl（再加抖动）。c 为 nil 或 ttl <= 0 时不缓存。
+func WithStockCache(c *cache.Cache[*inventoryv1.GetStockResponse], ttl time.Duration) Option {
+	return func(s *Service) {
+		if c != nil && ttl > 0 {
+			s.stockCache, s.stockCacheTTL = c, ttl
+		}
+	}
+}
+
+// New 返回使用 st 和库存闸门 gate 的 Service。
+func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger, opts ...Option) *Service {
+	s := &Service{store: st, gate: gate, logger: logger, txRetry: defaultTxRetry}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Reserve 实现 InventoryServiceServer。
@@ -169,13 +201,26 @@ func validateReserve(req *inventoryv1.ReserveRequest) ([]store.Item, error) {
 }
 
 // Confirm 实现 InventoryServiceServer。
+//
+// 和事件消费走同一条路径（确认后结清闸门里的占用）：排障时手工确认一个订单，
+// 闸门也应该得到同样的结果，否则这笔占用会一直挂着，held 偏大而对账看不出来
+// （Confirm 让 MySQL 一侧减少、占用不结清时 Redis 一侧不变，偏差会被对账当作
+// avail 偏大扣掉，占用本身却永远不会消失）。结清以订单号幂等，之后订单的 paid 事件再来也无害。
 func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) (*inventoryv1.ConfirmResponse, error) {
 	orderID := req.GetOrderId()
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
+	if err := s.confirmAndSettle(ctx, orderID); err != nil {
+		return nil, s.toStatus(ctx, "confirm", err, "order_id", orderID)
+	}
+	return &inventoryv1.ConfirmResponse{}, nil
+}
 
-	err := s.inTx(ctx, func(tx *store.Tx) error {
+// confirm 把订单的预占转为已售，以 order_id 幂等。gRPC 和事件消费共用。
+// 返回业务错误（errx）或未经转换的内部错误，由调用方决定如何对外呈现。
+func (s *Service) confirm(ctx context.Context, orderID int64) error {
+	return s.inTx(ctx, func(tx *store.Tx) error {
 		// 记录应当已经存在，加排他锁不会落到间隙上；不存在就报错，不会接着插入。
 		st, found, err := tx.ReservationStatusForUpdate(ctx, orderID)
 		if err != nil {
@@ -195,20 +240,27 @@ func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) 
 			return errors.New("unknown reservation status")
 		}
 	})
-	if err != nil {
-		return nil, s.toStatus(ctx, "confirm", err, "order_id", orderID)
-	}
-	return &inventoryv1.ConfirmResponse{}, nil
 }
 
 // Release 实现 InventoryServiceServer。
+//
+// 和 Confirm 一样走事件消费的同一条路径（释放后归还占用）。只释放 MySQL 而不归还的话，
+// 恒等式两边都不变，对账发现不了，闸门会永久少放这部分数量。
 func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) (*inventoryv1.ReleaseResponse, error) {
 	orderID := req.GetOrderId()
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
+	if err := s.releaseAndReturn(ctx, orderID); err != nil {
+		return nil, s.toStatus(ctx, "release", err, "order_id", orderID)
+	}
+	return &inventoryv1.ReleaseResponse{}, nil
+}
 
-	err := s.inTx(ctx, func(tx *store.Tx) error {
+// release 释放订单的预占，以 order_id 幂等；预占不存在时留下空回滚标记。
+// gRPC 和事件消费共用，错误约定同 confirm。
+func (s *Service) release(ctx context.Context, orderID int64) error {
+	return s.inTx(ctx, func(tx *store.Tx) error {
 		// 没有预占记录时插入成功，这一行就是“已释放”标记（空回滚），
 		// 它让仍在路上的 Reserve 撞上唯一键而被拒绝，防止库存悬挂。
 		// 已有记录时这一步已对它加了排他锁，见 InsertReservationOrLock。
@@ -235,10 +287,6 @@ func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) 
 			return errors.New("unknown reservation status")
 		}
 	})
-	if err != nil {
-		return nil, s.toStatus(ctx, "release", err, "order_id", orderID)
-	}
-	return &inventoryv1.ReleaseResponse{}, nil
 }
 
 // settle 把 RESERVED 的预占转为 to，并对每一项按 sku_id 升序执行 move。
@@ -273,15 +321,33 @@ func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, m
 	return nil
 }
 
-// GetStock 实现 InventoryServiceServer。
+// StockCacheKey 返回 sku 的库存查询缓存 key（不含 REDIS_PREFIX）。
+func StockCacheKey(skuID int64) string {
+	return "cache:stock:" + strconv.FormatInt(skuID, 10)
+}
+
+// GetStock 实现 InventoryServiceServer。启用缓存时，返回的消息可能被并发调用共享，不能修改。
 func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest) (*inventoryv1.GetStockResponse, error) {
 	skuID := req.GetSkuId()
-	stock, found, err := s.store.GetStock(ctx, skuID)
-	if err != nil {
-		return nil, s.toStatus(ctx, "get stock", err, "sku_id", skuID)
+	if s.stockCache == nil {
+		resp, found, err := s.loadStock(ctx, skuID)
+		return s.stockResult(ctx, skuID, resp, found, err)
 	}
-	if !found {
-		return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", skuID)
+	resp, found, err := s.stockCache.Get(ctx, StockCacheKey(skuID), func(ctx context.Context) (cache.Loaded[*inventoryv1.GetStockResponse], error) {
+		resp, found, err := s.loadStock(ctx, skuID)
+		if err != nil {
+			return cache.Loaded[*inventoryv1.GetStockResponse]{}, err
+		}
+		return cache.Loaded[*inventoryv1.GetStockResponse]{Value: resp, Found: found, TTL: s.stockCacheTTL}, nil
+	})
+	return s.stockResult(ctx, skuID, resp, found, err)
+}
+
+// loadStock 从库里读库存，转成响应。
+func (s *Service) loadStock(ctx context.Context, skuID int64) (*inventoryv1.GetStockResponse, bool, error) {
+	stock, found, err := s.store.GetStock(ctx, skuID)
+	if err != nil || !found {
+		return nil, false, err
 	}
 	return &inventoryv1.GetStockResponse{
 		SkuId:     stock.SKUID,
@@ -289,31 +355,27 @@ func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest
 		Reserved:  stock.Reserved,
 		Sold:      stock.Sold,
 		UnitPrice: toProtoMoney(stock.UnitPrice),
-	}, nil
+	}, true, nil
 }
 
-// inTx 执行事务，遇到死锁时整体重试，原因见 defaultTxAttempts。
-func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
-	var err error
-	for attempt := range s.txAttempts {
-		if attempt > 0 {
-			// 全抖动退避：在 [0, base·2^attempt) 内随机等待。
-			delay := rand.N(txRetryBaseDelay << attempt) //nolint:gosec // 抖动只为错开重试，不需要密码学随机
-			s.logger.WarnContext(ctx, "transaction deadlocked, retrying", "attempt", attempt, "delay_ms", delay.Milliseconds())
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		err = s.store.InTx(ctx, fn)
-		if !mysqlx.IsDeadlock(err) {
-			return err
-		}
+func (s *Service) stockResult(ctx context.Context, skuID int64, resp *inventoryv1.GetStockResponse, found bool, err error) (*inventoryv1.GetStockResponse, error) {
+	if err != nil {
+		return nil, s.toStatus(ctx, "get stock", err, "sku_id", skuID)
 	}
-	return err
+	if !found {
+		return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", skuID)
+	}
+	return resp, nil
+}
+
+// inTx 执行事务，遇到死锁时整体重试，原因见 defaultTxRetry。
+func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
+	return retry.Do(ctx, s.txRetry, func(ctx context.Context, attempt int) error {
+		if attempt > 1 {
+			s.logger.WarnContext(ctx, "transaction deadlocked, retrying", "attempt", attempt)
+		}
+		return s.store.InTx(ctx, fn)
+	})
 }
 
 // toStatus 把 handler 的错误转换为返回给调用方的 gRPC 错误。
@@ -323,6 +385,10 @@ func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...a
 		return err
 	}
 	switch {
+	case errors.Is(err, errGate):
+		// MySQL 的那一步已经提交（或根本没开始，如 WarmUp），调用方重试即可补上。
+		s.logger.WarnContext(ctx, "stock gate operation failed", append([]any{"op", op, "error", err.Error()}, attrs...)...)
+		return status.Error(codes.Unavailable, "stock gate unavailable, retry later")
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, "request canceled")
 	case errors.Is(err, context.DeadlineExceeded):

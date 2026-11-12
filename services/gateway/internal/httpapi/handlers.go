@@ -95,16 +95,16 @@ func (s *server) CreateOrder(c *gin.Context, params oas.CreateOrderParams) {
 		badRequest(c, "items must not be empty")
 		return
 	}
-	items := make([]*orderv1.CreateOrderItem, 0, len(req.Items))
+	items := make([]*orderv1.SubmitOrderItem, 0, len(req.Items))
 	for _, it := range req.Items {
 		if it.SkuId <= 0 || it.Quantity <= 0 {
 			badRequest(c, "each item needs a positive sku_id and quantity")
 			return
 		}
-		items = append(items, &orderv1.CreateOrderItem{SkuId: int64(it.SkuId), Quantity: it.Quantity})
+		items = append(items, &orderv1.SubmitOrderItem{SkuId: int64(it.SkuId), Quantity: it.Quantity})
 	}
 
-	resp, err := s.deps.Order.CreateOrder(c.Request.Context(), &orderv1.CreateOrderRequest{
+	resp, err := s.deps.Order.SubmitOrder(c.Request.Context(), &orderv1.SubmitOrderRequest{
 		UserId:         userID(c),
 		IdempotencyKey: key,
 		Items:          items,
@@ -114,10 +114,12 @@ func (s *server) CreateOrder(c *gin.Context, params oas.CreateOrderParams) {
 		return
 	}
 	if resp.GetOrder() == nil {
-		s.writeEmptyResponse(c, "CreateOrder")
+		s.writeEmptyResponse(c, "SubmitOrder")
 		return
 	}
-	writeJSON(c, http.StatusCreated, toOrder(resp.GetOrder()))
+	// 下单是异步的：这里只表示请求已受理，订单还没落库。Location 告诉客户端去哪里轮询结果。
+	c.Header("Location", "/api/v1/orders/"+strconv.FormatInt(resp.GetOrder().GetOrderId(), 10))
+	writeJSON(c, http.StatusAccepted, toOrder(resp.GetOrder()))
 }
 
 // GetOrder 实现 GET /api/v1/orders/{order_id}。

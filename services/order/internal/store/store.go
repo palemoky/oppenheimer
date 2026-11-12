@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/Oppenheimer/pkg/outbox"
 )
 
 var (
@@ -35,7 +37,6 @@ type Order struct {
 	RequestHash    []byte
 	PaymentID      int64  // 0 表示未支付
 	FailReason     string // 空表示没有
-	StockSettled   bool
 	ExpireAt       time.Time
 	PaidAt         time.Time // 零值表示未支付
 	CreatedAt      time.Time
@@ -56,13 +57,13 @@ type PaymentResult struct {
 	OrderID     int64
 	Succeeded   bool
 	Amount      int64
-	Disposition orderv1.PaymentDisposition
+	Disposition eventv1.PaymentDisposition
 }
 
-// OrderRef 是后台扫描返回的最小信息。
+// OrderRef 是后台扫描返回的最小信息。user_id 写进事件里，下单后不会变。
 type OrderRef struct {
 	OrderID int64
-	Status  orderv1.OrderStatus
+	UserID  int64
 }
 
 // Store 访问 order_db。
@@ -75,16 +76,8 @@ func New(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-// 终态。stock_settled 只对这些状态有意义。
-var terminalStatuses = []orderv1.OrderStatus{
-	orderv1.OrderStatus_ORDER_STATUS_PAID,
-	orderv1.OrderStatus_ORDER_STATUS_CANCELLED,
-	orderv1.OrderStatus_ORDER_STATUS_CLOSED,
-	orderv1.OrderStatus_ORDER_STATUS_FAILED,
-}
-
 const orderColumns = `order_id, user_id, status, total_amount, currency, idempotency_key, request_hash,
-	payment_id, fail_reason, stock_settled, expire_at, paid_at, created_at, updated_at`
+	payment_id, fail_reason, expire_at, paid_at, created_at, updated_at`
 
 // queryer 让读订单的代码在事务内外共用。
 type queryer interface {
@@ -100,10 +93,10 @@ func (s *Store) InsertOrder(ctx context.Context, o *Order) error {
 		// 后台任务按时限扫描时比较的是同一个时间源。
 		_, err := tx.ExecContext(ctx, `INSERT INTO orders
 			(order_id, user_id, status, total_amount, currency, idempotency_key, request_hash,
-			 stock_settled, expire_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 expire_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			o.OrderID, o.UserID, int32(o.Status), o.TotalAmount, o.Currency, o.IdempotencyKey, o.RequestHash,
-			o.StockSettled, o.ExpireAt, o.CreatedAt, o.UpdatedAt)
+			o.ExpireAt, o.CreatedAt, o.UpdatedAt)
 		if err != nil {
 			return fmt.Errorf("insert order: %w", err)
 		}
@@ -161,7 +154,7 @@ func scanOrder(row *sql.Row) (*Order, error) {
 		paidAt     sql.NullTime
 	)
 	err := row.Scan(&o.OrderID, &o.UserID, &status, &o.TotalAmount, &o.Currency, &o.IdempotencyKey, &o.RequestHash,
-		&paymentID, &failReason, &o.StockSettled, &o.ExpireAt, &paidAt, &o.CreatedAt, &o.UpdatedAt)
+		&paymentID, &failReason, &o.ExpireAt, &paidAt, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -225,113 +218,36 @@ func (s *Store) MarkReserved(ctx context.Context, orderID, total int64, currency
 	return done, nil
 }
 
-// MarkCreateFailed 把 CREATING 的订单改为 FAILED。settled 表示库存是否已确定无需释放。
-func (s *Store) MarkCreateFailed(ctx context.Context, orderID int64, reason string, settled bool, now time.Time) (bool, error) {
-	return s.exec(ctx, `UPDATE orders SET status = ?, fail_reason = ?, stock_settled = ?, updated_at = ?
-		WHERE order_id = ? AND status = ?`,
-		int32(orderv1.OrderStatus_ORDER_STATUS_FAILED), reason, settled, now,
-		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_CREATING))
-}
-
-// Cancel 把属于 userID 的 PENDING_PAYMENT 订单改为 CANCELLED。
-func (s *Store) Cancel(ctx context.Context, orderID, userID int64, now time.Time) (bool, error) {
-	return s.exec(ctx, `UPDATE orders SET status = ?, stock_settled = 0, updated_at = ?
-		WHERE order_id = ? AND user_id = ? AND status = ?`,
-		int32(orderv1.OrderStatus_ORDER_STATUS_CANCELLED), now,
-		orderID, userID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT))
-}
-
-// CloseExpired 把截止时间早于 now 的 PENDING_PAYMENT 订单改为 CLOSED。
-func (s *Store) CloseExpired(ctx context.Context, orderID int64, now time.Time) (bool, error) {
-	return s.exec(ctx, `UPDATE orders SET status = ?, stock_settled = 0, updated_at = ?
-		WHERE order_id = ? AND status = ? AND expire_at < ?`,
-		int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED), now,
-		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now)
-}
-
-// Touch 只更新 updated_at。补结清按 updated_at 从旧到新扫描，
-// 对暂时无法处理的订单调用它，使其排到队尾，不至于长期占住每一批的名额。
-func (s *Store) Touch(ctx context.Context, orderID int64, now time.Time) error {
-	_, err := s.exec(ctx, "UPDATE orders SET updated_at = ? WHERE order_id = ?", now, orderID)
-	return err
-}
-
-// MarkSettled 记录订单的库存已跟上订单状态。
-func (s *Store) MarkSettled(ctx context.Context, orderID int64, now time.Time) (bool, error) {
-	return s.exec(ctx, "UPDATE orders SET stock_settled = 1, updated_at = ? WHERE order_id = ? AND stock_settled = 0",
-		now, orderID)
-}
-
-// ListExpired 返回截止时间早于 now 的 PENDING_PAYMENT 订单号。
-func (s *Store) ListExpired(ctx context.Context, now time.Time, limit int) ([]int64, error) {
-	return s.listIDs(ctx, "SELECT order_id FROM orders WHERE status = ? AND expire_at < ? ORDER BY expire_at LIMIT ?",
+// ListExpired 返回截止时间早于 now 的 PENDING_PAYMENT 订单。
+func (s *Store) ListExpired(ctx context.Context, now time.Time, limit int) ([]OrderRef, error) {
+	return s.listRefs(ctx, "SELECT order_id, user_id FROM orders WHERE status = ? AND expire_at < ? ORDER BY expire_at LIMIT ?",
 		int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now, limit)
 }
 
-// ListStaleCreating 返回创建时间早于 before 仍在 CREATING 的订单号。
-func (s *Store) ListStaleCreating(ctx context.Context, before time.Time, limit int) ([]int64, error) {
-	return s.listIDs(ctx, "SELECT order_id FROM orders WHERE status = ? AND created_at < ? ORDER BY created_at LIMIT ?",
+// ListStaleCreating 返回落库时间（updated_at，CREATING 的行落库后不再更新）早于 before 仍在 CREATING 的订单。
+func (s *Store) ListStaleCreating(ctx context.Context, before time.Time, limit int) ([]OrderRef, error) {
+	return s.listRefs(ctx, "SELECT order_id, user_id FROM orders WHERE status = ? AND updated_at < ? ORDER BY updated_at LIMIT ?",
 		int32(orderv1.OrderStatus_ORDER_STATUS_CREATING), before, limit)
 }
 
-// ListUnsettled 返回最后更新早于 before、库存尚未结清的终态订单。
-func (s *Store) ListUnsettled(ctx context.Context, before time.Time, limit int) ([]OrderRef, error) {
-	args := []any{}
-	for _, st := range terminalStatuses {
-		args = append(args, int32(st))
-	}
-	args = append(args, before, limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT order_id, status FROM orders
-		WHERE stock_settled = 0 AND status IN (?, ?, ?, ?) AND updated_at < ?
-		ORDER BY updated_at LIMIT ?`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list unsettled: %w", err)
-	}
-	defer rows.Close()
-	var refs []OrderRef
-	for rows.Next() {
-		var (
-			r      OrderRef
-			status int32
-		)
-		if err := rows.Scan(&r.OrderID, &status); err != nil {
-			return nil, fmt.Errorf("scan unsettled: %w", err)
-		}
-		r.Status = orderv1.OrderStatus(status)
-		refs = append(refs, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate unsettled: %w", err)
-	}
-	return refs, nil
-}
-
-func (s *Store) listIDs(ctx context.Context, query string, args ...any) ([]int64, error) {
+func (s *Store) listRefs(ctx context.Context, query string, args ...any) ([]OrderRef, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list orders: %w", err)
 	}
 	defer rows.Close()
-	var ids []int64
+	var refs []OrderRef
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan order id: %w", err)
+		var r OrderRef
+		if err := rows.Scan(&r.OrderID, &r.UserID); err != nil {
+			return nil, fmt.Errorf("scan order ref: %w", err)
 		}
-		ids = append(ids, id)
+		refs = append(refs, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate order ids: %w", err)
+		return nil, fmt.Errorf("iterate order refs: %w", err)
 	}
-	return ids, nil
-}
-
-func (s *Store) exec(ctx context.Context, query string, args ...any) (bool, error) {
-	res, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return false, fmt.Errorf("exec: %w", err)
-	}
-	return affectedOne(res)
+	return refs, nil
 }
 
 func affectedOne(res sql.Result) (bool, error) {
@@ -374,15 +290,18 @@ func (t *Tx) GetPaymentResult(ctx context.Context, paymentID int64) (*PaymentRes
 	if err != nil {
 		return nil, fmt.Errorf("get payment result: %w", err)
 	}
-	r.Disposition = orderv1.PaymentDisposition(disposition)
+	r.Disposition = eventv1.PaymentDisposition(disposition)
 	return &r, nil
 }
 
-// InsertPaymentResult 记录一笔支付结果及给出的答复。
+// InsertPaymentResult 记录一笔支付结果及给出的答复。payment_id 已存在时返回 ErrDuplicate。
 func (t *Tx) InsertPaymentResult(ctx context.Context, r *PaymentResult, now time.Time) error {
 	_, err := t.tx.ExecContext(ctx, `INSERT INTO payment_results
 		(payment_id, order_id, succeeded, amount, disposition, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		r.PaymentID, r.OrderID, r.Succeeded, r.Amount, int32(r.Disposition), now)
+	if mysqlx.IsDuplicateKey(err) {
+		return fmt.Errorf("insert payment result: %w: %w", ErrDuplicate, err)
+	}
 	if err != nil {
 		return fmt.Errorf("insert payment result: %w", err)
 	}
@@ -391,12 +310,49 @@ func (t *Tx) InsertPaymentResult(ctx context.Context, r *PaymentResult, now time
 
 // MarkPaid 把 PENDING_PAYMENT 的订单改为 PAID。
 func (t *Tx) MarkPaid(ctx context.Context, orderID, paymentID int64, now time.Time) (bool, error) {
-	res, err := t.tx.ExecContext(ctx, `UPDATE orders SET status = ?, payment_id = ?, paid_at = ?, stock_settled = 0, updated_at = ?
+	res, err := t.tx.ExecContext(ctx, `UPDATE orders SET status = ?, payment_id = ?, paid_at = ?, updated_at = ?
 		WHERE order_id = ? AND status = ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_PAID), paymentID, now, now,
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT))
 	if err != nil {
 		return false, fmt.Errorf("mark paid: %w", err)
+	}
+	return affectedOne(res)
+}
+
+// MarkCreateFailed 把 CREATING 的订单改为 FAILED。
+func (t *Tx) MarkCreateFailed(ctx context.Context, orderID int64, reason string, now time.Time) (bool, error) {
+	return t.exec(ctx, `UPDATE orders SET status = ?, fail_reason = ?, updated_at = ?
+		WHERE order_id = ? AND status = ?`,
+		int32(orderv1.OrderStatus_ORDER_STATUS_FAILED), reason, now,
+		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_CREATING))
+}
+
+// Cancel 把属于 userID 的 PENDING_PAYMENT 订单改为 CANCELLED。
+func (t *Tx) Cancel(ctx context.Context, orderID, userID int64, now time.Time) (bool, error) {
+	return t.exec(ctx, `UPDATE orders SET status = ?, updated_at = ?
+		WHERE order_id = ? AND user_id = ? AND status = ?`,
+		int32(orderv1.OrderStatus_ORDER_STATUS_CANCELLED), now,
+		orderID, userID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT))
+}
+
+// CloseExpired 把截止时间早于 now 的 PENDING_PAYMENT 订单改为 CLOSED。
+func (t *Tx) CloseExpired(ctx context.Context, orderID int64, now time.Time) (bool, error) {
+	return t.exec(ctx, `UPDATE orders SET status = ?, updated_at = ?
+		WHERE order_id = ? AND status = ? AND expire_at < ?`,
+		int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED), now,
+		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now)
+}
+
+// AddOutbox 在本事务里写入待发布的消息，与本事务的状态变更一起提交或回滚。
+func (t *Tx) AddOutbox(ctx context.Context, msgs ...outbox.Message) error {
+	return outbox.Add(ctx, t.tx, msgs...)
+}
+
+func (t *Tx) exec(ctx context.Context, query string, args ...any) (bool, error) {
+	res, err := t.tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("exec: %w", err)
 	}
 	return affectedOne(res)
 }

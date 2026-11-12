@@ -31,16 +31,16 @@ const bigID int64 = 9007199254741994
 // 假客户端：嵌入接口，只实现用到的方法，并记录最后一次请求。
 type fakeOrder struct {
 	orderv1.OrderServiceClient
-	create     func(*orderv1.CreateOrderRequest) (*orderv1.CreateOrderResponse, error)
+	create     func(*orderv1.SubmitOrderRequest) (*orderv1.SubmitOrderResponse, error)
 	get        func(*orderv1.GetOrderRequest) (*orderv1.GetOrderResponse, error)
 	cancel     func(*orderv1.CancelOrderRequest) (*orderv1.CancelOrderResponse, error)
-	lastCreate *orderv1.CreateOrderRequest
+	lastCreate *orderv1.SubmitOrderRequest
 	lastGet    *orderv1.GetOrderRequest
 	lastCancel *orderv1.CancelOrderRequest
 	calls      int
 }
 
-func (f *fakeOrder) CreateOrder(_ context.Context, in *orderv1.CreateOrderRequest, _ ...grpc.CallOption) (*orderv1.CreateOrderResponse, error) {
+func (f *fakeOrder) SubmitOrder(_ context.Context, in *orderv1.SubmitOrderRequest, _ ...grpc.CallOption) (*orderv1.SubmitOrderResponse, error) {
 	f.calls++
 	f.lastCreate = in
 	return f.create(in)
@@ -122,6 +122,7 @@ func sampleOrder() *orderv1.Order {
 
 type result struct {
 	status int
+	header http.Header
 	body   map[string]any
 	raw    string
 }
@@ -138,7 +139,7 @@ func do(t *testing.T, h http.Handler, method, path, user, body string, hdr ...st
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	res := result{status: rec.Code, raw: rec.Body.String()}
+	res := result{status: rec.Code, header: rec.Header(), raw: rec.Body.String()}
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Fatalf("content-type = %q, body %s", ct, res.raw)
 	}
@@ -159,15 +160,19 @@ func errCode(t *testing.T, r result) string {
 
 func TestCreateOrder(t *testing.T) {
 	e := newEnv(t)
-	e.order.create = func(*orderv1.CreateOrderRequest) (*orderv1.CreateOrderResponse, error) {
-		return &orderv1.CreateOrderResponse{Order: sampleOrder()}, nil
+	e.order.create = func(*orderv1.SubmitOrderRequest) (*orderv1.SubmitOrderResponse, error) {
+		return &orderv1.SubmitOrderResponse{Order: sampleOrder()}, nil
 	}
 
 	// sku_id 分别用字符串和数字，都应被接受。
 	r := do(t, e.h, "POST", "/api/v1/orders", "7",
 		`{"items":[{"sku_id":"42","quantity":2},{"sku_id":43,"quantity":1}]}`, "Idempotency-Key", "k1")
-	if r.status != http.StatusCreated {
+	// 下单是异步受理：202，并用 Location 告诉客户端去哪里轮询。
+	if r.status != http.StatusAccepted {
 		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	if loc := r.header.Get("Location"); loc != "/api/v1/orders/9007199254741994" {
+		t.Errorf("Location = %q", loc)
 	}
 	in := e.order.lastCreate
 	if in.GetUserId() != 7 || in.GetIdempotencyKey() != "k1" || len(in.GetItems()) != 2 ||
@@ -447,6 +452,7 @@ func TestErrorMapping(t *testing.T) {
 		{"not cancellable", errx.New(codes.FailedPrecondition, errx.ReasonOrderNotCancellable, "no"), 409, "ORDER_NOT_CANCELLABLE"},
 		{"insufficient stock", errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "no stock"), 409, "INSUFFICIENT_STOCK"},
 		{"unavailable", errx.New(codes.Unavailable, "", "down"), 503, "UNAVAILABLE"},
+		{"backlogged", errx.New(codes.ResourceExhausted, errx.ReasonBacklogged, "busy"), 429, "BACKLOGGED"},
 		{"deadline", status.Error(codes.DeadlineExceeded, "slow"), 504, "DEADLINE_EXCEEDED"},
 		{"plain failed precondition", status.Error(codes.FailedPrecondition, "x"), 409, "FAILED_PRECONDITION"},
 		{"plain already exists", status.Error(codes.AlreadyExists, "x"), 409, "ALREADY_EXISTS"},

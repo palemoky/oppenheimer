@@ -7,18 +7,21 @@ import "oppenheimer/common/v1/money.proto";
 
 // OrderService 管理订单的创建、查询、取消，以及支付结果的处理。
 service OrderService {
-  // CreateOrder 创建订单并预占库存。
+  // SubmitOrder 受理下单请求：在库存闸门（Redis）里扣减并记下占用，把请求写入 Kafka 后立即返回。
+  // 订单随后由订单服务异步落库并预占库存，调用方用 GetOrder 轮询，直到状态离开 CREATING。
   //
-  // 以 (user_id, idempotency_key) 幂等：重复请求返回第一次创建的订单。
+  // 返回的订单状态是 CREATING，只有商品和数量，价格在预占成功后才有。
+  //
+  // 以 (user_id, idempotency_key) 幂等：重复请求返回第一次受理的订单（当前状态）。
   //
   // 错误：
-  //   INVALID_ARGUMENT     reason=INVALID_ARGUMENT     参数不合法
+  //   INVALID_ARGUMENT     reason=INVALID_ARGUMENT        参数不合法
   //   NOT_FOUND            reason=SKU_NOT_FOUND
   //   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK
-  //   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED 同一幂等键对应的请求内容不同
-  //   UNAVAILABLE                                       库存服务暂不可用，结果未知；用同一幂等键重试
-  //   ABORTED              reason=CREATE_TIMEOUT        订单长时间未能完成创建，已被置为失败；需换新的幂等键重新下单
-  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  //   FAILED_PRECONDITION  reason=PURCHASE_LIMIT_EXCEEDED 超出该 SKU 的每人限购数量
+  //   ALREADY_EXISTS       reason=IDEMPOTENCY_KEY_REUSED  同一幂等键对应的请求内容不同
+  //   UNAVAILABLE                                          Redis 或 Kafka 暂不可用，本次没有受理；用同一幂等键重试
+  rpc SubmitOrder(SubmitOrderRequest) returns (SubmitOrderResponse);
 
   // GetOrder 查询订单。订单不属于该用户时等同于不存在。
   //
@@ -32,15 +35,6 @@ service OrderService {
   //   NOT_FOUND            reason=ORDER_NOT_FOUND
   //   FAILED_PRECONDITION  reason=ORDER_NOT_CANCELLABLE 订单不在待支付状态
   rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
-
-  // HandlePaymentResult 由支付服务回调，通知一笔支付的最终结果。
-  //
-  // 以 payment_id 幂等，支付服务会重试直到收到成功响应。
-  //
-  // 错误：
-  //   NOT_FOUND            reason=ORDER_NOT_FOUND
-  //   FAILED_PRECONDITION  reason=AMOUNT_MISMATCH 支付金额与订单金额不一致
-  rpc HandlePaymentResult(HandlePaymentResultRequest) returns (HandlePaymentResultResponse);
 }
 
 enum OrderStatus {
@@ -78,21 +72,21 @@ message Order {
   google.protobuf.Timestamp pay_time = 8;
 }
 
-message CreateOrderItem {
+message SubmitOrderItem {
   int64 sku_id = 1;
   // 数量，必须大于 0。
   int32 quantity = 2;
 }
 
-message CreateOrderRequest {
+message SubmitOrderRequest {
   int64 user_id = 1;
   // 客户端生成的幂等键，1 到 64 个字符。
   string idempotency_key = 2;
   // 同一请求内 sku_id 不能重复，至少一项。
-  repeated CreateOrderItem items = 3;
+  repeated SubmitOrderItem items = 3;
 }
 
-message CreateOrderResponse {
+message SubmitOrderResponse {
   Order order = 1;
 }
 
@@ -112,25 +106,4 @@ message CancelOrderRequest {
 
 message CancelOrderResponse {
   Order order = 1;
-}
-
-enum PaymentDisposition {
-  PAYMENT_DISPOSITION_UNSPECIFIED = 0;
-  // 订单已按该支付结果处理（或此前已处理过）。
-  PAYMENT_DISPOSITION_ACCEPTED = 1;
-  // 支付成功，但订单已不能接受这笔钱（已取消、已关闭，或已被另一笔支付付清），需要退款。
-  PAYMENT_DISPOSITION_REFUND_REQUIRED = 2;
-}
-
-message HandlePaymentResultRequest {
-  int64 order_id = 1;
-  int64 payment_id = 2;
-  // 是否支付成功。
-  bool succeeded = 3;
-  // 实际支付金额。
-  oppenheimer.common.v1.Money amount = 4;
-}
-
-message HandlePaymentResultResponse {
-  PaymentDisposition disposition = 1;
 }

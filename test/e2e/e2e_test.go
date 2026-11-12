@@ -182,14 +182,51 @@ func createOrderBody(skuID int64, quantity int) map[string]any {
 	return map[string]any{"items": []map[string]any{{"sku_id": strconv.FormatInt(skuID, 10), "quantity": quantity}}}
 }
 
+// mustCreateOrder 提交订单并等它落库。
+//
+// 下单是异步的：提交只表示请求通过了库存闸门并进入队列（202，状态 creating），
+// 订单随后才落库并在 MySQL 里预占库存。这里轮询到状态离开 creating，
+// 返回的是已经可以支付的订单，调用方不用关心中间状态。
 func mustCreateOrder(t testing.TB, userID, skuID int64, quantity int) order {
 	t.Helper()
-	r := mustCall(t, http.MethodPost, "/api/v1/orders", userID, newKey(), createOrderBody(skuID, quantity))
-	if r.status != http.StatusCreated {
-		t.Fatalf("create order: status %d: %s", r.status, r.body)
+	id, err := submitOrder(t.Context(), userID, skuID, quantity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return waitLanded(t, userID, id)
+}
+
+// submitOrder 提交订单，返回受理（202，状态 creating）的订单号，不等落库。
+// 不调用 t.Fatal，可以在并发提交的 goroutine 里使用。
+func submitOrder(ctx context.Context, userID, skuID int64, quantity int) (string, error) {
+	r, err := call(ctx, http.MethodPost, "/api/v1/orders", userID, newKey(), createOrderBody(skuID, quantity))
+	if err != nil {
+		return "", fmt.Errorf("create order: %w", err)
+	}
+	if r.status != http.StatusAccepted {
+		return "", fmt.Errorf("create order: status %d: %s", r.status, r.body)
 	}
 	var o order
-	r.decode(t, &o)
+	if err := json.Unmarshal(r.body, &o); err != nil {
+		return "", fmt.Errorf("decode accepted order: %w: %s", err, r.body)
+	}
+	if o.Status != "creating" {
+		return "", fmt.Errorf("accepted order %s status = %q, want creating", o.OrderID, o.Status)
+	}
+	return o.OrderID, nil
+}
+
+// waitLanded 轮询到订单离开 creating，要求它落库后处于 pending_payment。
+func waitLanded(t testing.TB, userID int64, id string) order {
+	t.Helper()
+	var o order
+	eventually(t, 10*time.Second, "order "+id+" to leave creating", func() bool {
+		o = getOrder(t, userID, id)
+		return o.Status != "creating"
+	})
+	if o.Status != "pending_payment" {
+		t.Fatalf("order %s became %q, want pending_payment", id, o.Status)
+	}
 	return o
 }
 
@@ -254,6 +291,17 @@ func newSKU(t testing.TB, available int64) int64 {
 	return id
 }
 
+// newLimitedSKU 插入一个每人限购 limit 件的 SKU。
+func newLimitedSKU(t testing.TB, available, limit int64) int64 {
+	t.Helper()
+	id := newSKU(t, available)
+	if _, err := inventoryDB.ExecContext(t.Context(),
+		"UPDATE sku_stock SET purchase_limit = ? WHERE sku_id = ?", limit, id); err != nil {
+		t.Fatalf("set purchase limit: %v", err)
+	}
+	return id
+}
+
 // eventually 轮询直到 cond 返回 true。系统是最终一致的：
 // 支付结果、关单、库存结清都由后台任务异步完成，断言必须容忍这段延迟。
 func eventually(t testing.TB, timeout time.Duration, what string, cond func() bool) {
@@ -287,9 +335,6 @@ func TestOrderAndPay(t *testing.T) {
 	sku, user := newSKU(t, 10), newUser()
 
 	o := mustCreateOrder(t, user, sku, 3)
-	if o.Status != "pending_payment" {
-		t.Fatalf("status = %q, want pending_payment", o.Status)
-	}
 	if want := (money{Amount: 3 * unitPrice, Currency: "CNY"}); o.Total != want {
 		t.Errorf("total = %+v, want %+v", o.Total, want)
 	}
@@ -341,7 +386,7 @@ func TestFlashSaleNeverOversells(t *testing.T) {
 			switch {
 			case err != nil:
 				t.Errorf("create order: %v", err)
-			case r.status == http.StatusCreated:
+			case r.status == http.StatusAccepted:
 				created.Add(1)
 			case r.status == http.StatusConflict && r.errorCode() == "INSUFFICIENT_STOCK":
 				soldOut.Add(1)
@@ -379,7 +424,7 @@ func TestConcurrentDuplicateSubmitCreatesOneOrder(t *testing.T) {
 				t.Errorf("create order: %v", err)
 				return
 			}
-			if r.status != http.StatusCreated {
+			if r.status != http.StatusAccepted {
 				t.Errorf("attempt %d: status %d: %s", i, r.status, r.body)
 				return
 			}
@@ -446,8 +491,14 @@ func TestCancelReturnsStockOnce(t *testing.T) {
 // 支付与取消同时发生。两者是互斥的状态转换，无论谁赢，最终状态必须自洽：
 //   - 支付赢：订单已支付，库存已售，支付单成功。
 //   - 取消赢：订单已取消，库存归还；若钱已经付了，支付单必须被退款。
+//   - 关单赢：支付时限（e2e 里只有几秒）从受理时刻算起，到期的延迟消息也在和支付、取消抢同一个
+//     PENDING_PAYMENT。机器慢时最早受理的订单可能在支付结果和取消到达之前就被关闭。
+//     要求与取消相同：库存归还；若钱已经付了，支付单必须被退款。
 //
-// 不允许出现“订单取消了但钱没退”或“订单付了但库存被归还”。
+// 不允许出现“订单取消或关闭了但钱没退”或“订单付了但库存被归还”。
+//
+// 订单并发提交、再一起等落库，尽量少占用支付时限，让大部分订单留给支付与取消去竞争。
+// 逐个提交并等落库要两到三秒，几乎耗尽时限，最早的订单会在竞争开始前就被关单。
 func TestPayRacingCancelEndsConsistent(t *testing.T) {
 	t.Parallel()
 	const orders, perOrder = 40, 1
@@ -458,9 +509,24 @@ func TestPayRacingCancelEndsConsistent(t *testing.T) {
 		id   string
 	}
 	entries := make([]entry, orders)
+	var submit sync.WaitGroup
 	for i := range entries {
-		user := newUser()
-		entries[i] = entry{user: user, id: mustCreateOrder(t, user, sku, perOrder).OrderID}
+		entries[i].user = newUser()
+		submit.Go(func() {
+			id, err := submitOrder(t.Context(), entries[i].user, sku, perOrder)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			entries[i].id = id
+		})
+	}
+	submit.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	for _, e := range entries {
+		waitLanded(t, e.user, e.id)
 	}
 
 	var wg sync.WaitGroup
@@ -486,7 +552,7 @@ func TestPayRacingCancelEndsConsistent(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	var paid, cancelled int64
+	var paid, cancelled, closed int64
 	for _, e := range entries {
 		var o order
 		var p payment
@@ -495,7 +561,9 @@ func TestPayRacingCancelEndsConsistent(t *testing.T) {
 		eventually(t, 15*time.Second, "order "+e.id+" to settle", func() bool {
 			o = getOrder(t, e.user, e.id)
 			p, hasPayment = getPayment(t, e.user, e.id)
-			if o.Status != "paid" && o.Status != "cancelled" {
+			switch o.Status {
+			case "paid", "cancelled", "closed":
+			default:
 				return false
 			}
 			return !hasPayment || (p.Notified && p.Status != "pending")
@@ -507,21 +575,26 @@ func TestPayRacingCancelEndsConsistent(t *testing.T) {
 			if !hasPayment || p.Status != "succeeded" {
 				t.Errorf("order %s is paid but payment is %+v (found=%v)", e.id, p, hasPayment)
 			}
-		case "cancelled":
-			cancelled++
+		case "cancelled", "closed":
+			if o.Status == "cancelled" {
+				cancelled++
+			} else {
+				closed++
+			}
 			if hasPayment && p.Status != "refunded" {
-				t.Errorf("order %s is cancelled but its payment is %q, want refunded", e.id, p.Status)
+				t.Errorf("order %s is %s but its payment is %q, want refunded", e.id, o.Status, p.Status)
 			}
 		}
 	}
 
-	t.Logf("paid=%d cancelled=%d", paid, cancelled)
-	// 两种结局都要出现，否则这个测试没有真正覆盖到竞争。
+	t.Logf("paid=%d cancelled=%d closed=%d", paid, cancelled, closed)
+	// 支付与取消两种结局都要出现，否则这个测试没有真正覆盖到它们之间的竞争。关单可以出现，但不算数。
 	if paid == 0 || cancelled == 0 {
-		t.Errorf("paid=%d cancelled=%d; the race was not exercised in both directions", paid, cancelled)
+		t.Errorf("paid=%d cancelled=%d closed=%d; the pay/cancel race was not exercised in both directions",
+			paid, cancelled, closed)
 	}
 	wantStock(t, sku, stock{
-		Available: cancelled * perOrder,
+		Available: (cancelled + closed) * perOrder,
 		Reserved:  0,
 		Sold:      paid * perOrder,
 	})
@@ -549,4 +622,31 @@ func TestFailedPaymentLeavesOrderPendingUntilClosed(t *testing.T) {
 		return getOrder(t, user, o.OrderID).Status == "closed"
 	})
 	wantStock(t, sku, stock{Available: 4, Reserved: 0, Sold: 0})
+}
+
+// 限购：每人最多买 2 件。买满后再买被当场拒绝；取消后额度恢复；别的用户不受影响。
+func TestPurchaseLimit(t *testing.T) {
+	t.Parallel()
+	sku, user := newLimitedSKU(t, 10, 2), newUser()
+
+	first := mustCreateOrder(t, user, sku, 2)
+
+	r := mustCall(t, http.MethodPost, "/api/v1/orders", user, newKey(), createOrderBody(sku, 1))
+	if r.status != http.StatusConflict || r.errorCode() != "PURCHASE_LIMIT_EXCEEDED" {
+		t.Fatalf("over limit: status %d code %q, want 409 PURCHASE_LIMIT_EXCEEDED", r.status, r.errorCode())
+	}
+	// 被闸门拒绝的请求没有碰库存。
+	wantStock(t, sku, stock{Available: 8, Reserved: 2, Sold: 0})
+
+	mustCreateOrder(t, newUser(), sku, 2)
+
+	if r := mustCall(t, http.MethodPost, "/api/v1/orders/"+first.OrderID+"/cancel", user, "", nil); r.status != http.StatusOK {
+		t.Fatalf("cancel: status %d: %s", r.status, r.body)
+	}
+	// 额度的恢复是异步的：库存服务消费取消事件，先释放 MySQL 的预占，再归还闸门里的占用。
+	eventually(t, 10*time.Second, "purchase quota to be restored after cancel", func() bool {
+		r := mustCall(t, http.MethodPost, "/api/v1/orders", user, newKey(), createOrderBody(sku, 2))
+		return r.status == http.StatusAccepted
+	})
+	wantStock(t, sku, stock{Available: 6, Reserved: 4, Sold: 0})
 }

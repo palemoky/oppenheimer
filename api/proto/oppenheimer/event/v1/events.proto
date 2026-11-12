@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package oppenheimer.event.v1;
+
+import "google/protobuf/timestamp.proto";
+import "oppenheimer/common/v1/money.proto";
+
+option go_package = "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1;eventv1";
+
+// 本文件定义服务之间通过 Kafka 传递的事件。
+//
+// 约定：
+// - 每个 topic 只有一种消息类型（一个信封），具体事件放在 oneof 里。
+//   消费者遇到不认识或不关心的事件直接跳过，这样新增事件不会破坏旧的消费者。
+// - Kafka 消息的 key 是 order_id 的十进制字符串，保证同一订单的事件落在同一分区、按序到达。
+// - 投递语义是至少一次：同一个事件可能到达多次，消费者必须幂等。
+// - 事件是已经发生的事实，用过去式命名，不可撤回。
+
+// OrderEvent 是 topic order.events 的消息，由订单服务通过 outbox 发布。
+message OrderEvent {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  // 事件发生的时间（订单状态变更的时间）。
+  google.protobuf.Timestamp occur_time = 3;
+
+  oneof body {
+    OrderPaid paid = 10;
+    OrderCancelled cancelled = 11;
+    OrderClosed closed = 12;
+    OrderFailed failed = 13;
+    PaymentResultHandled payment_result_handled = 14;
+  }
+}
+
+// OrderPaid：订单已支付。库存服务据此把预占转为已售（Confirm）。
+message OrderPaid {
+  int64 payment_id = 1;
+}
+
+// OrderCancelled：用户取消了待支付的订单。库存服务据此释放预占（Release）。
+message OrderCancelled {}
+
+// OrderClosed：订单超时未支付被关闭。库存服务据此释放预占。
+message OrderClosed {}
+
+// OrderFailed：订单创建失败。库存服务据此释放预占；
+// 预占不存在时留下“已释放”标记，挡住之后迟到的预占请求（空回滚）。
+message OrderFailed {
+  // 失败原因码，取值同 errx 的原因码，或 CREATE_TIMEOUT。
+  string reason = 1;
+}
+
+// PaymentDisposition 是订单服务对一笔支付结果的处置意见。
+enum PaymentDisposition {
+  PAYMENT_DISPOSITION_UNSPECIFIED = 0;
+  // 已接受：支付成功且订单已付清，或支付失败已知悉。
+  PAYMENT_DISPOSITION_ACCEPTED = 1;
+  // 需要退款：钱已经付了，但订单不能接受这笔支付。
+  PAYMENT_DISPOSITION_REFUND_REQUIRED = 2;
+}
+
+// PaymentResultHandled：订单服务处理完一笔支付结果后给支付服务的答复。
+// 支付服务据此标记“已通知”，或在需要时退款。
+message PaymentResultHandled {
+  int64 payment_id = 1;
+  PaymentDisposition disposition = 2;
+  // 需要退款时的原因码，例如 ORDER_NOT_PAYABLE、AMOUNT_MISMATCH、ORDER_NOT_FOUND。
+  string reason = 3;
+}
+
+// PaymentEvent 是 topic payment.events 的消息，由支付服务通过 outbox 发布。
+message PaymentEvent {
+  int64 payment_id = 1;
+  int64 order_id = 2;
+  int64 user_id = 3;
+  google.protobuf.Timestamp occur_time = 4;
+
+  oneof body {
+    PaymentCompleted completed = 10;
+  }
+}
+
+// PaymentCompleted：支付有了最终结果（成功或失败）。
+// 订单服务据此推进订单状态，并用 OrderEvent.payment_result_handled 答复。
+message PaymentCompleted {
+  bool succeeded = 1;
+  oppenheimer.common.v1.Money amount = 2;
+}
+
+// OrderSubmitted 是 topic order.submit 的消息：一笔已被库存闸门放行、等待落库的下单请求。
+// 由订单服务在受理时直接发出（不经过 outbox，见设计文档 6.3），再由订单服务自己消费。
+message OrderSubmitted {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  string idempotency_key = 3;
+  // 请求内容（商品与数量）的 SHA-256，与 orders.request_hash 相同。
+  bytes request_hash = 4;
+  repeated SubmittedItem items = 5;
+  // 受理时间，作为订单的创建时间。
+  google.protobuf.Timestamp accept_time = 6;
+  // 支付截止时间 = 受理时间 + 支付时限。
+  google.protobuf.Timestamp expire_time = 7;
+}
+
+message SubmittedItem {
+  int64 sku_id = 1;
+  int32 quantity = 2;
+}
+
+// OrderCloseDue 是 topic order.close.delay 的消息：到期（消息头 due-at）时检查订单是否仍未支付。
+// 它只是一个“到点了”的提醒，订单该不该关由订单当时的状态决定。
+message OrderCloseDue {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  google.protobuf.Timestamp expire_time = 3;
+}

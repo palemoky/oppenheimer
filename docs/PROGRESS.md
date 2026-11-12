@@ -4,36 +4,41 @@
 
 ## 当前状态
 
-- **当前阶段**：1a 和「1a 补充」（对外接口契约 OpenAPI）都已完成，下一个是 1b
-- **当前分支**：`main`。「1a 补充」已通过 PR 合并；1b 从 `main` 新开分支
-- **最后更新**：2026-11-11
+- **当前阶段**：1b（高并发改造）已完成。下一个子阶段是 1c（分库分表与主从）
+- **当前分支**：`phase-1b`，合并 PR #5 之后切回 `main`
+- **最后更新**：2026-11-12
 
 ## 上次做到哪
 
-1a 全部完成并合并到 `main`（PR #2）。CI 全部通过，包括首次在 GitHub 上运行的 MySQL 集成测试任务和端到端任务。
+1b 分四步（见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 和 [design/1b-high-concurrency.md](design/1b-high-concurrency.md)），步骤一到三的经过见会话日志。
 
-- 四个服务由子 Agent 并行实现，主会话逐个评审后合入。评审和实现过程中发现并修复了两个设计缺陷（Release 的锁升级死锁、Reserve 被拒后的库存泄漏），详见 [notes/1a-consistency.md](notes/1a-consistency.md) 第 7 节。
-- 合并前补了两篇 ADR：[ADR-0005](adr/0005-openapi-spec-first.md)（对外接口 OpenAPI 规范先行，**只有决定和计划，还没有任何代码**）和 [ADR-0006](adr/0006-money-as-integer-minor-units.md)（金额用最小货币单位的整数，补记 1a 的既有决定）。
+**步骤四（加固）已完成**，阶段计划里四个 checkbox 都已勾：
 
-## 「1a 补充」做到哪
-
-gateway 已改为规范先行，已合并到 `main`，CI 通过。
-
-- 规范：`api/openapi/gateway.yaml`（OpenAPI 3.1，6 个接口）；生成配置 `api/openapi/oapi-codegen.yaml`。
-- 生成代码：`services/gateway/internal/httpapi/oas/oas.gen.go`；同目录的 `id.go` 是规范通过 `x-go-type` 引用的手写 ID 类型。
-- gateway：`server` 实现生成的 `ServerInterface`，路由由生成代码注册，手写的 DTO 已删除，`dto.go` 只剩 proto 到对外类型的转换。
-- 工具链：`make tools` 会安装 `oapi-codegen` v2.8.2，`make openapi` 重新生成；CI 新增 `openapi` 任务检查生成代码是否与规范一致。
-- ADR-0005 的四个待验证细节都已验证并写回，状态改为“已采纳”。
-- 本机验证：`make lint` 0 问题，`make test` 全过，`make e2e` 7 个场景通过。`server_test.go` 和端到端测试没有改动。
-- 对外行为的差异只有两处，都记在 ADR-0005 里：缺少 `Idempotency-Key` 时错误消息的文字变了（状态码和错误码不变）；重复的 `Idempotency-Key` 头现在返回 400。
+- 分布式锁：order 三把、payment 两把，都包了 `lock.FailOpen`；inventory 的对账保持 fail-closed（设计文档 7.1）。
+- 查询缓存：`pkg/cache`，库存短 TTL，订单只缓存终态，独立的 `redis-cache` 实例（7.2，ADR-0010）。
+- 杀进程对账：`make chaos`（`scripts/chaos.sh` 加 `test/load` 的 `verify`、`wait-quiet`、`warmup`），19 项检查全过、死信为零。测试发现并修了两个可用性问题：消费者会话超时 45 秒改为 10 秒；下单消费者重试 5 次改为 10 次（7.3.4）。
+- 吞吐对比：`make bench`（`scripts/bench.sh`），数字在笔记 `docs/notes/1b-high-concurrency.md` 第 6 节。**验收项“数量级提升”没有达到**（1.7 到 3.7 倍）。主人决定：吞吐结论挂到阶段 2 在集群上重测，落库性能问题挂到 1d，只在 1b 修“积压超过宽限期会丢已受理订单”。
+- 这个修复已完成（受理端背压，设计文档 6.4.1、ADR-0011）：闸门按队列长度（`ADMIT_MAX_QUEUE`，默认 1 万）和排队时长（`ADMIT_MAX_WAIT` 默认宽限期一半，`ADMIT_MAX_STALE` 默认 100）拒绝受理，返回 429 `BACKLOGGED`。
+  - 第一版只按排队时长，压测仍丢 2.3 万单，因为最老订单的等待衡量的是过去；加上长度上限后同样的负载零回收，积压 25 秒排空。
+  - 拒绝原本是 `UNAVAILABLE`，每条都被 grpcx 记成 ERROR，改为 `RESOURCE_EXHAUSTED` 加 HTTP 429。
+  - 验证：`make lint test` 通过；`make chaos` 2 次 PASS；压测复跑零回收、无 ERROR 日志。
+  - 这次修改涉及库存闸门和下单路径，按 AGENTS.md 应由 Fable 编写或评审。当时 Fable 没有额度，主人决定由 Opus 自行评审完成（见计划变更）。**下次 Fable 可用时，请它评审 `pkg/stockgate` 的 `holdScript` 和 `services/order/internal/service/submit.go` 的改动。**
+- 1b 面试笔记已写（`docs/notes/1b-high-concurrency.md`），步骤四新增的考点在阶段计划「面试考点」末尾，还没并进笔记。
 
 ## 下一步
 
-1. 进入 1b。先细化 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 的 1b 任务并写设计文档，顺序建议：Redis 预扣库存 → outbox 加 Kafka 替换轮询 → 异步下单 → 延迟关单 → 分布式锁 → 杀进程对账测试。1b 新增或修改对外接口时（例如异步下单的结果轮询），先改规范再写实现。
+1. 1b 已收尾：e2e 偶发失败已修（Redis 连接池固定大小并预热、预热调用按 SKU 合并，设计文档 7.3.4 末尾），`make e2e` 连跑 25 次全过。PR #5 已推送并合并到 `main`（以合并后的实际状态为准，见会话日志）。
+2. 把步骤四新增的考点（阶段计划「面试考点」末尾）并进 `docs/notes/1b-high-concurrency.md`。
+3. 设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条标注已解决。
+4. Fable 可用时，补评审背压修复（`pkg/stockgate` 的 `holdScript`、`services/order/internal/service/submit.go`）。
+5. 开始 1c：从 `main` 新开分支 `phase-1c`，先细化设计文档再动手。
 
-已推迟的任务（记在对应阶段的计划里，不会丢）：
+步骤三遗留、仍未处理的两点（记在这里不丢）：
 
-- 从 OpenAPI 规范生成客户端，替换 `test/e2e` 里手写的请求结构：移到阶段 3b，见 [plan/phase-3-observability.md](plan/phase-3-observability.md) 的第一项。
+- `closed` 结局在正常时限下几乎不出现，CI 覆盖不到“支付对关单”的竞争，要稳定覆盖需要单独写一个用例。
+- 支付时限从受理时刻起算，落库排队会挤占支付窗口。背压把排队限制在约 25 秒以内，影响变小了，但没有消除。
+
+挂到后续阶段的（已写进对应计划）：落库串行与轮询拖垮落库、压测工具开环模式、几个小问题（1d）；集群上重测吞吐、Kafka 静态成员（阶段 2）。
 
 ## 本机开发环境
 
@@ -73,6 +78,13 @@ gateway 已改为规范先行，已合并到 `main`，CI 通过。
 | 2026-11-11 | ADR 重新编号：原 0005（OpenTelemetry）改为 0004，新增的 OpenAPI 为 0005、金额表示为 0006 | 主人删除了原 ADR-0004（可观测先于故障注入），序号补齐 |
 | 2026-11-11 | 「1a 补充」的 gateway 重构由主会话完成，没有派给子 Agent | 验证 ADR-0005 的待验证细节需要先把重构做出来，改动很小 |
 | 2026-11-11 | 「从 OpenAPI 规范生成客户端」从「1a 补充」移到阶段 3b | 和压测脚本一起评估，避免做两次 |
+| 2026-11-12 | 步骤三设计修正：受理失败用 `ReturnIfUnclaimed`；认领的占用单独成列表；落库时已过期的订单直接失败；创建超时从落库时刻算起 | 都是实现时由子 Agent 的评审和测试发现的，见设计文档 6.3、6.4 |
+| 2026-11-12 | 1b 验收项“吞吐相对 1a 有数量级提升”移到阶段 2，在集群上重测；落库性能问题和压测工具开环模式移到 1d | 本机实测只有 1.7 到 3.7 倍，测量疑似受 OrbStack 端口转发干扰；主人决定 1b 只修积压与回收的冲突 |
+| 2026-11-12 | 1b 增加受理端背压（ADR-0011） | 压测发现积压超过回收宽限期会丢掉已受理的订单 |
+| 2026-11-12 | 背压修复由 Opus 编写和自评审，没有经过 Fable | Fable 没有额度，主人决定先由 Opus 完成；Fable 可用时补一次评审 |
+| 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
+| 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
+| 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
 
 ## 会话日志
 
@@ -87,3 +99,17 @@ gateway 已改为规范先行，已合并到 `main`，CI 通过。
 同日完成 1a 收尾：文档改动作为独立提交进入 1a 分支，推送、开 PR #2、CI 全绿后合并到 `main`。
 
 同日实施「1a 补充」：写了 OpenAPI 规范，引入 `oapi-codegen`，gateway 改为实现生成的接口，本机 lint、测试、端到端全部通过。随后提交、推送、开 PR 并合并到 `main`（git 操作派给 Haiku 子 Agent）。生成客户端的可选任务移到阶段 3b。
+
+同日开始 1b：写了设计文档和 ADR-0007、ADR-0008，完成步骤一的公共库（三个子 Agent 并行实现，主会话评审合入，outbox 由主会话编写）。步骤二改了 proto 和脚本后暂停，服务改造尚未开始。
+
+同日继续 1b：重新派出第二批四个子 Agent，全部完成。主会话评审合入，修了 outbox 的两处缺陷，`make lint test e2e` 通过，复核结论写入设计文档第 5.6 节。步骤二完成，已推送并开 draft PR #5；CI 的 e2e 首次失败（topic 创建后不可见），修复后全绿。
+
+### 2026-11-12
+
+完成 1b 步骤三。先细化设计文档第 6 节并写 ADR-0009，主会话写库存闸门和契约，order、inventory 派给子 Agent（中途因用量限制中断过一次，恢复后继续）。评审合入后修了两个设计问题，`make lint test e2e` 通过。
+
+同日提交推送步骤三，CI 的 e2e 失败（支付与取消竞争的用例超时）。派 Opus 排查并修复：根因是测试造数耗尽了支付时限，产品代码没有一致性缺陷。主会话评审 diff 后推送修复，CI 全绿。随后细化了步骤四的设计（设计文档第 7 节、ADR-0010），主人确认后定稿（订单只缓存终态）。步骤四的代码尚未动工。
+
+同日完成步骤四。主会话（Fable）写了 `lock.FailOpen`、`pkg/cache` 和 `redis-cache`；order、inventory、payment 的接入、压测工具、杀进程脚本、面试笔记、吞吐对比派给 Opus 和 Sonnet 子 Agent，主会话评审后合入。主人中途要求尽量把具体任务派给便宜的模型。杀进程测试发现消费者会话超时和下单重试两个问题，已修。吞吐没有达到数量级提升，主人决定挂到阶段 2。主人随后把会话切到 Opus，由 Opus 完成受理端背压（第一版只看排队时长，压测证明不够，改为按队列长度）。
+
+同日按主人要求修了 e2e 的偶发失败（冷连接池遇上突发流量，新连接丢包要等 1 秒的初始重传超时），推送 `phase-1b` 并合并 PR #5。
