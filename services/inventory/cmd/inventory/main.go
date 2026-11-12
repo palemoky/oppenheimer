@@ -17,6 +17,7 @@ import (
 	"github.com/palemoky/Oppenheimer/api/eventx"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/Oppenheimer/pkg/app"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/grpcx"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
 	"github.com/palemoky/Oppenheimer/pkg/lock"
@@ -52,6 +53,10 @@ type config struct {
 	kafkaPrefix  string
 	redisAddr    string
 	redisPrefix  string
+	// cacheRedisAddr 为空表示复用 redisAddr 的客户端。
+	cacheRedisAddr string
+	// stockCacheTTL 为 0 表示关闭 GetStock 缓存。
+	stockCacheTTL time.Duration
 
 	reconcileInterval time.Duration
 	reconcileRounds   int
@@ -67,8 +72,18 @@ func loadConfig() (config, error) {
 		redisAddr:    cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
 		redisPrefix:  os.Getenv("REDIS_PREFIX"),
 
+		cacheRedisAddr: os.Getenv("CACHE_REDIS_ADDR"),
+		stockCacheTTL:  time.Second,
+
 		reconcileInterval: reconcile.DefaultInterval,
 		reconcileRounds:   reconcile.DefaultRounds,
+	}
+	if v := os.Getenv("STOCK_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return config{}, fmt.Errorf("STOCK_CACHE_TTL: want a non-negative duration, got %q", v)
+		}
+		cfg.stockCacheTTL = d
 	}
 	if v := os.Getenv("GATE_RECONCILE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -138,7 +153,12 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 
 	st := store.New(db)
 	gate := stockgate.New(rdb, cfg.redisPrefix)
-	svc := service.New(st, gate, logger)
+	stockCache, closeCache, err := newStockCache(ctx, logger, cfg, rdb)
+	if err != nil {
+		return err
+	}
+	defer closeCache()
+	svc := service.New(st, gate, logger, service.WithStockCache(stockCache, cfg.stockCacheTTL))
 
 	reconciler, leader, err := newReconciler(logger, cfg, rdb, gate, st)
 	if err != nil {
@@ -178,6 +198,38 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	//   3. 然后 gRPC、HTTP。
 	// Redis 和 MySQL 的连接在 app.Run 返回、所有组件都停了之后才关（见上面的 defer）。
 	return app.Run(ctx, logger, httpServer, grpcServer, consumer, reconciler)
+}
+
+// newStockCache 创建 GetStock 的查询缓存；STOCK_CACHE_TTL 为 0 时返回 nil（不缓存）。
+// 设了 CACHE_REDIS_ADDR（且与 REDIS_ADDR 不同）时连专用的缓存 Redis，否则复用 rdb。
+// 返回的 closeFn 关闭专用客户端（复用 rdb 时什么也不做），调用方在所有组件停止后调用。
+func newStockCache(ctx context.Context, logger *slog.Logger, cfg config, rdb *redis.Client) (c *cache.Cache[*inventoryv1.GetStockResponse], closeFn func(), err error) {
+	closeFn = func() {}
+	if cfg.stockCacheTTL <= 0 {
+		return nil, closeFn, nil
+	}
+	client := rdb
+	if cfg.cacheRedisAddr != "" && cfg.cacheRedisAddr != cfg.redisAddr {
+		rctx, cancel := context.WithTimeout(ctx, redisSetupTimeout)
+		defer cancel()
+		dedicated, err := redisx.Open(rctx, redisx.Config{Addr: cfg.cacheRedisAddr})
+		if err != nil {
+			return nil, nil, fmt.Errorf("open cache redis: %w", err)
+		}
+		client = dedicated
+		closeFn = func() {
+			if err := dedicated.Close(); err != nil {
+				logger.Warn("close cache redis", "error", err)
+			}
+		}
+	}
+	c, err = cache.New(cache.Config{Client: client, KeyPrefix: cfg.redisPrefix, Logger: logger},
+		cache.ProtoCodec[*inventoryv1.GetStockResponse]{})
+	if err != nil {
+		closeFn()
+		return nil, nil, fmt.Errorf("new stock cache: %w", err)
+	}
+	return c, closeFn, nil
 }
 
 // newReconciler 创建对账任务。多个实例只有持有 leader 锁的那个在对账，理由见 reconcile.NewLoop。

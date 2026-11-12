@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -14,6 +15,7 @@ import (
 
 	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/Oppenheimer/pkg/cache"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/Oppenheimer/pkg/retry"
@@ -48,11 +50,33 @@ type Service struct {
 	logger *slog.Logger
 	// txRetry 的 MaxAttempts 只在测试中调为 1，用来证明某些场景根本不会死锁，而不是靠重试掩盖。
 	txRetry retry.Policy
+
+	// stockCache 和 stockCacheTTL 只用于 gRPC GetStock 的读路径；stockCache 为 nil 表示不缓存。
+	// 写路径和所有内部决策（Reserve、Confirm、Release、对账、闸门）一律读库，不经过它。
+	stockCache    *cache.Cache[*inventoryv1.GetStockResponse]
+	stockCacheTTL time.Duration
+}
+
+// Option 是 New 的可选配置。
+type Option func(*Service)
+
+// WithStockCache 让 GetStock 经过缓存 c，结果（包括 SKU 不存在）缓存 ttl。
+// 写库存时不失效缓存，读到的数据最多落后 ttl（再加抖动）。c 为 nil 或 ttl <= 0 时不缓存。
+func WithStockCache(c *cache.Cache[*inventoryv1.GetStockResponse], ttl time.Duration) Option {
+	return func(s *Service) {
+		if c != nil && ttl > 0 {
+			s.stockCache, s.stockCacheTTL = c, ttl
+		}
+	}
 }
 
 // New 返回使用 st 和库存闸门 gate 的 Service。
-func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger) *Service {
-	return &Service{store: st, gate: gate, logger: logger, txRetry: defaultTxRetry}
+func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger, opts ...Option) *Service {
+	s := &Service{store: st, gate: gate, logger: logger, txRetry: defaultTxRetry}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Reserve 实现 InventoryServiceServer。
@@ -297,15 +321,33 @@ func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, m
 	return nil
 }
 
-// GetStock 实现 InventoryServiceServer。
+// StockCacheKey 返回 sku 的库存查询缓存 key（不含 REDIS_PREFIX）。
+func StockCacheKey(skuID int64) string {
+	return "cache:stock:" + strconv.FormatInt(skuID, 10)
+}
+
+// GetStock 实现 InventoryServiceServer。启用缓存时，返回的消息可能被并发调用共享，不能修改。
 func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest) (*inventoryv1.GetStockResponse, error) {
 	skuID := req.GetSkuId()
-	stock, found, err := s.store.GetStock(ctx, skuID)
-	if err != nil {
-		return nil, s.toStatus(ctx, "get stock", err, "sku_id", skuID)
+	if s.stockCache == nil {
+		resp, found, err := s.loadStock(ctx, skuID)
+		return s.stockResult(ctx, skuID, resp, found, err)
 	}
-	if !found {
-		return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", skuID)
+	resp, found, err := s.stockCache.Get(ctx, StockCacheKey(skuID), func(ctx context.Context) (cache.Loaded[*inventoryv1.GetStockResponse], error) {
+		resp, found, err := s.loadStock(ctx, skuID)
+		if err != nil {
+			return cache.Loaded[*inventoryv1.GetStockResponse]{}, err
+		}
+		return cache.Loaded[*inventoryv1.GetStockResponse]{Value: resp, Found: found, TTL: s.stockCacheTTL}, nil
+	})
+	return s.stockResult(ctx, skuID, resp, found, err)
+}
+
+// loadStock 从库里读库存，转成响应。
+func (s *Service) loadStock(ctx context.Context, skuID int64) (*inventoryv1.GetStockResponse, bool, error) {
+	stock, found, err := s.store.GetStock(ctx, skuID)
+	if err != nil || !found {
+		return nil, false, err
 	}
 	return &inventoryv1.GetStockResponse{
 		SkuId:     stock.SKUID,
@@ -313,7 +355,17 @@ func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest
 		Reserved:  stock.Reserved,
 		Sold:      stock.Sold,
 		UnitPrice: toProtoMoney(stock.UnitPrice),
-	}, nil
+	}, true, nil
+}
+
+func (s *Service) stockResult(ctx context.Context, skuID int64, resp *inventoryv1.GetStockResponse, found bool, err error) (*inventoryv1.GetStockResponse, error) {
+	if err != nil {
+		return nil, s.toStatus(ctx, "get stock", err, "sku_id", skuID)
+	}
+	if !found {
+		return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", skuID)
+	}
+	return resp, nil
 }
 
 // inTx 执行事务，遇到死锁时整体重试，原因见 defaultTxRetry。
