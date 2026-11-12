@@ -28,7 +28,7 @@
 ## 下一步
 
 1. 1b 已收尾：e2e 偶发失败已修（Redis 连接池固定大小并预热、预热调用按 SKU 合并，设计文档 7.3.4 末尾），`make e2e` 连跑 25 次全过。PR #5 已推送并合并到 `main`（以合并后的实际状态为准，见会话日志）。
-2. 把步骤四新增的考点（阶段计划「面试考点」末尾）并进 `docs/notes/1b-high-concurrency.md`。
+2. 步骤四新增的考点已并进 `docs/notes/1b-high-concurrency.md`（新增 1.6、2.7、2.8，补了 5.2、5.3、第 6 节和缺口汇总）。其中 5.2 里“延迟双删、消费事件删除、订阅 binlog 删除各自盖住哪个窗口”是通用知识，不是本项目实测。
 3. 设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条标注已解决。
 4. Fable 可用时，补评审背压修复（`pkg/stockgate` 的 `holdScript`、`services/order/internal/service/submit.go`）。
 5. 开始 1c：从 `main` 新开分支 `phase-1c`，先细化设计文档再动手。
