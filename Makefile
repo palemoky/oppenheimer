@@ -101,6 +101,10 @@ e2e: build ## 端到端测试：在独立的 e2e_* 库上启动四个服务并�
 chaos: build ## 杀进程对账测试：压测期间随机 kill -9 服务，静止后对账（需要先 make up，CHAOS_* 变量见脚本）
 	scripts/chaos.sh
 
+.PHONY: bench
+bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本）
+	scripts/bench.sh
+
 .PHONY: load
 load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"
 	go run ./test/load run $(LOAD_ARGS)
