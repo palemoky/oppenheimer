@@ -58,13 +58,22 @@ type ConsumerConfig struct {
 
 	// DLQSuffix 是死信 topic 的后缀：死信 topic = 原 topic + DLQSuffix，默认 ".dlq"。
 	DLQSuffix string
+	// SessionTimeout 是 broker 多久收不到心跳就把这个成员踢出组，默认 10 秒。心跳间隔取它的三分之一。
+	//
+	// 它决定消费者被 kill -9（来不及主动离组）之后，它名下的分区要停多久才会分给别人，
+	// 重启的新实例也得等这么久：旧成员没被踢掉之前，重平衡完不成。franz-go 的默认值是 45 秒，
+	// 杀进程测试里表现为库存迟迟不归还、受理的订单等不到落库就被回收（设计文档 7.3.4）。
+	// 取得太短，一次长的 GC 暂停或网络抖动就会触发不必要的重平衡；不能低于 broker 的
+	// group.min.session.timeout.ms（默认 6 秒）。
+	SessionTimeout time.Duration
 }
 
 const (
-	defaultMaxAttempts  = 5
-	defaultRetryInitial = 100 * time.Millisecond
-	defaultRetryMax     = 5 * time.Second
-	defaultDLQSuffix    = ".dlq"
+	defaultMaxAttempts    = 5
+	defaultRetryInitial   = 100 * time.Millisecond
+	defaultRetryMax       = 5 * time.Second
+	defaultDLQSuffix      = ".dlq"
+	defaultSessionTimeout = 10 * time.Second
 
 	// maxPollRecords 限制一次拉取的条数，让拉取循环尽快把记录分发出去并允许再平衡。
 	maxPollRecords = 500
@@ -170,6 +179,9 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 	if cfg.DLQSuffix == "" {
 		cfg.DLQSuffix = defaultDLQSuffix
 	}
+	if cfg.SessionTimeout <= 0 {
+		cfg.SessionTimeout = defaultSessionTimeout
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -188,6 +200,8 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 
 	opts := []kgo.Opt{
 		kgo.ConsumerGroup(cfg.Group),
+		kgo.SessionTimeout(cfg.SessionTimeout),
+		kgo.HeartbeatInterval(cfg.SessionTimeout / 3),
 		kgo.ConsumeTopics(cfg.Topics...),
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(),

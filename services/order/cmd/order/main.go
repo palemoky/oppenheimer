@@ -47,6 +47,9 @@ const redisStartTimeout = 5 * time.Second
 // 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
 const closeDelayMaxAttempts = 10
 
+// submitMaxAttempts 是下单消息的最大处理次数，理由见创建消费者的地方。
+const submitMaxAttempts = 10
+
 // 周期任务的 leader 锁（设计文档 7.1）。持有者崩溃后锁要等 TTL 过期才能被别的副本接手，
 // 这段时间任务没人跑：中继的空窗直接表现为事件延迟，取得短；其余任务本来就是低频兜底，取 15 秒。
 // 正常退出时主动释放，没有空窗。
@@ -330,6 +333,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderSubmit),
 		Topics: []string{submitTopic},
 		Logger: logger,
+		// 落库要调 inventory 的 Reserve。默认的 5 次重试合计只有约 1.5 秒，inventory 重启一次
+		// （几秒）就足以把消息送进死信：订单最后由 sweeper 置为失败，数据一致，但用户的订单
+		// 因为依赖方抖了一下就没了。10 次合计约 26 秒，盖得住一次重启；再长就不值得让
+		// 整个分区等它，交给死信和 sweeper。
+		MaxAttempts: submitMaxAttempts,
 	}, svc.SubmitHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return err
