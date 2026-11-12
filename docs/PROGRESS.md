@@ -4,10 +4,32 @@
 
 ## 当前状态
 
-- **当前阶段**：1b（高并发改造），步骤一、二、三已完成；步骤四（加固）设计已定稿，尚未写代码
-- **当前分支**：`phase-1b`，步骤一、二、三都已推送（draft PR #5）。步骤三首次推送（`8afb981`）CI 的 e2e 失败，是测试的时间预算问题，修复（`9f09ebf`）推送后 CI 全绿（见下）
+- **当前阶段**：1b（高并发改造），步骤一、二、三已完成；步骤四（加固）实施中：共享部分已完成并本地提交，四个服务侧任务已派给子 Agent
+- **当前分支**：`phase-1b`（draft PR #5）。远端停在 `9f09ebf`，CI 全绿
 - **最后更新**：2026-11-12
-- **本地有一个提交未推送**：步骤四的设计（设计文档第 7 节、ADR-0010、ADR 索引、阶段计划的考点、本文件），都是文档。等主人说推送
+- **本地有两个提交未推送**：`0bafdfb`（步骤四的设计文档）和 `932214d`（步骤四的共享部分）。等主人说推送
+
+## 步骤四的实施状态
+
+已完成（主会话，提交 `932214d`，`pkg` 的 lint 和测试通过）：
+
+- `pkg/lock` 的 `FailOpen`（`failopen.go`）。
+- `pkg/cache`（`cache.go`、`codec.go`）。相对设计签名的调整已写回设计文档 7.2.5：`Client` 用 `redis.Cmdable`；新增 `DisableLock`（订单缓存用）；等待方每轮重新抢锁；拿到锁后复查缓存。已知缺口（Redis 拒绝连接时每个请求多等约半秒，需要熔断，放 1d）也记在那里。
+- compose 增加 `redis-cache`（端口 6380，`allkeys-lru`，不持久化）；`scripts/run-local.sh` 导出 `CACHE_REDIS_ADDR`；CI 通过 `make up` 自动带上，不用单独改。
+
+已合入主线（子 Agent 实现，主会话评审后 cherry-pick；主线 `make lint test e2e` 全部通过，e2e 8 个场景不改断言）：
+
+- inventory 的库存查询缓存（`STOCK_CACHE_TTL`，默认 1 秒，0 关闭）。
+- payment 连 Redis，中继和处理器各一把锁。
+- order 三个周期任务的锁，`GetOrder` 的终态缓存（`ORDER_CACHE_TTL` 默认 10 分钟，0 关闭；`ORDER_CACHE_NULL_TTL` 默认 2 秒）。主会话逐行评审过。
+- 子 Agent 评审时提出的缺口已记进设计文档 7.1 和 7.2.3 的末尾，都不影响正确性，没有改。
+
+仍在进行：
+
+- `test/load` 的 `run` 子命令（Opus，worktree `agent-ab660ecb11651708a`，基于 `932214d`）。`verify` 子命令只留了位置。被告知不要启动服务（端口共用）。
+- worktree `agent-a97714952afd11fa3`（payment，已合入）当时被子 Agent 锁着没删掉，之后用 `git worktree remove` 和 `git branch -D worktree-agent-a97714952afd11fa3` 清理。
+
+如果会话中断：用 `git worktree list` 和 `git branch` 找到子 Agent 的分支，读各自的 diff，按 AGENTS.md 的流程 cherry-pick 合入，再在主线跑 `make lint test e2e`。没有提交的 worktree 说明该任务没做完，重新派发即可。
 
 ## 上次做到哪
 
@@ -37,16 +59,15 @@
 1. e2e 修复的两个遗留点（CI run 43115796564 全绿，该用例 `paid=15 cancelled=25 closed=0`）：
    - 遗留：`closed` 结局在正常时限下几乎不出现，CI 覆盖不到“支付对关单”的竞争，要稳定覆盖需要单独写一个用例。
    - 遗留：支付时限从受理时刻起算，落库排队会挤占支付窗口；积压接近时限时订单落库后可能只剩几毫秒可付，库存白占一轮。可以加“剩余时间不足 X 就直接失败”的阈值，或在设计文档里写明取舍。步骤四细化设计时一并决定。
-2. **步骤四（加固）从这里开始实施**。设计已定稿：设计文档第 7 节和 ADR-0010（已采纳），主人 2026-11-12 确认了四点：
+2. **步骤四（加固）的设计依据**。设计已定稿：设计文档第 7 节和 ADR-0010（已采纳），主人 2026-11-12 确认了四点：
    - 订单只缓存终态，非终态一律读库，没有任何写时失效逻辑。因此 `GetOrder` 的 proto 不用改，`pkg/cache` 没有 `Delete`。
    - 缓存用独立的 Redis 实例（compose 加 `redis-cache`，CI 的 e2e 也要加；配置 `CACHE_REDIS_ADDR`，不设时退回 `REDIS_ADDR`）。
    - 锁不可用时：对账停下；中继、sweeper、回收任务、支付处理器放行（`lock.FailOpen`）。
    - payment 连 Redis，配置方式和其他服务相同。
-3. 实施顺序（代码一行还没写）：
-   - 先在主线串行做共享部分：`pkg/lock` 的 `FailOpen`（7.1）、`pkg/cache`（7.2.5，测试清单在 7.2.6）、compose 和 CI 的 `redis-cache`（版本登记到 `docs/infra/versions.md`）。
-   - 再并行派子 Agent，各自一个 worktree：order 接入（三个任务的 Guard 和订单缓存；涉及订单状态，由 Fable 写或逐行评审）、inventory 的库存缓存、payment 的 Redis 和两个 Guard、压测工具 `test/load`（7.3.1）。
-   - 最后做 `scripts/chaos.sh`、`make chaos` 和对账检查（7.3.2、7.3.3），并用同一个工具量 1a 的基线（`main` 上合并 PR #2 的提交，单独的 worktree）。验收项“吞吐相对 1a 有数量级提升”在这里完成，报告要同时给出 1a 下单吞吐、1b 受理吞吐、1b 落库吞吐。
-   - 每完成一项勾掉阶段计划里步骤四对应的 checkbox。7.3.4 列了杀进程测试预期会暴露的三个问题，测试时对照。
+3. 步骤四剩余的工作（顺序）：
+   - 验收并合入 `test/load`（`go.work` 会有改动，合入后跑 `go work sync`）。
+   - `test/load` 的 `verify` 子命令（7.3.3，18 条检查）、`scripts/chaos.sh`、`make chaos`（7.3.2）。7.3.4 列了杀进程测试预期会暴露的三个问题，测试时对照。
+   - 用同一个工具量 1a 的基线（`main` 上合并 PR #2 的提交，单独的 worktree）。验收项“吞吐相对 1a 有数量级提升”在这里完成，报告要同时给出 1a 下单吞吐、1b 受理吞吐、1b 落库吞吐。
 4. 把 1b 的面试考点整理到 `docs/notes/1b-*.md`（素材已记在阶段计划的「面试考点」和设计文档里）。
 
 已推迟的任务（记在对应阶段的计划里，不会丢）：
