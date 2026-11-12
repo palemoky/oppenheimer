@@ -113,10 +113,10 @@
 
 - [x] 分布式锁的使用：outbox 中继、sweeper 单实例运行；缓存重建互斥（order 三把锁、payment 两把锁，都包了 `lock.FailOpen`；重建互斥在 `pkg/cache`）
   - 不用在库存扣减主链路上：那里用 Lua 原子操作和条件更新，比加锁更快也更安全，写清楚为什么（设计文档 7.1 末尾）
-  - 对比 etcd 锁与 Redlock 的争议，写入面试考点（还没写，和下面的笔记一起做）
+  - 对比 etcd 锁与 Redlock 的争议，写入面试考点（笔记 4.4 节）
 - [x] 缓存问题：穿透、击穿、雪崩各做一次针对性处理（`pkg/cache`；库存查询缓存和订单终态缓存，独立的 `redis-cache` 实例）
-- [ ] 一致性测试升级：压测中途随机杀进程，恢复后对账零差异
-- [ ] 把 1b 的面试考点整理到 `docs/notes/1b-*.md`
+- [ ] 一致性测试升级：压测中途随机杀进程，恢复后对账零差异（压测工具 `test/load run` 已合入；`verify`、`scripts/chaos.sh` 进行中；1a 基线对比未做）
+- [x] 把 1b 的面试考点整理到 `docs/notes/1b-*.md`（[notes/1b-high-concurrency.md](../notes/1b-high-concurrency.md)，含 Redlock 与 etcd、ZooKeeper 的对比；压测数字待补）
 
 **验收**：本机压测下单接口吞吐相对 1a 有数量级提升；杀进程测试后订单、库存、支付三方对得上。
 

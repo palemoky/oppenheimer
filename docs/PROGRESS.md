@@ -7,7 +7,7 @@
 - **当前阶段**：1b（高并发改造），步骤一、二、三已完成；步骤四（加固）实施中：共享部分已完成并本地提交，四个服务侧任务已派给子 Agent
 - **当前分支**：`phase-1b`（draft PR #5）。远端停在 `9f09ebf`，CI 全绿
 - **最后更新**：2026-11-12
-- **本地有两个提交未推送**：`0bafdfb`（步骤四的设计文档）和 `932214d`（步骤四的共享部分）。等主人说推送
+- **本地有多个提交未推送**（`0bafdfb` 起，步骤四的设计、共享部分、三个服务的接入、压测工具、笔记）。等主人说推送
 
 ## 步骤四的实施状态
 
@@ -24,10 +24,12 @@
 - order 三个周期任务的锁，`GetOrder` 的终态缓存（`ORDER_CACHE_TTL` 默认 10 分钟，0 关闭；`ORDER_CACHE_NULL_TTL` 默认 2 秒）。主会话逐行评审过。
 - 子 Agent 评审时提出的缺口已记进设计文档 7.1 和 7.2.3 的末尾，都不影响正确性，没有改。
 
+- `test/load` 的 `run` 子命令（账本字段见 `test/load/internal/ledger/ledger.go`；用法 `make load LOAD_ARGS="-addr http://127.0.0.1:8080 -c 100 -duration 30s -skus 1001 ..."`）。**还没有对真实服务跑过**，只有 `httptest` 的测试。
+- 1b 面试笔记 `docs/notes/1b-high-concurrency.md`（Sonnet 写，主会话核对了 Redlock 一节）。压测数字待补。
+
 仍在进行：
 
-- `test/load` 的 `run` 子命令（Opus，worktree `agent-ab660ecb11651708a`，基于 `932214d`）。`verify` 子命令只留了位置。被告知不要启动服务（端口共用）。
-- worktree `agent-a97714952afd11fa3`（payment，已合入）当时被子 Agent 锁着没删掉，之后用 `git worktree remove` 和 `git branch -D worktree-agent-a97714952afd11fa3` 清理。
+- `verify`、`wait-quiet` 子命令和 `scripts/chaos.sh`、`make chaos`（Opus，一个 worktree，基于 `f9d1a25`）。它会启动真实服务并至少跑 3 次，被要求**只报告产品缺陷、不修、不放宽检查**。回来后主会话评审 verify 的 18 条检查，再决定缺陷怎么修。
 
 如果会话中断：用 `git worktree list` 和 `git branch` 找到子 Agent 的分支，读各自的 diff，按 AGENTS.md 的流程 cherry-pick 合入，再在主线跑 `make lint test e2e`。没有提交的 worktree 说明该任务没做完，重新派发即可。
 
@@ -65,10 +67,9 @@
    - 锁不可用时：对账停下；中继、sweeper、回收任务、支付处理器放行（`lock.FailOpen`）。
    - payment 连 Redis，配置方式和其他服务相同。
 3. 步骤四剩余的工作（顺序）：
-   - 验收并合入 `test/load`（`go.work` 会有改动，合入后跑 `go work sync`）。
-   - `test/load` 的 `verify` 子命令（7.3.3，18 条检查）、`scripts/chaos.sh`、`make chaos`（7.3.2）。7.3.4 列了杀进程测试预期会暴露的三个问题，测试时对照。
+   - 验收并合入 `verify` 和 `scripts/chaos.sh`；修杀进程测试发现的缺陷（先记进设计文档 7.3.4 再修）。
    - 用同一个工具量 1a 的基线（`main` 上合并 PR #2 的提交，单独的 worktree）。验收项“吞吐相对 1a 有数量级提升”在这里完成，报告要同时给出 1a 下单吞吐、1b 受理吞吐、1b 落库吞吐。
-4. 把 1b 的面试考点整理到 `docs/notes/1b-*.md`（素材已记在阶段计划的「面试考点」和设计文档里）。
+4. 把压测结果补进 `docs/notes/1b-high-concurrency.md`（笔记里标了“压测结果待补”）。设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条还没标注已解决，顺手改掉。
 
 已推迟的任务（记在对应阶段的计划里，不会丢）：
 
