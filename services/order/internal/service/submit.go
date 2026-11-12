@@ -124,7 +124,7 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 	for _, it := range req.Items {
 		skus = append(skus, it.SKUID)
 	}
-	warm, err := s.inventory.WarmUp(ctx, &inventoryv1.WarmUpRequest{SkuIds: skus})
+	warm, err := s.warmUp(ctx, skus)
 	if err != nil {
 		s.logger.WarnContext(ctx, "warm up stock gate failed", "sku_ids", skus, "error", err)
 		return res, errUnavailable("inventory unavailable")
@@ -137,6 +137,37 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 		return res, s.holdUnknown(ctx, req.OrderID, err)
 	}
 	return res, nil
+}
+
+// warmUpTimeout 是一次合并后的预热调用的时限。
+const warmUpTimeout = 3 * time.Second
+
+// warmUp 请库存服务把这些 SKU 装进闸门，同一组 SKU 的并发调用合并成一次。
+//
+// 为什么要合并：一个新 SKU 开卖的第一瞬间，几百个并发下单同时发现“未装载”。不合并的话
+// 每个请求各调一次 WarmUp，库存服务那边同时有几百个查库加写 Redis，连接池一下子要新建
+// 几百个连接，个别调用超时，用户拿到 503（端到端测试的偶发失败就是这样来的）。
+// 而装载本来就只需要做一次：Load 只在 SKU 不存在时写入，其余的调用都是白做。
+//
+// 合并后的调用用独立的时限，不用发起者的 ctx：发起者被取消时，搭便车的请求不应该跟着失败。
+func (s *Service) warmUp(ctx context.Context, skus []int64) (*inventoryv1.WarmUpResponse, error) {
+	sorted := slices.Sorted(slices.Values(skus))
+	key := fmt.Sprint(sorted)
+	ch := s.warmUps.DoChan(key, func() (any, error) {
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), warmUpTimeout)
+		defer cancel()
+		return s.inventory.WarmUp(callCtx, &inventoryv1.WarmUpRequest{SkuIds: sorted})
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		// 共享的响应只读：调用方只读 Missing。
+		return r.Val.(*inventoryv1.WarmUpResponse), nil
+	}
 }
 
 // holdUnknown 处理 Hold 返回错误的情况：结果未知，可能扣了也可能没扣。

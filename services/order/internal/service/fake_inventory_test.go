@@ -271,6 +271,9 @@ func (f *fakeInventory) GetStock(_ context.Context, in *inventoryv1.GetStockRequ
 // WarmUp 按契约把 SKU 装载进闸门：avail 取当前可售数量，已装载时只更新限购。
 func (f *fakeInventory) WarmUp(ctx context.Context, in *inventoryv1.WarmUpRequest, _ ...grpc.CallOption) (*inventoryv1.WarmUpResponse, error) {
 	ft := f.begin("WarmUp")
+	if ft.before != nil {
+		ft.before(0)
+	}
 	if ft.err != nil {
 		return nil, ft.err
 	}

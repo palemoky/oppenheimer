@@ -483,3 +483,29 @@ func TestSubmitBackpressure(t *testing.T) {
 	}
 	e.wantGate(t, skuA, 997, 3)
 }
+
+// 新 SKU 开卖瞬间的并发首单只触发一次预热，全部受理成功。
+func TestSubmitConcurrentWarmUpIsCoalesced(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	// 让第一次预热慢一点，其余请求一定会在它进行中到达。
+	e.inv.inject("WarmUp", fault{before: func(int64) { time.Sleep(200 * time.Millisecond) }})
+
+	const buyers = 50
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range buyers {
+		wg.Go(func() {
+			<-start
+			if _, err := e.svc.SubmitOrder(t.Context(), submitReq(int64(i+1), "k", items(skuA, 1))); err != nil {
+				t.Errorf("buyer %d: %v", i, err)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	if n := e.inv.callCount("WarmUp"); n != 1 {
+		t.Fatalf("warm up called %d times, want 1", n)
+	}
+	e.wantGate(t, skuA, 1000-buyers, buyers)
+}

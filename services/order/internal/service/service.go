@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -114,10 +115,12 @@ type Deps struct {
 type Service struct {
 	orderv1.UnimplementedOrderServiceServer
 
-	store          *store.Store
-	gate           *stockgate.Gate
-	sender         kafkax.Sender
-	inventory      inventoryv1.InventoryServiceClient
+	store     *store.Store
+	gate      *stockgate.Gate
+	sender    kafkax.Sender
+	inventory inventoryv1.InventoryServiceClient
+	// warmUps 合并对同一组 SKU 的并发预热，见 warmUp。
+	warmUps        singleflight.Group
 	ids            IDGenerator
 	logger         *slog.Logger
 	paymentTimeout time.Duration
