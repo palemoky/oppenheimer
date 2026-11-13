@@ -20,6 +20,7 @@ import (
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi"
@@ -85,23 +86,36 @@ func (f *fakeInventory) GetStock(ctx context.Context, in *inventoryv1.GetStockRe
 	return f.getStock(ctx, in)
 }
 
+type fakeOrderIndex struct {
+	orderindexv1.OrderIndexServiceClient
+	list func(*orderindexv1.ListMerchantOrdersRequest) (*orderindexv1.ListMerchantOrdersResponse, error)
+	last *orderindexv1.ListMerchantOrdersRequest
+}
+
+func (f *fakeOrderIndex) ListMerchantOrders(_ context.Context, in *orderindexv1.ListMerchantOrdersRequest, _ ...grpc.CallOption) (*orderindexv1.ListMerchantOrdersResponse, error) {
+	f.last = in
+	return f.list(in)
+}
+
 type env struct {
-	h         http.Handler
-	order     *fakeOrder
-	payment   *fakePayment
-	inventory *fakeInventory
-	logs      *bytes.Buffer
+	orderIndex *fakeOrderIndex
+	h          http.Handler
+	order      *fakeOrder
+	payment    *fakePayment
+	inventory  *fakeInventory
+	logs       *bytes.Buffer
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	e := &env{
-		order:     &fakeOrder{},
-		payment:   &fakePayment{},
-		inventory: &fakeInventory{},
-		logs:      &bytes.Buffer{},
+		order:      &fakeOrder{},
+		payment:    &fakePayment{},
+		inventory:  &fakeInventory{},
+		orderIndex: &fakeOrderIndex{},
+		logs:       &bytes.Buffer{},
 	}
-	e.h = httpapi.New(httpapi.Deps{Order: e.order, Payment: e.payment, Inventory: e.inventory}, httpapi.Config{
+	e.h = httpapi.New(httpapi.Deps{Order: e.order, Payment: e.payment, Inventory: e.inventory, OrderIndex: e.orderIndex}, httpapi.Config{
 		Logger:      slog.New(slog.NewJSONHandler(e.logs, nil)),
 		CallTimeout: time.Second,
 	})
@@ -551,5 +565,124 @@ func TestRequestLog(t *testing.T) {
 	}
 	if strings.Contains(e.logs.String(), "12345") {
 		t.Errorf("log should use the route template, not the concrete path: %s", e.logs)
+	}
+}
+
+func TestListMerchantOrders(t *testing.T) {
+	e := newEnv(t)
+	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	e.orderIndex.list = func(*orderindexv1.ListMerchantOrdersRequest) (*orderindexv1.ListMerchantOrdersResponse, error) {
+		return &orderindexv1.ListMerchantOrdersResponse{
+			Orders: []*orderindexv1.MerchantOrder{
+				{
+					OrderId: bigID, UserId: 7, Status: orderv1.OrderStatus_ORDER_STATUS_PAID,
+					Total: &commonv1.Money{Amount: 1999, Currency: "CNY"}, CreateTime: timestamppb.New(created),
+					PayTime: timestamppb.New(created.Add(time.Minute)),
+				},
+				{
+					OrderId: 5, UserId: 8, Status: orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT,
+					Total: &commonv1.Money{Amount: 100, Currency: "CNY"}, CreateTime: timestamppb.New(created),
+				},
+			},
+			NextBeforeOrderId: 5,
+		}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/merchants/3/orders", "7", "")
+	if r.status != http.StatusOK {
+		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	want := `{"orders":[
+		{"order_id":"9007199254741994","user_id":"7","status":"paid","total":{"amount":1999,"currency":"CNY"},"create_time":"2026-01-02T03:04:05Z","pay_time":"2026-01-02T03:05:05Z"},
+		{"order_id":"5","user_id":"8","status":"pending_payment","total":{"amount":100,"currency":"CNY"},"create_time":"2026-01-02T03:04:05Z"}],
+		"next_cursor":"5"}`
+	if !jsonEqual(t, []byte(r.raw), []byte(want)) {
+		t.Errorf("body = %s", r.raw)
+	}
+	got := e.orderIndex.last
+	if got.GetMerchantId() != 3 || got.GetPageSize() != 20 || got.GetBeforeOrderId() != 0 || got.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_UNSPECIFIED {
+		t.Errorf("request = %v", got)
+	}
+}
+
+func TestListMerchantOrdersFilterAndPaging(t *testing.T) {
+	e := newEnv(t)
+	e.orderIndex.list = func(*orderindexv1.ListMerchantOrdersRequest) (*orderindexv1.ListMerchantOrdersResponse, error) {
+		return &orderindexv1.ListMerchantOrdersResponse{NextBeforeOrderId: 123456789012}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/merchants/3/orders?status=paid&limit=50&cursor=999", "7", "")
+	if r.status != http.StatusOK {
+		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	got := e.orderIndex.last
+	if got.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_PAID || got.GetPageSize() != 50 || got.GetBeforeOrderId() != 999 {
+		t.Errorf("request = %v", got)
+	}
+	// 响应里的 next_cursor 原样回传给下一次请求。
+	cur, _ := r.body["next_cursor"].(string)
+	if cur != "123456789012" {
+		t.Fatalf("next_cursor = %q", cur)
+	}
+	do(t, e.h, "GET", "/api/v1/merchants/3/orders?cursor="+cur, "7", "")
+	if e.orderIndex.last.GetBeforeOrderId() != 123456789012 {
+		t.Errorf("before_order_id = %d", e.orderIndex.last.GetBeforeOrderId())
+	}
+}
+
+func TestListMerchantOrdersEmpty(t *testing.T) {
+	e := newEnv(t)
+	e.orderIndex.list = func(*orderindexv1.ListMerchantOrdersRequest) (*orderindexv1.ListMerchantOrdersResponse, error) {
+		return &orderindexv1.ListMerchantOrdersResponse{}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/merchants/3/orders", "7", "")
+	if r.status != http.StatusOK || !jsonEqual(t, []byte(r.raw), []byte(`{"orders":[]}`)) {
+		t.Errorf("status = %d, body %s", r.status, r.raw)
+	}
+}
+
+func TestListMerchantOrdersInvalidInput(t *testing.T) {
+	for _, q := range []string{
+		"limit=0", "limit=101", "limit=-1", "limit=abc",
+		"cursor=abc", "cursor=0", "cursor=-5", "cursor=1.5",
+		"status=bogus",
+	} {
+		t.Run(q, func(t *testing.T) {
+			e := newEnv(t)
+			r := do(t, e.h, "GET", "/api/v1/merchants/3/orders?"+q, "7", "")
+			if r.status != http.StatusBadRequest || errCode(t, r) != "INVALID_ARGUMENT" {
+				t.Errorf("status = %d, body %s", r.status, r.raw)
+			}
+			if e.orderIndex.last != nil {
+				t.Error("downstream must not be called")
+			}
+		})
+	}
+	e := newEnv(t)
+	r := do(t, e.h, "GET", "/api/v1/merchants/abc/orders", "7", "")
+	if r.status != http.StatusBadRequest {
+		t.Errorf("bad merchant id: status = %d", r.status)
+	}
+}
+
+func TestListMerchantOrdersDownstreamError(t *testing.T) {
+	for _, tt := range []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, "bad"), 400, "INVALID_ARGUMENT"},
+		{errx.New(codes.Unavailable, "", "down"), 503, "UNAVAILABLE"},
+		{status.Error(codes.DeadlineExceeded, "slow"), 504, "DEADLINE_EXCEEDED"},
+		{status.Error(codes.Internal, "sql: secret"), 500, "INTERNAL"},
+	} {
+		t.Run(tt.wantCode, func(t *testing.T) {
+			e := newEnv(t)
+			e.orderIndex.list = func(*orderindexv1.ListMerchantOrdersRequest) (*orderindexv1.ListMerchantOrdersResponse, error) {
+				return nil, tt.err
+			}
+			r := do(t, e.h, "GET", "/api/v1/merchants/3/orders", "7", "")
+			if r.status != tt.wantStatus || errCode(t, r) != tt.wantCode || strings.Contains(r.raw, "secret") {
+				t.Errorf("status = %d, body %s", r.status, r.raw)
+			}
+		})
 	}
 }

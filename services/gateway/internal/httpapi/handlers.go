@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
@@ -238,4 +240,69 @@ func (s *server) GetStock(c *gin.Context, rawSKUID oas.SkuId) {
 // writeEmptyResponse 处理下游成功却没带数据的情况，这违反契约，按内部错误处理。
 func (s *server) writeEmptyResponse(c *gin.Context, rpc string) {
 	s.writeGRPCError(c, errors.New("empty response from "+rpc))
+}
+
+const (
+	defaultListLimit = 20
+	maxListLimit     = 100
+)
+
+// ListMerchantOrders 实现 GET /api/v1/merchants/{merchant_id}/orders。
+// 数据来自异步同步的索引，是最终一致的；cursor 对客户端不透明，实际是下一页的 before_order_id。
+func (s *server) ListMerchantOrders(c *gin.Context, rawMerchantID oas.MerchantId, params oas.ListMerchantOrdersParams) {
+	merchantID, ok := pathID(c, "merchant_id", rawMerchantID)
+	if !ok {
+		return
+	}
+
+	limit := int32(defaultListLimit)
+	if params.Limit != nil {
+		limit = *params.Limit
+		if limit < 1 || limit > maxListLimit {
+			badRequest(c, "limit must be between 1 and "+strconv.Itoa(maxListLimit))
+			return
+		}
+	}
+
+	var before int64
+	if params.Cursor != nil && *params.Cursor != "" {
+		n, ok := parseID(*params.Cursor)
+		if !ok {
+			badRequest(c, "invalid cursor")
+			return
+		}
+		before = n
+	}
+
+	// 对外状态名到 proto 枚举；unspecified 和不传一样，表示不筛选。
+	var status orderv1.OrderStatus
+	if params.Status != nil {
+		v, found := orderv1.OrderStatus_value["ORDER_STATUS_"+strings.ToUpper(string(*params.Status))]
+		if !found {
+			badRequest(c, "invalid status")
+			return
+		}
+		status = orderv1.OrderStatus(v)
+	}
+
+	resp, err := s.deps.OrderIndex.ListMerchantOrders(c.Request.Context(), &orderindexv1.ListMerchantOrdersRequest{
+		MerchantId:    merchantID,
+		Status:        status,
+		PageSize:      limit,
+		BeforeOrderId: before,
+	})
+	if err != nil {
+		s.writeGRPCError(c, err)
+		return
+	}
+
+	out := oas.MerchantOrderList{Orders: make([]oas.MerchantOrder, 0, len(resp.GetOrders()))}
+	for _, o := range resp.GetOrders() {
+		out.Orders = append(out.Orders, toMerchantOrder(o))
+	}
+	if next := resp.GetNextBeforeOrderId(); next > 0 {
+		cur := strconv.FormatInt(next, 10)
+		out.NextCursor = &cur
+	}
+	writeJSON(c, http.StatusOK, out)
 }

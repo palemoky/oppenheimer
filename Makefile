@@ -90,11 +90,11 @@ tidy: ## 对所有模块执行 go mod tidy，并同步 workspace
 ## ---------- 运行 ----------
 
 .PHONY: run
-run: build ## 在本机启动四个服务（需要先 make up），Ctrl-C 停止
+run: build ## 在本机启动全部服务（需要先 make up），Ctrl-C 停止
 	scripts/run-local.sh
 
 .PHONY: e2e
-e2e: build ## 端到端测试：在独立的 e2e_* 库上启动四个服务并对网关跑测试（需要先 make up）
+e2e: build ## 端到端测试：在独立的 e2e_* 库上启动全部服务并对网关跑测试（需要先 make up）
 	scripts/e2e.sh
 
 .PHONY: chaos
@@ -112,10 +112,11 @@ load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例
 .PHONY: seed
 seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次、表已建好之后）
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) inventory_db -e \
-		"INSERT INTO sku_stock (sku_id, name, unit_price, available) VALUES \
-		 (1001, 'Mechanical Keyboard', 39900, 100), (1002, 'Wireless Mouse', 12900, 500), (1003, 'Limited Figure', 99900, 10) \
+		"INSERT INTO sku_stock (sku_id, merchant_id, name, unit_price, available) VALUES \
+		 (1001, 1, 'Mechanical Keyboard', 39900, 100), (1002, 1, 'Wireless Mouse', 12900, 500), (1003, 1, 'Limited Figure', 99900, 10), \
+		 (2001, 2, 'Desk Lamp', 15900, 200) \
 		 ON DUPLICATE KEY UPDATE name = VALUES(name);" 2>/dev/null
-	@echo "seeded sku 1001, 1002, 1003"
+	@echo "seeded sku 1001, 1002, 1003 (merchant 1), 2001 (merchant 2)"
 
 ## ---------- 本地依赖 ----------
 
@@ -127,8 +128,9 @@ CORE_SERVICES := mysql redis redis-cache kafka
 up-core: ## 只启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪，不含 order 主从；给不需要 order 主从的场景用（如按模块的测试）
 	$(COMPOSE) up -d --wait $(CORE_SERVICES)
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
-		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null
-	@echo "databases ready: inventory_db payment_db"
+		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS payment_db; \
+		 CREATE DATABASE IF NOT EXISTS merchant_index_db_0; CREATE DATABASE IF NOT EXISTS merchant_index_db_1;" 2>/dev/null
+	@echo "databases ready: inventory_db payment_db merchant_index_db_0 merchant_index_db_1"
 
 .PHONY: up
 up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka 并等待就绪

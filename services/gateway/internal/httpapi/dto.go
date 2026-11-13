@@ -13,6 +13,7 @@ import (
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
@@ -83,4 +84,19 @@ func utc(t *timestamppb.Timestamp) time.Time {
 		return time.Time{}
 	}
 	return t.AsTime().UTC()
+}
+
+func toMerchantOrder(o *orderindexv1.MerchantOrder) oas.MerchantOrder {
+	d := oas.MerchantOrder{
+		OrderId:    oas.ID(o.GetOrderId()),
+		UserId:     oas.ID(o.GetUserId()),
+		Status:     oas.OrderStatus(enumName(o.GetStatus().String(), "ORDER_STATUS_")),
+		Total:      toMoney(o.GetTotal()),
+		CreateTime: utc(o.GetCreateTime()),
+	}
+	if o.GetPayTime() != nil {
+		t := utc(o.GetPayTime())
+		d.PayTime = &t
+	}
+	return d
 }

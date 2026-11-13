@@ -131,6 +131,42 @@ type ErrorDetail struct {
 // Examples: 9007199254741994
 type Id = ID
 
+// MerchantOrder 列表里的一行，只有列表页要显示的字段。完整内容用订单详情接口。
+type MerchantOrder struct {
+	CreateTime time.Time `json:"create_time"`
+
+	// OrderId 64 位 ID 的十进制字符串。
+	// 为兼容旧客户端，服务端在请求体里也接受 JSON 整数，但客户端应当始终发送字符串。
+	//
+	//
+	// Examples: 9007199254741994
+	OrderId Id `json:"order_id"`
+
+	// PayTime 支付成功的时间，未支付时不出现
+	PayTime *time.Time `json:"pay_time,omitempty"`
+
+	// Status 订单状态。`creating` 是下单过程中的中间状态；`pending_payment` 待支付；`paid` 已支付；
+	// `cancelled` 用户取消；`closed` 超时未支付关单；`failed` 下单失败。
+	Status OrderStatus `json:"status"`
+
+	// Total 一笔金额。`amount` 的单位是该币种的最小货币单位（人民币为分）。
+	Total Money `json:"total"`
+
+	// UserId 64 位 ID 的十进制字符串。
+	// 为兼容旧客户端，服务端在请求体里也接受 JSON 整数，但客户端应当始终发送字符串。
+	//
+	//
+	// Examples: 9007199254741994
+	UserId Id `json:"user_id"`
+}
+
+// MerchantOrderList defines model for MerchantOrderList.
+type MerchantOrderList struct {
+	// NextCursor 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
+	NextCursor *string         `json:"next_cursor,omitempty"`
+	Orders     []MerchantOrder `json:"orders"`
+}
+
 // Money 一笔金额。`amount` 的单位是该币种的最小货币单位（人民币为分）。
 type Money struct {
 	// Amount Examples: 1999
@@ -265,6 +301,9 @@ type Stock struct {
 // IdempotencyKey defines model for IdempotencyKey.
 type IdempotencyKey = string
 
+// MerchantId defines model for MerchantId.
+type MerchantId = string
+
 // OrderId defines model for OrderId.
 type OrderId = string
 
@@ -286,6 +325,18 @@ type PayloadTooLarge = Error
 // Unauthorized defines model for Unauthorized.
 type Unauthorized = Error
 
+// ListMerchantOrdersParams defines parameters for ListMerchantOrders.
+type ListMerchantOrdersParams struct {
+	// Status 只返回这个状态的订单；不传表示不筛选。
+	Status *OrderStatus `form:"status,omitempty" json:"status,omitempty"`
+
+	// Limit 每页条数，1 到 100，默认 20。
+	Limit *int32 `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor 不透明的分页游标，传上一页响应里的 `next_cursor`。不传表示从最新的开始。
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
 // CreateOrderParams defines parameters for CreateOrder.
 type CreateOrderParams struct {
 	// IdempotencyKey 幂等键，由客户端生成，1 到 64 个字符。
@@ -300,6 +351,9 @@ type PayOrderJSONRequestBody = PayOrderRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
+	// ListMerchantOrders 列出商家的订单
+	// (GET /api/v1/merchants/{merchant_id}/orders)
+	ListMerchantOrders(c *gin.Context, merchantId MerchantId, params ListMerchantOrdersParams)
 	// CreateOrder 下单
 	// (POST /api/v1/orders)
 	CreateOrder(c *gin.Context, params CreateOrderParams)
@@ -328,6 +382,58 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(c *gin.Context)
+
+// ListMerchantOrders operation middleware
+func (siw *ServerInterfaceWrapper) ListMerchantOrders(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "merchant_id" -------------
+	var merchantId MerchantId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "merchant_id", c.Param("merchant_id"), &merchantId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter merchant_id: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListMerchantOrdersParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "status", c.Request.URL.Query(), &params.Status, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter status: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", c.Request.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: "int32"})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter limit: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", c.Request.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter cursor: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ListMerchantOrders(c, merchantId, params)
+}
 
 // CreateOrder operation middleware
 func (siw *ServerInterfaceWrapper) CreateOrder(c *gin.Context) {
@@ -530,4 +636,5 @@ func RegisterHandlersWithOptions(router gin.IRouter, si ServerInterface, options
 	router.POST(options.BaseURL+"/api/v1/orders/:order_id/pay", wrapper.PayOrder)
 	router.GET(options.BaseURL+"/api/v1/orders/:order_id/payment", wrapper.GetPayment)
 	router.GET(options.BaseURL+"/api/v1/skus/:sku_id/stock", wrapper.GetStock)
+	router.GET(options.BaseURL+"/api/v1/merchants/:merchant_id/orders", wrapper.ListMerchantOrders)
 }

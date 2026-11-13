@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在本机启动四个服务。依赖用 make up 启动。
+# 在本机启动六个服务。依赖用 make up 启动。
 #
 # 用法：
 #   scripts/run-local.sh            前台运行，Ctrl-C 停止全部
@@ -25,6 +25,10 @@ MYSQL_ORDER_1_REPLICA_PORT="${MYSQL_ORDER_1_REPLICA_PORT:-3322}"
 
 dsn_at() { echo "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:$1)/${DB_PREFIX}$2"; }
 dsn() { dsn_at "$MYSQL_PORT" "$1"; }
+
+# CDC 读 binlog 用的账号，由 scripts/mysql-replication.sh 在 order 的主库上创建。
+MYSQL_CDC_PASSWORD="${MYSQL_CDC_PASSWORD:-oppenheimer-cdc}"
+cdc_dsn() { echo "cdc:${MYSQL_CDC_PASSWORD}@tcp(127.0.0.1:$1)/${DB_PREFIX}$2"; }
 
 # Kafka 和 Redis 的地址对所有服务相同，直接导出，子进程会继承。
 # KAFKA_PREFIX、REDIS_PREFIX 默认为空；端到端测试会设置它们，与手动运行的环境隔离。
@@ -73,6 +77,12 @@ start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
 start order     8081 MYSQL_DSNS="$(dsn_at "$MYSQL_ORDER_0_PORT" order_db_0),$(dsn_at "$MYSQL_ORDER_1_PORT" order_db_1)" \
   MYSQL_REPLICA_DSNS="$(dsn_at "$MYSQL_ORDER_0_REPLICA_PORT" order_db_0),$(dsn_at "$MYSQL_ORDER_1_REPLICA_PORT" order_db_1)" WORKER_ID=2
 start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
+# 商家维度的订单索引（ADR-0014）。两个索引库在单实例 mysql 上。
+start orderindex 8084 MYSQL_DSNS="$(dsn merchant_index_db_0),$(dsn merchant_index_db_1)"
+# CDC 从 order 的两个从库读 binlog。排在 order 之后启动只是为了第一次全量时表已经建好；
+# 表在它启动之后才建也没关系，建表之后的写入都在 binlog 里。server-id 登记在 docs/infra/versions.md。
+start cdc 8085 CDC_SOURCE_NAMES=order-0,order-1 CDC_SERVER_IDS=1011,1021 \
+  CDC_SOURCE_DSNS="$(cdc_dsn "$MYSQL_ORDER_0_REPLICA_PORT" order_db_0),$(cdc_dsn "$MYSQL_ORDER_1_REPLICA_PORT" order_db_1)"
 start gateway   8080
 
 if [ "${1:-}" = "--" ]; then

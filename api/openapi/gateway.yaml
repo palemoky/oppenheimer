@@ -27,6 +27,8 @@ tags:
     description: 支付
   - name: inventory
     description: 库存
+  - name: merchants
+    description: 商家视角的查询
 
 paths:
   /api/v1/orders:
@@ -218,6 +220,59 @@ paths:
         default:
           $ref: '#/components/responses/Error'
 
+  /api/v1/merchants/{merchant_id}/orders:
+    get:
+      operationId: listMerchantOrders
+      tags: [merchants]
+      summary: 列出商家的订单
+      description: |
+        按创建时间从新到旧列出一个商家的订单，游标分页。
+        `merchant_id` 直接信任，和其他接口对 `X-User-Id` 的处理一致（没有真实鉴权）。
+
+        **最终一致**：这个列表来自订单库异步同步出来的一份索引（CDC），不是订单库本身。
+        新订单可能晚一点才出现，状态也可能比订单详情里的旧。只用于展示；
+        要看准确的状态，用 `GET /api/v1/orders/{order_id}`。
+
+        只包含创建成功过的订单（库存预占成功、有商家的订单），创建失败的订单不在列表里。
+        同一毫秒内创建的订单先后顺序不严格。商家没有订单时返回空数组，不是错误。
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+        - name: status
+          in: query
+          required: false
+          description: 只返回这个状态的订单；不传表示不筛选。
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数，1 到 100，默认 20。
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: 不透明的分页游标，传上一页响应里的 `next_cursor`。不传表示从最新的开始。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 一页订单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantOrderList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Error'
+
 components:
   securitySchemes:
     userId:
@@ -243,6 +298,14 @@ components:
       in: path
       required: true
       description: 订单号（正整数的十进制字符串）
+      schema:
+        type: string
+        pattern: '^[1-9][0-9]*$'
+    MerchantId:
+      name: merchant_id
+      in: path
+      required: true
+      description: 商家 ID（正整数的十进制字符串）
       schema:
         type: string
         pattern: '^[1-9][0-9]*$'
@@ -380,6 +443,39 @@ components:
           format: date-time
         expire_time:
           description: 支付截止时间，过期未支付的订单会被关闭
+          type: string
+          format: date-time
+        pay_time:
+          description: 支付成功的时间，未支付时不出现
+          type: string
+          format: date-time
+
+    MerchantOrderList:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/MerchantOrder'
+        next_cursor:
+          description: 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
+          type: string
+
+    MerchantOrder:
+      description: 列表里的一行，只有列表页要显示的字段。完整内容用订单详情接口。
+      type: object
+      required: [order_id, user_id, status, total, create_time]
+      properties:
+        order_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total:
+          $ref: '#/components/schemas/Money'
+        create_time:
           type: string
           format: date-time
         pay_time:

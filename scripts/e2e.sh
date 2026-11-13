@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 端到端测试：在独立的一组库（e2e_*）上启动四个服务，对网关跑 test/e2e 的测试。
+# 端到端测试：在独立的一组库（e2e_*）上启动全部服务，对网关跑 test/e2e 的测试。
 # 需要先 make up 和 make build。
 set -euo pipefail
 
@@ -31,10 +31,14 @@ run_sql() {
 # 不能在从库上建（从库是只读的，也会造成 GTID 分叉）。
 run_sql mysql "$MYSQL_PORT" "
   DROP DATABASE IF EXISTS e2e_inventory_db; CREATE DATABASE e2e_inventory_db;
-  DROP DATABASE IF EXISTS e2e_payment_db; CREATE DATABASE e2e_payment_db;"
+  DROP DATABASE IF EXISTS e2e_payment_db; CREATE DATABASE e2e_payment_db;
+  DROP DATABASE IF EXISTS e2e_merchant_index_db_0; CREATE DATABASE e2e_merchant_index_db_0;
+  DROP DATABASE IF EXISTS e2e_merchant_index_db_1; CREATE DATABASE e2e_merchant_index_db_1;"
+# CDC 的账号只有 order_db_N 的 SELECT 权限（复制脚本给的），e2e 的库要另外授权。授权也在主库上做，靠复制到从库。
 for i in 0 1; do
   port_var="MYSQL_ORDER_${i}_PORT"
-  run_sql "mysql-order-$i" "${!port_var}" "DROP DATABASE IF EXISTS e2e_order_db_$i; CREATE DATABASE e2e_order_db_$i;"
+  run_sql "mysql-order-$i" "${!port_var}" "DROP DATABASE IF EXISTS e2e_order_db_$i; CREATE DATABASE e2e_order_db_$i;
+    GRANT SELECT ON e2e_order_db_$i.* TO 'cdc'@'%';"
 done
 
 # 等库复制到从库，否则服务启动时连从库会报库不存在。有上限，超时就失败。
@@ -88,6 +92,9 @@ export LOG_LEVEL=warn
 export E2E_GATEWAY_URL=http://127.0.0.1:8080
 export E2E_INVENTORY_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_inventory_db"
 export E2E_PAYMENT_TIMEOUT=3s
+# 商家索引的用例：直接读两个索引库和 order 的两个主库上的 e2e 库，核对索引和订单表一致。
+export E2E_MERCHANT_INDEX_DSNS="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_merchant_index_db_0,root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_merchant_index_db_1"
+export E2E_ORDER_DSNS="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_0_PORT})/e2e_order_db_0,root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_1_PORT})/e2e_order_db_1"
 # 主从延迟用例：两个分片库的主库和从库（下标即分片号），以及读模式和标记时限。
 # 主库用来读 gtid_executed，从库用来停复制和等追上；不带库名，只用管理语句。
 export E2E_ORDER_PRIMARY_DSNS="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_0_PORT})/,root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_1_PORT})/"
