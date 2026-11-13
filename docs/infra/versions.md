@@ -35,6 +35,7 @@
 | oapi-codegen | v2.8.2 | 稳定版 | 2026-11-11 | 由 OpenAPI 规范生成 gateway 的类型和服务端接口；版本写在 `Makefile` 里，CI 通过 `make openapi-tools` 安装同一版本 |
 | twmb/franz-go | v1.22.3 | 稳定版 | 2026-11-11 | Kafka 客户端，见 ADR-0007；管理接口 `pkg/kadm` v1.20.0 |
 | redis/go-redis | v9.23.0 | 稳定版 | 2026-11-11 | Redis 客户端，见 ADR-0007 |
+| go-mysql-org/go-mysql | v1.16.0 | 稳定版 | 2026-11-13 | CDC 服务读 binlog 用它的 `replication` 包（ADR-0014）。GitHub 的 API 当时访问不了，版本是从仓库的标签列表和 Go 模块代理核对的；已实测能从 MySQL 9.7.4 读到列名、行映像和提交时间 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
 ## 本机 compose 的 MySQL 实例（2026-11-13）
@@ -49,7 +50,20 @@
 | `mysql-order-1` | `order_db_1` 主库 | 3321 | 21 |
 | `mysql-order-1-replica` | `order_db_1` 从库 | 3322 | 22 |
 
-复制由 `scripts/mysql-replication.sh` 建立（`make up` 会调用，可重复运行）。
+复制由 `scripts/mysql-replication.sh` 建立（`make up` 会调用，可重复运行）。从库用 `--relay-log=relay-bin` 固定了中继日志的文件名（默认取主机名，容器重建后会找不到旧文件）；复制元数据损坏时脚本会按从库的 `gtid_executed` 重新配置。
+
+五个实例都开了 `binlog_row_metadata=FULL`，binlog 里带列名，CDC 靠它得到列名。
+
+CDC 伪装成从库读 binlog，要占用 server-id，不能和上表以及彼此重复：
+
+| 流水线 | 源（默认） | server-id |
+|---|---|---|
+| `order-0` | `mysql-order-0-replica` | 1011 |
+| `order-1` | `mysql-order-1-replica` | 1021 |
+
+CDC 的集成测试每个用例用一个 10 万以上的随机 server-id，避免并行的用例互相踢掉连接。
+
+CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只读，账号靠复制到达）。
 
 ## 待引入（引入时查证并移到上表）
 
