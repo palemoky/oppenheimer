@@ -289,7 +289,7 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 
 	// 1. 认领。占用不存在说明它已被回收（受理方发消息失败后撤销，或回收任务），
 	// 或者订单早已走到终态、占用已被归还（重复投递）。两种情况都应当丢弃这条消息。
-	hold, ok, err := s.gate.Claim(ctx, o.OrderID)
+	hold, ok, err := s.gate.Claim(ctx, o.OrderID, s.now())
 	if err != nil {
 		return fmt.Errorf("claim hold of order %d: %w", o.OrderID, err)
 	}

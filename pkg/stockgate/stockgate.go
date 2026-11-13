@@ -69,7 +69,8 @@ const (
 	Insufficient
 	// LimitExceeded：超出该 SKU 的每人限购数量。
 	LimitExceeded
-	// Backlogged：等待落库的订单积压过多，暂不受理，见 BacklogLimit。HoldResult.Queued 是触发拒绝的那个计数。
+	// Backlogged：等待落库的订单积压过多，或落库长时间没有动静，暂不受理，见 BacklogLimit。
+	// HoldResult.Queued 是触发拒绝的那个计数。
 	Backlogged
 )
 
@@ -119,7 +120,7 @@ type HoldRequest struct {
 // 受理比落库快得多时，积压一旦超过宽限期，排在后面的订单还没轮到落库就被回收，
 // 用户先拿到 202，之后查询变成 404。背压要让每个被受理的订单都能在宽限期内落库。
 //
-// 两个条件，任何一个成立就拒绝：
+// 三个条件，任何一个成立就拒绝：
 //
 //   - 队列长度达到 MaxQueue。一个新订单要等多久，取决于排在它前面的有多少、落库有多快
 //     （利特尔定律：等待时间 = 队列长度 / 处理速率），所以限制长度才能限制新订单的等待。
@@ -129,12 +130,25 @@ type HoldRequest struct {
 //     只看“最老的那一个”不够：它衡量的是过去的等待，受理远快于落库时，最老的订单
 //     刚到 MaxWait，后面已经排了几分钟的量（压测里实际发生过）。按个数而不是看最老的一个，
 //     是为了容忍真正的孤儿（受理方在发消息前崩溃，要留到宽限期才被回收）：孤儿是零星的。
+//   - 落库已经至少 MaxWait 没有动静（gate:claim_at 不存在或早于 Now - MaxWait），
+//     并且队列长度超过 MaxStale。第二条单独不够：落库停住时它在约 MaxWait 后拒绝，
+//     但回收任务随后把排队超时的占用还掉，计数降回阈值以下，受理重新打开，新订单再排到超时、
+//     再被回收，消费者停多久就循环多久，用户一直拿到 202 然后订单消失。回收抹掉了队列里的证据，
+//     所以要一个回收抹不掉的信号：落库最后一次认领的时间（心跳，见 Claim）。
+//     没有动静时只放进少量“探测”订单：消费者活着就会认领它们、刷新心跳，受理随即恢复；
+//     消费者死了，每个宽限期最多损失 MaxStale+1 个订单，而不是受理速率 × MaxWait。
+//     冷启动或长时间空闲之后心跳很旧，但队列是空的，第一批订单照常受理，它们本身就是探测。
+//
+// 第二、三条都只在 MaxWait > 0 时检查。心跳由落库一方的时钟写、受理一方的时钟读，
+// 两边的时钟偏差要远小于 MaxWait。
 type BacklogLimit struct {
 	// MaxQueue 是等待落库的占用数上限，0 表示不限制。
 	MaxQueue int64
 	// MaxWait 是允许的排队时长，0 表示不检查。
 	MaxWait time.Duration
-	// MaxStale 是允许超过 MaxWait 的占用个数。
+	// MaxStale 有两个用途：允许排队超过 MaxWait 的占用个数（容忍零星的孤儿），
+	// 以及落库没有动静时队列里最多容忍的占用个数（探测订单的数量，可以多放进一个）。
+	// 取 0 时落库没有动静就只放进一个探测订单，不会因为没有心跳而永远关闭。
 	MaxStale int64
 }
 
@@ -152,11 +166,13 @@ type HoldResult struct {
 // holdScript 先做完所有检查，再做所有修改：任何一个 SKU 不满足条件都在写入之前返回，
 // 所以一个订单的多个 SKU 要么全部扣到，要么都不扣，不需要回滚。
 //
-// 积压检查放在库存和限购的检查之后：卖完了的请求应当得到“卖完”，而不是“稍后重试”，
-// 否则用户会对一个注定买不到的商品反复重试。它也只读不写，仍在所有修改之前。
+// 积压检查（三条，见 BacklogLimit）放在库存和限购的检查之后：卖完了的请求应当得到“卖完”，
+// 而不是“稍后重试”，否则用户会对一个注定买不到的商品反复重试。它们也只读不写，仍在所有修改之前。
+// 心跳只由 Claim 写，Hold 只读它：受理成功不能算作落库活着。
 //
 // ARGV: 前缀, 订单号, 用户, 幂等键, 请求哈希, 幂等键保留毫秒数, 受理时间毫秒, items 编码,
-// 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查）, 允许的超时个数, 然后是成对的 sku, 数量。
+// 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查第二、三条）, MaxStale, 然后是成对的 sku, 数量。
+// 第三条拿心跳和排队截止时间比：心跳早于它，说明落库至少 MaxWait 没有认领过任何消息。
 var holdScript = redis.NewScript(`
 local p, order, user, idem, hash = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local idemKey = p .. 'gate:idem:' .. user .. ':' .. idem
@@ -200,6 +216,13 @@ if ARGV[10] ~= '0' then
   local stale = redis.call('ZCOUNT', p .. 'gate:holds', '-inf', '(' .. ARGV[10])
   if stale > tonumber(ARGV[11]) then
     return {'BACKLOG', tostring(stale)}
+  end
+  local beat = redis.call('GET', p .. 'gate:claim_at')
+  if not beat or tonumber(beat) < tonumber(ARGV[10]) then
+    local queued = redis.call('ZCARD', p .. 'gate:holds')
+    if queued > tonumber(ARGV[11]) then
+      return {'BACKLOG', tostring(queued)}
+    end
   end
 end
 
@@ -297,9 +320,23 @@ type HoldInfo struct {
 // 认领时把订单号从 gate:holds 移到 gate:claimed。回收任务只扫 gate:holds：
 // 已认领的占用要活到订单结束（待支付的订单最长是整个支付时限），如果留在同一个列表里，
 // 它们会一直排在最前面，数量超过回收任务的一批之后，排在后面的孤儿就永远轮不到。
+//
+// claim 模式还把 gate:claim_at（落库的心跳，Hold 据此判断落库是否还活着）推进到 ARGV[4]，
+// 占用不存在或已认领过也推进：这同样说明消费者活着、在处理消息，而消费者恢复后最先消费到的
+// 往往正是已被回收的订单的消息，不记的话受理要等到它消费到一个还活着的占用才恢复。
+// 只往前推：多个消费者实例的时钟和调用顺序不一致，回退会让一个刚恢复的落库看起来又停了。
+//
+// ARGV: 前缀, 订单号, mode, 当前时间毫秒（get 模式不用）。
 var claimScript = redis.NewScript(`
 local hk = ARGV[1] .. 'gate:hold:' .. ARGV[2]
 local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'ts')
+if ARGV[3] == 'claim' then
+  local bk = ARGV[1] .. 'gate:claim_at'
+  local beat = redis.call('GET', bk)
+  if not beat or tonumber(beat) < tonumber(ARGV[4]) then
+    redis.call('SET', bk, ARGV[4])
+  end
+end
 if not h[1] then
   return {}
 end
@@ -317,17 +354,20 @@ return h
 // 认领和回收（ReturnIfUnclaimed）在 Redis 里互斥：同一笔占用，要么被认领后由订单的终态归还，
 // 要么被回收任务归还，不会两样都发生。占用不存在时返回 false，调用方应当放弃这笔订单。
 // 重复认领是安全的。
-func (g *Gate) Claim(ctx context.Context, orderID int64) (HoldInfo, bool, error) {
-	return g.readHold(ctx, orderID, "claim")
+//
+// 每次调用（包括占用不存在、重复认领）都把落库的心跳推进到 now，Hold 的第三条背压靠它
+// 区分“落库停住了”和“落库活着”，见 BacklogLimit。now 应当是调用方的当前时间。
+func (g *Gate) Claim(ctx context.Context, orderID int64, now time.Time) (HoldInfo, bool, error) {
+	return g.readHold(ctx, orderID, "claim", now.UnixMilli())
 }
 
 // Get 读取一笔占用，不改变它。
 func (g *Gate) Get(ctx context.Context, orderID int64) (HoldInfo, bool, error) {
-	return g.readHold(ctx, orderID, "get")
+	return g.readHold(ctx, orderID, "get", 0)
 }
 
-func (g *Gate) readHold(ctx context.Context, orderID int64, mode string) (HoldInfo, bool, error) {
-	res, err := claimScript.Run(ctx, g.rdb, nil, g.prefix, orderID, mode).StringSlice()
+func (g *Gate) readHold(ctx context.Context, orderID int64, mode string, nowMilli int64) (HoldInfo, bool, error) {
+	res, err := claimScript.Run(ctx, g.rdb, nil, g.prefix, orderID, mode, nowMilli).StringSlice()
 	if err != nil {
 		return HoldInfo{}, false, fmt.Errorf("stockgate: %s hold %d: %w", mode, orderID, err)
 	}
