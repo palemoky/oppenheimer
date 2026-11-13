@@ -7,12 +7,17 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
+	"github.com/palemoky/oppenheimer/pkg/sharding"
 	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
 // CheckLogCorrections 是“库存服务日志里没有出现过修正”这条检查的编号（设计里没有编号，排在 18 之后）。
 const CheckLogCorrections = 19
+
+// CheckMerchantIndex 是“商家索引与订单表一致”这条检查的编号，只在给了索引库时执行。
+const CheckMerchantIndex = 20
 
 // Violation 是一条不满足的检查。
 type Violation struct {
@@ -51,6 +56,18 @@ type Counts struct {
 	Corrections int
 	Capped      int
 	DLQ         int
+	// MerchantIndex 是第 20 条的统计；没有索引库时为 nil（跳过）。
+	MerchantIndex *MerchantIndexCounts
+}
+
+// MerchantIndexCounts 是第 20 条的统计。
+type MerchantIndexCounts struct {
+	Orders    int // 订单侧有商家的订单数
+	Rows      int // 索引侧的行数
+	Missing   int // 订单侧有、索引侧没有
+	Extra     int // 索引侧有、订单侧没有（含同一订单出现多行的多余行）
+	Mismatch  int // 两边都有但 status、total_amount、版本、merchant_id 不等
+	Misplaced int // 索引行所在的 slot 不是按 merchant_id 算出的 slot
 }
 
 // Result 是一次对账的结果。
@@ -108,6 +125,7 @@ func Check(in Input) *Result {
 	c.ledgerServer()   // 13–16
 	c.infrastructure() // 17–18
 	c.logs()           // 19
+	c.merchantIndex()  // 20
 
 	slices.SortStableFunc(c.res.Violations, func(a, b Violation) int {
 		return cmp.Or(cmp.Compare(a.Check, b.Check), cmp.Compare(a.Subject, b.Subject))
@@ -492,5 +510,91 @@ func (c *checker) logs() {
 	}
 	for _, line := range c.s.Capped {
 		c.note("gate reconciliation saw a persistent deviation (capped, not corrected): %s", line)
+	}
+}
+
+// ---------- 20 商家索引与订单表 ----------
+
+// indexExamples 是第 20 条每一类最多列出的例子数。压测后出问题时可能有成千上万行，全列出来没法看。
+const indexExamples = 5
+
+// merchantIndexIssues 收集第 20 条一类问题：总数和前几个例子。
+type merchantIndexIssues struct {
+	n        int
+	examples []string
+}
+
+func (m *merchantIndexIssues) add(format string, args ...any) {
+	m.n++
+	if len(m.examples) < indexExamples {
+		m.examples = append(m.examples, fmt.Sprintf(format, args...))
+	}
+}
+
+// merchantIndex 对比订单表里有商家的订单和索引表。没有索引库（Snapshot.MerchantIndex 为 nil）时跳过。
+//
+// 索引是最终一致的，所以只有在 CDC 和 orderindex 追平之后才有意义。
+func (c *checker) merchantIndex() {
+	d := c.s.MerchantIndex
+	if d == nil {
+		return
+	}
+	r, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil { // 布局是编译期常量，走不到这里
+		c.fail(CheckMerchantIndex, "merchant index", "build shard router: %v", err)
+		return
+	}
+	cnt := &MerchantIndexCounts{Orders: len(d.Orders), Rows: len(d.Index)}
+	c.res.Counts.MerchantIndex = cnt
+
+	orders := make(map[int64]MerchantOrderRow, len(d.Orders))
+	for _, o := range d.Orders {
+		orders[o.OrderID] = o
+	}
+	var missing, extra, mismatch, misplaced merchantIndexIssues
+	seen := make(map[int64]bool, len(d.Index))
+	for _, row := range slices.SortedFunc(slices.Values(d.Index), func(a, b MerchantOrderRow) int {
+		return cmp.Compare(a.OrderID, b.OrderID)
+	}) {
+		if want := r.ForMerchant(row.MerchantID); row.Slot != want {
+			misplaced.add("%s in merchant_orders_%d, merchant %d belongs to slot %d", orderSubj(row.OrderID), row.Slot, row.MerchantID, want)
+		}
+		o, ok := orders[row.OrderID]
+		switch {
+		case !ok:
+			extra.add("%s (merchant %d, status %s) not in the order dbs with a merchant", orderSubj(row.OrderID), row.MerchantID, OrderStatusName(row.Status))
+			continue
+		case seen[row.OrderID]:
+			extra.add("%s has more than one index row (merchant %d in merchant_orders_%d)", orderSubj(row.OrderID), row.MerchantID, row.Slot)
+			continue
+		}
+		seen[row.OrderID] = true
+		if o.MerchantID != row.MerchantID || o.Status != row.Status || o.TotalAmount != row.TotalAmount || o.Version != row.Version {
+			mismatch.add("%s order {merchant %d %s total %d version %d}, index {merchant %d %s total %d src_version %d}",
+				orderSubj(o.OrderID), o.MerchantID, OrderStatusName(o.Status), o.TotalAmount, o.Version,
+				row.MerchantID, OrderStatusName(row.Status), row.TotalAmount, row.Version)
+		}
+	}
+	for _, o := range slices.SortedFunc(maps.Values(orders), func(a, b MerchantOrderRow) int {
+		return cmp.Compare(a.OrderID, b.OrderID)
+	}) {
+		if !seen[o.OrderID] {
+			missing.add("%s (merchant %d, %s, version %d) not in the index", orderSubj(o.OrderID), o.MerchantID, OrderStatusName(o.Status), o.Version)
+		}
+	}
+	cnt.Missing, cnt.Extra, cnt.Mismatch, cnt.Misplaced = missing.n, extra.n, mismatch.n, misplaced.n
+
+	for _, k := range []struct {
+		what   string
+		issues *merchantIndexIssues
+	}{
+		{"missing from the index", &missing},
+		{"extra in the index", &extra},
+		{"differ from the order table", &mismatch},
+		{"in the wrong slot", &misplaced},
+	} {
+		if k.issues.n > 0 {
+			c.fail(CheckMerchantIndex, "merchant index", "%d rows %s, e.g. %s", k.issues.n, k.what, strings.Join(k.issues.examples, "; "))
+		}
 	}
 }

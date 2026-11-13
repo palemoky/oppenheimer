@@ -31,6 +31,10 @@ type Sources struct {
 	OrderDBs  []*sql.DB
 	PaymentDB *sql.DB
 
+	// MerchantIndexDBs 按库序号排列，第 i 个是 merchant_index_db_i。为空时不检查商家索引
+	// （chaos 和 bench 不启动 CDC 与 orderindex，不会给这些库）。
+	MerchantIndexDBs []*sql.DB
+
 	// Redis 是闸门所在的实例，RedisPrefix 是服务的 REDIS_PREFIX。
 	Redis       *redis.Client
 	RedisPrefix string
@@ -92,6 +96,7 @@ func Collect(ctx context.Context, src Sources, initial map[int64]int64) (*Snapsh
 		{"inventory_db", collectInventory},
 		{"order_db", collectOrders},
 		{"payment_db", collectPayments},
+		{"merchant index", collectMerchantIndex},
 		{"stock gate", collectGate},
 		{"dead letter topics", collectDLQ},
 		{"inventory log", collectLog},
@@ -192,6 +197,59 @@ func collectOrders(ctx context.Context, src Sources, s *Snapshot) error {
 		pending += n
 	}
 	s.OutboxPending["order"] = pending
+	return nil
+}
+
+// collectMerchantIndex 读出订单侧和索引侧的商家订单。没有给索引库时什么也不读，Snapshot.MerchantIndex 保持 nil。
+//
+// 订单侧的列（merchant_id、version）只在这里读，不碰 collectOrders 的查询，
+// 没有索引库时对账读的库表与加入这一项之前完全一样。
+func collectMerchantIndex(ctx context.Context, src Sources, s *Snapshot) error {
+	if len(src.MerchantIndexDBs) == 0 {
+		return nil
+	}
+	if len(src.MerchantIndexDBs) != sharding.MerchantIndexDBs {
+		return fmt.Errorf("verify: got %d merchant index dbs, layout has %d", len(src.MerchantIndexDBs), sharding.MerchantIndexDBs)
+	}
+	data := &MerchantIndexData{}
+	scan := func(slot int, rows *[]MerchantOrderRow) func(*sql.Rows) error {
+		return func(r *sql.Rows) error {
+			row := MerchantOrderRow{Slot: slot}
+			if err := r.Scan(&row.OrderID, &row.MerchantID, &row.Status, &row.TotalAmount, &row.Version); err != nil {
+				return err
+			}
+			*rows = append(*rows, row)
+			return nil
+		}
+	}
+
+	orderShards, err := orderShards(src)
+	if err != nil {
+		return err
+	}
+	for db, slots := range orderShards {
+		for _, slot := range slots {
+			q := "SELECT order_id, merchant_id, status, total_amount, version FROM " +
+				sharding.Table("orders", slot) + " WHERE merchant_id IS NOT NULL"
+			if err := queryEach(ctx, src.OrderDBs[db], q, scan(slot, &data.Orders)); err != nil {
+				return err
+			}
+		}
+	}
+
+	r, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil {
+		return fmt.Errorf("build merchant index shard router: %w", err)
+	}
+	for db, conn := range src.MerchantIndexDBs {
+		for _, slot := range r.SlotsOf(db) {
+			q := "SELECT order_id, merchant_id, status, total_amount, src_version FROM " + sharding.Table("merchant_orders", slot)
+			if err := queryEach(ctx, conn, q, scan(slot, &data.Index)); err != nil {
+				return err
+			}
+		}
+	}
+	s.MerchantIndex = data
 	return nil
 }
 

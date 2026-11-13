@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/palemoky/oppenheimer/pkg/sharding"
 	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
@@ -252,5 +253,94 @@ func TestScanLog(t *testing.T) {
 	}
 	if len(corrected) != 1 || !strings.Contains(corrected[0], `"deviation":2`) || len(capped) != 1 {
 		t.Fatalf("corrected %v capped %v", corrected, capped)
+	}
+}
+
+// merchantWorld 在自洽的终态上加一份一致的商家索引：订单 1、2 属于商家 1，订单 3 属于商家 2。
+func merchantWorld() Input {
+	in := world()
+	r, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil {
+		panic(err)
+	}
+	rows := []MerchantOrderRow{
+		{OrderID: 1, MerchantID: 1, Status: OrderPaid, TotalAmount: 200, Version: 3},
+		{OrderID: 2, MerchantID: 1, Status: OrderCancelled, TotalAmount: 100, Version: 2},
+		{OrderID: 3, MerchantID: 2, Status: OrderClosed, TotalAmount: 100, Version: 4},
+	}
+	d := &MerchantIndexData{}
+	for _, row := range rows {
+		d.Orders = append(d.Orders, row)
+		row.Slot = r.ForMerchant(row.MerchantID)
+		d.Index = append(d.Index, row)
+	}
+	in.Snapshot.MerchantIndex = d
+	return in
+}
+
+func TestMerchantIndexCheck(t *testing.T) {
+	in := merchantWorld()
+	res := Check(in)
+	if res.Failed() {
+		t.Fatalf("unexpected violations: %v", res.Violations)
+	}
+	if c := res.Counts.MerchantIndex; c == nil || *c != (MerchantIndexCounts{Orders: 3, Rows: 3}) {
+		t.Fatalf("counts = %+v", c)
+	}
+
+	// 没有索引库：跳过，不算失败，统计为 nil。
+	in = world()
+	if res := Check(in); res.Failed() || res.Counts.MerchantIndex != nil {
+		t.Fatalf("skipped: violations %v counts %+v", res.Violations, res.Counts.MerchantIndex)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(d *MerchantIndexData)
+		want   MerchantIndexCounts
+	}{
+		{"missing", func(d *MerchantIndexData) { d.Index = d.Index[1:] }, MerchantIndexCounts{Orders: 3, Rows: 2, Missing: 1}},
+		{"extra", func(d *MerchantIndexData) {
+			d.Index = append(d.Index, MerchantOrderRow{OrderID: 99, MerchantID: 1, Status: OrderPaid, Slot: d.Index[0].Slot})
+		}, MerchantIndexCounts{Orders: 3, Rows: 4, Extra: 1}},
+		{"duplicate row of one order is extra", func(d *MerchantIndexData) {
+			d.Index = append(d.Index, d.Index[0])
+		}, MerchantIndexCounts{Orders: 3, Rows: 4, Extra: 1}},
+		{"status differs", func(d *MerchantIndexData) { d.Index[0].Status = OrderPendingPayment }, MerchantIndexCounts{Orders: 3, Rows: 3, Mismatch: 1}},
+		{"amount differs", func(d *MerchantIndexData) { d.Index[1].TotalAmount++ }, MerchantIndexCounts{Orders: 3, Rows: 3, Mismatch: 1}},
+		{"version differs", func(d *MerchantIndexData) { d.Index[2].Version-- }, MerchantIndexCounts{Orders: 3, Rows: 3, Mismatch: 1}},
+		{"merchant differs", func(d *MerchantIndexData) { d.Index[1].MerchantID = 2 }, MerchantIndexCounts{Orders: 3, Rows: 3, Mismatch: 1, Misplaced: 1}},
+		{"wrong slot", func(d *MerchantIndexData) {
+			d.Index[0].Slot = (d.Index[0].Slot + 1) % sharding.MerchantIndexSlots
+		}, MerchantIndexCounts{Orders: 3, Rows: 3, Misplaced: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := merchantWorld()
+			tc.mutate(in.Snapshot.MerchantIndex)
+			got := failedChecks(t, in)
+			if !slices.Equal(got, []int{CheckMerchantIndex}) {
+				t.Fatalf("failed checks = %v, want [%d]", got, CheckMerchantIndex)
+			}
+			if c := Check(in).Counts.MerchantIndex; c == nil || *c != tc.want {
+				t.Fatalf("counts = %+v, want %+v", c, tc.want)
+			}
+		})
+	}
+}
+
+// 例子只列前几个，不会因为索引整体坏掉而刷屏。
+func TestMerchantIndexExamplesAreCapped(t *testing.T) {
+	in := merchantWorld()
+	in.Snapshot.MerchantIndex.Index = nil
+	for i := range 50 {
+		in.Snapshot.MerchantIndex.Orders = append(in.Snapshot.MerchantIndex.Orders, MerchantOrderRow{OrderID: int64(100 + i), MerchantID: 1})
+	}
+	res := Check(in)
+	if len(res.Violations) != 1 || res.Counts.MerchantIndex.Missing != 53 {
+		t.Fatalf("violations %d, counts %+v", len(res.Violations), res.Counts.MerchantIndex)
+	}
+	if n := strings.Count(res.Violations[0].Detail, "not in the index"); n != indexExamples {
+		t.Fatalf("%d examples listed, want %d", n, indexExamples)
 	}
 }

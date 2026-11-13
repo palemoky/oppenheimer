@@ -35,6 +35,8 @@ type sourceFlags struct {
 	inventoryDSN, orderDSNs, paymentDSN string
 	redisAddr, redisPrefix              string
 	kafkaBrokers, kafkaPrefix           string
+	// merchantIndexDSNs 可选：给了才对账商家索引（verify 的第 20 条）。
+	merchantIndexDSNs string
 }
 
 func (f *sourceFlags) register(fs *flag.FlagSet) {
@@ -46,6 +48,8 @@ func (f *sourceFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.redisPrefix, "redis-prefix", "", "REDIS_PREFIX of the services")
 	fs.StringVar(&f.kafkaBrokers, "kafka-brokers", "127.0.0.1:9092", "comma-separated kafka brokers")
 	fs.StringVar(&f.kafkaPrefix, "kafka-prefix", "", "KAFKA_PREFIX of the services")
+	fs.StringVar(&f.merchantIndexDSNs, "merchant-index-dsns", "",
+		"optional, comma-separated merchant index DB DSNs, the i-th is merchant_index_db_i; when empty verify check 20 is skipped")
 }
 
 // open 连上全部数据源，返回的 close 关闭它们。
@@ -86,6 +90,14 @@ func (f *sourceFlags) open(ctx context.Context) (verify.Sources, func(), error) 
 	}
 	if len(src.OrderDBs) == 0 {
 		return fail(errors.New("-order-dsns is empty"))
+	}
+	for i, dsn := range splitList(f.merchantIndexDSNs) {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: 4})
+		if err != nil {
+			return fail(fmt.Errorf("open merchant index db %d: %w", i, err))
+		}
+		closers = append(closers, func() { _ = db.Close() })
+		src.MerchantIndexDBs = append(src.MerchantIndexDBs, db)
 	}
 	rdb, err := redisx.Open(ctx, redisx.Config{Addr: f.redisAddr, ReadTimeout: 5 * time.Second})
 	if err != nil {
@@ -251,11 +263,19 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 		p("sku %d: initial %d available %d reserved %d sold %d | gate avail %d held %d limit %d",
 			sku, snap.Initial[sku], st.Available, st.Reserved, st.Sold, g.Avail, g.Held, g.Limit)
 	}
+	last := 19
+	if mi := c.MerchantIndex; mi != nil {
+		last = verify.CheckMerchantIndex
+		p("[20] merchant index: %d orders with a merchant, %d index rows; missing %d, extra %d, mismatched %d, misplaced %d",
+			mi.Orders, mi.Rows, mi.Missing, mi.Extra, mi.Mismatch, mi.Misplaced)
+	} else {
+		p("[20] merchant index: skipped (no -merchant-index-dsns)")
+	}
 	for _, n := range res.Notes {
 		p("note: %s", n)
 	}
 	if !res.Failed() {
-		p("RESULT: PASS (checks 1-19)")
+		p("RESULT: PASS (checks 1-%d)", last)
 		return
 	}
 	p("== violations (%d) ==", len(res.Violations))

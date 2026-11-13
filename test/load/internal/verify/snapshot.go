@@ -167,9 +167,30 @@ type Snapshot struct {
 
 	DLQ []DLQMessage
 
+	// MerchantIndex 是商家索引对账要的数据；没有给索引库时为 nil，对应的检查跳过。
+	MerchantIndex *MerchantIndexData
+
 	// Corrections 是库存服务日志里闸门对账做过修正的行；Capped 是偏差持续但被上限截住的行。
 	Corrections []string
 	Capped      []string
+}
+
+// MerchantOrderRow 是订单库（merchant_id 非空的订单）或商家索引表里的一行，只取对账要比的列。
+type MerchantOrderRow struct {
+	OrderID     int64
+	MerchantID  int64
+	Status      int
+	TotalAmount int64
+	// Version 在订单侧是 orders.version，在索引侧是 src_version。
+	Version int64
+	// Slot 是行所在的物理表的 slot：订单侧是 orders_{slot}，索引侧是 merchant_orders_{slot}。
+	Slot int
+}
+
+// MerchantIndexData 是商家索引与订单表的两侧数据。
+type MerchantIndexData struct {
+	Orders []MerchantOrderRow // 订单侧：全部 merchant_id IS NOT NULL 的订单
+	Index  []MerchantOrderRow // 索引侧：全部 merchant_orders_{slot} 的行
 }
 
 // IdemRef 是订单库唯一键 (user_id, idempotency_key)。

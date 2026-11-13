@@ -50,6 +50,7 @@ func newOrderDBs(t *testing.T) []*sql.DB {
 			fmt.Fprintf(&sb, `CREATE TABLE %s (
 	order_id BIGINT NOT NULL, user_id BIGINT NOT NULL, status TINYINT NOT NULL,
 	total_amount BIGINT NOT NULL DEFAULT 0, currency CHAR(3) NOT NULL DEFAULT 'CNY',
+	merchant_id BIGINT NULL, version BIGINT NOT NULL DEFAULT 0,
 	idempotency_key VARCHAR(64) NOT NULL, request_hash BINARY(32) NOT NULL,
 	payment_id BIGINT NULL, fail_reason VARCHAR(64) NULL, expire_at DATETIME(6) NOT NULL,
 	paid_at DATETIME(6) NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -269,5 +270,119 @@ func TestOrderShardsRejectsWrongDBCount(t *testing.T) {
 	}
 	if total != sharding.OrderSlots {
 		t.Errorf("shards cover %d slots, want %d", total, sharding.OrderSlots)
+	}
+}
+
+// newMerchantIndexDBs 用 orderindex 的迁移建两个索引库，每个库只有本库 slot 的表。
+func newMerchantIndexDBs(t *testing.T) []*sql.DB {
+	t.Helper()
+	r, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys := os.DirFS(filepath.Join("..", "..", "..", "..", "services", "orderindex"))
+	dbs := make([]*sql.DB, r.DBs())
+	for i := range dbs {
+		dbs[i] = testdb.NewTemplate(t, fsys, "migrations", struct{ Slots []int }{r.SlotsOf(i)})
+	}
+	return dbs
+}
+
+// 商家索引对账读库：造出一致、缺失、多余、不一致、放错 slot 各一种情况，Collect 读出两侧，Check 逐类报出。
+func TestCollectAndCheckMerchantIndex(t *testing.T) {
+	ords, idx := newOrderDBs(t), newMerchantIndexDBs(t)
+	or, err := sharding.New(sharding.OrderLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ir, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 订单按 user_id 落表，索引按 merchant_id 落表。
+	const insOrder = `INSERT INTO %s (order_id, user_id, merchant_id, version, status, total_amount, idempotency_key, request_hash, expire_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, REPEAT('a', 32), NOW(6))`
+	addOrder := func(orderID, userID int64, merchant any, version int64, status int, total int64) {
+		slot := or.ForUser(userID)
+		exec(t, ords[or.DB(slot)], fmt.Sprintf(insOrder, sharding.Table("orders", slot)),
+			orderID, userID, merchant, version, status, total, fmt.Sprintf("k%d", orderID))
+	}
+	const insIndex = `INSERT INTO %s (merchant_id, order_id, user_id, status, total_amount, currency, created_at, src_version, synced_at)
+		VALUES (?, ?, 1, ?, ?, 'CNY', NOW(6), ?, NOW(6))`
+	addIndex := func(slot int, merchant, orderID int64, status int, total, version int64) {
+		exec(t, idx[ir.DB(slot)], fmt.Sprintf(insIndex, sharding.Table("merchant_orders", slot)),
+			merchant, orderID, status, total, version)
+	}
+	slotOf := ir.ForMerchant
+	wrongSlot := func(m int64) int { return (slotOf(m) + 1) % sharding.MerchantIndexSlots }
+
+	const m1, m2 = 1, 2
+	// 一致：订单 1 付清（版本 2），订单 2 待支付。没有商家的订单 9 不进索引，也不该被当成缺失。
+	addOrder(1, 11, m1, 2, OrderPaid, 200)
+	addIndex(slotOf(m1), m1, 1, OrderPaid, 200, 2)
+	addOrder(2, 12, m2, 1, OrderPendingPayment, 100)
+	addIndex(slotOf(m2), m2, 2, OrderPendingPayment, 100, 1)
+	addOrder(9, 19, nil, 0, OrderFailed, 0)
+
+	run := func() (*Result, *MerchantIndexData) {
+		// 只跑索引这一步：其余数据源（库存、支付、闸门）这里没有建。
+		snap := &Snapshot{}
+		if err := collectMerchantIndex(t.Context(), Sources{OrderDBs: ords, MerchantIndexDBs: idx}, snap); err != nil {
+			t.Fatal(err)
+		}
+		c := &checker{s: snap}
+		c.merchantIndex()
+		return &c.res, snap.MerchantIndex
+	}
+
+	res, data := run()
+	if res.Failed() || len(data.Orders) != 2 || len(data.Index) != 2 {
+		t.Fatalf("consistent: violations %v, orders %d, index rows %d", res.Violations, len(data.Orders), len(data.Index))
+	}
+	if c := res.Counts.MerchantIndex; c == nil || *c != (MerchantIndexCounts{Orders: 2, Rows: 2}) {
+		t.Fatalf("consistent counts = %+v", c)
+	}
+
+	// 缺失：订单 3 有商家，索引没有。
+	addOrder(3, 13, m1, 1, OrderPendingPayment, 300)
+	// 多余：索引里有订单 4，订单表里没有。
+	addIndex(slotOf(m2), m2, 4, OrderPaid, 400, 2)
+	// 不一致：订单 5 在订单表里已取消（版本 3），索引停在待支付（版本 1）。
+	addOrder(5, 15, m1, 3, OrderCancelled, 500)
+	addIndex(slotOf(m1), m1, 5, OrderPendingPayment, 500, 1)
+	// 放错 slot：订单 6 一致，但索引行在别的 slot 的表里。
+	addOrder(6, 16, m2, 1, OrderPendingPayment, 600)
+	addIndex(wrongSlot(m2), m2, 6, OrderPendingPayment, 600, 1)
+
+	res, _ = run()
+	want := MerchantIndexCounts{Orders: 5, Rows: 5, Missing: 1, Extra: 1, Mismatch: 1, Misplaced: 1}
+	if c := res.Counts.MerchantIndex; c == nil || *c != want {
+		t.Fatalf("counts = %+v, want %+v", c, want)
+	}
+	if len(res.Violations) != 4 {
+		t.Fatalf("violations = %v, want one per kind", res.Violations)
+	}
+	for _, frag := range []string{"order 3", "order 4", "order 5", "order 6"} {
+		found := false
+		for _, v := range res.Violations {
+			found = found || strings.Contains(v.Detail, frag)
+		}
+		if !found {
+			t.Errorf("no violation mentions %s: %v", frag, res.Violations)
+		}
+	}
+
+	// 没给索引库：不读索引，第 20 条跳过。
+	snap := &Snapshot{}
+	if err := collectMerchantIndex(t.Context(), Sources{OrderDBs: ords}, snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.MerchantIndex != nil {
+		t.Fatalf("MerchantIndex collected without index dbs")
+	}
+	// 库数与布局不一致时报错。
+	if err := collectMerchantIndex(t.Context(), Sources{OrderDBs: ords, MerchantIndexDBs: idx[:1]}, &Snapshot{}); err == nil {
+		t.Fatal("collect with one merchant index db succeeded, want error")
 	}
 }
