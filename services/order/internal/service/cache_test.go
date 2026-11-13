@@ -32,7 +32,7 @@ func (e *env) cachedService(t *testing.T, st *store.Store) *Service {
 	if st == nil {
 		st = e.store
 	}
-	return New(Deps{
+	return mustNew(t, Deps{
 		Store: st, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids,
 		Logger: e.svc.logger, OrderCache: c,
 	}, Config{

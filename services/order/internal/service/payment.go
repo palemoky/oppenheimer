@@ -157,7 +157,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	if !handled {
 		return nil
 	}
-	s.kick(ev.GetOrderId())
+	s.afterCommit(ctx, ev.GetOrderId())
 	if reply.GetDisposition() == refundRequired {
 		s.logger.WarnContext(ctx, "payment requires refund",
 			"order_id", ev.GetOrderId(), "payment_id", ev.GetPaymentId(), "reason", reply.GetReason())

@@ -119,8 +119,42 @@ func (s *Sweeper) sweepSlot(ctx context.Context, slot int, now time.Time) {
 	s.failStaleCreating(ctx, slot, now)
 }
 
+// list 先在从库上列出候选，从库出错时在同一个 slot 的时限内改用主库再列一次。
+//
+// 扫描可以走从库：列表只用来找候选，真正的状态转换是主库上带前置条件的更新。从库旧了只有两种后果：
+// 还没复制到的订单这一轮看不到，下一轮（或延迟消息）再处理；已在主库上被支付、取消的订单还被列出来，
+// 对它做的条件更新影响 0 行、不写事件，只是白做一次。两者都不会让订单走错状态。
+// 从库读挂了就退回主库，不让兜底任务因为从库停摆。
+//
+// 从库那次查询只给 slot 剩余时限的一半：从库挂起（连得上但不响应）时，如果它和主库共用整个 slot 的时限，
+// 会把时限耗光，退回主库时已经没有时间，这个 slot 这一轮就被跳过；从库一直挂着，兜底任务就一直不工作。
+// 留下的另一半给主库那次查询和处理这一批订单。按剩余时间而不是固定的 SlotTimeout/2 算：一个 slot 依次做
+// 两类扫描，第二次列表开始时 slot 的时限已经用掉一部分，固定的一半可能把剩下的全部占掉。
+// 没有从库时直接查一次主库，不加这层时限。
+func (s *Sweeper) list(ctx context.Context, slot int, kind string,
+	query func(ctx context.Context, src store.Source) ([]store.OrderRef, error),
+) ([]store.OrderRef, error) {
+	if !s.svc.store.HasReplicas() {
+		return query(ctx, store.Primary)
+	}
+	budget := s.cfg.SlotTimeout / 2
+	if dl, ok := ctx.Deadline(); ok {
+		budget = time.Until(dl) / 2
+	}
+	rctx, cancel := context.WithTimeout(ctx, budget)
+	refs, err := query(rctx, store.Replica)
+	cancel()
+	if err == nil {
+		return refs, nil
+	}
+	s.logger.WarnContext(ctx, "list on replica failed, retrying on primary", "kind", kind, "slot", slot, "error", err)
+	return query(ctx, store.Primary)
+}
+
 func (s *Sweeper) closeExpired(ctx context.Context, slot int, now time.Time) {
-	refs, err := s.svc.store.ListExpired(ctx, slot, now, s.cfg.BatchSize)
+	refs, err := s.list(ctx, slot, "expired", func(ctx context.Context, src store.Source) ([]store.OrderRef, error) {
+		return s.svc.store.ListExpired(ctx, slot, now, s.cfg.BatchSize, src)
+	})
 	if err != nil {
 		s.logger.ErrorContext(ctx, "list expired orders failed", "slot", slot, "error", err)
 		return
@@ -144,7 +178,9 @@ func (s *Sweeper) closeOrder(ctx context.Context, r store.OrderRef, now time.Tim
 }
 
 func (s *Sweeper) failStaleCreating(ctx context.Context, slot int, now time.Time) {
-	refs, err := s.svc.store.ListStaleCreating(ctx, slot, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize)
+	refs, err := s.list(ctx, slot, "stale creating", func(ctx context.Context, src store.Source) ([]store.OrderRef, error) {
+		return s.svc.store.ListStaleCreating(ctx, slot, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize, src)
+	})
 	if err != nil {
 		s.logger.ErrorContext(ctx, "list stale creating orders failed", "slot", slot, "error", err)
 		return

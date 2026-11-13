@@ -1,10 +1,12 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"log/slog"
+	"os"
 	"slices"
 	"strconv"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/testdb"
 	"github.com/palemoky/Oppenheimer/pkg/testredis"
 	"github.com/palemoky/Oppenheimer/services/order"
+	"github.com/palemoky/Oppenheimer/services/order/internal/readmark"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
 
@@ -182,6 +186,9 @@ type env struct {
 	svc     *Service
 	sweeper *Sweeper
 	reaper  *Reaper
+	// replicas 是 store 的“从库”（见 envOptions），没有从库时为空。
+	replicas []*sql.DB
+	marks    *readmark.Marks
 
 	// consumed[db] 是 consumeEvents 在第 db 个库的 outbox 里已经处理到的行数；
 	// simulated 是它代替库存服务发起的调用次数。
@@ -216,10 +223,73 @@ func (e *env) table(base string, orderID int64) string {
 	return sharding.Table(base, e.router.ForOrder(orderID))
 }
 
+// replicaKind 是测试环境里“从库”的接法。测试不搭真正的复制，用两种极端代替：
+type replicaKind int
+
+const (
+	noReplica replicaKind = iota
+	// emptyReplica 接到另一组只跑了迁移、没有数据的库：等价于延迟无限大的从库。
+	emptyReplica
+	// sameReplica 接到与主库同一个库的另一个连接池：等价于已经追上的从库。
+	sameReplica
+	// brokenReplica 接到连不上的地址：任何查询都失败。
+	brokenReplica
+)
+
+type envOptions struct {
+	replica  replicaKind
+	readMode ReadMode
+	// marksRDB 是标记用的 Redis 客户端，为空时用闸门那个。给一个连不上的客户端可以模拟 Redis 不可用。
+	marksRDB *redis.Client
+	// pinTTL、gtidWait 对应 Config 的同名字段，零值用默认值。
+	pinTTL   time.Duration
+	gtidWait time.Duration
+}
+
 func newEnv(t *testing.T) *env {
+	t.Helper()
+	return newEnvWith(t, envOptions{})
+}
+
+// reopen 返回连到 db 所在的同一个库的另一个连接池。
+func reopen(t testing.TB, db *sql.DB) *sql.DB {
+	t.Helper()
+	var name string
+	if err := db.QueryRowContext(t.Context(), "SELECT DATABASE()").Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := mysql.ParseDSN(os.Getenv(testdb.DSNEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DBName = name
+	cfg.ParseTime = true
+	other, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	return other
+}
+
+func newEnvWith(t *testing.T, opts envOptions) *env {
 	t.Helper()
 	router := newRouter(t)
 	dbs := newShardDBs(t, router)
+	var replicas []*sql.DB
+	switch opts.replica {
+	case noReplica:
+	case emptyReplica:
+		replicas = newShardDBs(t, router)
+	case sameReplica:
+		for _, db := range dbs {
+			replicas = append(replicas, reopen(t, db))
+		}
+	case brokenReplica:
+		for range dbs {
+			replicas = append(replicas, brokenDB(t))
+		}
+	}
 	rdb, prefix := testredis.New(t)
 	gate := stockgate.New(rdb, prefix)
 	inv := newFakeInventory(gate)
@@ -234,22 +304,30 @@ func newEnv(t *testing.T) *env {
 	}
 	clock := &fakeClock{t: time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)}
 	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
-	st, err := store.New(dbs, router)
+	var storeOpts []store.Option
+	if replicas != nil {
+		storeOpts = append(storeOpts, store.WithReplicas(replicas))
+	}
+	st, err := store.New(dbs, router, storeOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}
+	marks := readmark.New(cmp.Or(opts.marksRDB, rdb), prefix)
 	relays := make([]*fakeRelay, router.DBs())
 	for i := range relays {
 		relays[i] = &fakeRelay{}
 	}
 	sender := &fakeSender{}
-	e := &env{dbs: dbs, router: router, relays: relays}
-	svc := New(Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger}, Config{
+	e := &env{dbs: dbs, router: router, relays: relays, replicas: replicas, marks: marks}
+	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger, Marks: marks}, Config{
 		Clock:            clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,
 		CloseDelayTopic:  testCloseTopic,
 		Relays:           e.kickers(),
+		ReadMode:         opts.readMode,
+		ReadPinTTL:       opts.pinTTL,
+		ReadGTIDWait:     opts.gtidWait,
 	})
 	sweeper, err := NewSweeper(svc, SweeperConfig{})
 	if err != nil {
@@ -655,4 +733,31 @@ func wantStock(t *testing.T, inv *fakeInventory, sku, available, reserved, sold 
 
 func refOf(o *orderv1.Order) store.OrderRef {
 	return store.OrderRef{OrderID: o.GetOrderId(), UserID: o.GetUserId()}
+}
+
+// mustNew 是 New 的测试版本：配置有误时终止测试。
+func mustNew(t testing.TB, d Deps, cfg Config) *Service {
+	t.Helper()
+	svc, err := New(d, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc
+}
+
+// copyToReplica 把主库上 orderID 当前的行（orders 和 order_items）原样复制到“空从库”对应的表里，
+// 用来构造“从库上有一份旧数据”：之后在主库上推进状态，从库停在复制时的样子。
+// 只用于 emptyReplica：两组库在同一个实例上，可以跨库 INSERT ... SELECT。
+func (e *env) copyToReplica(t *testing.T, orderID int64) {
+	t.Helper()
+	db := e.router.DB(e.router.ForOrder(orderID))
+	var primary string
+	if err := e.dbs[db].QueryRowContext(t.Context(), "SELECT DATABASE()").Scan(&primary); err != nil {
+		t.Fatal(err)
+	}
+	for _, base := range []string{"orders", "order_items"} {
+		tb := e.table(base, orderID)
+		testdb.MustExec(t, e.replicas[db],
+			"INSERT INTO "+tb+" SELECT * FROM `"+primary+"`."+tb+" WHERE order_id = ?", orderID)
+	}
 }

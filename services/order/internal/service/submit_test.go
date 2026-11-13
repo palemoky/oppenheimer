@@ -119,7 +119,7 @@ func TestSubmitDoesNotTouchMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+	svc := mustNew(t, Deps{Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
 		Config{Clock: e.clock.Now, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic})
 	for _, it := range [][]*orderv1.SubmitOrderItem{items(skuA, 1), items(skuScarce, 5), items(skuMissing, 1)} {
 		_, err := svc.SubmitOrder(t.Context(), submitReq(1, fmt.Sprint(it), it))
@@ -411,7 +411,7 @@ func TestSubmitGateUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{
+	svc := mustNew(t, Deps{
 		Store: e.store, Gate: stockgate.New(broken, prefix), Sender: e.sender, Inventory: e.inv, IDs: ids,
 		Logger: slog.New(slog.DiscardHandler),
 	}, Config{Clock: e.clock.Now})
@@ -438,7 +438,7 @@ func TestSubmitBackpressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+	svc := mustNew(t, Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
 		Config{
 			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
 			Backlog: stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1},
@@ -493,7 +493,7 @@ func TestSubmitResumesAfterLandingDropsReapedOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+	svc := mustNew(t, Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
 		Config{
 			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
 			Backlog: stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1},

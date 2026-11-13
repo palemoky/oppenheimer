@@ -92,7 +92,7 @@ func TestSweeperSkipsUnavailableDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Store: half, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: nil, Logger: e.svc.logger}, Config{
+	svc := mustNew(t, Deps{Store: half, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: nil, Logger: e.svc.logger}, Config{
 		Clock:            e.clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		Relays:           e.kickers(),
@@ -137,7 +137,7 @@ func TestSweeperSlotTimeoutSkipsHungDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Store: half, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: nil, Logger: e.svc.logger}, Config{
+	svc := mustNew(t, Deps{Store: half, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: nil, Logger: e.svc.logger}, Config{
 		Clock:            e.clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		Relays:           e.kickers(),

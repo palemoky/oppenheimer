@@ -216,7 +216,7 @@ func TestListBySlot(t *testing.T) {
 	}
 	later := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
 	for slot := range f.router.Slots() {
-		refs, err := f.store.ListStaleCreating(t.Context(), slot, later, 100)
+		refs, err := f.store.ListStaleCreating(t.Context(), slot, later, 100, store.Primary)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,15 +228,15 @@ func TestListBySlot(t *testing.T) {
 				t.Errorf("slot %d returned order %d of user %d", slot, r.OrderID, r.UserID)
 			}
 		}
-		if _, err := f.store.ListExpired(t.Context(), slot, later, 100); err != nil {
+		if _, err := f.store.ListExpired(t.Context(), slot, later, 100, store.Primary); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, slot := range []int{-1, f.router.Slots()} {
-		if _, err := f.store.ListExpired(t.Context(), slot, later, 1); !errors.Is(err, store.ErrWrongShard) {
+		if _, err := f.store.ListExpired(t.Context(), slot, later, 1, store.Primary); !errors.Is(err, store.ErrWrongShard) {
 			t.Errorf("ListExpired(slot %d) = %v, want ErrWrongShard", slot, err)
 		}
-		if _, err := f.store.ListStaleCreating(t.Context(), slot, later, 1); !errors.Is(err, store.ErrWrongShard) {
+		if _, err := f.store.ListStaleCreating(t.Context(), slot, later, 1, store.Primary); !errors.Is(err, store.ErrWrongShard) {
 			t.Errorf("ListStaleCreating(slot %d) = %v, want ErrWrongShard", slot, err)
 		}
 	}

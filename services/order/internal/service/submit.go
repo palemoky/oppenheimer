@@ -304,7 +304,11 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 
 	// 2. 写订单行（CREATING）。订单号已存在是重复投递，读出来继续推进。
 	o.UpdatedAt = s.now()
+	s.pin(ctx, o.OrderID)
 	err = s.store.InsertOrder(ctx, o)
+	if err == nil {
+		s.stamp(ctx, o.OrderID)
+	}
 	switch {
 	case errors.Is(err, store.ErrDuplicate):
 		existing, gerr := s.store.GetOrder(ctx, o.OrderID)

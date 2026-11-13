@@ -77,10 +77,34 @@ type OrderRef struct {
 
 // Store 访问分片后的订单库。并发安全。
 type Store struct {
-	dbs    []*sql.DB
-	router *sharding.Router
-	tables []tables // 下标是 slot
+	dbs []*sql.DB
+	// replicas[i] 是 dbs[i] 的从库，为空表示没有配置从库。
+	replicas []*sql.DB
+	router   *sharding.Router
+	tables   []tables // 下标是 slot
 }
+
+// Option 是 New 的可选项。
+type Option func(*Store)
+
+// WithReplicas 给每个库配一个异步复制的从库，replicas[i] 是 dbs[i] 的从库。
+// 个数必须等于 router.DBs()，元素不能为 nil（在 New 里检查）。
+//
+// 从库可能落后，读它会读到旧数据。所以只有显式带“从库”字样的方法（GetOrderFromReplica、
+// 带 Replica 参数的扫描）会读它，其余方法一律读写主库，行为与没有从库时相同。
+func WithReplicas(replicas []*sql.DB) Option {
+	return func(s *Store) { s.replicas = replicas }
+}
+
+// Source 指定一次只读查询读主库还是从库。
+type Source int
+
+const (
+	// Primary 读主库。
+	Primary Source = iota
+	// Replica 读从库；没有配置从库时读主库。
+	Replica
+)
 
 // tables 是一个 slot 上的物理表名，全部由 sharding.Table 生成。
 type tables struct {
@@ -88,7 +112,7 @@ type tables struct {
 }
 
 // New 返回使用 dbs 的 Store，dbs[i] 是第 i 个库。库的个数必须等于 router.DBs()。
-func New(dbs []*sql.DB, router *sharding.Router) (*Store, error) {
+func New(dbs []*sql.DB, router *sharding.Router, opts ...Option) (*Store, error) {
 	if router == nil {
 		return nil, errors.New("store: nil router")
 	}
@@ -108,8 +132,25 @@ func New(dbs []*sql.DB, router *sharding.Router) (*Store, error) {
 			payments: sharding.Table("payment_results", slot),
 		}
 	}
-	return &Store{dbs: dbs, router: router, tables: ts}, nil
+	st := &Store{dbs: dbs, router: router, tables: ts}
+	for _, o := range opts {
+		o(st)
+	}
+	if st.replicas != nil {
+		if len(st.replicas) != router.DBs() {
+			return nil, fmt.Errorf("store: got %d replicas, sharding layout has %d databases", len(st.replicas), router.DBs())
+		}
+		for i, db := range st.replicas {
+			if db == nil {
+				return nil, fmt.Errorf("store: replica %d is nil", i)
+			}
+		}
+	}
+	return st, nil
 }
+
+// HasReplicas 报告是否配置了从库。
+func (s *Store) HasReplicas() bool { return s.replicas != nil }
 
 // Router 返回 Store 使用的分片布局。
 func (s *Store) Router() *sharding.Router { return s.router }
@@ -118,6 +159,21 @@ func (s *Store) Router() *sharding.Router { return s.router }
 func (s *Store) DBOfOrder(orderID int64) int { return s.router.DB(s.router.ForOrder(orderID)) }
 
 func (s *Store) dbOf(slot int) *sql.DB { return s.dbs[s.router.DB(slot)] }
+
+// replicaOf 返回 slot 所在库的从库，没有配置从库时返回主库。
+func (s *Store) replicaOf(slot int) *sql.DB {
+	if s.replicas == nil {
+		return s.dbOf(slot)
+	}
+	return s.replicas[s.router.DB(slot)]
+}
+
+func (s *Store) sourceOf(slot int, src Source) *sql.DB {
+	if src == Replica {
+		return s.replicaOf(slot)
+	}
+	return s.dbOf(slot)
+}
 
 func (s *Store) checkSlot(slot int) error {
 	if slot < 0 || slot >= s.router.Slots() {
@@ -188,6 +244,15 @@ func (s *Store) InsertOrder(ctx context.Context, o *Order) error {
 func (s *Store) GetOrder(ctx context.Context, orderID int64) (*Order, error) {
 	slot := s.router.ForOrder(orderID)
 	return getOrder(ctx, s.dbOf(slot), s.tables[slot], "WHERE order_id = ?", orderID)
+}
+
+// GetOrderFromReplica 与 GetOrder 相同，但读订单所在库的从库；没有配置从库时读主库。
+//
+// 结果可能是旧的，从库还没复制到的订单返回 ErrNotFound。只能用于展示，
+// 不能作为任何写入或决定的前提；“订单不存在”必须由主库确认。
+func (s *Store) GetOrderFromReplica(ctx context.Context, orderID int64) (*Order, error) {
+	slot := s.router.ForOrder(orderID)
+	return getOrder(ctx, s.replicaOf(slot), s.tables[slot], "WHERE order_id = ?", orderID)
 }
 
 // GetOrderByIdempotencyKey 按 (user_id, idempotency_key) 读订单及明细，只查用户所在的 slot。
@@ -286,27 +351,29 @@ func (s *Store) MarkReserved(ctx context.Context, orderID, total int64, currency
 // ListExpired 返回 slot 上截止时间早于 now 的 PENDING_PAYMENT 订单。
 //
 // 后台扫描是明确豁免的全分片扫描：调用方逐个 slot 调用，不合并排序。
-func (s *Store) ListExpired(ctx context.Context, slot int, now time.Time, limit int) ([]OrderRef, error) {
+// src 为 Replica 时读从库，结果可能是旧的，只能当作候选。
+func (s *Store) ListExpired(ctx context.Context, slot int, now time.Time, limit int, src Source) ([]OrderRef, error) {
 	if err := s.checkSlot(slot); err != nil {
 		return nil, err
 	}
-	return s.listRefs(ctx, slot,
+	return s.listRefs(ctx, slot, src,
 		"SELECT order_id, user_id FROM "+s.tables[slot].orders+" WHERE status = ? AND expire_at < ? ORDER BY expire_at LIMIT ?",
 		int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now, limit)
 }
 
 // ListStaleCreating 返回 slot 上落库时间（updated_at，CREATING 的行落库后不再更新）早于 before 仍在 CREATING 的订单。
-func (s *Store) ListStaleCreating(ctx context.Context, slot int, before time.Time, limit int) ([]OrderRef, error) {
+// src 的含义同 ListExpired。
+func (s *Store) ListStaleCreating(ctx context.Context, slot int, before time.Time, limit int, src Source) ([]OrderRef, error) {
 	if err := s.checkSlot(slot); err != nil {
 		return nil, err
 	}
-	return s.listRefs(ctx, slot,
+	return s.listRefs(ctx, slot, src,
 		"SELECT order_id, user_id FROM "+s.tables[slot].orders+" WHERE status = ? AND updated_at < ? ORDER BY updated_at LIMIT ?",
 		int32(orderv1.OrderStatus_ORDER_STATUS_CREATING), before, limit)
 }
 
-func (s *Store) listRefs(ctx context.Context, slot int, query string, args ...any) ([]OrderRef, error) {
-	rows, err := s.dbOf(slot).QueryContext(ctx, query, args...)
+func (s *Store) listRefs(ctx context.Context, slot int, src Source, query string, args ...any) ([]OrderRef, error) {
+	rows, err := s.sourceOf(slot, src).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list orders in slot %d: %w", slot, err)
 	}

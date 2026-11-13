@@ -144,7 +144,7 @@ func TestSweeperStartStop(t *testing.T) {
 func TestSweeperStopBeforeFirstTick(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		svc := New(Deps{Logger: slog.New(slog.DiscardHandler)}, Config{})
+		svc := mustNew(t, Deps{Logger: slog.New(slog.DiscardHandler)}, Config{})
 		sw, err := NewSweeper(svc, SweeperConfig{Interval: time.Hour})
 		if err != nil {
 			t.Fatal(err)
@@ -166,7 +166,7 @@ func TestSweeperStopBeforeFirstTick(t *testing.T) {
 func TestSweeperStartReturnsOnContextCancel(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		svc := New(Deps{Logger: slog.New(slog.DiscardHandler)}, Config{})
+		svc := mustNew(t, Deps{Logger: slog.New(slog.DiscardHandler)}, Config{})
 		sw, err := NewSweeper(svc, SweeperConfig{Interval: time.Hour})
 		if err != nil {
 			t.Fatal(err)

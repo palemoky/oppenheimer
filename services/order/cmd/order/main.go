@@ -33,6 +33,7 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/sharding"
 	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/order"
+	"github.com/palemoky/Oppenheimer/services/order/internal/readmark"
 	"github.com/palemoky/Oppenheimer/services/order/internal/service"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
@@ -79,8 +80,9 @@ const (
 )
 
 // defaultMySQLDSNs 是 MYSQL_DSNS 的默认值，第 i 个是 order_db_i。
-const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3306)/order_db_0," +
-	"root:oppenheimer@tcp(127.0.0.1:3306)/order_db_1"
+// 两个库在两个 MySQL 实例上；它们的从库在 3312、3322，从库没有默认值（不设 MYSQL_REPLICA_DSNS 就是没有从库）。
+const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
+	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
 
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
@@ -102,6 +104,12 @@ type config struct {
 	grpcAddr string
 	// mysqlDSNs[i] 是第 i 个订单库（order_db_i）。
 	mysqlDSNs []string
+	// mysqlReplicaDSNs[i] 是 order_db_i 的从库，为空表示没有从库。
+	mysqlReplicaDSNs []string
+	readMode         service.ReadMode
+	readPinTTL       time.Duration
+	readGTIDTTL      time.Duration
+	readGTIDWait     time.Duration
 	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
 	mysqlMaxOpenConns int
 	workerID          int64
@@ -154,6 +162,29 @@ func loadConfig() (config, error) {
 	if len(cfg.mysqlDSNs) != sharding.OrderDBs || slices.Contains(cfg.mysqlDSNs, "") {
 		return cfg, fmt.Errorf("MYSQL_DSNS must have exactly %d non-empty DSNs (order_db_0 .. order_db_%d), got %d",
 			sharding.OrderDBs, sharding.OrderDBs-1, len(cfg.mysqlDSNs))
+	}
+	if v := os.Getenv("MYSQL_REPLICA_DSNS"); v != "" {
+		for d := range strings.SplitSeq(v, ",") {
+			cfg.mysqlReplicaDSNs = append(cfg.mysqlReplicaDSNs, strings.TrimSpace(d))
+		}
+		if len(cfg.mysqlReplicaDSNs) != sharding.OrderDBs || slices.Contains(cfg.mysqlReplicaDSNs, "") {
+			return cfg, fmt.Errorf("MYSQL_REPLICA_DSNS must have exactly %d non-empty DSNs (replicas of order_db_0 .. order_db_%d), got %d",
+				sharding.OrderDBs, sharding.OrderDBs-1, len(cfg.mysqlReplicaDSNs))
+		}
+	}
+	switch m := cmp.Or(os.Getenv("ORDER_READ_MODE"), "primary"); m {
+	case "primary":
+		cfg.readMode = service.ReadPrimary
+	case "window":
+		cfg.readMode = service.ReadWindow
+	case "gtid":
+		cfg.readMode = service.ReadGTID
+	default:
+		return cfg, fmt.Errorf("ORDER_READ_MODE must be primary, window or gtid, got %q", m)
+	}
+	// 在这里就拒绝，而不是等 service.New：错误信息能直接指出缺的是哪个环境变量。
+	if cfg.readMode != service.ReadPrimary && cfg.mysqlReplicaDSNs == nil {
+		return cfg, fmt.Errorf("ORDER_READ_MODE=%s needs MYSQL_REPLICA_DSNS", cfg.readMode)
 	}
 	maxOpen, err := envInt("MYSQL_MAX_OPEN_CONNS", defaultMySQLMaxOpenConns)
 	if err != nil {
@@ -236,6 +267,15 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
 	}
 	cfg.backlog.MaxStale = stale
+	if cfg.readPinTTL, err = envDuration("ORDER_READ_PIN_TTL", service.DefaultReadPinTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.readGTIDTTL, err = envDuration("ORDER_READ_GTID_TTL", service.DefaultReadGTIDTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.readGTIDWait, err = envDuration("ORDER_READ_GTID_WAIT", service.DefaultReadGTIDWait); err != nil {
+		return cfg, err
+	}
 	cfg.cacheRedisAddr = cmp.Or(os.Getenv("CACHE_REDIS_ADDR"), cfg.redisAddr)
 	if cfg.orderCacheTTL, err = envDurationOrZero("ORDER_CACHE_TTL", service.DefaultOrderCacheTTL); err != nil {
 		return cfg, err
@@ -305,7 +345,21 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 		dbs[i] = db
 	}
-	st, err := store.New(dbs, router)
+	var storeOpts []store.Option
+	if cfg.mysqlReplicaDSNs != nil {
+		replicas := make([]*sql.DB, router.DBs())
+		for i, dsn := range cfg.mysqlReplicaDSNs {
+			db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
+			if err != nil {
+				return fmt.Errorf("open order db %d replica: %w", i, err)
+			}
+			defer db.Close()
+			// 从库上不跑迁移：表结构经复制从主库过来，在从库上直接执行 DDL 会让两边分叉、打断复制。
+			replicas[i] = db
+		}
+		storeOpts = append(storeOpts, store.WithReplicas(replicas))
+	}
+	st, err := store.New(dbs, router, storeOpts...)
 	if err != nil {
 		return err
 	}
@@ -398,7 +452,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		relays[i], kickers[i] = r, r
 	}
 
-	svc := service.New(service.Deps{
+	logger.Info("order read mode", "read_mode", cfg.readMode.String(), "replicas", st.HasReplicas())
+	svc, err := service.New(service.Deps{
 		Store:      st,
 		Gate:       gate,
 		Sender:     producer,
@@ -406,6 +461,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		IDs:        ids,
 		Logger:     logger,
 		OrderCache: orderCache,
+		// 标记放在闸门那个实例上（noeviction）：被淘汰的标记等于提前到期。
+		Marks: readmark.New(rdb, cfg.redisPrefix),
 	}, service.Config{
 		PaymentTimeout:    cfg.paymentTimeout,
 		IdempotencyTTL:    cfg.idempotencyTTL,
@@ -416,7 +473,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 		Backlog:           cfg.backlog,
+		ReadMode:          cfg.readMode,
+		ReadPinTTL:        cfg.readPinTTL,
+		ReadGTIDTTL:       cfg.readGTIDTTL,
+		ReadGTIDWait:      cfg.readGTIDWait,
 	})
+	if err != nil {
+		return err
+	}
 	cfg.sweeper.Guard = lock.FailOpen(sweeperLeader, logger)
 	cfg.reaper.Guard = lock.FailOpen(reaperLeader, logger)
 	sweeper, err := service.NewSweeper(svc, cfg.sweeper)
