@@ -540,10 +540,13 @@ func TestPayRacingCancelEndsConsistent(t *testing.T) {
 		})
 		wg.Go(func() {
 			<-start
-			// 模拟支付在受理后几百毫秒内出结果并回调，具体时刻取决于后台任务的节拍。
-			// 把取消均匀撒在 0 到 800ms：最早的一定赶在支付结果之前，最晚的一定在之后，
+			// 模拟支付在受理后几百毫秒内出结果并回调，具体时刻取决于后台任务的节拍和机器的快慢。
+			// 把取消均匀撒在 0 到 2s：最早的一定赶在支付结果之前，最晚的一定在之后，
 			// 中间的正好撞上，两种结局都会出现。
-			time.Sleep(time.Duration(i%9) * 100 * time.Millisecond)
+			// 窗口原来是 0 到 800ms。CI 上支付结果要六七百毫秒才到，40 个订单里只有 5 到 16 个能走到已支付；
+			// 加了 cdc、orderindex 两个进程和几个并行用例之后，有一次全部晚于 800ms，一个已支付都没有。
+			// 最晚的取消仍然早于 3s 的支付时限；即使个别订单先被超时关单，也只是记为 closed，不影响断言。
+			time.Sleep(time.Duration(i%9) * 250 * time.Millisecond)
 			if _, err := call(t.Context(), http.MethodPost, "/api/v1/orders/"+e.id+"/cancel", e.user, "", nil); err != nil {
 				t.Errorf("cancel: %v", err)
 			}
