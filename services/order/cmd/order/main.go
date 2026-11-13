@@ -78,15 +78,17 @@ const (
 	holdReaperLock  = "order:hold-reaper"
 )
 
-// 分片布局（ADR-0012）。写成常量而不是配置：配置错了数据就找不到了，改它是一次数据迁移，不是一次重启。
-const (
-	shardSlots = 8
-	shardDBs   = 2
-)
-
 // defaultMySQLDSNs 是 MYSQL_DSNS 的默认值，第 i 个是 order_db_i。
 const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3306)/order_db_0," +
 	"root:oppenheimer@tcp(127.0.0.1:3306)/order_db_1"
+
+// defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
+//
+// 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
+// payment 各 50，合计 150，刚好放得下。分片后 order 连 sharding.OrderDBs 个库、每个库一个池，
+// 仍用 50 就是 100，合计 200，超过上限后新连接会被拒（Too many connections）。每个库取 25，
+// 两个库合计 50，与分片前持平。库分到不同实例上之后，每个池只占自己那个实例的预算，可以调大。
+const defaultMySQLMaxOpenConns = 25
 
 // relayName 是第 db 个库的 outbox 中继的名字。各库必须不同：event-id 是“中继名:outbox 行 id”，
 // 行 id 是各库自己的自增列，名字相同时两个库的不同事件会有相同的 event-id，按 event-id 去重的下游会丢掉一条。
@@ -99,19 +101,21 @@ type config struct {
 	httpAddr string
 	grpcAddr string
 	// mysqlDSNs[i] 是第 i 个订单库（order_db_i）。
-	mysqlDSNs      []string
-	workerID       int64
-	inventoryAddr  string
-	paymentTimeout time.Duration
-	idempotencyTTL time.Duration
-	sweeper        service.SweeperConfig
-	reaper         service.ReaperConfig
-	backlog        stockgate.BacklogLimit
-	kafkaBrokers   []string
-	kafkaPrefix    string
-	outboxInterval time.Duration
-	redisAddr      string
-	redisPrefix    string
+	mysqlDSNs []string
+	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
+	mysqlMaxOpenConns int
+	workerID          int64
+	inventoryAddr     string
+	paymentTimeout    time.Duration
+	idempotencyTTL    time.Duration
+	sweeper           service.SweeperConfig
+	reaper            service.ReaperConfig
+	backlog           stockgate.BacklogLimit
+	kafkaBrokers      []string
+	kafkaPrefix       string
+	outboxInterval    time.Duration
+	redisAddr         string
+	redisPrefix       string
 	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
 	cacheRedisAddr string
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
@@ -146,10 +150,19 @@ func loadConfig() (config, error) {
 	for d := range strings.SplitSeq(cmp.Or(os.Getenv("MYSQL_DSNS"), defaultMySQLDSNs), ",") {
 		cfg.mysqlDSNs = append(cfg.mysqlDSNs, strings.TrimSpace(d))
 	}
-	if len(cfg.mysqlDSNs) != shardDBs || slices.Contains(cfg.mysqlDSNs, "") {
+	// 分片布局见 sharding.OrderLayout，是代码里的常量，不随配置变。
+	if len(cfg.mysqlDSNs) != sharding.OrderDBs || slices.Contains(cfg.mysqlDSNs, "") {
 		return cfg, fmt.Errorf("MYSQL_DSNS must have exactly %d non-empty DSNs (order_db_0 .. order_db_%d), got %d",
-			shardDBs, shardDBs-1, len(cfg.mysqlDSNs))
+			sharding.OrderDBs, sharding.OrderDBs-1, len(cfg.mysqlDSNs))
 	}
+	maxOpen, err := envInt("MYSQL_MAX_OPEN_CONNS", defaultMySQLMaxOpenConns)
+	if err != nil {
+		return cfg, err
+	}
+	if maxOpen <= 0 {
+		return cfg, errors.New("MYSQL_MAX_OPEN_CONNS must be positive")
+	}
+	cfg.mysqlMaxOpenConns = int(maxOpen)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -158,7 +171,6 @@ func loadConfig() (config, error) {
 	if len(cfg.kafkaBrokers) == 0 {
 		return cfg, errors.New("KAFKA_BROKERS has no broker addresses")
 	}
-	var err error
 	if cfg.outboxInterval, err = envDuration("OUTBOX_INTERVAL", 100*time.Millisecond); err != nil {
 		return cfg, err
 	}
@@ -275,13 +287,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	router, err := sharding.New(sharding.Config{Slots: shardSlots, DBs: shardDBs})
+	router, err := sharding.New(sharding.OrderLayout())
 	if err != nil {
 		return err
 	}
 	dbs := make([]*sql.DB, router.DBs())
 	for i, dsn := range cfg.mysqlDSNs {
-		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn})
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
 		if err != nil {
 			return fmt.Errorf("open order db %d: %w", i, err)
 		}

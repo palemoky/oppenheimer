@@ -4,7 +4,9 @@ package mysqlx
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 // MySQL 错误码。
@@ -144,13 +147,20 @@ func hasNumber(err error, number uint16) bool {
 }
 
 // Migrate 把 fsys 中 dir 目录下的 goose 迁移应用到最新版本。
-// 多个实例同时启动时，goose 用数据库的咨询锁保证只有一个在执行。
+//
+// 多个实例同时启动时，迁移前先在一条专用连接上用 GET_LOCK 拿本库的迁移锁，同一个库上
+// 同一时刻只有一个实例在执行，其余的等它做完再看到“已是最新”。等锁最多 60 秒，
+// 超时返回 ErrMigrationLockTimeout。
+//
+// 锁只防并发，不防中途崩溃：MySQL 的 DDL 隐式提交，一个版本里有多条 DDL 时，进程在中间被杀
+// 会留下部分表而版本号没记。迁移文件要写成可重入的（CREATE TABLE IF NOT EXISTS 等），
+// 下次启动重跑这个版本才能成功。
 func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) error {
 	sub, err := fs.Sub(fsys, dir)
 	if err != nil {
 		return fmt.Errorf("mysqlx: migrations dir %q: %w", dir, err)
 	}
-	return migrate(ctx, db, sub)
+	return migrate(ctx, db, sub, migrationLockTimeout)
 }
 
 // MigrateTemplate 把 fsys 中 dir 下的迁移文件当作 text/template 渲染（数据为 data），再应用到最新版本。
@@ -166,7 +176,7 @@ func MigrateTemplate(ctx context.Context, db *sql.DB, fsys fs.FS, dir string, da
 	if err != nil {
 		return err
 	}
-	return migrate(ctx, db, rendered)
+	return migrate(ctx, db, rendered, migrationLockTimeout)
 }
 
 // RenderMigrations 把 fsys 中 dir 下的每个文件当作 text/template 渲染，返回以文件名为路径的内存文件系统。
@@ -176,6 +186,8 @@ func RenderMigrations(fsys fs.FS, dir string, data any) (fs.FS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mysqlx: read migrations dir %q: %w", dir, err)
 	}
+	// fstest.MapFS 虽在 testing/ 下，但只依赖 testing/iotest 和基础库，不会把 testing 包
+	// （以及它注册的 -test.* 命令行参数）带进生产二进制，已用 go list -deps 确认。
 	out := fstest.MapFS{}
 	for _, e := range entries {
 		if !e.Type().IsRegular() {
@@ -199,9 +211,10 @@ func RenderMigrations(fsys fs.FS, dir string, data any) (fs.FS, error) {
 	return out, nil
 }
 
-func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+func migrate(ctx context.Context, db *sql.DB, fsys fs.FS, lockTimeout time.Duration) error {
 	provider, err := goose.NewProvider(goose.DialectMySQL, db, fsys,
 		goose.WithSlog(slog.New(slog.DiscardHandler)),
+		goose.WithSessionLocker(getLockLocker{timeout: lockTimeout}),
 	)
 	if err != nil {
 		return fmt.Errorf("mysqlx: new migration provider: %w", err)
@@ -210,4 +223,83 @@ func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 		return fmt.Errorf("mysqlx: migrate up: %w", err)
 	}
 	return nil
+}
+
+// migrationLockTimeout 是等待迁移锁的上限。正常的迁移几秒内做完；等这么久还拿不到，
+// 多半是持锁的实例卡住了，与其无限等下去不如启动失败，让人看到。
+const migrationLockTimeout = 60 * time.Second
+
+// ErrMigrationLockTimeout 表示在时限内没有拿到迁移锁。
+var ErrMigrationLockTimeout = errors.New("mysqlx: timed out waiting for migration lock")
+
+// getLockLocker 用 MySQL 的 GET_LOCK 实现 goose 的 SessionLocker。goose v3.30.0 只为 MySQL 提供了
+// 基于表和租约的 Locker，需要额外的锁表和心跳；GET_LOCK 是会话级的，连接断开（包括进程被杀）
+// 时服务端自动释放，不会留下需要人工清理的死锁。goose 拿锁和执行迁移用的是同一条连接。
+//
+// GET_LOCK 的等待时间只能精确到秒，不足一秒按一秒算。
+type getLockLocker struct {
+	timeout time.Duration
+}
+
+var _ lock.SessionLocker = getLockLocker{}
+
+func (l getLockLocker) SessionLock(ctx context.Context, conn *sql.Conn) error {
+	name, err := migrationLockName(ctx, conn)
+	if err != nil {
+		return err
+	}
+	// GET_LOCK 返回 1 表示拿到，0 表示超时，NULL 表示出错（例如被 KILL）。
+	var got sql.NullInt64
+	secs := max(1, int(l.timeout/time.Second))
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", name, secs).Scan(&got); err != nil {
+		return fmt.Errorf("mysqlx: get migration lock %q: %w", name, err)
+	}
+	switch {
+	case !got.Valid:
+		return fmt.Errorf("mysqlx: get migration lock %q: GET_LOCK returned NULL", name)
+	case got.Int64 != 1:
+		return fmt.Errorf("%w %q after %ds", ErrMigrationLockTimeout, name, secs)
+	}
+	return nil
+}
+
+func (getLockLocker) SessionUnlock(ctx context.Context, conn *sql.Conn) error {
+	name, err := migrationLockName(ctx, conn)
+	if err != nil {
+		return err
+	}
+	// 返回 1 才是本连接持有并释放了；0 或 NULL 说明锁早已不在本连接上，迁移期间的互斥可能没有成立。
+	var released sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", name).Scan(&released); err != nil {
+		return fmt.Errorf("mysqlx: release migration lock %q: %w", name, err)
+	}
+	if !released.Valid || released.Int64 != 1 {
+		return fmt.Errorf("mysqlx: release migration lock %q: not held by this session", name)
+	}
+	return nil
+}
+
+// migrationLockName 返回当前库的迁移锁名。GET_LOCK 的锁是实例级的，锁名带库名，
+// 不同库（例如 order 的两个分库在同一个实例上时）的迁移互不阻塞。
+func migrationLockName(ctx context.Context, conn *sql.Conn) (string, error) {
+	var dbName sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&dbName); err != nil {
+		return "", fmt.Errorf("mysqlx: current database: %w", err)
+	}
+	if !dbName.Valid || dbName.String == "" {
+		return "", errors.New("mysqlx: migrate: no database selected in DSN")
+	}
+	return lockNameFor(dbName.String), nil
+}
+
+// lockNameFor 返回库 dbName 的迁移锁名。锁名上限 64 字符，库名本身最长也是 64，
+// 加上前缀超长时改用库名的哈希。
+func lockNameFor(dbName string) string {
+	const prefix = "goose_migrate:"
+	const maxLen = 64
+	if name := prefix + dbName; len(name) <= maxLen {
+		return name
+	}
+	sum := sha256.Sum256([]byte(dbName))
+	return prefix + hex.EncodeToString(sum[:])[:maxLen-len(prefix)]
 }

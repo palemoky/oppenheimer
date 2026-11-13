@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，待 Fable 评审
+- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，Fable 已评审，评审发现的问题已修复，未提交
 - **当前分支**：`phase-1c`（本地提交，未推送）
 - **最后更新**：2026-11-13
 
@@ -21,15 +21,26 @@
 - 验证：`make lint test e2e` 通过，`make chaos` 两次 PASS。
 - 实现中发现的问题记在设计文档 2.6（CHECK 约束名库级唯一、`payment_results` 主键只在 slot 内唯一、chaos 回收数偏高待复核）。
 
-**本会话由 Opus 主持，Fable 不可用。** 涉及订单状态的代码按 AGENTS.md 要 Fable 评审，主人决定 Fable 可用后一并评审。
+**Fable 评审（2026-11-13）**：1c 步骤一和 1b 遗留的背压代码没有一致性缺陷。发现并修掉了四个问题，细节在设计文档 1c 的 2.6.1 和 ADR-0011：
+
+- 迁移没有锁（注释说有），也不可重入。`mysqlx` 用 `GET_LOCK` 实现了 goose 的会话锁，order 的建表改成 `IF NOT EXISTS`。
+- order 两个连接池合计 100，加上其他服务超过 `max_connections`（151）。新增 `MYSQL_MAX_OPEN_CONNS`，每库默认 25。
+- sweeper 没有按 slot 的时限，一个库挂起会拖住另一个库。新增 `SlotTimeout`，默认 10 秒。
+- 背压在落库完全停住时周期性重新放行。`Claim` 记心跳，落库超过 `ADMIT_MAX_WAIT` 没有动静时只放进 `ADMIT_MAX_STALE + 1` 个探测订单。`Gate.Claim` 多了一个 `now` 参数。
+- 分片布局改为只在 `pkg/sharding` 定义（`OrderSlots`、`OrderDBs`）。
+
+前三项和布局由 Opus 子 Agent 实现，背压由 Opus 子 Agent 实现、Fable 逐行评审。合入后 `make lint test e2e` 通过，`make chaos` 两次 PASS（回收数都是 0）。
+
+**chaos 回收数偏高与分片无关。** 旧日志显示分片前就有过 180 条（order 被杀 6 次）；回收只出现在 order 被杀之后，而且集中在其中一两次击杀上，和击杀次数的相关性弱。order 从启动到监听在分片前后都是冷启动约 1.4 秒、再启动 0.1 到 0.4 秒。推断的原因（没有直接量到）：`kill -9` 不会退出消费组，新实例要等旧成员的会话过期（10 秒）才分到分区，这段时间受理照常进行，而 chaos 把回收宽限期设成了 5 秒。chaos 的负载只有约 10 单/秒，队列到不了探测名额，所以这次的背压修复对它没有影响。chaos 里大量的 `claimed hold outlived twice the payment timeout` 是支付时限设成 5 秒造成的，对账通过。
 
 ## 下一步
 
-1. **Fable 评审**（可用时一次做完）：
-   - 1c 步骤一：`services/order/internal/store/store.go`（slot 绑定、`InsertOrder` 基因校验）、`internal/service` 的 `inTx`/中继踢动/sweeper/`orderFromSubmitted`、`cmd/order/main.go` 的多中继与锁释放顺序、`pkg/sharding`。
-   - 1b 遗留：`pkg/stockgate` 的 `holdScript`、`services/order/internal/service/submit.go` 的背压改动。
-   - 复核 chaos 回收数偏高是否与分片有关（设计文档 2.6 最后一条）。
-2. 评审通过后推送 `phase-1c`、开 draft PR。
+1. **提交并推送**（主人还没要求提交）。工作区里有未提交的改动：评审发现的问题的修复（见下）和对应的文档。提交后推送 `phase-1c`、开 draft PR。注意 `main` 上多了一个 dependabot 的合并（gateway 的 quic-go 升级，`09b431f`），`phase-1c` 还没有，开 PR 前先合进来。
+2. 评审遗留、没有做的：
+   - inventory 的 `00001_init.sql`（3 条建表）和 payment 的 `00002_outbox.sql`（建表后跟 `ALTER`）中途被杀后不可重入。并发启动已经由迁移锁解决。
+   - 背压的第三项检查只管落库完全停住。消费者活着但落不了库（部分分区停住、极慢、认领后写库失败）时，原来的“触发、回收、重新放行”仍会出现，见 ADR-0011 的后果一节，建议 1d 处理。
+   - `ListStaleCreating` 没有 `(status, updated_at)` 索引，决定不加：MySQL 没有 `ADD INDEX IF NOT EXISTS`，而 CREATING 的行很少。
+   - 消费者没有“加入消费组、分配到分区”的日志，order 启动时也没有迁移耗时的日志，排查恢复耗时只能靠推断。
 3. 步骤二（主从）：先细化设计文档第 3 节，compose 每分片一主一从。
 
 步骤三遗留、仍未处理的两点（记在这里不丢）：
@@ -83,6 +94,7 @@
 | 2026-11-12 | 背压修复由 Opus 编写和自评审，没有经过 Fable | Fable 没有额度，主人决定先由 Opus 完成；Fable 可用时补一次评审 |
 | 2026-11-13 | 1c 拆成五步，步骤一只拆 order；payment、inventory 不分库 | 见设计文档 1c 第 1 节、ADR-0012 |
 | 2026-11-13 | 1c 步骤一由 Opus 主持并派子 Agent 实现，订单状态相关代码待 Fable 评审 | Fable 不可用，主人决定可用后一并评审 |
+| 2026-11-13 | 背压增加第三项检查（落库心跳加探测名额），ADR-0011 补充 | 评审发现原来的第二项检查会被回收任务抹掉信号 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -118,3 +130,5 @@
 ### 2026-11-13
 
 开始 1c。Opus 主持：写了设计文档 1c 和 ADR-0012、`pkg/sharding`；order 服务派给 Opus 子 Agent，脚本和对账工具派给 Sonnet 子 Agent，两者并行。合入后 `make lint test e2e` 通过，`make chaos` 两次 PASS。根据子 Agent 的报告补了设计文档 2.6，旧 `MYSQL_DSN` 改为拒绝启动。待 Fable 评审。
+
+同日 Fable 评审步骤一和 1b 遗留代码，结论和修复见“上次做到哪”。修复派给两个 Opus 子 Agent 并行实现，e2e 和 chaos 的验证与回收数调查派给 Sonnet 子 Agent。改动未提交。

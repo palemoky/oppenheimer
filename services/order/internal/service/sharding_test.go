@@ -6,6 +6,7 @@ import (
 	"time"
 
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/Oppenheimer/pkg/testdb"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
 )
 
@@ -111,6 +112,52 @@ func TestSweeperSkipsUnavailableDB(t *testing.T) {
 	for _, o := range []*orderv1.Order{inDB0, inDB1} {
 		e.wantEvents(t, o.GetOrderId(), "closed")
 	}
+}
+
+// 一个库挂起（连得上但不响应）时，它上面的每个 slot 最多耗 SlotTimeout，之后照常扫后面的 slot，
+// 另一个库上过期的订单被关闭。与上一个测试的区别：那里查询立刻失败，这里查询会一直等。
+func TestSweeperSlotTimeoutSkipsHungDB(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	inDB0 := e.mustPending(t, 2, "k") // slot 2，库 0
+	inDB1 := e.mustPending(t, 1, "k") // slot 1，库 1
+	e.clock.Advance(DefaultPaymentTimeout + time.Second)
+
+	// 挂起的库放在库 0：slot 0 最先扫，能验证超时之后后面的 slot 仍被扫到。
+	// 连接池只有一个连接且被占住，sweeper 的查询拿不到连接，只能等到 ctx 超时。
+	hung, _ := testdb.Empty(t)
+	hung.SetMaxOpenConns(1)
+	held, err := hung.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	half, err := store.New([]*sql.DB{hung, e.dbs[1]}, e.router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(Deps{Store: half, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: nil, Logger: e.svc.logger}, Config{
+		Clock:            e.clock.Now,
+		OrderEventsTopic: testEventsTopic,
+		Relays:           e.kickers(),
+	})
+	const slotTimeout = 100 * time.Millisecond
+	sw, err := NewSweeper(svc, SweeperConfig{SlotTimeout: slotTimeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	sw.RunOnce(t.Context())
+	// 库 0 上有 4 个 slot，每个最多耗一个 SlotTimeout；留足余量，只排除“卡住不返回”。
+	if elapsed, limit := time.Since(start), 20*slotTimeout*time.Duration(e.router.Slots()); elapsed > limit {
+		t.Errorf("RunOnce took %s with a hung db, want under %s", elapsed, limit)
+	}
+
+	wantStatus(t, e.load(t, inDB1.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CLOSED)
+	wantStatus(t, e.load(t, inDB0.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
+	e.wantEvents(t, inDB1.GetOrderId(), "closed")
 }
 
 // 按订单号定位：订单号所在的 slot 里没有就是不存在，不去别的 slot 找。

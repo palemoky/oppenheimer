@@ -26,6 +26,19 @@ type Config struct {
 	DBs   int
 }
 
+// 订单数据的分片布局（ADR-0012）：8 个 slot 分在 2 个库上。order 服务、对账工具和测试都引用这里，
+// 不各写一份：两处不一致时，按另一种布局去读的一方会悄悄漏掉分片。
+//
+// 写成常量而不是配置：配置错了数据就找不到了，改它是一次数据迁移，不是一次重启。
+// 用常量而不是包级变量，是为了不让任何地方在运行时改掉它。
+const (
+	OrderSlots = 8
+	OrderDBs   = 2
+)
+
+// OrderLayout 返回订单数据的分片布局，即 Config{Slots: OrderSlots, DBs: OrderDBs}。
+func OrderLayout() Config { return Config{Slots: OrderSlots, DBs: OrderDBs} }
+
 // Router 按分片键计算 slot 和库号。零值不可用，用 New 构造。并发安全（只读）。
 type Router struct {
 	slots int

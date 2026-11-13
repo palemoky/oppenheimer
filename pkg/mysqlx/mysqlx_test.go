@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
@@ -252,5 +253,123 @@ func TestIsDeadlock(t *testing.T) {
 	}
 	if deadlocks != 1 {
 		t.Errorf("got %d deadlock victims, want exactly 1 (errs: %v)", deadlocks, errs)
+	}
+}
+
+// 多个副本同时在空库上启动：迁移锁保证同一时刻只有一个在执行，其余的看到已是最新。
+// 测试数据里的建表语句没有 IF NOT EXISTS，不加锁时并发执行会报表已存在。
+func TestMigrateConcurrentOnEmptyDB(t *testing.T) {
+	t.Parallel()
+	db, _ := testdb.Empty(t)
+	data := templateData{Slots: []int{0, 2}, Shared: "shared"}
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { errs[i] = mysqlx.MigrateTemplate(t.Context(), db, templated, templatedDir, data) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("migrator %d: %v", i, err)
+		}
+	}
+
+	if got, want := tableNames(t, db), []string{"item_0", "item_2", "shared"}; !slices.Equal(got, want) {
+		t.Errorf("tables = %v, want %v", got, want)
+	}
+	// 每个版本只应记录一次。
+	var applied int
+	if err := db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM goose_db_version WHERE version_id > 0").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 2 {
+		t.Errorf("goose_db_version has %d applied rows, want 2", applied)
+	}
+}
+
+// 空库上 goose 建版本表时的重试（失败后等 1 秒）碰巧把并发的迁移错开了，上一个测试不加锁也能过。
+// 这里先应用第一个版本，让版本表已经存在，再让多个副本同时应用第二个版本，竞争落在迁移本身上。
+func TestMigrateConcurrentPendingVersion(t *testing.T) {
+	t.Parallel()
+	db, _ := testdb.Empty(t)
+	rendered, err := mysqlx.RenderMigrations(templated, templatedDir, templateData{Slots: []int{0}, Shared: "shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := fs.ReadFile(rendered, "00001_init.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mysqlx.Migrate(t.Context(), db, fstest.MapFS{"00001_init.sql": {Data: first}}, "."); err != nil {
+		t.Fatalf("apply first version: %v", err)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { errs[i] = mysqlx.Migrate(t.Context(), db, rendered, ".") })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("migrator %d: %v", i, err)
+		}
+	}
+	if got, want := tableNames(t, db), []string{"item_0", "shared"}; !slices.Equal(got, want) {
+		t.Errorf("tables = %v, want %v", got, want)
+	}
+}
+
+// 锁被别人一直占着时，等到时限返回 ErrMigrationLockTimeout；锁释放后迁移照常完成。
+func TestMigrateLockTimeout(t *testing.T) {
+	t.Parallel()
+	db, name := testdb.Empty(t)
+
+	holder, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	var got int
+	if err := holder.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 0)", mysqlx.LockNameFor(name)).Scan(&got); err != nil || got != 1 {
+		t.Fatalf("hold lock: got=%d err=%v", got, err)
+	}
+
+	start := time.Now()
+	err = mysqlx.MigrateWithLockTimeout(t.Context(), db, migrations, migrationsDir, time.Second)
+	if !errors.Is(err, mysqlx.ErrMigrationLockTimeout) {
+		t.Fatalf("Migrate while locked = %v, want ErrMigrationLockTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("Migrate took %s to time out, want about 1s", elapsed)
+	}
+	if got := tableNames(t, db); len(got) != 0 {
+		t.Errorf("tables after lock timeout = %v, want none", got)
+	}
+
+	if _, err := holder.ExecContext(t.Context(), "DO RELEASE_LOCK(?)", mysqlx.LockNameFor(name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mysqlx.Migrate(t.Context(), db, migrations, migrationsDir); err != nil {
+		t.Fatalf("Migrate after release: %v", err)
+	}
+}
+
+func TestLockNameFor(t *testing.T) {
+	t.Parallel()
+	if got := mysqlx.LockNameFor("order_0"); !strings.Contains(got, "order_0") {
+		t.Errorf("LockNameFor(order_0) = %q, want it to contain the db name", got)
+	}
+	long1, long2 := strings.Repeat("a", 64), strings.Repeat("a", 63)+"b"
+	n1, n2 := mysqlx.LockNameFor(long1), mysqlx.LockNameFor(long2)
+	if len(n1) > 64 || len(n2) > 64 {
+		t.Errorf("lock names exceed 64 chars: %d, %d", len(n1), len(n2))
+	}
+	if n1 == n2 {
+		t.Errorf("different databases share lock name %q", n1)
 	}
 }

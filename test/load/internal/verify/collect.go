@@ -45,12 +45,15 @@ type Sources struct {
 	InventoryLog string
 }
 
-// OrderSlots 是订单分表的 slot 数，与 order 服务的配置一致。
-const OrderSlots = 8
-
 // orderShards 列出每个订单库上的每张分片表所在的库和 slot。对账工具允许全分片扫描。
+//
+// 布局取 sharding.OrderLayout，与 order 服务是同一份。传入的库数必须与布局一致：少给一个库时
+// 若按传入的个数重算布局，slot 会被分到错误的库上，对账就悄悄漏读了分片。
 func orderShards(src Sources) (map[int][]int, error) {
-	r, err := sharding.New(sharding.Config{Slots: OrderSlots, DBs: len(src.OrderDBs)})
+	if len(src.OrderDBs) != sharding.OrderDBs {
+		return nil, fmt.Errorf("verify: got %d order dbs, layout has %d", len(src.OrderDBs), sharding.OrderDBs)
+	}
+	r, err := sharding.New(sharding.OrderLayout())
 	if err != nil {
 		return nil, fmt.Errorf("build order shard router: %w", err)
 	}

@@ -146,15 +146,12 @@ func (f *fakeSender) records(topic string) []kafkax.Record {
 	return out
 }
 
-// 测试用与生产相同的分片布局：8 个 slot、2 个库。
-const (
-	testSlots = 8
-	testDBs   = 2
-)
+// 测试用与生产相同的分片布局（sharding.OrderLayout）。
+const testSlots = sharding.OrderSlots
 
 func newRouter(t testing.TB) *sharding.Router {
 	t.Helper()
-	r, err := sharding.New(sharding.Config{Slots: testSlots, DBs: testDBs})
+	r, err := sharding.New(sharding.OrderLayout())
 	if err != nil {
 		t.Fatal(err)
 	}
