@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package oppenheimer.orderindex.v1;
+
+import "google/protobuf/timestamp.proto";
+import "oppenheimer/common/v1/money.proto";
+import "oppenheimer/order/v1/order.proto";
+
+option go_package = "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1;orderindexv1";
+
+// OrderIndexService 回答不带订单分片键（user_id）的订单查询。
+//
+// 它的数据是订单表的一份异构副本，按 merchant_id 分片，由 CDC 从订单库的 binlog 同步过来
+// （设计文档 1c 第 4 节、ADR-0014）。副本是最终一致的：
+// - 新订单可能晚一点出现，状态可能是旧的。延迟等于主从复制延迟加上同步链路的延迟。
+// - 只用于展示。任何要以订单状态为前提的操作，都必须按订单号回订单服务重新读。
+// - 只包含预占成功过的订单（有商家的订单）。创建失败的订单不在里面。
+service OrderIndexService {
+  // ListMerchantOrders 按创建时间从新到旧列出一个商家的订单。
+  //
+  // 用订单号做游标：订单号的高位是毫秒时间戳，按订单号倒序就是按创建时间倒序。
+  // 不同节点的时钟有偏差，同一毫秒内的先后不严格。
+  //
+  // 商家没有订单时返回空列表，不是错误。
+  //
+  // 错误：
+  //   INVALID_ARGUMENT  reason=INVALID_ARGUMENT  参数不合法
+  rpc ListMerchantOrders(ListMerchantOrdersRequest) returns (ListMerchantOrdersResponse);
+}
+
+message ListMerchantOrdersRequest {
+  // 必须大于 0。
+  int64 merchant_id = 1;
+  // 只返回这个状态的订单；ORDER_STATUS_UNSPECIFIED 表示不筛选。
+  oppenheimer.order.v1.OrderStatus status = 2;
+  // 每页条数，1 到 100；0 表示用默认值 20。
+  int32 page_size = 3;
+  // 只返回订单号小于它的订单；0 表示从最新的开始。传上一页响应里的 next_before_order_id。
+  int64 before_order_id = 4;
+}
+
+message ListMerchantOrdersResponse {
+  repeated MerchantOrder orders = 1;
+  // 下一页的游标；0 表示没有更多了。
+  int64 next_before_order_id = 2;
+}
+
+// MerchantOrder 是列表里的一行，只有列表页要显示的字段。订单详情用订单服务的 GetOrder。
+message MerchantOrder {
+  int64 order_id = 1;
+  int64 user_id = 2;
+  // 同步过来的状态，可能比订单库里的旧。
+  oppenheimer.order.v1.OrderStatus status = 3;
+  oppenheimer.common.v1.Money total = 4;
+  google.protobuf.Timestamp create_time = 5;
+  // 仅已支付的订单有值。
+  google.protobuf.Timestamp pay_time = 6;
+}

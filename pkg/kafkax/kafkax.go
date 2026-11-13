@@ -50,6 +50,9 @@ type TopicSpec struct {
 	Partitions int32
 	// ReplicationFactor 为 0 时取 1（本机单节点）。集群上由部署清单管理 topic，不走这里。
 	ReplicationFactor int16
+	// Configs 是创建 topic 时的配置，例如 {"cleanup.policy": "compact"}；nil 表示全部用 broker 的默认值。
+	// 只在创建时生效：topic 已存在时不比较、不修改。
+	Configs map[string]string
 }
 
 // EnsureTopics 创建不存在的 topic，已存在的不动（也不修改分区数）。
@@ -63,7 +66,7 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, specs ...TopicSpec) e
 		if rf == 0 {
 			rf = 1
 		}
-		resp, err := adm.CreateTopic(ctx, spec.Partitions, rf, nil, spec.Name)
+		resp, err := adm.CreateTopic(ctx, spec.Partitions, rf, topicConfigs(spec.Configs), spec.Name)
 		if err == nil {
 			err = resp.Err
 		}
@@ -124,4 +127,16 @@ func leadersReady(d kadm.TopicDetail) bool {
 		}
 	}
 	return len(d.Partitions) > 0
+}
+
+// topicConfigs 把配置转成 kadm 要的形式（值为指针，nil 表示用默认值）。
+func topicConfigs(configs map[string]string) map[string]*string {
+	if len(configs) == 0 {
+		return nil
+	}
+	out := make(map[string]*string, len(configs))
+	for k, v := range configs {
+		out[k] = &v
+	}
+	return out
 }

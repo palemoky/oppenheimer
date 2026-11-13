@@ -101,3 +101,21 @@ func TestTable(t *testing.T) {
 		t.Errorf("Table = %q", got)
 	}
 }
+
+// 商家索引的布局合法，连续的商家号均匀分到各个 slot。
+func TestMerchantIndexLayout(t *testing.T) {
+	t.Parallel()
+	r, err := New(MerchantIndexLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make([]int, r.Slots())
+	for m := int64(1); m <= int64(r.Slots())*100; m++ {
+		counts[r.ForMerchant(m)]++
+	}
+	for slot, n := range counts {
+		if n != 100 {
+			t.Errorf("slot %d has %d merchants, want 100", slot, n)
+		}
+	}
+}

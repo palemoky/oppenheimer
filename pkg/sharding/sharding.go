@@ -39,6 +39,16 @@ const (
 // OrderLayout 返回订单数据的分片布局，即 Config{Slots: OrderSlots, DBs: OrderDBs}。
 func OrderLayout() Config { return Config{Slots: OrderSlots, DBs: OrderDBs} }
 
+// 商家维度订单索引的分片布局（ADR-0014）：4 个 slot 分在 2 个库上，按 merchant_id 分片。
+// 它和订单的布局互相独立：同一个订单在订单库里按 user_id 落 slot，在索引库里按 merchant_id 落 slot。
+const (
+	MerchantIndexSlots = 4
+	MerchantIndexDBs   = 2
+)
+
+// MerchantIndexLayout 返回商家维度订单索引的分片布局。
+func MerchantIndexLayout() Config { return Config{Slots: MerchantIndexSlots, DBs: MerchantIndexDBs} }
+
 // Router 按分片键计算 slot 和库号。零值不可用，用 New 构造。并发安全（只读）。
 type Router struct {
 	slots int
@@ -66,6 +76,11 @@ func (r *Router) DBs() int { return r.dbs }
 
 // ForUser 返回用户的数据所在的 slot。
 func (r *Router) ForUser(userID int64) int { return int(idgen.GeneOf(userID)) & (r.slots - 1) }
+
+// ForMerchant 返回 merchantID 所在的 slot，用于按商家分片的布局。
+func (r *Router) ForMerchant(merchantID int64) int {
+	return int(idgen.GeneOf(merchantID)) & (r.slots - 1)
+}
 
 // ForOrder 返回订单所在的 slot，依据订单号里的分片基因。
 // 对 idgen 以 user_id 为分片键生成的订单号，ForOrder(orderID) == ForUser(userID)。

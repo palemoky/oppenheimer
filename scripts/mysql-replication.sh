@@ -11,6 +11,9 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-oppenheimer}"
 # 复制账号的密码，仅用于本地开发；不要在任何共享环境里使用这个默认值。
 MYSQL_REPL_PASSWORD="${MYSQL_REPL_PASSWORD:-oppenheimer-repl}"
 REPL_USER=repl
+# CDC 服务读 binlog 用的账号（设计文档 1c 的 4.3），同样仅用于本地开发。
+MYSQL_CDC_PASSWORD="${MYSQL_CDC_PASSWORD:-oppenheimer-cdc}"
+CDC_USER=cdc
 WAIT_SECONDS="${REPL_WAIT_SECONDS:-60}"
 SHARDS=(0 1)
 
@@ -33,7 +36,10 @@ status_field() { # <状态文本> <字段名>
   awk -F= -v k="$2" '$1 == k { print $2 }' <<<"$1"
 }
 
-# 1. 主库：复制账号和分片库。
+# 1. 主库：复制账号、分片库和 CDC 账号。
+# CDC 从从库读 binlog，但从库是只读的，账号只能建在主库上，靠复制到达从库。
+# 它要三样权限：REPLICATION SLAVE（请求 binlog）、REPLICATION CLIENT（读 gtid_executed、gtid_purged）、
+# 对分片库的 SELECT（全量阶段分批读表）。
 # MySQL 9 移除了 mysql_native_password，账号只能用默认的 caching_sha2_password。
 # 这种账号在没有 TLS 的连接上做完整认证时，客户端要拿到服务端的 RSA 公钥才能加密密码。
 # CHANGE REPLICATION SOURCE TO 的 GET_SOURCE_PUBLIC_KEY=1 让从库在连接时向主库请求公钥，
@@ -43,26 +49,41 @@ for i in "${SHARDS[@]}"; do
   sql "mysql-order-$i" -e "
     CREATE USER IF NOT EXISTS '$REPL_USER'@'%' IDENTIFIED BY '$MYSQL_REPL_PASSWORD';
     GRANT REPLICATION SLAVE ON *.* TO '$REPL_USER'@'%';
-    CREATE DATABASE IF NOT EXISTS order_db_$i;"
+    CREATE DATABASE IF NOT EXISTS order_db_$i;
+    CREATE USER IF NOT EXISTS '$CDC_USER'@'%' IDENTIFIED BY '$MYSQL_CDC_PASSWORD';
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '$CDC_USER'@'%';
+    GRANT SELECT ON order_db_$i.* TO '$CDC_USER'@'%';"
 done
 
-# 2. 从库：没有配置复制才配置；已经配置的不碰（重新 CHANGE SOURCE 要先 STOP，会打断复制）。
+# 2. 从库：没有配置复制才配置；已经在复制的不碰（重新 CHANGE SOURCE 要先 STOP，会打断复制）。
+configure() { # <shard>
+  # SOURCE_AUTO_POSITION=1：用 GTID 自动定位，不需要记 binlog 文件和位置，主从切换时也不用重算。
+  sql "mysql-order-$1-replica" -e "
+    CHANGE REPLICATION SOURCE TO
+      SOURCE_HOST='mysql-order-$1', SOURCE_PORT=3306,
+      SOURCE_USER='$REPL_USER', SOURCE_PASSWORD='$MYSQL_REPL_PASSWORD',
+      SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
+    START REPLICA;"
+}
+
 for i in "${SHARDS[@]}"; do
   replica="mysql-order-$i-replica"
   st="$(replica_status "$replica")"
   if [ -z "$st" ]; then
     echo "configuring replication: $replica <- mysql-order-$i"
-    # SOURCE_AUTO_POSITION=1：用 GTID 自动定位，不需要记 binlog 文件和位置，主从切换时也不用重算。
-    sql "$replica" -e "
-      CHANGE REPLICATION SOURCE TO
-        SOURCE_HOST='mysql-order-$i', SOURCE_PORT=3306,
-        SOURCE_USER='$REPL_USER', SOURCE_PASSWORD='$MYSQL_REPL_PASSWORD',
-        SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
-      START REPLICA;"
+    configure "$i"
   elif [ "$(status_field "$st" Replica_IO_Running)" != Yes ] || [ "$(status_field "$st" Replica_SQL_Running)" != Yes ]; then
-    # 配置过但线程停了（比如上次出错）：只重新启动，不改配置。
+    # 配置过但线程停了（比如上次出错）：先只重新启动，不改配置。
     echo "restarting replication threads: $replica"
-    sql "$replica" -e "START REPLICA;"
+    if ! sql "$replica" -e "START REPLICA;"; then
+      # 启动不了，说明复制元数据本身坏了。见过的情况：中继日志的文件名跟着主机名变了，
+      # 元数据里记的旧文件找不到（错误 1872）。丢掉元数据和中继日志重新配置。
+      # 这样做不丢也不重复数据：位置不是从元数据里来的，而是从库自己的 gtid_executed，
+      # 主库按它补发缺的事务；中继日志里没应用的部分会重新拉取。
+      echo "replication metadata unusable, reconfiguring from gtid_executed: $replica" >&2
+      sql "$replica" -e "STOP REPLICA; RESET REPLICA ALL;"
+      configure "$i"
+    fi
   else
     echo "replication already running: $replica"
   fi

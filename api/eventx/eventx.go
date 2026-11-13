@@ -25,6 +25,13 @@ const (
 	// OrderCloseDelay 是延迟关单的提醒，消息类型是 OrderCloseDue。
 	// 这是一个固定延迟的 topic：里面所有消息的延迟时长都等于支付时限（见 ADR-0009）。
 	OrderCloseDelay = "order.close.delay"
+	// CDCOrders 是订单表（orders_N）的行变更，由 CDC 服务从 binlog 读出后发布，消息类型是 cdc.v1.RowChange，
+	// key 是 order_id。压缩保留（cleanup.policy=compact）：每个订单至少留着最新的一条，
+	// 新增的下游从头消费就能得到全量。见 ADR-0014。
+	CDCOrders = "cdc.order.orders"
+	// CDCCheckpoint 存 CDC 各条流水线的位点，消息类型是 cdc.v1.Checkpoint，key 是流水线名。
+	// 压缩保留，只有一个分区：位点只需要每个 key 的最新值。
+	CDCCheckpoint = "cdc.checkpoint"
 )
 
 // Partitions 是本机创建 topic 时使用的分区数。
@@ -48,6 +55,7 @@ const (
 	GroupOrderPaymentEvents   = "order.payment-events"
 	GroupOrderSubmit          = "order.order-submit"
 	GroupOrderCloseDelay      = "order.order-close-delay"
+	GroupOrderIndexCDCOrders  = "orderindex.cdc-orders"
 )
 
 // OrderKey 返回以订单号为准的消息 key。

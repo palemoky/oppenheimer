@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package oppenheimer.cdc.v1;
+
+option go_package = "github.com/palemoky/oppenheimer/api/gen/oppenheimer/cdc/v1;cdcv1";
+
+// 本文件定义 CDC 服务发到 Kafka 的消息（设计文档 1c 第 4 节、ADR-0014）。
+//
+// CDC 读 MySQL 的 binlog，把行变更原样发出来。它不认识任何一张业务表：消息按列名携带值，
+// 列名取自 binlog（binlog_row_metadata=FULL），是“产生这条日志时”的表结构。
+//
+// 约定：
+// - 一个逻辑表一个 topic。分片表（orders_0 到 orders_7）合成一个逻辑表 orders，slot 写在消息里。
+// - Kafka 消息的 key 是主键的十进制字符串，同一行的变更落在同一分区。
+// - 投递语义是至少一次：CDC 从位点重启后会把一段变更再发一遍，全量和增量也会重叠。
+//   消费者必须靠行自己的版本列比较新旧，只接受更新的映像，不能依赖到达顺序。
+// - 新增列会自动出现在消息里，消费者要忽略不认识的列；需要的列缺失时应当停下来报错，不能跳过。
+
+// Value 是一列的值。kind 没有设置表示 SQL 的 NULL。
+message Value {
+  oneof kind {
+    // 有符号整数列（TINYINT 到 BIGINT）。
+    int64 int = 1;
+    // 无符号整数列。
+    uint64 uint = 2;
+    // 字符列。DATETIME、TIMESTAMP、DATE、TIME、DECIMAL 也以 MySQL 的文本形式放在这里，
+    // 例如 "2026-06-01 12:00:00.123456"；时间不带时区，按库的时区（本项目是 UTC）解释。
+    string str = 3;
+    // 二进制列（BINARY、VARBINARY、BLOB）。
+    bytes raw = 4;
+    // FLOAT、DOUBLE。
+    double float = 5;
+  }
+}
+
+// Op 是变更的种类。
+enum Op {
+  OP_UNSPECIFIED = 0;
+  // 插入。只有 after。
+  OP_INSERT = 1;
+  // 更新。before 和 after 都是整行（binlog_row_image=FULL）。
+  OP_UPDATE = 2;
+  // 删除。只有 before。
+  OP_DELETE = 3;
+  // 全量阶段从表里读到的行，不对应某一次变更。只有 after。
+  OP_READ = 4;
+}
+
+// RowChange 是一行的一次变更。
+message RowChange {
+  // 来源流水线的名字，如 "order-0"。一条流水线对应一个源库。
+  string source = 1;
+  // 逻辑表名，如 "orders"（不带 slot 后缀）。
+  string table = 2;
+  // 这一行所在的 slot，取自物理表名的后缀。
+  int32 slot = 3;
+  Op op = 4;
+  // 列名到值。列不在 map 里表示这一列不存在；在 map 里但 kind 未设置表示 NULL。
+  map<string, Value> before = 5;
+  map<string, Value> after = 6;
+  // 所在事务的 GTID，只用于排查。OP_READ 为空。
+  string gtid = 7;
+  // 事务在最初的主库上提交的时间，Unix 微秒，取自 GTID 事件的 original_commit_timestamp。
+  // 用来计算同步延迟。OP_READ 为 0。
+  int64 commit_micros = 8;
+}
+
+// Checkpoint 是一条流水线的位点，存在压缩 topic cdc.checkpoint 里，key 是流水线名。
+// 只在“此前发出的消息都已被 Kafka 确认”之后写入，所以从它重启不会丢变更，只会重发。
+message Checkpoint {
+  // 增量从这个 GTID 集合之后继续。只在事务边界推进。
+  // 全量进行期间，它保持为全量开始前读到的集合。
+  string gtid_set = 1;
+  // 存在表示全量还没做完，重启后从这里继续读；全量做完后清空。
+  SnapshotCursor snapshot = 2;
+  // 写入位点的时间，Unix 微秒，只用于排查。
+  int64 update_micros = 3;
+}
+
+// SnapshotCursor 记录全量读到了哪里。物理表按名字排序依次读，表内按主键升序分批读。
+message SnapshotCursor {
+  // 正在读的物理表，如 "orders_3"。排在它前面的表已经读完。
+  string table = 1;
+  // 这张表里已经发出并确认的最大主键；0 表示这张表还没开始。
+  int64 last_key = 2;
+}

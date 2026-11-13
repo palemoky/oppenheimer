@@ -24,6 +24,9 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-row-image=FULL
+      # 让每个 TABLE_MAP 事件带上列名。行事件里只有按位置排列的值，CDC 靠它得到“产生这条日志时”的列名，
+      # 不用去库里查当前的表结构（设计文档 1c 的 4.8）。从库的 binlog 由从库自己写，所以每个实例都要设。
+      - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
     environment:
@@ -67,6 +70,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
       - --performance-schema=OFF
@@ -100,6 +104,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
       - --performance-schema=OFF
@@ -118,6 +123,9 @@ services:
       - --max-heap-table-size=16M
       - --mysqlx=OFF
       - --replica-parallel-workers=2
+      # 中继日志的文件名默认取主机名，而容器每次重建主机名都会变：复制元数据里记的旧文件名找不到，
+      # 复制线程起不来（错误 1872）。固定成与主机名无关的名字。
+      - --relay-log=relay-bin
       - --server-id=12
     ports:
       - 127.0.0.1:${MYSQL_ORDER_0_REPLICA_PORT:-3312}:3306
@@ -130,6 +138,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
       - --performance-schema=OFF
@@ -163,6 +172,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
       - --performance-schema=OFF
@@ -181,6 +191,7 @@ services:
       - --max-heap-table-size=16M
       - --mysqlx=OFF
       - --replica-parallel-workers=2
+      - --relay-log=relay-bin
       - --server-id=22
     ports:
       - 127.0.0.1:${MYSQL_ORDER_1_REPLICA_PORT:-3322}:3306
