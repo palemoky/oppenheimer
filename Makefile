@@ -119,12 +119,20 @@ seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次�
 
 ## ---------- 本地依赖 ----------
 
-.PHONY: up
-up: ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka 并等待就绪
-	$(COMPOSE) up -d --wait
+# up 和 up-core 共用：启动核心依赖并建 inventory_db、payment_db。
+# order 的 4 个 MySQL 容器不在 CORE_SERVICES 里。
+CORE_SERVICES := mysql redis redis-cache kafka
+
+.PHONY: up-core
+up-core: ## 只启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪，不含 order 主从；给不需要 order 主从的场景用（如按模块的测试）
+	$(COMPOSE) up -d --wait $(CORE_SERVICES)
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
 		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null
 	@echo "databases ready: inventory_db payment_db"
+
+.PHONY: up
+up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka 并等待就绪
+	$(COMPOSE) up -d --wait
 	@# order_db_0、order_db_1 在各自的分片主库上由复制脚本创建，并确认已复制到从库。
 	@MYSQL_ROOT_PASSWORD=$(MYSQL_ROOT_PASSWORD) scripts/mysql-replication.sh
 

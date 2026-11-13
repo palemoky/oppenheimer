@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一（分片）、步骤二（主从与读写分离）已完成；步骤二未提交
+- **当前阶段**：1c（分库分表与主从），步骤一（分片）、步骤二（主从与读写分离）已完成并推送
 - **当前分支**：`phase-1c`（已推送，draft PR 已开）
 - **最后更新**：2026-11-13
 
@@ -35,19 +35,24 @@
 
 ## 下一步
 
-1. 等 draft PR 的 CI 通过（`phase-1c` 已推送并合入了 `main` 上的 dependabot 更新）。步骤一到五都在这个 PR 里，1c 全部完成后再转为正式 PR。
-2. 评审遗留、没有做的：
+**从 1c 步骤三（非分片键查询：CDC 同步到按商家分片的索引表）开始。** 步骤一、二已完成并推送，都在 draft PR #6（`phase-1c`）里，1c 五步全部完成后再转为正式 PR。
+
+1. 步骤三动工前先做设计，写进设计文档 1c 第 4 节并新增 ADR，主人确认后再实现：
+   - CDC 用 Go 实现（go-mysql 库伪装成从库读 binlog），写入 Kafka 再由消费者落索引表；ADR 里与 Canal、Debezium 对比。阶段计划里列了要回答的问题：位点管理与断点续传、全量加增量的初始化、表结构变更、顺序与幂等、同步延迟的监控和应对。
+   - **前置条件**：数据模型里要先有商家（SKU 所属商家），要改 inventory 的表和下单时的快照。这是共享部分的改动（表结构、可能还有 proto），先在主线串行完成，再分出去并行。
+   - 现在的拓扑对 CDC 有用的事实：order 的两个主库和从库都开了 GTID 和 ROW 格式的 binlog（`binlog-row-image=FULL`）；从库关了 `performance_schema`。CDC 从主库还是从库读，是设计时要定的。
+   - 引入 go-mysql 等新依赖时去官方发布页查版本，登记到 `docs/infra/versions.md`。
+2. 步骤一评审的遗留，没有做：
    - inventory 的 `00001_init.sql`（3 条建表）和 payment 的 `00002_outbox.sql`（建表后跟 `ALTER`）中途被杀后不可重入。并发启动已经由迁移锁解决。
    - 背压的第三项检查只管落库完全停住。消费者活着但落不了库（部分分区停住、极慢、认领后写库失败）时，原来的“触发、回收、重新放行”仍会出现，见 ADR-0011 的后果一节，建议 1d 处理。
    - `ListStaleCreating` 没有 `(status, updated_at)` 索引，决定不加：MySQL 没有 `ADD INDEX IF NOT EXISTS`，而 CREATING 的行很少。
    - 消费者没有“加入消费组、分配到分区”的日志，order 启动时也没有迁移耗时的日志，排查恢复耗时只能靠推断。
-3. **提交并推送步骤二**（主人还没要求提交）。步骤二（主从与读写分离）已完成，改动全部在工作区里：compose 主从拓扑和复制脚本、`store` 的从库读、`internal/readmark`、三种读模式、sweeper 扫描读从库、延迟下的端到端用例、设计文档 1c 第 3 节、ADR-0013、`docs/infra/versions.md`。`make lint test` 通过，`make e2e` 在 `gtid`（默认）、`window`、`primary` 三种模式下通过。结果见设计文档 3.10。
-   - 推送后要看 CI：每个测试 job 的 `make up` 现在多起 4 个 MySQL 容器、多跑一个复制脚本，没有在 CI 上实际跑过。耗时明显变长的话，给不需要主从的 job 单独一个启动目标。
+3. 步骤二（主从与读写分离）的结果见设计文档 3.10，决定见 ADR-0013。遗留：
+   - CI 的按模块测试 job 改用 `make up-core`（只起 `mysql`、Redis、Kafka），只有 e2e job 用 `make up` 起主从。加主从后这些 job 各慢了 1 到 3 分钟，这是为了把时间降回去；本机 `make test` 同样只需要 `make up-core`。
    - 已知局限，建议 1d 和熔断降级一起做：从库整体落后时 `gtid` 模式的每次展示读先等满 100 毫秒再读主库；从库一直挂起时 sweeper 每轮约 1 分钟。
    - 定量的读模式对比挪到阶段 3（见计划变更）。
-4. 步骤三（CDC 索引表）：动工前先细化设计文档第 4 节并写 ADR（与 Canal、Debezium 对比）。前置条件是数据模型里要先有商家（SKU 所属商家），要改 inventory 的表和下单时的快照。
 
-步骤三遗留、仍未处理的两点（记在这里不丢）：
+1b 步骤三遗留、仍未处理的两点（记在这里不丢）：
 
 - `closed` 结局在正常时限下几乎不出现，CI 覆盖不到“支付对关单”的竞争，要稳定覆盖需要单独写一个用例。
 - 支付时限从受理时刻起算，落库排队会挤占支付窗口。背压把排队限制在约 25 秒以内，影响变小了，但没有消除。
@@ -57,6 +62,7 @@
 ## 本机开发环境
 
 - `make tools` 安装 buf、proto 插件和 `oapi-codegen` 到 `./bin`（已装）。
+- `make up-core` 只启动现有的 `mysql`、Redis、Kafka，够跑 `make test`。
 - `make up` 启动依赖：现有的 `mysql`（inventory_db、payment_db 和测试用的临时库）、order 的两主两从（`order_db_0`、`order_db_1`，端口见 `docs/infra/versions.md`）、Redis、Kafka，并建立复制。`make down` 停止并保留数据。当前依赖处于**运行**状态。
 - order 的读模式由 `ORDER_READ_MODE` 控制（`primary`、`window`、`gtid`），`make e2e` 默认 `gtid`，`make run` 会连上从库但默认是 `primary`，要读从库时自己设这个变量。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
@@ -141,3 +147,5 @@
 同日 Fable 评审步骤一和 1b 遗留代码，结论和修复见“上次做到哪”。修复派给两个 Opus 子 Agent 并行实现，e2e 和 chaos 的验证与回收数调查派给 Sonnet 子 Agent。提交和推送派给 Haiku 子 Agent，随后合入 `main` 并开 draft PR。
 
 同日完成步骤二：设计（设计文档 1c 第 3 节、ADR-0013）经主人确认后，compose 拓扑和延迟用例派给 Sonnet 子 Agent，从库读和读模式派给 Opus 子 Agent，Fable 评审后返工一次。`make up` 现在起 9 个容器，本机依赖处于运行状态。
+
+同日收尾：步骤二分三个提交推送，CI 全绿；加了 `make up-core`，CI 的按模块测试 job 改用它。下一个会话从步骤三的设计开始。
