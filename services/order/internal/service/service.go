@@ -85,8 +85,10 @@ type Config struct {
 	// 默认 eventx.OrderSubmit、eventx.OrderCloseDelay。
 	SubmitTopic     string
 	CloseDelayTopic string
-	// Relay 可选。为空时事件只靠中继的兜底轮询发出，正确性不受影响，只是延迟变大。
-	Relay Kicker
+	// Relays 是各库的 outbox 中继，下标是库号（与 store 的库号一致）。可选，也可以只给一部分或含 nil：
+	// 缺的库事件只靠中继的兜底轮询发出，正确性不受影响，只是延迟变大。
+	// 事务提交后只踢事务所在库的中继：别的库的 outbox 里没有这次写入的行。
+	Relays []Kicker
 	// OrderCacheTTL 是终态订单在查询缓存里的保留时长，默认 DefaultOrderCacheTTL。
 	// 只在 Deps.OrderCache 非空时有意义。
 	OrderCacheTTL time.Duration
@@ -130,7 +132,7 @@ type Service struct {
 	eventsTopic    string
 	submitTopic    string
 	closeTopic     string
-	relay          Kicker
+	relays         []Kicker
 	orderCache     *cache.Cache[*orderv1.Order]
 	cacheTTL       time.Duration
 	cacheNullTTL   time.Duration
@@ -161,7 +163,7 @@ func New(d Deps, cfg Config) *Service {
 		eventsTopic:    cmp.Or(cfg.OrderEventsTopic, eventx.OrderEvents),
 		submitTopic:    cmp.Or(cfg.SubmitTopic, eventx.OrderSubmit),
 		closeTopic:     cmp.Or(cfg.CloseDelayTopic, eventx.OrderCloseDelay),
-		relay:          cfg.Relay,
+		relays:         cfg.Relays,
 		orderCache:     d.OrderCache,
 		cacheTTL:       cmp.Or(cfg.OrderCacheTTL, DefaultOrderCacheTTL),
 		cacheNullTTL:   cmp.Or(cfg.OrderCacheNullTTL, DefaultOrderCacheNullTTL),
@@ -644,17 +646,20 @@ var txRetry = retry.Policy{
 	Retryable:   mysqlx.IsDeadlock,
 }
 
-// inTx 在事务里执行 fn，遇到死锁时整个重做。fn 可能执行多次，不能在外部变量里累积结果。
-func (s *Service) inTx(ctx context.Context, p retry.Policy, fn func(tx *store.Tx) error) error {
+// inTx 在 orderID 所在分片上的事务里执行 fn，遇到死锁时整个重做。fn 可能执行多次，不能在外部变量里累积结果。
+// 事务只能操作这一个订单所在 slot 的表（store.Tx 会拒绝别的 slot 的订单）。
+func (s *Service) inTx(ctx context.Context, p retry.Policy, orderID int64, fn func(tx *store.Tx) error) error {
 	return retry.Do(ctx, p, func(ctx context.Context, _ int) error {
-		return s.store.InTx(ctx, fn)
+		return s.store.InTx(ctx, orderID, fn)
 	})
 }
 
-// kick 在事务提交后通知中继立即发送。提交前调用没有意义：中继看不到未提交的行。
-func (s *Service) kick() {
-	if s.relay != nil {
-		s.relay.Kick()
+// kick 在 orderID 所在库的事务提交后通知那个库的中继立即发送。
+// 提交前调用没有意义：中继看不到未提交的行。
+func (s *Service) kick(orderID int64) {
+	db := s.store.DBOfOrder(orderID)
+	if db < len(s.relays) && s.relays[db] != nil {
+		s.relays[db].Kick()
 	}
 }
 
@@ -686,7 +691,7 @@ func (s *Service) transition(ctx context.Context, ev *eventv1.OrderEvent,
 	update func(ctx context.Context, tx *store.Tx) (bool, error),
 ) (bool, error) {
 	var done bool
-	err := s.inTx(ctx, txRetry, func(tx *store.Tx) error {
+	err := s.inTx(ctx, txRetry, ev.GetOrderId(), func(tx *store.Tx) error {
 		done = false
 		ok, err := update(ctx, tx)
 		if err != nil || !ok {
@@ -702,7 +707,7 @@ func (s *Service) transition(ctx context.Context, ev *eventv1.OrderEvent,
 		return false, err
 	}
 	if done {
-		s.kick()
+		s.kick(ev.GetOrderId())
 	}
 	return done, nil
 }

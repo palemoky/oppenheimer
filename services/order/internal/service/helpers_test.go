@@ -23,6 +23,7 @@ import (
 	"github.com/palemoky/Oppenheimer/pkg/errx"
 	"github.com/palemoky/Oppenheimer/pkg/idgen"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/Oppenheimer/pkg/sharding"
 	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/pkg/testdb"
 	"github.com/palemoky/Oppenheimer/pkg/testredis"
@@ -145,8 +146,34 @@ func (f *fakeSender) records(topic string) []kafkax.Record {
 	return out
 }
 
+// 测试用与生产相同的分片布局：8 个 slot、2 个库。
+const (
+	testSlots = 8
+	testDBs   = 2
+)
+
+func newRouter(t testing.TB) *sharding.Router {
+	t.Helper()
+	r, err := sharding.New(sharding.Config{Slots: testSlots, DBs: testDBs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// newShardDBs 建 router.DBs() 个临时库，各自跑与生产一样的模板迁移。
+func newShardDBs(t testing.TB, router *sharding.Router) []*sql.DB {
+	t.Helper()
+	dbs := make([]*sql.DB, router.DBs())
+	for i := range dbs {
+		dbs[i] = testdb.NewTemplate(t, order.Migrations, order.MigrationsDir, order.MigrationData{Slots: router.SlotsOf(i)})
+	}
+	return dbs
+}
+
 type env struct {
-	db      *sql.DB
+	dbs     []*sql.DB // 下标是库号
+	router  *sharding.Router
 	store   *store.Store
 	rdb     *redis.Client
 	prefix  string
@@ -154,20 +181,48 @@ type env struct {
 	sender  *fakeSender
 	inv     *fakeInventory
 	clock   *fakeClock
-	relay   *fakeRelay
+	relays  []*fakeRelay // 下标是库号
 	svc     *Service
 	sweeper *Sweeper
 	reaper  *Reaper
 
-	// consumed 是 consumeEvents 已经处理到的 outbox 行数；simulated 是它代替库存服务发起的调用次数。
+	// consumed[db] 是 consumeEvents 在第 db 个库的 outbox 里已经处理到的行数；
+	// simulated 是它代替库存服务发起的调用次数。
 	mu        sync.Mutex
-	consumed  int
+	consumed  []int
 	simulated map[string]int
+}
+
+// kickers 把各库的 fakeRelay 转成 Config.Relays。
+func (e *env) kickers() []Kicker {
+	out := make([]Kicker, len(e.relays))
+	for i, r := range e.relays {
+		out[i] = r
+	}
+	return out
+}
+
+// kicks 返回所有库的中继被 Kick 的总次数。
+func (e *env) kicks() int64 {
+	var n int64
+	for _, r := range e.relays {
+		n += r.kicks.Load()
+	}
+	return n
+}
+
+// dbOf 返回订单所在的库。
+func (e *env) dbOf(orderID int64) *sql.DB { return e.dbs[e.router.DB(e.router.ForOrder(orderID))] }
+
+// table 返回订单所在 slot 上的物理表名。
+func (e *env) table(base string, orderID int64) string {
+	return sharding.Table(base, e.router.ForOrder(orderID))
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	db := testdb.New(t, order.Migrations, order.MigrationsDir)
+	router := newRouter(t)
+	dbs := newShardDBs(t, router)
 	rdb, prefix := testredis.New(t)
 	gate := stockgate.New(rdb, prefix)
 	inv := newFakeInventory(gate)
@@ -182,15 +237,22 @@ func newEnv(t *testing.T) *env {
 	}
 	clock := &fakeClock{t: time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)}
 	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
-	st := store.New(db)
-	relay := &fakeRelay{}
+	st, err := store.New(dbs, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relays := make([]*fakeRelay, router.DBs())
+	for i := range relays {
+		relays[i] = &fakeRelay{}
+	}
 	sender := &fakeSender{}
+	e := &env{dbs: dbs, router: router, relays: relays}
 	svc := New(Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger}, Config{
 		Clock:            clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,
 		CloseDelayTopic:  testCloseTopic,
-		Relay:            relay,
+		Relays:           e.kickers(),
 	})
 	sweeper, err := NewSweeper(svc, SweeperConfig{})
 	if err != nil {
@@ -200,21 +262,18 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{
-		db:        db,
-		store:     st,
-		rdb:       rdb,
-		prefix:    prefix,
-		gate:      gate,
-		sender:    sender,
-		inv:       inv,
-		clock:     clock,
-		relay:     relay,
-		svc:       svc,
-		sweeper:   sweeper,
-		reaper:    reaper,
-		simulated: map[string]int{},
-	}
+	e.store = st
+	e.rdb = rdb
+	e.prefix = prefix
+	e.gate = gate
+	e.sender = sender
+	e.inv = inv
+	e.clock = clock
+	e.svc = svc
+	e.sweeper = sweeper
+	e.reaper = reaper
+	e.consumed = make([]int, router.DBs())
+	e.simulated = map[string]int{}
 	// 1b 起订单服务只同步调用 Reserve，确认和释放全部交给库存服务消费事件完成。
 	// 每个测试结束时检查这一点，任何一条路径偷偷调回库存都会被发现。
 	t.Cleanup(func() {
@@ -229,15 +288,23 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-// consumeEvents 扮演库存服务：按顺序消费 outbox 里新增的事件，
+// consumeEvents 扮演库存服务：按顺序消费各库 outbox 里新增的事件，
 // paid 确认预占后结清占用，cancelled、closed、failed 释放预占后归还占用（先 MySQL 后 Redis）。
-// 用来验证“事件发出去之后库存不会泄漏”。
+// 用来验证“事件发出去之后库存不会泄漏”。每个库的 outbox 各自有序，同一订单的事件都在一个库里。
 func (e *env) consumeEvents(t *testing.T) {
 	t.Helper()
-	evs := e.allEvents(t)
+	byDB := e.eventsByDB(t)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, ev := range evs[e.consumed:] {
+	for db, evs := range byDB {
+		e.consumeLocked(t, evs[e.consumed[db]:])
+		e.consumed[db] = len(evs)
+	}
+}
+
+func (e *env) consumeLocked(t *testing.T, evs []*eventv1.OrderEvent) {
+	t.Helper()
+	for _, ev := range evs {
 		var err error
 		switch ev.GetBody().(type) {
 		case *eventv1.OrderEvent_Paid:
@@ -255,7 +322,6 @@ func (e *env) consumeEvents(t *testing.T) {
 			t.Errorf("inventory rejected event for order %d: %v", ev.GetOrderId(), err)
 		}
 	}
-	e.consumed = len(evs)
 }
 
 func items(pairs ...int64) []*orderv1.SubmitOrderItem {
@@ -337,10 +403,26 @@ func (e *env) load(t *testing.T, orderID int64) *store.Order {
 	return o
 }
 
-func (e *env) count(t *testing.T, query string, args ...any) int {
+// count 对所有 slot 上的 base 表（orders、order_items、payment_results）执行
+// SELECT COUNT(*) ... where 并求和。where 为空表示不加条件。
+func (e *env) count(t *testing.T, base, where string, args ...any) int {
 	t.Helper()
+	total := 0
+	for slot := range e.router.Slots() {
+		total += e.countSlot(t, base, slot, where, args...)
+	}
+	return total
+}
+
+// countSlot 是 count 在一个 slot 上的部分。
+func (e *env) countSlot(t *testing.T, base string, slot int, where string, args ...any) int {
+	t.Helper()
+	q := "SELECT COUNT(*) FROM " + sharding.Table(base, slot)
+	if where != "" {
+		q += " WHERE " + where
+	}
 	var n int
-	if err := e.db.QueryRowContext(t.Context(), query, args...).Scan(&n); err != nil {
+	if err := e.dbs[e.router.DB(slot)].QueryRowContext(t.Context(), q, args...).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -348,7 +430,7 @@ func (e *env) count(t *testing.T, query string, args ...any) int {
 
 func (e *env) orderRows(t *testing.T) int {
 	t.Helper()
-	return e.count(t, "SELECT COUNT(*) FROM orders")
+	return e.count(t, "orders", "")
 }
 
 // wantGate 断言闸门里 sku 的可放行数量和占用数量。
@@ -442,10 +524,36 @@ func (e *env) reply(t *testing.T, paymentID int64) *eventv1.PaymentResultHandled
 	return found[0]
 }
 
-// allEvents 按写入顺序返回 outbox 里的全部 OrderEvent，并检查 topic 和 key。
+// allEvents 返回所有库 outbox 里的全部 OrderEvent，并检查 topic 和 key。
+// 每个库内按写入顺序，库与库之间依次排列：只有同一订单的事件之间有先后可言，它们都在一个库里。
 func (e *env) allEvents(t *testing.T) []*eventv1.OrderEvent {
 	t.Helper()
-	rows, err := e.db.QueryContext(t.Context(), "SELECT topic, msg_key, payload FROM outbox ORDER BY id")
+	var all []*eventv1.OrderEvent
+	for _, evs := range e.eventsByDB(t) {
+		all = append(all, evs...)
+	}
+	return all
+}
+
+// eventsByDB 按库返回 outbox 里的 OrderEvent，每个库内按写入顺序。
+// 同时检查每个事件都写在它的订单所在的库里。
+func (e *env) eventsByDB(t *testing.T) [][]*eventv1.OrderEvent {
+	t.Helper()
+	out := make([][]*eventv1.OrderEvent, len(e.dbs))
+	for i := range e.dbs {
+		out[i] = e.outboxEvents(t, i)
+		for _, ev := range out[i] {
+			if db := e.router.DB(e.router.ForOrder(ev.GetOrderId())); db != i {
+				t.Errorf("event of order %d is in db %d's outbox, order lives in db %d", ev.GetOrderId(), i, db)
+			}
+		}
+	}
+	return out
+}
+
+func (e *env) outboxEvents(t *testing.T, db int) []*eventv1.OrderEvent {
+	t.Helper()
+	rows, err := e.dbs[db].QueryContext(t.Context(), "SELECT topic, msg_key, payload FROM outbox ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,9 +618,18 @@ func (e *env) wantEvents(t *testing.T, orderID int64, want ...string) {
 	}
 }
 
+// outboxRows 返回所有库 outbox 的行数之和。
 func (e *env) outboxRows(t *testing.T) int {
 	t.Helper()
-	return e.count(t, "SELECT COUNT(*) FROM outbox")
+	total := 0
+	for _, db := range e.dbs {
+		var n int
+		if err := db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM outbox").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		total += n
+	}
+	return total
 }
 
 func wantErr(t *testing.T, err error, code codes.Code, reason string) {

@@ -1,6 +1,10 @@
 -- +goose Up
 
-CREATE TABLE orders (
+-- 本文件是 text/template（见 mysqlx.MigrateTemplate），模板数据是 {Slots []int}：本库上的逻辑分片。
+-- 每个 slot 一组表，表名带全局 slot 号（ADR-0012），由 pkg/sharding.Table 生成同样的名字。
+-- CHECK 约束名在库内必须唯一，所以也带 slot 号；索引名只需在表内唯一，不用带。
+{{range .Slots}}
+CREATE TABLE orders_{{.}} (
     order_id         BIGINT      NOT NULL COMMENT '由 idgen 生成，低 6 位是 user_id 的分片基因',
     user_id          BIGINT      NOT NULL,
     status           TINYINT     NOT NULL COMMENT '与 proto OrderStatus 的数值一致：1 CREATING, 2 PENDING_PAYMENT, 3 PAID, 4 CANCELLED, 5 CLOSED, 6 FAILED',
@@ -10,8 +14,6 @@ CREATE TABLE orders (
     request_hash     BINARY(32)  NOT NULL COMMENT '请求内容（商品与数量）的 SHA-256，用于识别幂等键被复用到不同请求',
     payment_id       BIGINT      NULL COMMENT '付清本订单的支付单',
     fail_reason      VARCHAR(64) NULL COMMENT '创建失败的原因码',
-    -- 进入终态后还需要通知库存服务（确认或释放）。0 表示尚未完成，由后台任务重试直到成功。
-    stock_settled    TINYINT     NOT NULL DEFAULT 0,
     expire_at        DATETIME(6) NOT NULL COMMENT '支付截止时间',
     paid_at          DATETIME(6) NULL,
     created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -19,24 +21,24 @@ CREATE TABLE orders (
     PRIMARY KEY (order_id),
     UNIQUE KEY uk_orders_user_idem (user_id, idempotency_key),
     KEY idx_orders_user_created (user_id, created_at),
-    -- 后台任务按状态扫描：超时的待支付订单、卡在 CREATING 的订单、未结清库存的终态订单。
+    -- 后台任务按状态扫描：超时的待支付订单、卡在 CREATING 的订单。
     KEY idx_orders_status_expire (status, expire_at),
-    KEY idx_orders_settle (stock_settled, status, updated_at),
-    CONSTRAINT chk_orders_total CHECK (total_amount >= 0)
+    CONSTRAINT chk_orders_{{.}}_total CHECK (total_amount >= 0)
 ) ENGINE = InnoDB;
 
-CREATE TABLE order_items (
+CREATE TABLE order_items_{{.}} (
     order_id    BIGINT      NOT NULL,
     sku_id      BIGINT      NOT NULL,
     quantity    INT         NOT NULL,
     unit_price  BIGINT      NOT NULL DEFAULT 0 COMMENT '下单时的单价快照，预占成功后写入',
     created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (order_id, sku_id),
-    CONSTRAINT chk_order_items_quantity CHECK (quantity > 0)
+    CONSTRAINT chk_order_items_{{.}}_quantity CHECK (quantity > 0)
 ) ENGINE = InnoDB;
 
 -- 已处理过的支付结果，以 payment_id 幂等，并记下当时给支付服务的答复。
-CREATE TABLE payment_results (
+-- 只在锁住订单行的事务里读写，所以和订单在同一个 slot。
+CREATE TABLE payment_results_{{.}} (
     payment_id   BIGINT      NOT NULL,
     order_id     BIGINT      NOT NULL,
     succeeded    TINYINT     NOT NULL,
@@ -46,8 +48,25 @@ CREATE TABLE payment_results (
     PRIMARY KEY (payment_id),
     KEY idx_payment_results_order (order_id)
 ) ENGINE = InnoDB;
+{{end}}
+
+-- 本地消息表（见 pkg/outbox），每个库一张，不按 slot 拆。订单状态变更和要发布的 OrderEvent
+-- 在同一个事务里写入，由本库的 outbox 中继发到 Kafka。建表语句与 outbox.Schema 一致，由 migrations_test.go 校验。
+CREATE TABLE outbox (
+    id            BIGINT          NOT NULL AUTO_INCREMENT,
+    topic         VARCHAR(128)    NOT NULL,
+    msg_key       VARBINARY(128)  NOT NULL,
+    payload       MEDIUMBLOB      NOT NULL,
+    created_at    DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    published_at  DATETIME(6)     NULL,
+    PRIMARY KEY (id),
+    KEY idx_outbox_pending (published_at, id)
+) ENGINE = InnoDB;
 
 -- +goose Down
-DROP TABLE payment_results;
-DROP TABLE order_items;
-DROP TABLE orders;
+DROP TABLE outbox;
+{{range .Slots}}
+DROP TABLE payment_results_{{.}};
+DROP TABLE order_items_{{.}};
+DROP TABLE orders_{{.}};
+{{end}}

@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"embed"
 	"errors"
+	"io/fs"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +37,89 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	// testdb.New 已经迁移过一次，再来一次应该什么都不做。
 	if err := mysqlx.Migrate(t.Context(), db, migrations, migrationsDir); err != nil {
 		t.Fatalf("second Migrate: %v", err)
+	}
+}
+
+//go:embed testdata/templated/*.sql
+var templated embed.FS
+
+const templatedDir = "testdata/templated"
+
+type templateData struct {
+	Slots  []int
+	Shared string
+}
+
+func tableNames(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name <> 'goose_db_version' ORDER BY table_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return names
+}
+
+func TestMigrateTemplateRendersPerDatabase(t *testing.T) {
+	t.Parallel()
+	a := testdb.NewTemplate(t, templated, templatedDir, templateData{Slots: []int{0, 2}, Shared: "shared"})
+	b := testdb.NewTemplate(t, templated, templatedDir, templateData{Slots: []int{1, 3, 5}, Shared: "shared"})
+
+	if got, want := tableNames(t, a), []string{"item_0", "item_2", "shared"}; !slices.Equal(got, want) {
+		t.Errorf("db a tables = %v, want %v", got, want)
+	}
+	if got, want := tableNames(t, b), []string{"item_1", "item_3", "item_5", "shared"}; !slices.Equal(got, want) {
+		t.Errorf("db b tables = %v, want %v", got, want)
+	}
+
+	// 再迁移一次什么都不做：版本号按文件名记录，已经应用过了。
+	if err := mysqlx.MigrateTemplate(t.Context(), a, templated, templatedDir,
+		templateData{Slots: []int{0, 2}, Shared: "shared"}); err != nil {
+		t.Fatalf("second MigrateTemplate: %v", err)
+	}
+}
+
+func TestRenderMigrations(t *testing.T) {
+	t.Parallel()
+	fsys, err := mysqlx.RenderMigrations(templated, templatedDir, templateData{Slots: []int{4, 6}, Shared: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := fs.ReadFile(fsys, "00001_init.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{"CREATE TABLE item_4 ", "CREATE TABLE item_6 ", "DROP TABLE item_4;", "DROP TABLE item_6;"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("rendered migration lacks %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "{{") {
+		t.Errorf("rendered migration still has template actions:\n%s", s)
+	}
+}
+
+// 模板引用了不存在的字段时报错，而不是渲染出 "<no value>" 交给数据库。
+func TestRenderMigrationsRejectsMissingKey(t *testing.T) {
+	t.Parallel()
+	if _, err := mysqlx.RenderMigrations(templated, templatedDir, map[string]any{"Slots": []int{0}}); err == nil {
+		t.Error("RenderMigrations with missing key succeeded, want error")
+	}
+	if _, err := mysqlx.RenderMigrations(templated, "no/such/dir", templateData{}); err == nil {
+		t.Error("RenderMigrations with missing dir succeeded, want error")
 	}
 }
 

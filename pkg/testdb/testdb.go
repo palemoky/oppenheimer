@@ -28,6 +28,27 @@ const DSNEnv = "OPPENHEIMER_TEST_MYSQL_DSN"
 // 避免集成测试因配置遗漏而被悄悄跳过。
 func New(t testing.TB, migrations fs.FS, dir string) *sql.DB {
 	t.Helper()
+	db, name := Empty(t)
+	if err := mysqlx.Migrate(t.Context(), db, migrations, dir); err != nil {
+		t.Fatalf("migrate %s: %v", name, err)
+	}
+	return db
+}
+
+// NewTemplate 与 New 相同，但迁移文件先按 data 渲染（见 mysqlx.MigrateTemplate），用于分库分表的服务。
+// 每次调用都新建一个库，需要多个库时调用多次。
+func NewTemplate(t testing.TB, migrations fs.FS, dir string, data any) *sql.DB {
+	t.Helper()
+	db, name := Empty(t)
+	if err := mysqlx.MigrateTemplate(t.Context(), db, migrations, dir, data); err != nil {
+		t.Fatalf("migrate %s: %v", name, err)
+	}
+	return db
+}
+
+// Empty 返回一个连到全新空库的连接池和库名，不应用任何迁移。跳过与失败的规则与 New 相同。
+func Empty(t testing.TB) (*sql.DB, string) {
+	t.Helper()
 
 	dsn := os.Getenv(DSNEnv)
 	if dsn == "" {
@@ -72,11 +93,7 @@ func New(t testing.TB, migrations fs.FS, dir string) *sql.DB {
 	}
 	// 后注册的先执行：先关连接池，再删库。
 	t.Cleanup(func() { _ = db.Close() })
-
-	if err := mysqlx.Migrate(ctx, db, migrations, dir); err != nil {
-		t.Fatalf("migrate %s: %v", name, err)
-	}
-	return db
+	return db, name
 }
 
 // MustExec 执行一条语句，失败则终止测试。用于准备测试数据。

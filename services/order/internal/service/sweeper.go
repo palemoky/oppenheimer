@@ -15,7 +15,7 @@ import (
 type SweeperConfig struct {
 	// Interval 是两轮扫描之间的间隔，默认 30 秒。
 	Interval time.Duration
-	// BatchSize 是每类扫描每轮最多处理的订单数，默认 100。
+	// BatchSize 是每类扫描每轮在每个 slot 上最多处理的订单数，默认 100。
 	BatchSize int
 	// CreateTimeout 是订单落库后停留在 CREATING 的时限，超过后置为失败，默认 1 分钟。
 	// 应明显大于一次 Reserve 调用的超时，否则会和正常进行中的落库抢。
@@ -88,16 +88,24 @@ func (s *Sweeper) Start(ctx context.Context) error { return s.loop.Start(ctx) }
 func (s *Sweeper) Stop(ctx context.Context) error { return s.loop.Stop(ctx) }
 
 // RunOnce 执行一轮两类扫描。单个订单失败只记日志，不中断整轮。
+//
+// 订单分在多个 slot 上，每一轮依次扫所有 slot，每个 slot 各取一批（BatchSize 是每个 slot 的上限）。
+// 某个库不可用时，它上面的 slot 列表失败、记日志后跳过，不影响其他库的 slot。
 func (s *Sweeper) RunOnce(ctx context.Context) {
 	now := s.svc.now()
-	s.closeExpired(ctx, now)
-	s.failStaleCreating(ctx, now)
+	for slot := range s.svc.store.Router().Slots() {
+		if ctx.Err() != nil {
+			return
+		}
+		s.closeExpired(ctx, slot, now)
+		s.failStaleCreating(ctx, slot, now)
+	}
 }
 
-func (s *Sweeper) closeExpired(ctx context.Context, now time.Time) {
-	refs, err := s.svc.store.ListExpired(ctx, now, s.cfg.BatchSize)
+func (s *Sweeper) closeExpired(ctx context.Context, slot int, now time.Time) {
+	refs, err := s.svc.store.ListExpired(ctx, slot, now, s.cfg.BatchSize)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "list expired orders failed", "error", err)
+		s.logger.ErrorContext(ctx, "list expired orders failed", "slot", slot, "error", err)
 		return
 	}
 	for _, r := range refs {
@@ -118,10 +126,10 @@ func (s *Sweeper) closeOrder(ctx context.Context, r store.OrderRef, now time.Tim
 	// !ok：扫描之后被支付或取消抢先了，事件由抢先的一方写。
 }
 
-func (s *Sweeper) failStaleCreating(ctx context.Context, now time.Time) {
-	refs, err := s.svc.store.ListStaleCreating(ctx, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize)
+func (s *Sweeper) failStaleCreating(ctx context.Context, slot int, now time.Time) {
+	refs, err := s.svc.store.ListStaleCreating(ctx, slot, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "list stale creating orders failed", "error", err)
+		s.logger.ErrorContext(ctx, "list stale creating orders failed", "slot", slot, "error", err)
 		return
 	}
 	for _, r := range refs {

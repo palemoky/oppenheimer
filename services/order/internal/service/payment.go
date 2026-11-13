@@ -73,7 +73,8 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 		reply   *eventv1.PaymentResultHandled
 	)
 	now := s.now()
-	err := s.inTx(ctx, paymentTxRetry, func(tx *store.Tx) error {
+	// 事务落在订单所在的分片上：订单行、payment_results 和 outbox 都在那个库里。
+	err := s.inTx(ctx, paymentTxRetry, ev.GetOrderId(), func(tx *store.Tx) error {
 		handled, reply = false, nil
 
 		// 先锁订单行：同一订单的重复投递在此排队，与取消、关单的条件更新也互斥。
@@ -156,7 +157,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	if !handled {
 		return nil
 	}
-	s.kick()
+	s.kick(ev.GetOrderId())
 	if reply.GetDisposition() == refundRequired {
 		s.logger.WarnContext(ctx, "payment requires refund",
 			"order_id", ev.GetOrderId(), "payment_id", ev.GetPaymentId(), "reason", reply.GetReason())

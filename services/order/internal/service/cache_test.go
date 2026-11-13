@@ -40,19 +40,34 @@ func (e *env) cachedService(t *testing.T, st *store.Store) *Service {
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,
 		CloseDelayTopic:  testCloseTopic,
-		Relay:            e.relay,
+		Relays:           e.kickers(),
 	})
 }
 
-// brokenStore 返回一个任何查询都会失败的 store：连到一个不监听的端口。
-func brokenStore(t *testing.T) *store.Store {
+// brokenDB 返回一个任何查询都会失败的连接池：连到一个不监听的端口。
+func brokenDB(t testing.TB) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("mysql", "root:x@tcp(127.0.0.1:1)/none?timeout=200ms")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return store.New(db)
+	return db
+}
+
+// brokenStore 返回一个任何查询都会失败的 store：每个库都连不上。
+func brokenStore(t *testing.T) *store.Store {
+	t.Helper()
+	router := newRouter(t)
+	dbs := make([]*sql.DB, router.DBs())
+	for i := range dbs {
+		dbs[i] = brokenDB(t)
+	}
+	st, err := store.New(dbs, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 func getOrder(t *testing.T, svc *Service, orderID, userID int64) (*orderv1.Order, error) {
@@ -148,7 +163,8 @@ func TestGetOrderCacheServesTerminalFromCache(t *testing.T) {
 	}
 	first := mustGetStatus(t, svc, o.GetOrderId(), 1, orderv1.OrderStatus_ORDER_STATUS_CANCELLED)
 
-	if _, err := e.db.ExecContext(t.Context(), "UPDATE orders SET total_amount = 1 WHERE order_id = ?", o.GetOrderId()); err != nil {
+	if _, err := e.dbOf(o.GetOrderId()).ExecContext(t.Context(),
+		"UPDATE "+e.table("orders", o.GetOrderId())+" SET total_amount = 1 WHERE order_id = ?", o.GetOrderId()); err != nil {
 		t.Fatal(err)
 	}
 	second := mustGetStatus(t, svc, o.GetOrderId(), 1, orderv1.OrderStatus_ORDER_STATUS_CANCELLED)

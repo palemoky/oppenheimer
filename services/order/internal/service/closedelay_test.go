@@ -37,13 +37,13 @@ func TestCloseDueExpired(t *testing.T) {
 	e := newEnv(t)
 	o := e.mustPending(t, 1, "k")
 	e.clock.Advance(DefaultPaymentTimeout + time.Millisecond)
-	kicks := e.relay.kicks.Load()
+	kicks := e.kicks()
 	if err := e.closeDue(t, o.GetOrderId()); err != nil {
 		t.Fatal(err)
 	}
 	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CLOSED)
 	e.wantEvents(t, o.GetOrderId(), "closed")
-	if e.relay.kicks.Load() <= kicks {
+	if e.kicks() <= kicks {
 		t.Error("relay was not kicked after close")
 	}
 	// 重复投递、sweeper 再扫：不再写事件。

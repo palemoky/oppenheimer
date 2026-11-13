@@ -29,13 +29,13 @@ func TestSweeperClosesExpiredOrders(t *testing.T) {
 	e.wantEvents(t, expired.GetOrderId())
 
 	e.clock.Advance(time.Second)
-	kicks := e.relay.kicks.Load()
+	kicks := e.kicks()
 	e.sweeper.RunOnce(t.Context())
 	wantStatus(t, e.load(t, expired.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CLOSED)
 	wantStatus(t, e.load(t, fresh.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
 	e.wantEvents(t, expired.GetOrderId(), "closed")
 	e.wantEvents(t, fresh.GetOrderId())
-	if e.relay.kicks.Load() <= kicks {
+	if e.kicks() <= kicks {
 		t.Error("relay was not kicked after close")
 	}
 	// 库存的释放由库存服务消费 closed 事件完成，这里只预占过。
@@ -67,11 +67,11 @@ func TestSweeperBatchSize(t *testing.T) {
 	}
 	e.clock.Advance(DefaultPaymentTimeout + time.Second)
 	sw.RunOnce(t.Context())
-	if n := e.count(t, "SELECT COUNT(*) FROM orders WHERE status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != 2 {
+	if n := e.count(t, "orders", "status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != 2 {
 		t.Fatalf("closed = %d after one round, want 2", n)
 	}
 	sw.RunOnce(t.Context())
-	if n := e.count(t, "SELECT COUNT(*) FROM orders WHERE status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != 3 {
+	if n := e.count(t, "orders", "status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != 3 {
 		t.Fatalf("closed = %d after two rounds, want 3", n)
 	}
 	if n := e.outboxRows(t); n != 3 {
@@ -97,7 +97,7 @@ func TestSweeperConcurrentReplicas(t *testing.T) {
 		wg.Go(func() { sw.RunOnce(t.Context()) })
 	}
 	wg.Wait()
-	if n := e.count(t, "SELECT COUNT(*) FROM orders WHERE status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != orders {
+	if n := e.count(t, "orders", "status = ?", int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED)); n != orders {
 		t.Fatalf("closed = %d, want %d", n, orders)
 	}
 	if n := e.outboxRows(t); n != orders {

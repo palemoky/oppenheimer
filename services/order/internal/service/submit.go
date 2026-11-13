@@ -16,6 +16,7 @@ import (
 	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/Oppenheimer/pkg/idgen"
 	"github.com/palemoky/Oppenheimer/pkg/kafkax"
 	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 	"github.com/palemoky/Oppenheimer/services/order/internal/store"
@@ -316,6 +317,9 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 		default:
 			return fmt.Errorf("load order %d: %w", o.OrderID, gerr)
 		}
+	case errors.Is(err, store.ErrWrongShard):
+		// orderFromSubmitted 已经按基因挡过，走到这里说明两边的判断不一致。重试也一样，进死信。
+		return fmt.Errorf("%w: insert order %d: %w", ErrInvalidEvent, o.OrderID, err)
 	case err != nil:
 		return fmt.Errorf("insert order %d: %w", o.OrderID, err)
 	}
@@ -379,6 +383,10 @@ func orderFromSubmitted(m *eventv1.OrderSubmitted) (*store.Order, error) {
 	switch {
 	case m.GetOrderId() <= 0 || m.GetUserId() <= 0:
 		return nil, invalid("order_id and user_id must be positive")
+	case idgen.Gene(m.GetOrderId()) != idgen.GeneOf(m.GetUserId()):
+		// 订单号由受理方以 user_id 为分片键生成，基因必然一致。不一致说明上游有缺陷，
+		// 写进去的话按用户和按订单号会找到两个不同的分片。在认领之前拒绝：占用留给回收任务。
+		return nil, invalid("order id gene %d does not match user %d", idgen.Gene(m.GetOrderId()), m.GetUserId())
 	case m.GetIdempotencyKey() == "" || len(m.GetIdempotencyKey()) > maxIdempotencyKeyLen:
 		return nil, invalid("bad idempotency key")
 	case len(m.GetRequestHash()) != 32:

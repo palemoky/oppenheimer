@@ -28,7 +28,7 @@ func TestCancelOrder(t *testing.T) {
 		t.Fatalf("outbox = %d after failed cancels, want 0", n)
 	}
 
-	kicks := e.relay.kicks.Load()
+	kicks := e.kicks()
 	for range 3 {
 		resp, err := e.svc.CancelOrder(t.Context(), cancelReq(o.GetOrderId(), 1))
 		if err != nil || resp.GetOrder().GetStatus() != orderv1.OrderStatus_ORDER_STATUS_CANCELLED {
@@ -39,7 +39,7 @@ func TestCancelOrder(t *testing.T) {
 	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_CANCELLED)
 	// 重复取消只有第一次完成转换，只有它写事件、通知中继。
 	e.wantEvents(t, o.GetOrderId(), "cancelled")
-	if got := e.relay.kicks.Load() - kicks; got != 1 {
+	if got := e.kicks() - kicks; got != 1 {
 		t.Errorf("relay kicked %d times, want 1", got)
 	}
 	ev := e.allEvents(t)[0]

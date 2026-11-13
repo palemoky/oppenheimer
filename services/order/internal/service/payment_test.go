@@ -39,8 +39,8 @@ func (e *env) sideEffects(t *testing.T, orderID int64) sideEffects {
 	t.Helper()
 	se := sideEffects{
 		outbox:         e.outboxRows(t),
-		paymentResults: e.count(t, "SELECT COUNT(*) FROM payment_results"),
-		kicks:          e.relay.kicks.Load(),
+		paymentResults: e.count(t, "payment_results", ""),
+		kicks:          e.kicks(),
 	}
 	if o, err := e.store.GetOrder(t.Context(), orderID); err == nil {
 		se.order = fmt.Sprintf("%s/%d/%s/%s", o.Status, o.PaymentID, o.PaidAt, o.UpdatedAt)
@@ -107,7 +107,7 @@ func TestHandlePaymentSuccess(t *testing.T) {
 	e := newEnv(t)
 	o := e.mustPending(t, 1, "k")
 	total := o.GetTotal().GetAmount()
-	kicks := e.relay.kicks.Load()
+	kicks := e.kicks()
 
 	reply, err := e.pay(t, o.GetOrderId(), 501, total, true)
 	wantReply(t, reply, err, accepted, "")
@@ -126,7 +126,7 @@ func TestHandlePaymentSuccess(t *testing.T) {
 			t.Errorf("event user_id = %d, occur_time = %s", ev.GetUserId(), ev.GetOccurTime().AsTime())
 		}
 	}
-	if e.relay.kicks.Load() <= kicks {
+	if e.kicks() <= kicks {
 		t.Error("relay was not kicked after commit")
 	}
 	// 库存只预占过，确认由库存服务消费 paid 事件完成。
@@ -155,7 +155,7 @@ func TestHandlePaymentFailed(t *testing.T) {
 	reply, err := e.pay(t, o.GetOrderId(), 600, o.GetTotal().GetAmount(), false)
 	wantReply(t, reply, err, accepted, "")
 	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
-	if n := e.count(t, "SELECT COUNT(*) FROM payment_results WHERE payment_id = 600 AND succeeded = 0"); n != 1 {
+	if n := e.count(t, "payment_results", "payment_id = 600 AND succeeded = 0"); n != 1 {
 		t.Errorf("payment_results = %d, want 1", n)
 	}
 	e.wantEvents(t, o.GetOrderId(), "handled")
@@ -184,7 +184,7 @@ func TestHandlePaymentAmountMismatch(t *testing.T) {
 		wantReply(t, reply, err, refundRequired, errx.ReasonAmountMismatch)
 	}
 	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
-	if n := e.count(t, "SELECT COUNT(*) FROM payment_results WHERE disposition = ?", int32(refundRequired)); n != 3 {
+	if n := e.count(t, "payment_results", "disposition = ?", int32(refundRequired)); n != 3 {
 		t.Errorf("refund payment_results = %d, want 3", n)
 	}
 	e.wantEvents(t, o.GetOrderId(), "handled", "handled", "handled")
@@ -209,10 +209,10 @@ func TestHandlePaymentOrderNotFound(t *testing.T) {
 			t.Errorf("reply user_id = %d, want 1", ev.GetUserId())
 		}
 	}
-	if n := e.count(t, "SELECT COUNT(*) FROM payment_results"); n != 2 {
+	if n := e.count(t, "payment_results", ""); n != 2 {
 		t.Errorf("payment_results = %d, want 2", n)
 	}
-	if n := e.count(t, "SELECT COUNT(*) FROM orders"); n != 0 {
+	if n := e.count(t, "orders", ""); n != 0 {
 		t.Errorf("orders = %d, want 0", n)
 	}
 }
@@ -325,7 +325,7 @@ func TestHandlePaymentConcurrentDuplicates(t *testing.T) {
 	close(start)
 	wg.Wait()
 	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PAID)
-	if n := e.count(t, "SELECT COUNT(*) FROM payment_results"); n != 1 {
+	if n := e.count(t, "payment_results", ""); n != 1 {
 		t.Errorf("payment_results = %d, want 1", n)
 	}
 	e.wantEvents(t, o.GetOrderId(), "paid", "handled")
@@ -351,7 +351,7 @@ func TestHandlePaymentConcurrentDuplicatesOrderNotFound(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
-	if n := e.count(t, "SELECT COUNT(*) FROM payment_results"); n != 1 {
+	if n := e.count(t, "payment_results", ""); n != 1 {
 		t.Errorf("payment_results = %d, want 1", n)
 	}
 	if n := e.outboxRows(t); n != 1 {

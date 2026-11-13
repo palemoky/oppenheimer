@@ -2,12 +2,16 @@
 package mysqlx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"path"
+	"testing/fstest"
+	"text/template"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -146,7 +150,57 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, dir string) error {
 	if err != nil {
 		return fmt.Errorf("mysqlx: migrations dir %q: %w", dir, err)
 	}
-	provider, err := goose.NewProvider(goose.DialectMySQL, db, sub,
+	return migrate(ctx, db, sub)
+}
+
+// MigrateTemplate 把 fsys 中 dir 下的迁移文件当作 text/template 渲染（数据为 data），再应用到最新版本。
+//
+// 用于分库分表：同一组迁移文件按每个库上的分片渲染出不同的建表语句（例如用 {{range .Slots}}
+// 为每个分片建一组表）。渲染结果放在内存里交给 goose，版本号仍按文件名，每个库各自记录。
+// 模板引用了 data 里不存在的字段时返回错误，不会渲染出半截 SQL。
+//
+// 已应用过的版本不会因为 data 变了而重新执行：goose 只看版本号。改变一个库上有哪些分片
+// 是一次数据迁移，不能靠改模板数据完成。
+func MigrateTemplate(ctx context.Context, db *sql.DB, fsys fs.FS, dir string, data any) error {
+	rendered, err := RenderMigrations(fsys, dir, data)
+	if err != nil {
+		return err
+	}
+	return migrate(ctx, db, rendered)
+}
+
+// RenderMigrations 把 fsys 中 dir 下的每个文件当作 text/template 渲染，返回以文件名为路径的内存文件系统。
+// 只处理 dir 这一层的普通文件（goose 也只读这一层）。
+func RenderMigrations(fsys fs.FS, dir string, data any) (fs.FS, error) {
+	entries, err := fs.ReadDir(fsys, dir)
+	if err != nil {
+		return nil, fmt.Errorf("mysqlx: read migrations dir %q: %w", dir, err)
+	}
+	out := fstest.MapFS{}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		name := e.Name()
+		src, err := fs.ReadFile(fsys, path.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("mysqlx: read migration %s: %w", name, err)
+		}
+		tmpl, err := template.New(name).Option("missingkey=error").Parse(string(src))
+		if err != nil {
+			return nil, fmt.Errorf("mysqlx: parse migration template %s: %w", name, err)
+		}
+		var b bytes.Buffer
+		if err := tmpl.Execute(&b, data); err != nil {
+			return nil, fmt.Errorf("mysqlx: render migration %s: %w", name, err)
+		}
+		out[name] = &fstest.MapFile{Data: b.Bytes(), Mode: 0o444}
+	}
+	return out, nil
+}
+
+func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	provider, err := goose.NewProvider(goose.DialectMySQL, db, fsys,
 		goose.WithSlog(slog.New(slog.DiscardHandler)),
 	)
 	if err != nil {

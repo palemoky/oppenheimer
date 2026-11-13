@@ -87,7 +87,7 @@ func TestLandTwice(t *testing.T) {
 			if n := e.orderRows(t); n != 1 {
 				t.Fatalf("orders = %d, want 1", n)
 			}
-			if n := e.count(t, "SELECT COUNT(*) FROM order_items"); n != 1 {
+			if n := e.count(t, "order_items", ""); n != 1 {
 				t.Errorf("order_items = %d, want 1", n)
 			}
 			if n := e.inv.appliedCount("Reserve"); n != 1 {
@@ -459,12 +459,16 @@ func TestLandInvalidMessage(t *testing.T) {
 		}
 	}
 	for name, mutate := range map[string]func(m *eventv1.OrderSubmitted){
-		"no user":   func(m *eventv1.OrderSubmitted) { m.UserId = 0 },
-		"no key":    func(m *eventv1.OrderSubmitted) { m.IdempotencyKey = "" },
-		"bad hash":  func(m *eventv1.OrderSubmitted) { m.RequestHash = []byte{1} },
-		"no items":  func(m *eventv1.OrderSubmitted) { m.Items = nil },
-		"bad qty":   func(m *eventv1.OrderSubmitted) { m.Items[0].Quantity = 0 },
-		"no expire": func(m *eventv1.OrderSubmitted) { m.ExpireTime = nil },
+		"no user": func(m *eventv1.OrderSubmitted) { m.UserId = 0 },
+		// 订单号 1 的基因是 1，用户 2 的基因是 2：毒消息，不重试。
+		"gene mismatch": func(m *eventv1.OrderSubmitted) { m.UserId = 2 },
+		// 基因只差在 slot 位以上（1 和 9 都落在 slot 1）也拒绝：idgen 嵌入的是完整的 6 位基因。
+		"gene high bits": func(m *eventv1.OrderSubmitted) { m.UserId = 9 },
+		"no key":         func(m *eventv1.OrderSubmitted) { m.IdempotencyKey = "" },
+		"bad hash":       func(m *eventv1.OrderSubmitted) { m.RequestHash = []byte{1} },
+		"no items":       func(m *eventv1.OrderSubmitted) { m.Items = nil },
+		"bad qty":        func(m *eventv1.OrderSubmitted) { m.Items[0].Quantity = 0 },
+		"no expire":      func(m *eventv1.OrderSubmitted) { m.ExpireTime = nil },
 	} {
 		m := valid()
 		mutate(m)
