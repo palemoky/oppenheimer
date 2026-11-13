@@ -356,15 +356,21 @@ func (s *Service) advance(ctx context.Context, o *store.Order) (*store.Order, er
 		// 由后台任务按创建超时置为失败并释放库存。
 		return nil, fmt.Errorf("%w: invalid reserve response for order %d: %w", ErrUnrecoverable, o.OrderID, err)
 	}
+	merchantID := resp.GetMerchantId()
+	if merchantID <= 0 {
+		// 同上：预占已成功，但没有商家的订单进不了商家维度的索引，不能让它走到待支付。
+		return nil, fmt.Errorf("%w: reserve response for order %d has no merchant", ErrUnrecoverable, o.OrderID)
+	}
 	now := s.now()
 	s.pin(ctx, o.OrderID)
-	ok, err := s.store.MarkReserved(ctx, o.OrderID, total, currency, priced, now)
+	ok, err := s.store.MarkReserved(ctx, o.OrderID, merchantID, total, currency, priced, now)
 	if err != nil {
 		return nil, fmt.Errorf("mark order %d reserved: %w", o.OrderID, err)
 	}
 	if ok {
 		s.stamp(ctx, o.OrderID)
 		o.Status = orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT
+		o.MerchantID = merchantID
 		o.TotalAmount = total
 		o.Currency = currency
 		o.Items = priced
@@ -388,7 +394,7 @@ func (s *Service) reload(ctx context.Context, orderID int64) (*store.Order, erro
 
 func (s *Service) handleReserveError(ctx context.Context, o *store.Order, reserveErr error) (*store.Order, error) {
 	switch reason := errx.Reason(reserveErr); reason {
-	case errx.ReasonSKUNotFound, errx.ReasonInsufficientStock, errx.ReasonReservationReleased:
+	case errx.ReasonSKUNotFound, errx.ReasonInsufficientStock, errx.ReasonReservationReleased, errx.ReasonMixedMerchants:
 		// 拒绝只说明“这一次”Reserve 没有占到库存，不能推出“这个订单没有预占”：
 		// 同一订单可能有另一次推进在并发进行（同一条消息被重复投递），库存恰好在两次之间被释放出来，
 		// 那一次的 Reserve 就会成功。所以不区分原因，一律置为 FAILED 并发 failed 事件，

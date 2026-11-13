@@ -37,8 +37,12 @@ var (
 
 // Order 是 orders 表的一行及其商品明细。
 type Order struct {
-	OrderID        int64
-	UserID         int64
+	OrderID int64
+	UserID  int64
+	// MerchantID 是订单所属的商家，预占成功时写入；0 表示还没有（CREATING，或预占前就失败）。
+	MerchantID int64
+	// Version 是行版本号，每次更新加一。只由数据库维护，写入时忽略。
+	Version        int64
 	Status         orderv1.OrderStatus
 	TotalAmount    int64
 	Currency       string
@@ -182,7 +186,7 @@ func (s *Store) checkSlot(slot int) error {
 	return nil
 }
 
-const orderColumns = `order_id, user_id, status, total_amount, currency, idempotency_key, request_hash,
+const orderColumns = `order_id, user_id, merchant_id, version, status, total_amount, currency, idempotency_key, request_hash,
 	payment_id, fail_reason, expire_at, paid_at, created_at, updated_at`
 
 // queryer 让读订单的代码在事务内外共用。
@@ -276,11 +280,12 @@ func scanOrder(row *sql.Row) (*Order, error) {
 	var (
 		o          Order
 		status     int32
+		merchantID sql.NullInt64
 		paymentID  sql.NullInt64
 		failReason sql.NullString
 		paidAt     sql.NullTime
 	)
-	err := row.Scan(&o.OrderID, &o.UserID, &status, &o.TotalAmount, &o.Currency, &o.IdempotencyKey, &o.RequestHash,
+	err := row.Scan(&o.OrderID, &o.UserID, &merchantID, &o.Version, &status, &o.TotalAmount, &o.Currency, &o.IdempotencyKey, &o.RequestHash,
 		&paymentID, &failReason, &o.ExpireAt, &paidAt, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -289,6 +294,7 @@ func scanOrder(row *sql.Row) (*Order, error) {
 		return nil, fmt.Errorf("scan order: %w", err)
 	}
 	o.Status = orderv1.OrderStatus(status)
+	o.MerchantID = merchantID.Int64
 	o.PaymentID = paymentID.Int64
 	o.FailReason = failReason.String
 	o.PaidAt = paidAt.Time
@@ -316,17 +322,21 @@ func listItems(ctx context.Context, q queryer, tb tables, orderID int64) ([]Item
 	return items, nil
 }
 
-// MarkReserved 把 CREATING 的订单改为 PENDING_PAYMENT，写入总金额、币种和各商品单价。
+// MarkReserved 把 CREATING 的订单改为 PENDING_PAYMENT，写入所属商家、总金额、币种和各商品单价。
 // 订单已不在 CREATING 时返回 false，什么都不改。
-func (s *Store) MarkReserved(ctx context.Context, orderID, total int64, currency string, items []Item, now time.Time) (bool, error) {
+//
+// 更新 orders 的每条语句都带 version = version + 1（见迁移 00002）。漏掉的后果是 CDC 的下游
+// 把这次变更当成重复的旧映像丢掉；TestEveryOrderUpdateBumpsVersion 检查本文件里的每条语句。
+func (s *Store) MarkReserved(ctx context.Context, orderID, merchantID, total int64, currency string, items []Item, now time.Time) (bool, error) {
 	slot := s.router.ForOrder(orderID)
 	tb := s.tables[slot]
 	var done bool
 	err := mysqlx.InTx(ctx, s.dbOf(slot), func(tx *sql.Tx) error {
 		//nolint:gosec // 表名只来自 sharding.Table，不含外部输入
-		res, err := tx.ExecContext(ctx, `UPDATE `+tb.orders+` SET status = ?, total_amount = ?, currency = ?, updated_at = ?
+		res, err := tx.ExecContext(ctx, `UPDATE `+tb.orders+` SET status = ?, merchant_id = ?, total_amount = ?, currency = ?, updated_at = ?,
+			version = version + 1
 			WHERE order_id = ? AND status = ?`,
-			int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), total, currency, now,
+			int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), merchantID, total, currency, now,
 			orderID, int32(orderv1.OrderStatus_ORDER_STATUS_CREATING))
 		if err != nil {
 			return fmt.Errorf("mark reserved: %w", err)
@@ -487,7 +497,8 @@ func (t *Tx) MarkPaid(ctx context.Context, orderID, paymentID int64, now time.Ti
 		return false, err
 	}
 	//nolint:gosec // 表名只来自 sharding.Table，不含外部输入
-	res, err := t.tx.ExecContext(ctx, `UPDATE `+t.tables.orders+` SET status = ?, payment_id = ?, paid_at = ?, updated_at = ?
+	res, err := t.tx.ExecContext(ctx, `UPDATE `+t.tables.orders+` SET status = ?, payment_id = ?, paid_at = ?, updated_at = ?,
+		version = version + 1
 		WHERE order_id = ? AND status = ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_PAID), paymentID, now, now,
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT))
@@ -502,7 +513,8 @@ func (t *Tx) MarkCreateFailed(ctx context.Context, orderID int64, reason string,
 	if err := t.own(orderID); err != nil {
 		return false, err
 	}
-	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, fail_reason = ?, updated_at = ?
+	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, fail_reason = ?, updated_at = ?,
+		version = version + 1
 		WHERE order_id = ? AND status = ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_FAILED), reason, now,
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_CREATING))
@@ -513,7 +525,8 @@ func (t *Tx) Cancel(ctx context.Context, orderID, userID int64, now time.Time) (
 	if err := t.own(orderID); err != nil {
 		return false, err
 	}
-	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, updated_at = ?
+	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, updated_at = ?,
+		version = version + 1
 		WHERE order_id = ? AND user_id = ? AND status = ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_CANCELLED), now,
 		orderID, userID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT))
@@ -524,7 +537,8 @@ func (t *Tx) CloseExpired(ctx context.Context, orderID int64, now time.Time) (bo
 	if err := t.own(orderID); err != nil {
 		return false, err
 	}
-	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, updated_at = ?
+	return t.exec(ctx, `UPDATE `+t.tables.orders+` SET status = ?, updated_at = ?,
+		version = version + 1
 		WHERE order_id = ? AND status = ? AND expire_at < ?`,
 		int32(orderv1.OrderStatus_ORDER_STATUS_CLOSED), now,
 		orderID, int32(orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT), now)

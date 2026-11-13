@@ -241,3 +241,94 @@ func TestListBySlot(t *testing.T) {
 		}
 	}
 }
+
+// 更新 orders 的每条语句都要给 version 加一：CDC 的下游只接受版本更高的行映像，
+// 漏掉的那次变更会被当成重复的旧映像丢掉（ADR-0014）。这里走一遍全部五种状态变更。
+func TestEveryOrderUpdateBumpsVersion(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	now := time.Date(2026, 6, 1, 12, 0, 1, 0, time.UTC)
+	version := func(t *testing.T, id int64) int64 {
+		t.Helper()
+		o, err := f.store.GetOrder(t.Context(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o.Version
+	}
+	// insert 落一个 CREATING 的订单；pending 再把它推到 PENDING_PAYMENT。
+	insert := func(t *testing.T, key string) *store.Order {
+		t.Helper()
+		o := f.newOrder(t, 1, key)
+		if err := f.store.InsertOrder(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+		if v := version(t, o.OrderID); v != 0 {
+			t.Fatalf("version after insert = %d, want 0", v)
+		}
+		return o
+	}
+	pending := func(t *testing.T, key string) *store.Order {
+		t.Helper()
+		o := insert(t, key)
+		if ok, err := f.store.MarkReserved(t.Context(), o.OrderID, 7, 100, "CNY", o.Items, now); err != nil || !ok {
+			t.Fatalf("MarkReserved = %v, %v", ok, err)
+		}
+		if v := version(t, o.OrderID); v != 1 {
+			t.Fatalf("version after MarkReserved = %d, want 1", v)
+		}
+		return o
+	}
+	inTx := func(t *testing.T, o *store.Order, want int64, fn func(tx *store.Tx) (bool, error)) {
+		t.Helper()
+		err := f.store.InTx(t.Context(), o.OrderID, func(tx *store.Tx) error {
+			ok, err := fn(tx)
+			if err == nil && !ok {
+				err = errors.New("update did not apply")
+			}
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v := version(t, o.OrderID); v != want {
+			t.Errorf("version = %d, want %d", v, want)
+		}
+	}
+
+	t.Run("MarkReserved records the merchant", func(t *testing.T) {
+		o := pending(t, "reserved")
+		got, err := f.store.GetOrder(t.Context(), o.OrderID)
+		if err != nil || got.MerchantID != 7 {
+			t.Errorf("merchant_id = %d, %v; want 7", got.MerchantID, err)
+		}
+	})
+	t.Run("MarkCreateFailed", func(t *testing.T) {
+		o := insert(t, "failed")
+		inTx(t, o, 1, func(tx *store.Tx) (bool, error) { return tx.MarkCreateFailed(t.Context(), o.OrderID, "X", now) })
+	})
+	t.Run("MarkPaid", func(t *testing.T) {
+		o := pending(t, "paid")
+		inTx(t, o, 2, func(tx *store.Tx) (bool, error) { return tx.MarkPaid(t.Context(), o.OrderID, 99, now) })
+	})
+	t.Run("Cancel", func(t *testing.T) {
+		o := pending(t, "cancelled")
+		inTx(t, o, 2, func(tx *store.Tx) (bool, error) { return tx.Cancel(t.Context(), o.OrderID, o.UserID, now) })
+	})
+	t.Run("CloseExpired", func(t *testing.T) {
+		o := pending(t, "closed")
+		inTx(t, o, 2, func(tx *store.Tx) (bool, error) {
+			return tx.CloseExpired(t.Context(), o.OrderID, o.ExpireAt.Add(time.Second))
+		})
+	})
+	// 条件不满足的更新不改行，版本也不动。
+	t.Run("rejected update leaves the version alone", func(t *testing.T) {
+		o := pending(t, "noop")
+		if ok, err := f.store.MarkReserved(t.Context(), o.OrderID, 8, 1, "CNY", o.Items, now); err != nil || ok {
+			t.Fatalf("second MarkReserved = %v, %v; want false, nil", ok, err)
+		}
+		if v := version(t, o.OrderID); v != 1 {
+			t.Errorf("version = %d, want 1", v)
+		}
+	})
+}

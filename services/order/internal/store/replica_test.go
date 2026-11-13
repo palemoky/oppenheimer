@@ -122,7 +122,7 @@ func TestListBySource(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if ok, err := f.store.MarkReserved(t.Context(), pending.OrderID, 100, "CNY", pending.Items, pending.UpdatedAt); err != nil || !ok {
+	if ok, err := f.store.MarkReserved(t.Context(), pending.OrderID, 7, 100, "CNY", pending.Items, pending.UpdatedAt); err != nil || !ok {
 		t.Fatalf("MarkReserved = %v, %v", ok, err)
 	}
 	later := pending.ExpireAt.Add(time.Second)

@@ -129,3 +129,44 @@ func TestMigrationResumesAfterPartialRun(t *testing.T) {
 		t.Errorf("tables after resume = %d, want %d", got, len(creates))
 	}
 }
+
+func hasColumn(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	var n int
+	err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, table, column).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n == 1
+}
+
+// 00002 给每张 orders 表加两列。模拟它中途被杀：一部分表已经改完、其余没改、版本号没记。
+// MySQL 没有 ADD COLUMN IF NOT EXISTS，整版重跑要靠迁移里对 information_schema 的判断。
+func TestAddColumnMigrationResumesAfterPartialRun(t *testing.T) {
+	t.Parallel()
+	r, err := sharding.New(sharding.OrderLayout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := MigrationData{Slots: r.SlotsOf(0)}
+	db := testdb.NewTemplate(t, Migrations, MigrationsDir, data)
+
+	// 回到“00002 跑了一半”：去掉它的版本记录，再把后一半表的两列删掉。
+	testdb.MustExec(t, db, `DELETE FROM goose_db_version WHERE version_id = 2`)
+	undone := data.Slots[len(data.Slots)/2:]
+	for _, s := range undone {
+		testdb.MustExec(t, db, "ALTER TABLE "+sharding.Table("orders", s)+" DROP COLUMN merchant_id, DROP COLUMN version")
+	}
+
+	if err := mysqlx.MigrateTemplate(t.Context(), db, Migrations, MigrationsDir, data); err != nil {
+		t.Fatalf("migrate after partial run: %v", err)
+	}
+	for _, s := range data.Slots {
+		for _, col := range []string{"merchant_id", "version"} {
+			if !hasColumn(t, db, sharding.Table("orders", s), col) {
+				t.Errorf("%s.%s missing after resume", sharding.Table("orders", s), col)
+			}
+		}
+	}
+}

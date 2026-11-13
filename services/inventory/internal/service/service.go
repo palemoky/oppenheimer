@@ -87,16 +87,19 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		return nil, err
 	}
 
-	var result []store.Item
+	var (
+		result     []store.Item
+		merchantID int64
+	)
 	err = s.inTx(ctx, func(tx *store.Tx) error {
-		result = nil
+		result, merchantID = nil, 0
 		// 先插入再判断，让唯一键充当互斥；并发的重复请求会等这里提交或回滚。
 		inserted, err := tx.InsertReservation(ctx, orderID, store.StatusReserved)
 		if err != nil {
 			return err
 		}
 		if !inserted {
-			result, err = reserveReplay(ctx, tx, orderID, want)
+			result, merchantID, err = reserveReplay(ctx, tx, orderID, want)
 			return err
 		}
 
@@ -124,56 +127,103 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		for i, it := range want {
 			skuIDs[i] = it.SKUID
 		}
-		prices, err := tx.SKUPrices(ctx, skuIDs)
+		skus, err := tx.SKUs(ctx, skuIDs)
 		if err != nil {
 			return err
 		}
 		items := slices.Clone(want)
 		for i := range items {
-			p, ok := prices[items[i].SKUID]
+			sku, ok := skus[items[i].SKUID]
 			if !ok {
 				// 刚刚成功扣减过的行不可能消失，出现就是数据被破坏。
-				return errors.New("sku price missing after reserve")
+				return errors.New("sku missing after reserve")
 			}
-			items[i].UnitPrice = p
+			items[i].UnitPrice = sku.UnitPrice
+		}
+		// 一个订单只属于一个商家（ADR-0014）。返回错误让整个事务回滚，连同已扣的库存。
+		merchant, err := singleMerchant(skus)
+		if err != nil {
+			return err
+		}
+		if err := tx.SetReservationMerchant(ctx, orderID, merchant); err != nil {
+			return err
 		}
 		if err := tx.InsertReservationItems(ctx, orderID, items); err != nil {
 			return err
 		}
-		result = items
+		result, merchantID = items, merchant
 		return nil
 	})
 	if err != nil {
 		return nil, s.toStatus(ctx, "reserve", err, "order_id", orderID)
 	}
-	return &inventoryv1.ReserveResponse{Items: toProtoItems(result)}, nil
+	return &inventoryv1.ReserveResponse{Items: toProtoItems(result), MerchantId: merchantID}, nil
+}
+
+// singleMerchant 返回这些 SKU 共同所属的商家；它们属于不同商家时返回 MIXED_MERCHANTS。
+func singleMerchant(skus map[int64]store.SKU) (int64, error) {
+	var merchant int64
+	first := true
+	for _, sku := range skus {
+		if first {
+			merchant, first = sku.MerchantID, false
+			continue
+		}
+		if sku.MerchantID != merchant {
+			return 0, errx.New(codes.FailedPrecondition, errx.ReasonMixedMerchants, "skus belong to different merchants")
+		}
+	}
+	if first {
+		return 0, errors.New("no sku to take the merchant from")
+	}
+	return merchant, nil
 }
 
 // reserveReplay 处理订单已有预占记录的重复 Reserve：内容一致返回原结果，否则拒绝。
-func reserveReplay(ctx context.Context, tx *store.Tx, orderID int64, want []store.Item) ([]store.Item, error) {
+func reserveReplay(ctx context.Context, tx *store.Tx, orderID int64, want []store.Item) ([]store.Item, int64, error) {
 	st, found, err := tx.ReservationStatusForShare(ctx, orderID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !found {
 		// 刚撞上唯一键冲突，记录又不存在，只可能是被删除了，而本服务从不删除预占。
-		return nil, errors.New("reservation vanished after duplicate key")
+		return nil, 0, errors.New("reservation vanished after duplicate key")
 	}
 	if st == store.StatusReleased {
-		return nil, errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "reservation of order %d has been released", orderID)
+		return nil, 0, errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "reservation of order %d has been released", orderID)
 	}
 
 	stored, err := tx.ReservationItems(ctx, orderID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	same := slices.EqualFunc(stored, want, func(a, b store.Item) bool {
 		return a.SKUID == b.SKUID && a.Quantity == b.Quantity
 	})
 	if !same {
-		return nil, errx.New(codes.AlreadyExists, errx.ReasonReservationMismatch, "order %d already reserved with different items", orderID)
+		return nil, 0, errx.New(codes.AlreadyExists, errx.ReasonReservationMismatch, "order %d already reserved with different items", orderID)
 	}
-	return stored, nil
+
+	merchant, found, err := tx.ReservationMerchant(ctx, orderID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !found {
+		// 头记录是加 merchant_id 这一列之前写的。SKU 所属的商家不会变，现在读出来的和当时一样。
+		// 那时没有“一个订单一个商家”的检查，这里不补做：预占已经成立，拒绝它只会让订单卡住。
+		skuIDs := make([]int64, len(stored))
+		for i, it := range stored {
+			skuIDs[i] = it.SKUID
+		}
+		skus, err := tx.SKUs(ctx, skuIDs)
+		if err != nil {
+			return nil, 0, err
+		}
+		if sku, ok := skus[stored[0].SKUID]; ok {
+			merchant = sku.MerchantID
+		}
+	}
+	return stored, merchant, nil
 }
 
 // validateReserve 校验请求，返回按 sku_id 升序排列的预占项。

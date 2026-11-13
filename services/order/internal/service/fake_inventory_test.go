@@ -36,7 +36,11 @@ const (
 	resReleased
 )
 
+// fakeMerchant 是 addSKU 给 SKU 的默认商家。
+const fakeMerchant int64 = 42
+
 type fakeSKU struct {
+	merchant                  int64
 	price                     int64
 	currency                  string
 	available, reserved, sold int64
@@ -75,7 +79,13 @@ func newFakeInventory(gate *stockgate.Gate) *fakeInventory {
 func (f *fakeInventory) addSKU(id, price, available int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.skus[id] = &fakeSKU{price: price, currency: "CNY", available: available}
+	f.skus[id] = &fakeSKU{merchant: fakeMerchant, price: price, currency: "CNY", available: available}
+}
+
+func (f *fakeInventory) setMerchant(id, merchant int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.skus[id].merchant = merchant
 }
 
 func (f *fakeInventory) setLimit(id, limit int64) {
@@ -186,6 +196,11 @@ func (f *fakeInventory) Reserve(_ context.Context, in *inventoryv1.ReserveReques
 			}
 		}
 		for _, it := range in.GetItems() {
+			if f.skus[it.GetSkuId()].merchant != f.skus[in.GetItems()[0].GetSkuId()].merchant {
+				return nil, errx.New(codes.FailedPrecondition, errx.ReasonMixedMerchants, "mixed merchants")
+			}
+		}
+		for _, it := range in.GetItems() {
 			sku := f.skus[it.GetSkuId()]
 			sku.available -= int64(it.GetQuantity())
 			sku.reserved += int64(it.GetQuantity())
@@ -206,7 +221,7 @@ func (f *fakeInventory) reserved(items []*inventoryv1.ReserveItem) *inventoryv1.
 			UnitPrice: &commonv1.Money{Amount: sku.price, Currency: sku.currency},
 		})
 	}
-	return &inventoryv1.ReserveResponse{Items: out}
+	return &inventoryv1.ReserveResponse{Items: out, MerchantId: f.skus[items[0].GetSkuId()].merchant}
 }
 
 func (f *fakeInventory) Confirm(_ context.Context, in *inventoryv1.ConfirmRequest, _ ...grpc.CallOption) (*inventoryv1.ConfirmResponse, error) {

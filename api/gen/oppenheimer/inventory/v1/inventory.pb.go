@@ -190,8 +190,11 @@ func (x *ReserveRequest) GetItems() []*ReserveItem {
 }
 
 type ReserveResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Items         []*ReservedItem        `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Items []*ReservedItem        `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	// 这些 SKU 所属的商家。一个订单的所有 SKU 属于同一个商家，否则 Reserve 被拒绝。
+	// 重复调用返回第一次预占时记下的值。
+	MerchantId    int64 `protobuf:"varint,2,opt,name=merchant_id,json=merchantId,proto3" json:"merchant_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -231,6 +234,13 @@ func (x *ReserveResponse) GetItems() []*ReservedItem {
 		return x.Items
 	}
 	return nil
+}
+
+func (x *ReserveResponse) GetMerchantId() int64 {
+	if x != nil {
+		return x.MerchantId
+	}
+	return 0
 }
 
 type ConfirmRequest struct {
@@ -617,9 +627,11 @@ const file_oppenheimer_inventory_v1_inventory_proto_rawDesc = "" +
 	"unit_price\x18\x03 \x01(\v2\x1c.oppenheimer.common.v1.MoneyR\tunitPrice\"h\n" +
 	"\x0eReserveRequest\x12\x19\n" +
 	"\border_id\x18\x01 \x01(\x03R\aorderId\x12;\n" +
-	"\x05items\x18\x02 \x03(\v2%.oppenheimer.inventory.v1.ReserveItemR\x05items\"O\n" +
+	"\x05items\x18\x02 \x03(\v2%.oppenheimer.inventory.v1.ReserveItemR\x05items\"p\n" +
 	"\x0fReserveResponse\x12<\n" +
-	"\x05items\x18\x01 \x03(\v2&.oppenheimer.inventory.v1.ReservedItemR\x05items\"+\n" +
+	"\x05items\x18\x01 \x03(\v2&.oppenheimer.inventory.v1.ReservedItemR\x05items\x12\x1f\n" +
+	"\vmerchant_id\x18\x02 \x01(\x03R\n" +
+	"merchantId\"+\n" +
 	"\x0eConfirmRequest\x12\x19\n" +
 	"\border_id\x18\x01 \x01(\x03R\aorderId\"\x11\n" +
 	"\x0fConfirmResponse\"+\n" +

@@ -50,6 +50,12 @@ type Item struct {
 	UnitPrice Price
 }
 
+// SKU 是预占时从 sku_stock 读出的快照：单价和所属商家。
+type SKU struct {
+	UnitPrice  Price
+	MerchantID int64
+}
+
 // Stock 是 sku_stock 的一行。
 type Stock struct {
 	SKUID     int64
@@ -173,6 +179,27 @@ func (t *Tx) UpdateReservationStatus(ctx context.Context, orderID int64, from, t
 	return affectedOne(res)
 }
 
+// SetReservationMerchant 在预占头记录上记下订单所属的商家，使重复的 Reserve 返回同样的结果。
+// 只由刚插入这条头记录的事务调用。
+func (t *Tx) SetReservationMerchant(ctx context.Context, orderID, merchantID int64) error {
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE reservation SET merchant_id = ? WHERE order_id = ?`, merchantID, orderID); err != nil {
+		return fmt.Errorf("set reservation merchant %d: %w", orderID, err)
+	}
+	return nil
+}
+
+// ReservationMerchant 读取预占头记录上的商家。没有记下时（加这一列之前的预占）found 为 false。
+// 调用方已经锁住了头记录。
+func (t *Tx) ReservationMerchant(ctx context.Context, orderID int64) (merchantID int64, found bool, err error) {
+	var m sql.NullInt64
+	if err := t.tx.QueryRowContext(ctx,
+		`SELECT merchant_id FROM reservation WHERE order_id = ?`, orderID).Scan(&m); err != nil {
+		return 0, false, fmt.Errorf("select reservation merchant %d: %w", orderID, err)
+	}
+	return m.Int64, m.Valid, nil
+}
+
 // ReservationItems 按 sku_id 升序读取订单的预占明细。
 //
 // 用一致性读而不是加锁读：明细与头记录在同一个事务里写入、之后不再修改，
@@ -267,10 +294,10 @@ func (t *Tx) SKUExists(ctx context.Context, skuID int64) (bool, error) {
 	return true, nil
 }
 
-// SKUPrices 读取一组 SKU 的单价。不存在的 SKU 不出现在结果里。
-func (t *Tx) SKUPrices(ctx context.Context, skuIDs []int64) (map[int64]Price, error) {
+// SKUs 读取一组 SKU 的单价和所属商家。不存在的 SKU 不出现在结果里。
+func (t *Tx) SKUs(ctx context.Context, skuIDs []int64) (map[int64]SKU, error) {
 	if len(skuIDs) == 0 {
-		return map[int64]Price{}, nil
+		return map[int64]SKU{}, nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(skuIDs)), ",")
 	args := make([]any, len(skuIDs))
@@ -278,28 +305,28 @@ func (t *Tx) SKUPrices(ctx context.Context, skuIDs []int64) (map[int64]Price, er
 		args[i] = id
 	}
 	rows, err := t.tx.QueryContext(ctx,
-		`SELECT sku_id, unit_price, currency FROM sku_stock WHERE sku_id IN (`+placeholders+`)`, //nolint:gosec // 只拼接占位符
+		`SELECT sku_id, unit_price, currency, merchant_id FROM sku_stock WHERE sku_id IN (`+placeholders+`)`, //nolint:gosec // 只拼接占位符
 		args...)
 	if err != nil {
-		return nil, fmt.Errorf("select sku prices: %w", err)
+		return nil, fmt.Errorf("select skus: %w", err)
 	}
 	defer rows.Close()
 
-	prices := make(map[int64]Price, len(skuIDs))
+	skus := make(map[int64]SKU, len(skuIDs))
 	for rows.Next() {
 		var (
-			id int64
-			p  Price
+			id  int64
+			sku SKU
 		)
-		if err := rows.Scan(&id, &p.Amount, &p.Currency); err != nil {
-			return nil, fmt.Errorf("scan sku price: %w", err)
+		if err := rows.Scan(&id, &sku.UnitPrice.Amount, &sku.UnitPrice.Currency, &sku.MerchantID); err != nil {
+			return nil, fmt.Errorf("scan sku: %w", err)
 		}
-		prices[id] = p
+		skus[id] = sku
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sku prices: %w", err)
+		return nil, fmt.Errorf("iterate skus: %w", err)
 	}
-	return prices, nil
+	return skus, nil
 }
 
 // affectedOne 报告语句是否恰好修改了一行。

@@ -45,6 +45,7 @@ type InventoryServiceClient interface {
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK  有 SKU 可用库存不足
 	//   FAILED_PRECONDITION  reason=RESERVATION_RELEASED 该订单的预占已被释放（含先于 Reserve 到达的 Release），不允许再预占
 	//   ALREADY_EXISTS       reason=RESERVATION_MISMATCH 该订单已预占过，但本次的 SKU 或数量与上次不同
+	//   FAILED_PRECONDITION  reason=MIXED_MERCHANTS      订单里的 SKU 属于不同的商家（一个订单只属于一个商家）
 	Reserve(ctx context.Context, in *ReserveRequest, opts ...grpc.CallOption) (*ReserveResponse, error)
 	// Confirm 把订单的预占转为已售。
 	//
@@ -148,6 +149,7 @@ type InventoryServiceServer interface {
 	//   FAILED_PRECONDITION  reason=INSUFFICIENT_STOCK  有 SKU 可用库存不足
 	//   FAILED_PRECONDITION  reason=RESERVATION_RELEASED 该订单的预占已被释放（含先于 Reserve 到达的 Release），不允许再预占
 	//   ALREADY_EXISTS       reason=RESERVATION_MISMATCH 该订单已预占过，但本次的 SKU 或数量与上次不同
+	//   FAILED_PRECONDITION  reason=MIXED_MERCHANTS      订单里的 SKU 属于不同的商家（一个订单只属于一个商家）
 	Reserve(context.Context, *ReserveRequest) (*ReserveResponse, error)
 	// Confirm 把订单的预占转为已售。
 	//
