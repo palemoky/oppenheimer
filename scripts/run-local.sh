@@ -6,7 +6,8 @@
 #   scripts/run-local.sh -- <命令>   启动服务，执行命令，然后停止全部；退出码取自该命令
 #
 # 可用环境变量覆盖：DB_PREFIX（库名前缀，默认空，即 order_db_0 等）、MYSQL_ROOT_PASSWORD、MYSQL_PORT、
-# 以及各服务自己的配置（PAYMENT_TIMEOUT、SWEEP_INTERVAL 等）。
+# 以及 order 分片的四个端口 MYSQL_ORDER_{0,1}_PORT、MYSQL_ORDER_{0,1}_REPLICA_PORT，
+# 和各服务自己的配置（PAYMENT_TIMEOUT、SWEEP_INTERVAL 等）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +17,14 @@ DB_PREFIX="${DB_PREFIX:-}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-oppenheimer}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
 
-dsn() { echo "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/${DB_PREFIX}$1"; }
+# order 的两个分片各有一主一从，端口与 compose 一致；inventory、payment 仍在单实例 mysql 上。
+MYSQL_ORDER_0_PORT="${MYSQL_ORDER_0_PORT:-3311}"
+MYSQL_ORDER_0_REPLICA_PORT="${MYSQL_ORDER_0_REPLICA_PORT:-3312}"
+MYSQL_ORDER_1_PORT="${MYSQL_ORDER_1_PORT:-3321}"
+MYSQL_ORDER_1_REPLICA_PORT="${MYSQL_ORDER_1_REPLICA_PORT:-3322}"
+
+dsn_at() { echo "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:$1)/${DB_PREFIX}$2"; }
+dsn() { dsn_at "$MYSQL_PORT" "$1"; }
 
 # Kafka 和 Redis 的地址对所有服务相同，直接导出，子进程会继承。
 # KAFKA_PREFIX、REDIS_PREFIX 默认为空；端到端测试会设置它们，与手动运行的环境隔离。
@@ -61,7 +69,9 @@ start() {
 
 # 启动顺序按依赖方向：被依赖的先起。
 start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
-start order     8081 MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" WORKER_ID=2
+# MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应。
+start order     8081 MYSQL_DSNS="$(dsn_at "$MYSQL_ORDER_0_PORT" order_db_0),$(dsn_at "$MYSQL_ORDER_1_PORT" order_db_1)" \
+  MYSQL_REPLICA_DSNS="$(dsn_at "$MYSQL_ORDER_0_REPLICA_PORT" order_db_0),$(dsn_at "$MYSQL_ORDER_1_REPLICA_PORT" order_db_1)" WORKER_ID=2
 start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
 start gateway   8080
 

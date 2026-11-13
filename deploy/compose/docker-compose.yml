@@ -2,6 +2,19 @@
 # 版本登记在 docs/infra/versions.md。端口只绑定到 127.0.0.1。
 name: oppenheimer
 
+# order 的四个 MySQL 实例共用的部分（镜像、root 密码、healthcheck）。每个实例的 server-id 不同，
+# command 是列表无法合并，所以各自完整列出。
+x-mysql-shard: &mysql-shard
+  image: mysql:9.7.4
+  environment:
+    MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-oppenheimer}
+  healthcheck:
+    test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 20s
+
 services:
   mysql:
     image: mysql:9.7.4
@@ -26,6 +39,153 @@ services:
       timeout: 3s
       retries: 30
       start_period: 20s
+
+  # ---- order 服务的两个分片，每个分片一主一从（1c）----
+  # 分片 i 的主库承载 order_db_i，从库通过 GTID 自动定位复制主库。复制关系由
+  # scripts/mysql-replication.sh 在 make up 里建立（幂等），compose 只负责把实例起来。
+  # 现有的 mysql 继续承载 inventory_db、payment_db，以及 chaos/bench 带前缀的库。
+  #
+  # 内存调优（参数名均用 `mysqld --verbose --help` 在 mysql:9.7.4 上确认存在）：
+  # 5 个 MySQL 同时跑，默认配置每个约 400 MB 以上，笔记本放不下；本地练习的数据量很小，
+  # 所以把各类缓冲压到够用的最小值，目标空闲时每个实例 300 MB 以内。
+  #   performance_schema=OFF       最大的一块固定开销（几十到上百 MB），本地不需要看它的表
+  #   innodb_buffer_pool_size=64M  默认 128M；数据集很小，压测的热数据也放得下
+  #   innodb_log_buffer_size=8M    默认 64M；事务都很短，不需要大的 redo 缓冲
+  #   innodb_adaptive_hash_index=OFF  省掉哈希索引占用，点查负载收益有限
+  #   innodb_buffer_pool_instances=1  64M 的池没必要分多个实例
+  #   max_connections=100          压测时每个服务在每个分片上的连接池加起来不超过它；再低就有风险
+  #   table_open_cache=400、table_definition_cache=400、table_open_cache_instances=2
+  #                                默认 4000/2000/16；这里只有十几张表（order 分表数 * 库）
+  #   thread_cache_size=8、host_cache_size=0   缩小线程缓存；本地不需要主机名缓存
+  #   key_buffer_size=1M、tmp_table_size=16M、max_heap_table_size=16M  MyISAM 键缓存基本用不到，临时表有上限
+  #   mysqlx=OFF                   关掉 X Plugin（33060 端口），用不到
+  #   replica_parallel_workers=2   从库回放线程默认 4 个，压到 2 个省线程栈内存；
+  #                                本地压力下 2 个足够，也减少复制延迟的干扰因素
+  mysql-order-0:
+    <<: *mysql-shard
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=11
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_0_PORT:-3311}:3306
+    volumes:
+      - mysql-order-0-data:/var/lib/mysql
+
+  # 从库的 read_only / super_read_only 不写在 command 里：官方镜像首次启动时要在临时实例上
+  # 写 root 密码和系统表，super_read_only 会让初始化失败。改由 mysql-replication.sh 在复制建立之后
+  # 用 SET PERSIST 打开，持久化在 mysqld-auto.cnf，容器重启后依然生效。
+  mysql-order-0-replica:
+    <<: *mysql-shard
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=12
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_0_REPLICA_PORT:-3312}:3306
+    volumes:
+      - mysql-order-0-replica-data:/var/lib/mysql
+
+  mysql-order-1:
+    <<: *mysql-shard
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=21
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_1_PORT:-3321}:3306
+    volumes:
+      - mysql-order-1-data:/var/lib/mysql
+
+  # 从库的 read_only / super_read_only 不写在 command 里：官方镜像首次启动时要在临时实例上
+  # 写 root 密码和系统表，super_read_only 会让初始化失败。改由 mysql-replication.sh 在复制建立之后
+  # 用 SET PERSIST 打开，持久化在 mysqld-auto.cnf，容器重启后依然生效。
+  mysql-order-1-replica:
+    <<: *mysql-shard
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=22
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_1_REPLICA_PORT:-3322}:3306
+    volumes:
+      - mysql-order-1-replica-data:/var/lib/mysql
 
   redis:
     image: redis:8.10.3
@@ -106,5 +266,9 @@ services:
 
 volumes:
   mysql-data:
+  mysql-order-0-data:
+  mysql-order-0-replica-data:
+  mysql-order-1-data:
+  mysql-order-1-replica-data:
   redis-data:
   kafka-data:
