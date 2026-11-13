@@ -10,7 +10,7 @@ COMPOSE=(docker compose -f "$ROOT/deploy/compose/docker-compose.yml")
 
 # 每次从干净的库开始，结果不受上一次运行影响。
 sql=""
-for db in inventory_db order_db payment_db; do
+for db in inventory_db order_db_0 order_db_1 payment_db; do
   sql+="DROP DATABASE IF EXISTS e2e_${db}; CREATE DATABASE e2e_${db};"
 done
 if [ -n "${CI:-}" ]; then

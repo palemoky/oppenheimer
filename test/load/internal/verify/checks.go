@@ -404,7 +404,7 @@ func (c *checker) ledgerServer() {
 				o, ok := c.s.Orders[id]
 				switch {
 				case !ok:
-					c.fail(14, orderSubj(id), "cancel returned 200, order not in order_db")
+					c.fail(14, orderSubj(id), "cancel returned 200, order not in the order dbs")
 				case o.Status != OrderCancelled:
 					c.fail(14, orderSubj(id), "cancel returned 200, order is %s", OrderStatusName(o.Status))
 				}
@@ -416,7 +416,7 @@ func (c *checker) ledgerServer() {
 			o, ok := c.s.Orders[id]
 			switch {
 			case !ok:
-				c.fail(13, orderSubj(id), "client saw paid (%s line %d), order not in order_db", e.Op, i+1)
+				c.fail(13, orderSubj(id), "client saw paid (%s line %d), order not in the order dbs", e.Op, i+1)
 			case o.Status != OrderPaid:
 				c.fail(13, orderSubj(id), "client saw paid (%s line %d), order is %s", e.Op, i+1, OrderStatusName(o.Status))
 			}
@@ -430,13 +430,13 @@ func (c *checker) ledgerServer() {
 		if o, ok := c.s.Orders[id]; ok {
 			c.res.Counts.AcceptedInDB++
 			if o.UserID != f.userID || o.IdempotencyKey != f.key {
-				c.fail(15, orderSubj(id), "accepted for user %d key %q, order_db has user %d key %q",
+				c.fail(15, orderSubj(id), "accepted for user %d key %q, the order dbs have user %d key %q",
 					f.userID, f.key, o.UserID, o.IdempotencyKey)
 			}
 			continue
 		}
 		if c.s.Holds[id] {
-			c.fail(15, orderSubj(id), "accepted (202), not in order_db, hold still in the gate")
+			c.fail(15, orderSubj(id), "accepted (202), not in the order dbs, hold still in the gate")
 			continue
 		}
 		c.res.Counts.Reaped++
@@ -463,7 +463,7 @@ func (c *checker) ledgerServer() {
 		}
 	}
 	if n := c.res.Counts.OrdersWithoutFlow; n > 0 && len(c.led) > 0 {
-		c.note("%d orders in order_db have an idempotency key that is not in the ledger", n)
+		c.note("%d orders in the order dbs have an idempotency key that is not in the ledger", n)
 	}
 }
 

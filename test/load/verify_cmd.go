@@ -32,14 +32,15 @@ import (
 
 // sourceFlags 是 verify 和 wait-quiet 共用的数据源参数。
 type sourceFlags struct {
-	inventoryDSN, orderDSN, paymentDSN string
-	redisAddr, redisPrefix             string
-	kafkaBrokers, kafkaPrefix          string
+	inventoryDSN, orderDSNs, paymentDSN string
+	redisAddr, redisPrefix              string
+	kafkaBrokers, kafkaPrefix           string
 }
 
 func (f *sourceFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.inventoryDSN, "inventory-dsn", "root:oppenheimer@tcp(127.0.0.1:3306)/inventory_db", "inventory_db DSN")
-	fs.StringVar(&f.orderDSN, "order-dsn", "root:oppenheimer@tcp(127.0.0.1:3306)/order_db", "order_db DSN")
+	fs.StringVar(&f.orderDSNs, "order-dsns", "root:oppenheimer@tcp(127.0.0.1:3306)/order_db_0,root:oppenheimer@tcp(127.0.0.1:3306)/order_db_1",
+		"comma-separated order DB DSNs; the i-th is order_db_i")
 	fs.StringVar(&f.paymentDSN, "payment-dsn", "root:oppenheimer@tcp(127.0.0.1:3306)/payment_db", "payment_db DSN")
 	fs.StringVar(&f.redisAddr, "redis-addr", "127.0.0.1:6379", "stock gate redis address")
 	fs.StringVar(&f.redisPrefix, "redis-prefix", "", "REDIS_PREFIX of the services")
@@ -66,7 +67,6 @@ func (f *sourceFlags) open(ctx context.Context) (verify.Sources, func(), error) 
 		dst  **sql.DB
 	}{
 		{"inventory", f.inventoryDSN, &src.InventoryDB},
-		{"order", f.orderDSN, &src.OrderDB},
 		{"payment", f.paymentDSN, &src.PaymentDB},
 	} {
 		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: d.dsn, MaxOpenConns: 4})
@@ -75,6 +75,17 @@ func (f *sourceFlags) open(ctx context.Context) (verify.Sources, func(), error) 
 		}
 		closers = append(closers, func() { _ = db.Close() })
 		*d.dst = db
+	}
+	for i, dsn := range splitList(f.orderDSNs) {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: 4})
+		if err != nil {
+			return fail(fmt.Errorf("open order db %d: %w", i, err))
+		}
+		closers = append(closers, func() { _ = db.Close() })
+		src.OrderDBs = append(src.OrderDBs, db)
+	}
+	if len(src.OrderDBs) == 0 {
+		return fail(errors.New("-order-dsns is empty"))
 	}
 	rdb, err := redisx.Open(ctx, redisx.Config{Addr: f.redisAddr, ReadTimeout: 5 * time.Second})
 	if err != nil {
@@ -224,13 +235,13 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 	p := func(format string, args ...any) { fmt.Fprintf(w, format+"\n", args...) }
 	p("== verify summary ==")
 	p("ledger lines: %d", ledgerLines)
-	p("orders in order_db: %d %v", len(snap.Orders), sortedCounts(c.OrdersByStatus))
+	p("orders in the order dbs: %d %v", len(snap.Orders), sortedCounts(c.OrdersByStatus))
 	p("payments: %d", len(snap.Payments))
-	p("accepted order ids (201/202): %d, in order_db: %d", c.Accepted, c.AcceptedInDB)
-	p("[15] accepted, not in order_db, no hold (reaped): %d (of which the flow later got another order: %d)",
+	p("accepted order ids (201/202): %d, in the order dbs: %d", c.Accepted, c.AcceptedInDB)
+	p("[15] accepted, not in the order dbs, no hold (reaped): %d (of which the flow later got another order: %d)",
 		c.Reaped, c.ReapedResubmitted)
 	p("[16] unknown outcomes: %v; 5xx: %v", sortedCounts(c.Unknown), sortedCounts(c.HTTP5xx))
-	p("submit gave up without an order id (some attempt unknown/5xx): %d, found in order_db by (user_id, key): %v",
+	p("submit gave up without an order id (some attempt unknown/5xx): %d, found in the order dbs by (user_id, key): %v",
 		c.GaveUp, sortedCounts(c.GaveUpFound))
 	p("orders whose idempotency key is not in the ledger: %d", c.OrdersWithoutFlow)
 	p("gate reconciliation log: corrected %d, capped %d", c.Corrections, c.Capped)

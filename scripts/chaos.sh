@@ -70,7 +70,7 @@ export CREATE_TIMEOUT="${CREATE_TIMEOUT:-11s}"
 export GATE_RECONCILE_INTERVAL="${GATE_RECONCILE_INTERVAL:-2s}"
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 
-SRC_FLAGS="-inventory-dsn $(dsn inventory_db) -order-dsn $(dsn order_db) -payment-dsn $(dsn payment_db)
+SRC_FLAGS="-inventory-dsn $(dsn inventory_db) -order-dsns $(dsn order_db_0),$(dsn order_db_1) -payment-dsn $(dsn payment_db)
   -redis-addr $REDIS_ADDR -redis-prefix $REDIS_PREFIX -kafka-brokers $KAFKA_BROKERS -kafka-prefix $KAFKA_PREFIX"
 
 # ---------- 进程管理 ----------
@@ -99,7 +99,7 @@ start_svc() {
   local s="$1" pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >>"$RUN_DIR/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSN="$(dsn order_db)" WORKER_ID=2 "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" WORKER_ID=2 "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
     payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
     gateway) "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
   esac
@@ -165,7 +165,7 @@ log "building load tool"
 
 log "run dir $RUN_DIR, kafka prefix $KAFKA_PREFIX, redis prefix $REDIS_PREFIX"
 sql=""
-for db in inventory_db order_db payment_db; do
+for db in inventory_db order_db_0 order_db_1 payment_db; do
   sql="$sql DROP DATABASE IF EXISTS chaos_${db}; CREATE DATABASE chaos_${db};"
 done
 mysql_exec -e "$sql"

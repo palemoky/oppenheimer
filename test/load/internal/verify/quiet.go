@@ -2,7 +2,6 @@ package verify
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -13,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 
 	"github.com/palemoky/Oppenheimer/api/eventx"
+	"github.com/palemoky/Oppenheimer/pkg/sharding"
 )
 
 // QuietState 是 7.3.2 第 3 步的各项静止条件的当前值。全部为零才算静止。
@@ -64,16 +64,31 @@ func (q QuietState) Problems() []string {
 func Probe(ctx context.Context, src Sources) (QuietState, error) {
 	q := QuietState{OutboxPending: map[string]int64{}, Lag: map[string]int64{}, LagErr: map[string]string{}}
 	var err error
-	for svc, db := range map[string]*sql.DB{"order": src.OrderDB, "payment": src.PaymentDB} {
-		if q.OutboxPending[svc], err = countPendingOutbox(ctx, db); err != nil {
-			return q, fmt.Errorf("%s: %w", svc, err)
-		}
+	if q.OutboxPending["payment"], err = countPendingOutbox(ctx, src.PaymentDB); err != nil {
+		return q, fmt.Errorf("payment: %w", err)
 	}
-	if err := src.OrderDB.QueryRowContext(ctx,
-		"SELECT COALESCE(SUM(status = ?), 0), COALESCE(SUM(status = ?), 0) FROM orders WHERE status IN (?, ?)",
-		OrderCreating, OrderPendingPayment, OrderCreating, OrderPendingPayment,
-	).Scan(&q.CreatingOrders, &q.PendingPaymentOrders); err != nil {
-		return q, fmt.Errorf("count unfinished orders: %w", err)
+	shards, err := orderShards(src)
+	if err != nil {
+		return q, err
+	}
+	for db, slots := range shards {
+		conn := src.OrderDBs[db]
+		n, err := countPendingOutbox(ctx, conn)
+		if err != nil {
+			return q, fmt.Errorf("order_db_%d: %w", db, err)
+		}
+		q.OutboxPending["order"] += n
+		for _, slot := range slots {
+			var creating, pendingPay int64
+			if err := conn.QueryRowContext(ctx,
+				"SELECT COALESCE(SUM(status = ?), 0), COALESCE(SUM(status = ?), 0) FROM "+sharding.Table("orders", slot)+" WHERE status IN (?, ?)",
+				OrderCreating, OrderPendingPayment, OrderCreating, OrderPendingPayment,
+			).Scan(&creating, &pendingPay); err != nil {
+				return q, fmt.Errorf("count unfinished orders in order_db_%d slot %d: %w", db, slot, err)
+			}
+			q.CreatingOrders += creating
+			q.PendingPaymentOrders += pendingPay
+		}
 	}
 	if err := src.PaymentDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM payments WHERE status = ?", PaymentPending).
 		Scan(&q.PendingPayments); err != nil {

@@ -20,14 +20,16 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/palemoky/Oppenheimer/api/eventx"
+	"github.com/palemoky/Oppenheimer/pkg/sharding"
 	"github.com/palemoky/Oppenheimer/pkg/stockgate"
 )
 
 // Sources 是对账要读的外部数据源。
 type Sources struct {
 	InventoryDB *sql.DB
-	OrderDB     *sql.DB
-	PaymentDB   *sql.DB
+	// OrderDBs 按库序号排列，第 i 个是 order_db_i。订单按 slot 分表，slot 在库间的分布见 pkg/sharding。
+	OrderDBs  []*sql.DB
+	PaymentDB *sql.DB
 
 	// Redis 是闸门所在的实例，RedisPrefix 是服务的 REDIS_PREFIX。
 	Redis       *redis.Client
@@ -41,6 +43,22 @@ type Sources struct {
 
 	// InventoryLog 是库存服务的日志文件，为空时不检查。
 	InventoryLog string
+}
+
+// OrderSlots 是订单分表的 slot 数，与 order 服务的配置一致。
+const OrderSlots = 8
+
+// orderShards 列出每个订单库上的每张分片表所在的库和 slot。对账工具允许全分片扫描。
+func orderShards(src Sources) (map[int][]int, error) {
+	r, err := sharding.New(sharding.Config{Slots: OrderSlots, DBs: len(src.OrderDBs)})
+	if err != nil {
+		return nil, fmt.Errorf("build order shard router: %w", err)
+	}
+	out := make(map[int][]int, len(src.OrderDBs))
+	for db := range src.OrderDBs {
+		out[db] = r.SlotsOf(db)
+	}
+	return out, nil
 }
 
 // ConsumedTopics 是被消费的 topic 的基础名，每个有一个死信 topic。
@@ -126,41 +144,51 @@ func collectInventory(ctx context.Context, src Sources, s *Snapshot) error {
 }
 
 func collectOrders(ctx context.Context, src Sources, s *Snapshot) error {
-	db := src.OrderDB
-	s.Orders = map[int64]Order{}
-	s.OrdersByIdem = map[IdemRef]int64{}
-	if err := queryEach(ctx, db, `SELECT order_id, user_id, status, total_amount, currency,
-		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM orders`, func(r *sql.Rows) error {
-		o := Order{Items: map[int64]int64{}}
-		if err := r.Scan(&o.OrderID, &o.UserID, &o.Status, &o.TotalAmount, &o.Currency,
-			&o.IdempotencyKey, &o.PaymentID, &o.FailReason); err != nil {
-			return err
-		}
-		s.Orders[o.OrderID] = o
-		s.OrdersByIdem[IdemRef{UserID: o.UserID, Key: o.IdempotencyKey}] = o.OrderID
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	if err := queryEach(ctx, db, "SELECT order_id, sku_id, quantity FROM order_items", func(r *sql.Rows) error {
-		var orderID, sku, qty int64
-		if err := r.Scan(&orderID, &sku, &qty); err != nil {
-			return err
-		}
-		if o, ok := s.Orders[orderID]; ok {
-			o.Items[sku] += qty
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	n, err := countPendingOutbox(ctx, db)
+	shards, err := orderShards(src)
 	if err != nil {
 		return err
 	}
-	s.OutboxPending["order"] = n
+	s.Orders = map[int64]Order{}
+	s.OrdersByIdem = map[IdemRef]int64{}
+	var pending int64
+	for db, slots := range shards {
+		conn := src.OrderDBs[db]
+		for _, slot := range slots {
+			orders, items := sharding.Table("orders", slot), sharding.Table("order_items", slot)
+			if err := queryEach(ctx, conn, `SELECT order_id, user_id, status, total_amount, currency,
+		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM `+orders, func(r *sql.Rows) error {
+				o := Order{Items: map[int64]int64{}}
+				if err := r.Scan(&o.OrderID, &o.UserID, &o.Status, &o.TotalAmount, &o.Currency,
+					&o.IdempotencyKey, &o.PaymentID, &o.FailReason); err != nil {
+					return err
+				}
+				s.Orders[o.OrderID] = o
+				s.OrdersByIdem[IdemRef{UserID: o.UserID, Key: o.IdempotencyKey}] = o.OrderID
+				return nil
+			}); err != nil {
+				return err
+			}
+			// 订单和明细同槽同库，明细只会落在订单所在的那张分片表。
+			if err := queryEach(ctx, conn, "SELECT order_id, sku_id, quantity FROM "+items, func(r *sql.Rows) error {
+				var orderID, sku, qty int64
+				if err := r.Scan(&orderID, &sku, &qty); err != nil {
+					return err
+				}
+				if o, ok := s.Orders[orderID]; ok {
+					o.Items[sku] += qty
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		n, err := countPendingOutbox(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("order_db_%d: %w", db, err)
+		}
+		pending += n
+	}
+	s.OutboxPending["order"] = pending
 	return nil
 }
 

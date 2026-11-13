@@ -123,8 +123,8 @@ seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次�
 up: ## 启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪
 	$(COMPOSE) up -d --wait
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
-		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS order_db; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null
-	@echo "databases ready: inventory_db order_db payment_db"
+		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS order_db_0; CREATE DATABASE IF NOT EXISTS order_db_1; CREATE DATABASE IF NOT EXISTS payment_db;" 2>/dev/null
+	@echo "databases ready: inventory_db order_db_0 order_db_1 payment_db"
 
 .PHONY: down
 down: ## 停止本地依赖，保留数据

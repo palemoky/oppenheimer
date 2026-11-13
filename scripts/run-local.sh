@@ -5,7 +5,7 @@
 #   scripts/run-local.sh            前台运行，Ctrl-C 停止全部
 #   scripts/run-local.sh -- <命令>   启动服务，执行命令，然后停止全部；退出码取自该命令
 #
-# 可用环境变量覆盖：DB_PREFIX（库名前缀，默认空，即 order_db 等）、MYSQL_ROOT_PASSWORD、MYSQL_PORT、
+# 可用环境变量覆盖：DB_PREFIX（库名前缀，默认空，即 order_db_0 等）、MYSQL_ROOT_PASSWORD、MYSQL_PORT、
 # 以及各服务自己的配置（PAYMENT_TIMEOUT、SWEEP_INTERVAL 等）。
 set -euo pipefail
 
@@ -61,7 +61,7 @@ start() {
 
 # 启动顺序按依赖方向：被依赖的先起。
 start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
-start order     8081 MYSQL_DSN="$(dsn order_db)"     WORKER_ID=2
+start order     8081 MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" WORKER_ID=2
 start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
 start gateway   8080
 
