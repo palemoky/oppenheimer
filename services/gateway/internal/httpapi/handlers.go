@@ -9,10 +9,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (

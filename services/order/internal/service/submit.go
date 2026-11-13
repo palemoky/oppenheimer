@@ -11,15 +11,15 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // releaseTimeout 是受理失败后归还占用的时限。这一步在请求的 ctx 可能已经到期之后执行，

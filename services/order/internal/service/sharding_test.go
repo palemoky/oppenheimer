@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // 一批连续的用户号下单、落库后，8 张订单表的行数相同，且每个订单都在它的用户所在的 slot。

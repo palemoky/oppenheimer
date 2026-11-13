@@ -6,8 +6,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 )
 
 func cancelReq(orderID, userID int64) *orderv1.CancelOrderRequest {

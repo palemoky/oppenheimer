@@ -11,7 +11,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 )
 
 // topic 的基础名。实际使用时要经过 Topic 加上环境前缀。

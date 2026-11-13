@@ -5,7 +5,7 @@
 // 外部系统就测试，连库的部分只负责“读对”。
 package verify
 
-import "github.com/palemoky/Oppenheimer/test/load/internal/ledger"
+import "github.com/palemoky/oppenheimer/test/load/internal/ledger"
 
 // 订单状态，与 proto OrderStatus 的数值一致（order 的 00001_init.sql）。
 const (

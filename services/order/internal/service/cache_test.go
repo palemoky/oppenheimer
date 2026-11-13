@@ -11,10 +11,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // cachedService 返回一个与 e.svc 共用依赖、但 GetOrder 走查询缓存的 Service。

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
 // fakeGateway 在内存里模拟网关的下单、查询、支付、取消接口。

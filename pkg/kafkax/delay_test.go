@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 func startDelayConsumer(t *testing.T, cfg kafkax.ConsumerConfig, clock kafkax.Clock, h kafkax.Handler) *runner {

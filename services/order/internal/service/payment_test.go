@@ -10,12 +10,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 func wantReply(t *testing.T, got *eventv1.PaymentResultHandled, err error, d eventv1.PaymentDisposition, reason string) {

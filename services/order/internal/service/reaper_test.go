@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 )
 
 // 未认领的旧占用被归还（并删除幂等键），宽限期内的和已认领的不动。

@@ -13,13 +13,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 func (e *env) setLimit(t *testing.T, skuID, limit int64) {

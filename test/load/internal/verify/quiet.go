@@ -11,8 +11,8 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kadm"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	"github.com/palemoky/Oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
 )
 
 // QuietState 是 7.3.2 第 3 步的各项静止条件的当前值。全部为零才算静止。

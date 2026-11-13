@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/worker"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/worker"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // SweeperConfig 是后台任务的配置，零值字段使用默认值。

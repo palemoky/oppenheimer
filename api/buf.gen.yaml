@@ -4,7 +4,7 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/palemoky/Oppenheimer/api/gen
+      value: github.com/palemoky/oppenheimer/api/gen
 plugins:
   - local: protoc-gen-go
     out: gen

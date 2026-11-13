@@ -16,7 +16,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 )
 
 // DSNEnv 是指定测试用 MySQL 的环境变量。DSN 里的库名会被忽略。

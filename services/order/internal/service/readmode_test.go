@@ -10,10 +10,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // 读己之写的测试不搭真正的复制，“从库”用两种极端代替（见 replicaKind）：

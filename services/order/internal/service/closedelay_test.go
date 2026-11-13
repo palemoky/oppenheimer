@@ -9,11 +9,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 // closeDue 把受理时为 orderID 发出的延迟关单消息交给 handler 处理一次。

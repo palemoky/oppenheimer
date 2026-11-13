@@ -1,11 +1,11 @@
-module github.com/palemoky/Oppenheimer/services/order
+module github.com/palemoky/oppenheimer/services/order
 
 go 1.27
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
-	github.com/palemoky/Oppenheimer/api v0.0.0
-	github.com/palemoky/Oppenheimer/pkg v0.0.0
+	github.com/palemoky/oppenheimer/api v0.0.0
+	github.com/palemoky/oppenheimer/pkg v0.0.0
 	github.com/redis/go-redis/v9 v9.23.0
 	golang.org/x/sync v0.25.0
 	google.golang.org/grpc v1.85.0
@@ -31,6 +31,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261110000943-09e21b237f2c // indirect
 )
 
-replace github.com/palemoky/Oppenheimer/pkg => ../../pkg
+replace github.com/palemoky/oppenheimer/pkg => ../../pkg
 
-replace github.com/palemoky/Oppenheimer/api => ../../api
+replace github.com/palemoky/oppenheimer/api => ../../api

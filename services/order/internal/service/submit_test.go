@@ -12,14 +12,14 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/redisx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/redisx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 func TestSubmitValidation(t *testing.T) {

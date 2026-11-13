@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 )
 
 // Clock 是手动推进的时钟，并发安全。

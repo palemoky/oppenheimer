@@ -1,4 +1,4 @@
-module github.com/palemoky/Oppenheimer/api
+module github.com/palemoky/oppenheimer/api
 
 go 1.27
 

@@ -12,8 +12,8 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
 )
 
 //go:embed testdata/migrations/*.sql

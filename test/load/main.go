@@ -24,8 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
-	"github.com/palemoky/Oppenheimer/test/load/internal/runner"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/runner"
 )
 
 func main() {

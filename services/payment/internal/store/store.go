@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"time"
 
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 )
 
 var (

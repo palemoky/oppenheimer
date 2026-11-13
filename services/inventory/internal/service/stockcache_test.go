@@ -7,12 +7,12 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/cache"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
-	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
 
 // cacheEnv 在 env 之外多一个带缓存的 Service。env.svc 仍不缓存，供 seed 的恒等式检查读库。

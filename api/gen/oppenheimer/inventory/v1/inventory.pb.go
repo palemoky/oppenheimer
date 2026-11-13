@@ -7,7 +7,7 @@
 package inventoryv1
 
 import (
-	v1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
+	v1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -645,7 +645,7 @@ const file_oppenheimer_inventory_v1_inventory_proto_rawDesc = "" +
 	"\aRelease\x12(.oppenheimer.inventory.v1.ReleaseRequest\x1a).oppenheimer.inventory.v1.ReleaseResponse\x12a\n" +
 	"\bGetStock\x12).oppenheimer.inventory.v1.GetStockRequest\x1a*.oppenheimer.inventory.v1.GetStockResponse\x12[\n" +
 	"\x06WarmUp\x12'.oppenheimer.inventory.v1.WarmUpRequest\x1a(.oppenheimer.inventory.v1.WarmUpResponseB\xfe\x01\n" +
-	"\x1ccom.oppenheimer.inventory.v1B\x0eInventoryProtoP\x01ZLgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1;inventoryv1\xa2\x02\x03OIX\xaa\x02\x18Oppenheimer.Inventory.V1\xca\x02\x18Oppenheimer\\Inventory\\V1\xe2\x02$Oppenheimer\\Inventory\\V1\\GPBMetadata\xea\x02\x1aOppenheimer::Inventory::V1b\x06proto3"
+	"\x1ccom.oppenheimer.inventory.v1B\x0eInventoryProtoP\x01ZLgithub.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1;inventoryv1\xa2\x02\x03OIX\xaa\x02\x18Oppenheimer.Inventory.V1\xca\x02\x18Oppenheimer\\Inventory\\V1\xe2\x02$Oppenheimer\\Inventory\\V1\\GPBMetadata\xea\x02\x1aOppenheimer::Inventory::V1b\x06proto3"
 
 var (
 	file_oppenheimer_inventory_v1_inventory_proto_rawDescOnce sync.Once

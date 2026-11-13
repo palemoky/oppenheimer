@@ -4,7 +4,7 @@ import (
 	"encoding/json/v2"
 	"testing"
 
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 func TestIDMarshalsAsString(t *testing.T) {

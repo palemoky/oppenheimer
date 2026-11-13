@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/sharding"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/order"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/order"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 type fixture struct {

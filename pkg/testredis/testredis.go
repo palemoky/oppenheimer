@@ -11,7 +11,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/pkg/redisx"
+	"github.com/palemoky/oppenheimer/pkg/redisx"
 )
 
 // AddrEnv 是指定测试用 Redis 地址的环境变量，例如 127.0.0.1:6379。

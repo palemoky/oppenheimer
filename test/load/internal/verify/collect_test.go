@@ -18,14 +18,14 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/sharding"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/pkg/testkafka"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/testkafka"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 // newDB 用仓库里服务的迁移文件建库，不依赖服务模块。

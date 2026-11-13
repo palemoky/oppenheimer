@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/outbox"
-	"github.com/palemoky/Oppenheimer/pkg/sharding"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/outbox"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
 )
 
 // 迁移文件里的 outbox 建表语句必须与 outbox.Schema 一致：SQL 文件引用不了 Go 常量，

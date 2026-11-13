@@ -17,12 +17,12 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi"
 )
 
 // 超过 2^53 的 ID，用来验证字符串往返不丢精度。

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 func values(prefix string, n int) []kafkax.Record {

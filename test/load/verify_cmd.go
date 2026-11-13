@@ -21,13 +21,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/redisx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
-	"github.com/palemoky/Oppenheimer/test/load/internal/verify"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/redisx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/verify"
 )
 
 // sourceFlags 是 verify 和 wait-quiet 共用的数据源参数。

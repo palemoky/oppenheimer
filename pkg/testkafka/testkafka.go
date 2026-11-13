@@ -17,7 +17,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 // BrokersEnv 是指定测试用 Kafka 的环境变量，逗号分隔。

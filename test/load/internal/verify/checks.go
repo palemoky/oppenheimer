@@ -8,7 +8,7 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
 // CheckLogCorrections 是“库存服务日志里没有出现过修正”这条检查的编号（设计里没有编号，排在 18 之后）。

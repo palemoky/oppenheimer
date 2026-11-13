@@ -9,10 +9,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
 )
 
 // errTimeout 模拟调用超时：调用方无法知道下游是否执行了。

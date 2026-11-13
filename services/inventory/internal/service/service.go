@@ -13,14 +13,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/cache"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/retry"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/retry"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
 
 // 事务遇到死锁时的重试参数。

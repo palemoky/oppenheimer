@@ -19,9 +19,9 @@ import (
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	"github.com/palemoky/Oppenheimer/pkg/sharding"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
 )
 
 // Sources 是对账要读的外部数据源。

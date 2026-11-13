@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"slices"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 )
 
 // maxWarmUpSKUs 是一次 WarmUp 最多装载的 SKU 数。订单服务只为一个订单里未装载的 SKU 调用，

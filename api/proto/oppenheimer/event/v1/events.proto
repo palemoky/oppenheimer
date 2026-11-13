@@ -5,7 +5,7 @@ package oppenheimer.event.v1;
 import "google/protobuf/timestamp.proto";
 import "oppenheimer/common/v1/money.proto";
 
-option go_package = "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1;eventv1";
+option go_package = "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1;eventv1";
 
 // 本文件定义服务之间通过 Kafka 传递的事件。
 //

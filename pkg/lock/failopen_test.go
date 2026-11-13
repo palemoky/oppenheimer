@@ -11,7 +11,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 // stubGuard 按预设返回结果。

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
-	"github.com/palemoky/Oppenheimer/services/order/internal/readmark"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/services/order/internal/readmark"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 const orderID = 4242

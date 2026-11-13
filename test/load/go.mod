@@ -1,10 +1,10 @@
-module github.com/palemoky/Oppenheimer/test/load
+module github.com/palemoky/oppenheimer/test/load
 
 go 1.27
 
 require (
-	github.com/palemoky/Oppenheimer/api v0.0.0
-	github.com/palemoky/Oppenheimer/pkg v0.0.0
+	github.com/palemoky/oppenheimer/api v0.0.0
+	github.com/palemoky/oppenheimer/pkg v0.0.0
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/twmb/franz-go v1.22.3
 	github.com/twmb/franz-go/pkg/kadm v1.20.0
@@ -32,6 +32,6 @@ require (
 )
 
 replace (
-	github.com/palemoky/Oppenheimer/api => ../../api
-	github.com/palemoky/Oppenheimer/pkg => ../../pkg
+	github.com/palemoky/oppenheimer/api => ../../api
+	github.com/palemoky/oppenheimer/pkg => ../../pkg
 )

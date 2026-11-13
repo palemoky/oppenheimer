@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
 )
 
 // MaxSlots 是 slot 数的上限，等于分片基因能表示的取值个数。

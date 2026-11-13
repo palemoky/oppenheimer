@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
 )
 
 func TestNewRejectsInvalidConfig(t *testing.T) {

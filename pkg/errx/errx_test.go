@@ -8,7 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/palemoky/Oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 )
 
 func TestNewCarriesCodeReasonAndMessage(t *testing.T) {

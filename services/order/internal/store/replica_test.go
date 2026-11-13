@@ -10,10 +10,10 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/order"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/order"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // 测试不搭真正的复制：“空从库”是另一组只跑了迁移的库（延迟无限大），

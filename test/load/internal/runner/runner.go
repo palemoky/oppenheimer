@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
 // action 是订单落库后虚拟用户要做的事，在提交之前就抽好，保证同一个种子的动作序列不受结果影响。

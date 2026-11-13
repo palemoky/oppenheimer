@@ -62,6 +62,6 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/palemoky/Oppenheimer
+        - github.com/palemoky/oppenheimer
   exclusions:
     generated: lax

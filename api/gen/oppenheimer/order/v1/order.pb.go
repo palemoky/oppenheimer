@@ -7,7 +7,7 @@
 package orderv1
 
 import (
-	v1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
+	v1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -656,7 +656,7 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\bGetOrder\x12%.oppenheimer.order.v1.GetOrderRequest\x1a&.oppenheimer.order.v1.GetOrderResponse\x12b\n" +
 	"\vCancelOrder\x12(.oppenheimer.order.v1.CancelOrderRequest\x1a).oppenheimer.order.v1.CancelOrderResponseB\xde\x01\n" +
 	"\x18com.oppenheimer.order.v1B\n" +
-	"OrderProtoP\x01ZDgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1;orderv1\xa2\x02\x03OOX\xaa\x02\x14Oppenheimer.Order.V1\xca\x02\x14Oppenheimer\\Order\\V1\xe2\x02 Oppenheimer\\Order\\V1\\GPBMetadata\xea\x02\x16Oppenheimer::Order::V1b\x06proto3"
+	"OrderProtoP\x01ZDgithub.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1;orderv1\xa2\x02\x03OOX\xaa\x02\x14Oppenheimer.Order.V1\xca\x02\x14Oppenheimer\\Order\\V1\xe2\x02 Oppenheimer\\Order\\V1\\GPBMetadata\xea\x02\x16Oppenheimer::Order::V1b\x06proto3"
 
 var (
 	file_oppenheimer_order_v1_order_proto_rawDescOnce sync.Once

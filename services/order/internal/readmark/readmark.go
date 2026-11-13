@@ -18,7 +18,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // Mark 是一个订单当前的标记。

@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
-	"github.com/palemoky/Oppenheimer/services/inventory"
-	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/services/inventory"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
 
 const interval = 5 * time.Second

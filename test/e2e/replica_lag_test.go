@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 )
 
 const (

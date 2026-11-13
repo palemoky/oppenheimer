@@ -11,15 +11,15 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/payment"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/consumer"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/store"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/testkit"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/payment"
+	"github.com/palemoky/oppenheimer/services/payment/internal/consumer"
+	"github.com/palemoky/oppenheimer/services/payment/internal/store"
+	"github.com/palemoky/oppenheimer/services/payment/internal/testkit"
 )
 
 const (

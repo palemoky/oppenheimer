@@ -19,9 +19,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/worker"
-	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/worker"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
 
 // 默认值，对应配置 GATE_RECONCILE_INTERVAL 和 GATE_RECONCILE_ROUNDS。

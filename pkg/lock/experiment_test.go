@@ -20,7 +20,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 // stalledHolder 走完剧本的 1 到 3 步：返回卡顿后醒来的 A 和新持有者 B。

@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 )
 
 // Status 是 reservation.status 的取值。

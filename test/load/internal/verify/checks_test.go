@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
 )
 
 // world 构造一个自洽的系统终态：SKU 1001 初始 10 件，订单 1 付清 2 件、订单 2 取消、

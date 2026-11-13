@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/worker"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/worker"
 )
 
 // ReaperConfig 是回收任务的配置，零值字段使用默认值。
