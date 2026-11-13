@@ -138,7 +138,11 @@ func loadConfig() (config, error) {
 		redisAddr:     cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
 		redisPrefix:   os.Getenv("REDIS_PREFIX"),
 	}
-	// 不读旧的 MYSQL_DSN：它指向的是分片前的 order_db，不能当作任何一个分片库。
+	// 旧的 MYSQL_DSN 指向分片前的 order_db，不能当作任何一个分片库。还设着它说明部署配置没跟上，
+	// 静默忽略会让服务连上默认的本机库，所以直接拒绝启动。
+	if os.Getenv("MYSQL_DSN") != "" {
+		return cfg, errors.New("MYSQL_DSN is no longer supported by order; set MYSQL_DSNS (order_db_0,order_db_1) instead")
+	}
 	for d := range strings.SplitSeq(cmp.Or(os.Getenv("MYSQL_DSNS"), defaultMySQLDSNs), ",") {
 		cfg.mysqlDSNs = append(cfg.mysqlDSNs, strings.TrimSpace(d))
 	}

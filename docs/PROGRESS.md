@@ -4,34 +4,33 @@
 
 ## 当前状态
 
-- **当前阶段**：1b（高并发改造）已完成。下一个子阶段是 1c（分库分表与主从）
-- **当前分支**：`phase-1b`，合并 PR #5 之后切回 `main`
-- **最后更新**：2026-11-12
+- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，待 Fable 评审
+- **当前分支**：`phase-1c`（本地提交，未推送）
+- **最后更新**：2026-11-13
 
 ## 上次做到哪
 
-1b 分四步（见 [plan/phase-1-order-system.md](plan/phase-1-order-system.md) 和 [design/1b-high-concurrency.md](design/1b-high-concurrency.md)），步骤一到三的经过见会话日志。
+1c 分五步（设计文档 [design/1c-sharding.md](design/1c-sharding.md) 第 1 节）：分片、主从、CDC 索引表、跨分片查询与扩容、冷热归档。
 
-**步骤四（加固）已完成**，阶段计划里四个 checkbox 都已勾：
+**步骤一（分片）已完成**，阶段计划里前两个 checkbox 已勾：
 
-- 分布式锁：order 三把、payment 两把，都包了 `lock.FailOpen`；inventory 的对账保持 fail-closed（设计文档 7.1）。
-- 查询缓存：`pkg/cache`，库存短 TTL，订单只缓存终态，独立的 `redis-cache` 实例（7.2，ADR-0010）。
-- 杀进程对账：`make chaos`（`scripts/chaos.sh` 加 `test/load` 的 `verify`、`wait-quiet`、`warmup`），19 项检查全过、死信为零。测试发现并修了两个可用性问题：消费者会话超时 45 秒改为 10 秒；下单消费者重试 5 次改为 10 次（7.3.4）。
-- 吞吐对比：`make bench`（`scripts/bench.sh`），数字在笔记 `docs/notes/1b-high-concurrency.md` 第 6 节。**验收项“数量级提升”没有达到**（1.7 到 3.7 倍）。主人决定：吞吐结论挂到阶段 2 在集群上重测，落库性能问题挂到 1d，只在 1b 修“积压超过宽限期会丢已受理订单”。
-- 这个修复已完成（受理端背压，设计文档 6.4.1、ADR-0011）：闸门按队列长度（`ADMIT_MAX_QUEUE`，默认 1 万）和排队时长（`ADMIT_MAX_WAIT` 默认宽限期一半，`ADMIT_MAX_STALE` 默认 100）拒绝受理，返回 429 `BACKLOGGED`。
-  - 第一版只按排队时长，压测仍丢 2.3 万单，因为最老订单的等待衡量的是过去；加上长度上限后同样的负载零回收，积压 25 秒排空。
-  - 拒绝原本是 `UNAVAILABLE`，每条都被 grpcx 记成 ERROR，改为 `RESOURCE_EXHAUSTED` 加 HTTP 429。
-  - 验证：`make lint test` 通过；`make chaos` 2 次 PASS；压测复跑零回收、无 ERROR 日志。
-  - 这次修改涉及库存闸门和下单路径，按 AGENTS.md 应由 Fable 编写或评审。当时 Fable 没有额度，主人决定由 Opus 自行评审完成（见计划变更）。**下次 Fable 可用时，请它评审 `pkg/stockgate` 的 `holdScript` 和 `services/order/internal/service/submit.go` 的改动。**
-- 1b 面试笔记已写（`docs/notes/1b-high-concurrency.md`），步骤四新增的考点在阶段计划「面试考点」末尾，还没并进笔记。
+- 布局（ADR-0012）：8 个 slot，`slot = user_id & 7`，`db = slot % 2`，表名带全局 slot 号（`orders_3`），每库一张 `outbox`。只拆 order。
+- `pkg/sharding`（主会话写）：纯计算的路由。
+- order 服务（Opus 子 Agent）：`mysqlx.MigrateTemplate` 按 slot 渲染迁移，迁移历史压缩成一个文件；store 的事务绑定 slot，跨 slot 返回 `ErrWrongShard`；每库一个中继（`order-0`、`order-1`）；sweeper 逐 slot 扫；落库消息基因不一致当毒消息。`MYSQL_DSNS` 取代 `MYSQL_DSN`（设了旧变量拒绝启动）。
+- 脚本、Makefile、`test/load` 的 verify 和 wait-quiet（Sonnet 子 Agent）：建两个库，按 slot 汇总。
+- 验证：`make lint test e2e` 通过，`make chaos` 两次 PASS。
+- 实现中发现的问题记在设计文档 2.6（CHECK 约束名库级唯一、`payment_results` 主键只在 slot 内唯一、chaos 回收数偏高待复核）。
+
+**本会话由 Opus 主持，Fable 不可用。** 涉及订单状态的代码按 AGENTS.md 要 Fable 评审，主人决定 Fable 可用后一并评审。
 
 ## 下一步
 
-1. 1b 已收尾：e2e 偶发失败已修（Redis 连接池固定大小并预热、预热调用按 SKU 合并，设计文档 7.3.4 末尾），`make e2e` 连跑 25 次全过。PR #5 已推送并合并到 `main`（以合并后的实际状态为准，见会话日志）。
-2. 步骤四新增的考点已并进 `docs/notes/1b-high-concurrency.md`（新增 1.6、2.7、2.8，补了 5.2、5.3、第 6 节和缺口汇总）。其中 5.2 里“延迟双删、消费事件删除、订阅 binlog 删除各自盖住哪个窗口”是通用知识，不是本项目实测。
-3. 设计文档 5.6 的缺口列表里“中继单实例运行，步骤四处理”那一条标注已解决。
-4. Fable 可用时，补评审背压修复（`pkg/stockgate` 的 `holdScript`、`services/order/internal/service/submit.go`）。
-5. 开始 1c：从 `main` 新开分支 `phase-1c`，先细化设计文档再动手。
+1. **Fable 评审**（可用时一次做完）：
+   - 1c 步骤一：`services/order/internal/store/store.go`（slot 绑定、`InsertOrder` 基因校验）、`internal/service` 的 `inTx`/中继踢动/sweeper/`orderFromSubmitted`、`cmd/order/main.go` 的多中继与锁释放顺序、`pkg/sharding`。
+   - 1b 遗留：`pkg/stockgate` 的 `holdScript`、`services/order/internal/service/submit.go` 的背压改动。
+   - 复核 chaos 回收数偏高是否与分片有关（设计文档 2.6 最后一条）。
+2. 评审通过后推送 `phase-1c`、开 draft PR。
+3. 步骤二（主从）：先细化设计文档第 3 节，compose 每分片一主一从。
 
 步骤三遗留、仍未处理的两点（记在这里不丢）：
 
@@ -43,7 +42,7 @@
 ## 本机开发环境
 
 - `make tools` 安装 buf、proto 插件和 `oapi-codegen` 到 `./bin`（已装）。
-- `make up` 启动依赖并建好三个库，`make down` 停止并保留数据。当前依赖处于**运行**状态。
+- `make up` 启动依赖并建好四个库（inventory_db、order_db_0、order_db_1、payment_db），`make down` 停止并保留数据。当前依赖处于**运行**状态。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
 - `make run` 启动四个服务，`make seed` 写入示例 SKU，`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
 
@@ -82,6 +81,8 @@
 | 2026-11-12 | 1b 验收项“吞吐相对 1a 有数量级提升”移到阶段 2，在集群上重测；落库性能问题和压测工具开环模式移到 1d | 本机实测只有 1.7 到 3.7 倍，测量疑似受 OrbStack 端口转发干扰；主人决定 1b 只修积压与回收的冲突 |
 | 2026-11-12 | 1b 增加受理端背压（ADR-0011） | 压测发现积压超过回收宽限期会丢掉已受理的订单 |
 | 2026-11-12 | 背压修复由 Opus 编写和自评审，没有经过 Fable | Fable 没有额度，主人决定先由 Opus 完成；Fable 可用时补一次评审 |
+| 2026-11-13 | 1c 拆成五步，步骤一只拆 order；payment、inventory 不分库 | 见设计文档 1c 第 1 节、ADR-0012 |
+| 2026-11-13 | 1c 步骤一由 Opus 主持并派子 Agent 实现，订单状态相关代码待 Fable 评审 | Fable 不可用，主人决定可用后一并评审 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -113,3 +114,7 @@
 同日完成步骤四。主会话（Fable）写了 `lock.FailOpen`、`pkg/cache` 和 `redis-cache`；order、inventory、payment 的接入、压测工具、杀进程脚本、面试笔记、吞吐对比派给 Opus 和 Sonnet 子 Agent，主会话评审后合入。主人中途要求尽量把具体任务派给便宜的模型。杀进程测试发现消费者会话超时和下单重试两个问题，已修。吞吐没有达到数量级提升，主人决定挂到阶段 2。主人随后把会话切到 Opus，由 Opus 完成受理端背压（第一版只看排队时长，压测证明不够，改为按队列长度）。
 
 同日按主人要求修了 e2e 的偶发失败（冷连接池遇上突发流量，新连接丢包要等 1 秒的初始重传超时），推送 `phase-1b` 并合并 PR #5。
+
+### 2026-11-13
+
+开始 1c。Opus 主持：写了设计文档 1c 和 ADR-0012、`pkg/sharding`；order 服务派给 Opus 子 Agent，脚本和对账工具派给 Sonnet 子 Agent，两者并行。合入后 `make lint test e2e` 通过，`make chaos` 两次 PASS。根据子 Agent 的报告补了设计文档 2.6，旧 `MYSQL_DSN` 改为拒绝启动。待 Fable 评审。
