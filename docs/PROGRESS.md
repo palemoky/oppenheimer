@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，Fable 已评审，评审发现的问题已修复，未提交
-- **当前分支**：`phase-1c`（本地提交，未推送）
+- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，Fable 已评审，评审发现的问题已修复并推送
+- **当前分支**：`phase-1c`（已推送，draft PR 已开）
 - **最后更新**：2026-11-13
 
 ## 上次做到哪
@@ -35,7 +35,7 @@
 
 ## 下一步
 
-1. **提交并推送**（主人还没要求提交）。工作区里有未提交的改动：评审发现的问题的修复（见下）和对应的文档。提交后推送 `phase-1c`、开 draft PR。注意 `main` 上多了一个 dependabot 的合并（gateway 的 quic-go 升级，`09b431f`），`phase-1c` 还没有，开 PR 前先合进来。
+1. 等 draft PR 的 CI 通过（`phase-1c` 已推送并合入了 `main` 上的 dependabot 更新）。步骤一到五都在这个 PR 里，1c 全部完成后再转为正式 PR。
 2. 评审遗留、没有做的：
    - inventory 的 `00001_init.sql`（3 条建表）和 payment 的 `00002_outbox.sql`（建表后跟 `ALTER`）中途被杀后不可重入。并发启动已经由迁移锁解决。
    - 背压的第三项检查只管落库完全停住。消费者活着但落不了库（部分分区停住、极慢、认领后写库失败）时，原来的“触发、回收、重新放行”仍会出现，见 ADR-0011 的后果一节，建议 1d 处理。
@@ -131,4 +131,4 @@
 
 开始 1c。Opus 主持：写了设计文档 1c 和 ADR-0012、`pkg/sharding`；order 服务派给 Opus 子 Agent，脚本和对账工具派给 Sonnet 子 Agent，两者并行。合入后 `make lint test e2e` 通过，`make chaos` 两次 PASS。根据子 Agent 的报告补了设计文档 2.6，旧 `MYSQL_DSN` 改为拒绝启动。待 Fable 评审。
 
-同日 Fable 评审步骤一和 1b 遗留代码，结论和修复见“上次做到哪”。修复派给两个 Opus 子 Agent 并行实现，e2e 和 chaos 的验证与回收数调查派给 Sonnet 子 Agent。改动未提交。
+同日 Fable 评审步骤一和 1b 遗留代码，结论和修复见“上次做到哪”。修复派给两个 Opus 子 Agent 并行实现，e2e 和 chaos 的验证与回收数调查派给 Sonnet 子 Agent。提交和推送派给 Haiku 子 Agent，随后合入 `main` 并开 draft PR。
