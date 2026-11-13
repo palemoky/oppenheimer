@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一（分片）已完成，Fable 已评审，评审发现的问题已修复并推送
+- **当前阶段**：1c（分库分表与主从），步骤一（分片）、步骤二（主从与读写分离）已完成；步骤二未提交
 - **当前分支**：`phase-1c`（已推送，draft PR 已开）
 - **最后更新**：2026-11-13
 
@@ -41,7 +41,11 @@
    - 背压的第三项检查只管落库完全停住。消费者活着但落不了库（部分分区停住、极慢、认领后写库失败）时，原来的“触发、回收、重新放行”仍会出现，见 ADR-0011 的后果一节，建议 1d 处理。
    - `ListStaleCreating` 没有 `(status, updated_at)` 索引，决定不加：MySQL 没有 `ADD INDEX IF NOT EXISTS`，而 CREATING 的行很少。
    - 消费者没有“加入消费组、分配到分区”的日志，order 启动时也没有迁移耗时的日志，排查恢复耗时只能靠推断。
-3. 步骤二（主从）：先细化设计文档第 3 节，compose 每分片一主一从。
+3. **提交并推送步骤二**（主人还没要求提交）。步骤二（主从与读写分离）已完成，改动全部在工作区里：compose 主从拓扑和复制脚本、`store` 的从库读、`internal/readmark`、三种读模式、sweeper 扫描读从库、延迟下的端到端用例、设计文档 1c 第 3 节、ADR-0013、`docs/infra/versions.md`。`make lint test` 通过，`make e2e` 在 `gtid`（默认）、`window`、`primary` 三种模式下通过。结果见设计文档 3.10。
+   - 推送后要看 CI：每个测试 job 的 `make up` 现在多起 4 个 MySQL 容器、多跑一个复制脚本，没有在 CI 上实际跑过。耗时明显变长的话，给不需要主从的 job 单独一个启动目标。
+   - 已知局限，建议 1d 和熔断降级一起做：从库整体落后时 `gtid` 模式的每次展示读先等满 100 毫秒再读主库；从库一直挂起时 sweeper 每轮约 1 分钟。
+   - 定量的读模式对比挪到阶段 3（见计划变更）。
+4. 步骤三（CDC 索引表）：动工前先细化设计文档第 4 节并写 ADR（与 Canal、Debezium 对比）。前置条件是数据模型里要先有商家（SKU 所属商家），要改 inventory 的表和下单时的快照。
 
 步骤三遗留、仍未处理的两点（记在这里不丢）：
 
@@ -53,7 +57,8 @@
 ## 本机开发环境
 
 - `make tools` 安装 buf、proto 插件和 `oapi-codegen` 到 `./bin`（已装）。
-- `make up` 启动依赖并建好四个库（inventory_db、order_db_0、order_db_1、payment_db），`make down` 停止并保留数据。当前依赖处于**运行**状态。
+- `make up` 启动依赖：现有的 `mysql`（inventory_db、payment_db 和测试用的临时库）、order 的两主两从（`order_db_0`、`order_db_1`，端口见 `docs/infra/versions.md`）、Redis、Kafka，并建立复制。`make down` 停止并保留数据。当前依赖处于**运行**状态。
+- order 的读模式由 `ORDER_READ_MODE` 控制（`primary`、`window`、`gtid`），`make e2e` 默认 `gtid`，`make run` 会连上从库但默认是 `primary`，要读从库时自己设这个变量。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
 - `make run` 启动四个服务，`make seed` 写入示例 SKU，`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
 
@@ -95,6 +100,8 @@
 | 2026-11-13 | 1c 拆成五步，步骤一只拆 order；payment、inventory 不分库 | 见设计文档 1c 第 1 节、ADR-0012 |
 | 2026-11-13 | 1c 步骤一由 Opus 主持并派子 Agent 实现，订单状态相关代码待 Fable 评审 | Fable 不可用，主人决定可用后一并评审 |
 | 2026-11-13 | 背压增加第三项检查（落库心跳加探测名额），ADR-0011 补充 | 评审发现原来的第二项检查会被回收任务抹掉信号 |
+| 2026-11-13 | 步骤二的读模式定量对比（读主库比例、落库吞吐）挪到阶段 3 | 现在没有指标能统计读走了哪里，本机吞吐测量不可靠；端到端用例已量到两种模式的行为差异 |
+| 2026-11-13 | `super_read_only` 改由复制脚本在复制建立后设置，不写在 compose 启动参数里 | 官方镜像首次初始化会失败 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -132,3 +139,5 @@
 开始 1c。Opus 主持：写了设计文档 1c 和 ADR-0012、`pkg/sharding`；order 服务派给 Opus 子 Agent，脚本和对账工具派给 Sonnet 子 Agent，两者并行。合入后 `make lint test e2e` 通过，`make chaos` 两次 PASS。根据子 Agent 的报告补了设计文档 2.6，旧 `MYSQL_DSN` 改为拒绝启动。待 Fable 评审。
 
 同日 Fable 评审步骤一和 1b 遗留代码，结论和修复见“上次做到哪”。修复派给两个 Opus 子 Agent 并行实现，e2e 和 chaos 的验证与回收数调查派给 Sonnet 子 Agent。提交和推送派给 Haiku 子 Agent，随后合入 `main` 并开 draft PR。
+
+同日完成步骤二：设计（设计文档 1c 第 3 节、ADR-0013）经主人确认后，compose 拓扑和延迟用例派给 Sonnet 子 Agent，从库读和读模式派给 Opus 子 Agent，Fable 评审后返工一次。`make up` 现在起 9 个容器，本机依赖处于运行状态。

@@ -37,6 +37,20 @@
 | redis/go-redis | v9.23.0 | 稳定版 | 2026-11-11 | Redis 客户端，见 ADR-0007 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
+## 本机 compose 的 MySQL 实例（2026-11-13）
+
+镜像都是上表的 MySQL 版本。order 的 4 个实例调小了内存（关 `performance_schema`、缓冲池 64 MB 等，见 compose 文件里的注释），空闲时主库约 140 MiB、从库约 180 MiB。
+
+| compose 服务 | 用途 | 宿主机端口 | server-id |
+|---|---|---|---|
+| `mysql` | inventory、payment，`make test` 的临时库，chaos 和 bench 的库 | 3306 | 1 |
+| `mysql-order-0` | `order_db_0` 主库 | 3311 | 11 |
+| `mysql-order-0-replica` | `order_db_0` 从库 | 3312 | 12 |
+| `mysql-order-1` | `order_db_1` 主库 | 3321 | 21 |
+| `mysql-order-1-replica` | `order_db_1` 从库 | 3322 | 22 |
+
+复制由 `scripts/mysql-replication.sh` 建立（`make up` 会调用，可重复运行）。
+
 ## 待引入（引入时查证并移到上表）
 
 | 组件 | 阶段 | 是否有 LTS |
