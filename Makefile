@@ -176,12 +176,12 @@ up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含�
 	@MYSQL_ROOT_PASSWORD=$(MYSQL_ROOT_PASSWORD) scripts/mysql-replication.sh
 
 .PHONY: down
-down: ## 停止本地依赖（含 kafbat-ui），保留数据
-	$(COMPOSE) --profile ui down
+down: ## 停止本地依赖（含 kafbat-ui、otel-lgtm），保留数据
+	$(COMPOSE) --profile ui --profile obs down
 
 .PHONY: down-volumes
-down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例和 kafbat-ui）
-	$(COMPOSE) --profile expand --profile ui down --volumes
+down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例、kafbat-ui 和 otel-lgtm）
+	$(COMPOSE) --profile expand --profile ui --profile obs down --volumes
 
 .PHONY: envoy-validate
 envoy-validate: ## 用 Envoy 自己的校验模式检查 deploy/envoy/ 下每个边车的配置（需要 docker，不需要 make up）
@@ -215,6 +215,19 @@ kafka-ui: ## 启动 Kafka 的 Web 界面 kafbat-ui（profile ui，只读）并�
 .PHONY: kafka-ui-down
 kafka-ui-down: ## 停止并删除 kafbat-ui 容器（不影响其他实例）
 	$(COMPOSE) --profile ui rm -f -s -v kafka-ui
+
+GRAFANA_PORT ?= 3000
+export GRAFANA_PORT
+
+.PHONY: obs-up
+obs-up: ## 启动本机可观测后端 otel-lgtm（profile obs，Grafana+Tempo+Prometheus+Loki）并等待就绪，打印地址；之后 make run 会自动导出（OBS=off 关闭）
+	$(COMPOSE) --profile obs up -d --wait otel-lgtm
+	@echo "Grafana: http://127.0.0.1:$(GRAFANA_PORT)  (login: admin / admin, image default)"
+	@echo "OTLP gRPC: 127.0.0.1:4317, OTLP HTTP: 127.0.0.1:4318"
+
+.PHONY: obs-down
+obs-down: ## 停止并删除 otel-lgtm 容器（数据不持久化，一并丢失；不影响其他实例）
+	$(COMPOSE) --profile obs rm -f -s -v otel-lgtm
 
 .PHONY: ps
 ps: ## 查看本地依赖的状态

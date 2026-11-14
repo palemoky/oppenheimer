@@ -166,6 +166,8 @@ trap on_signal INT TERM
 # ---------- 准备 ----------
 
 sidecar_setup
+# 不导出：开发者 shell 里残留的 OTEL_EXPORTER_OTLP_ENDPOINT 不能让故障实验去连后端（ADR-0023）。
+unset OTEL_EXPORTER_OTLP_ENDPOINT
 for p in 8080 8081 8082 8083 8089; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2

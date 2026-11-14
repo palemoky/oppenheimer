@@ -67,6 +67,14 @@
 #   BENCH_RATELIMIT_DURATION  对比里每轮的下单时长，默认同 BENCH_DURATION
 #   BENCH_RATELIMIT_REPEAT    对比重复次数（每次含限流开和关各一轮），默认 1
 #
+# 可观测（ADR-0023，scripts/lib/obs.sh）：make obs-up 起着 otel-lgtm 时，服务默认把链路和指标导出过去（OBS=auto）。
+# 压测时全量采样每秒几万个 span 会影响测量，所以默认按 1% 采样：
+#   OBS                   auto（默认，后端在运行就导出）、on（后端没起就报错）、off（不导出，做对照组）
+#   OTEL_TRACES_SAMPLER   默认 parentbased_traceidratio
+#   OTEL_TRACES_SAMPLER_ARG  默认 0.01
+#   OTEL_METRIC_EXPORT_INTERVAL  指标导出间隔（毫秒），默认 10000
+# 这几个变量调用方已设就原样用。要量可观测本身的代价：同样的参数分别用 OBS=off 和 OBS=on 各跑一次。
+#
 # 服务之间的 gRPC 调用默认经过 Envoy 边车（ADR-0020，deploy/envoy/，端口见 scripts/lib/sidecar.sh），
 # 所以上面所有轮次的数字都包含边车这两跳；SIDECAR=off 时直连。1a 没有服务间调用的边车，BENCH_ARCH=1a 时不经过边车。
 # 下面的对比量边车本身的代价：
@@ -82,6 +90,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/sidecar.sh
 . "$ROOT/scripts/lib/sidecar.sh"
+# shellcheck source=lib/obs.sh
+. "$ROOT/scripts/lib/obs.sh"
 ARCH="${BENCH_ARCH:-1b}"
 BIN="${BENCH_BIN_DIR:-$ROOT/bin}"
 case "$BIN" in /*) ;; *) BIN="$ROOT/$BIN" ;; esac
@@ -280,6 +290,8 @@ landed_count() { sql -e "SELECT COUNT(*) FROM ($(all_orders_sql status "WHERE st
 # ---------- 准备 ----------
 
 sidecar_setup
+# 压测默认 1% 采样；服务是后面 start_svc 启动的，继承这里 export 的变量。
+obs_setup parentbased_traceidratio 0.01
 for p in 8080 8081 8082 8083 8089; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2

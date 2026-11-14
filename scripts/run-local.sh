@@ -20,6 +20,8 @@
 # 服务之间的 gRPC 调用经过各自的 Envoy 边车（ADR-0020，make up 会启动它们）：gateway、order、payment 的下游地址
 # 指向自己边车的出站端口，熔断、并发上限、路由超时都在边车的配置里（deploy/envoy/）。SIDECAR=off 时直连
 # （不经过边车，也就没有这些保护），用来对比或者在边车没起来的环境里跑。
+# 可观测（ADR-0023，scripts/lib/obs.sh）：OBS=auto（默认）时 otel-lgtm 容器（make obs-up）在运行就把链路和指标导出到它，
+# 默认全量采样；OBS=on 容器没起就报错，OBS=off 不导出。调用方自己设了 OTEL_EXPORTER_OTLP_ENDPOINT、OTEL_TRACES_SAMPLER 等就原样用。
 # 冷库要先建好（make up 会建；e2e、chaos、bench 各自建带前缀的）。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
 set -euo pipefail
 
@@ -101,6 +103,12 @@ order_to_inventory="$SC_ORDER_INVENTORY"
 payment_to_order="$SC_PAYMENT_ORDER"
 gateway_addrs="$SC_GATEWAY_ADDRS"
 
+# 可观测后端在运行就导出（export 的变量由 start 里的 env 传给每个服务进程）；run-local.sh 默认全量采样，不设采样器。
+# shellcheck source=lib/obs.sh
+. "$ROOT/scripts/lib/obs.sh"
+obs_setup
+[ "$OBS_EXPORTING" = 1 ] && echo "exporting traces and metrics to $OTEL_EXPORTER_OTLP_ENDPOINT"
+
 # 启动顺序按依赖方向：被依赖的先起。
 start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
 # MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应。
@@ -144,4 +152,5 @@ fi
 
 echo "gateway listening on http://127.0.0.1:8080 — press Ctrl-C to stop"
 echo "gateway admin (degrade switches) on http://127.0.0.1:8089/degrade"
+[ "$OBS_EXPORTING" = 1 ] && echo "Grafana (traces, metrics) on $OBS_GRAFANA_URL"
 wait

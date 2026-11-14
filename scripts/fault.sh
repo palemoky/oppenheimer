@@ -535,6 +535,8 @@ lat_add() {
 # ---------- 准备 ----------
 
 sidecar_setup
+# 不导出：开发者 shell 里残留的 OTEL_EXPORTER_OTLP_ENDPOINT 不能让故障实验去连后端（ADR-0023）。
+unset OTEL_EXPORTER_OTLP_ENDPOINT
 for p in 8080 8081 8082 8083 8084 8085 8089; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
     echo "port $p is already in use; stop the other services first" >&2

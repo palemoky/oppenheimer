@@ -510,6 +510,32 @@ services:
       retries: 30
       start_period: 30s
 
+  # ---- 本机可观测后端（grafana/otel-lgtm，ADR-0023）----
+  # 一个容器里有 OpenTelemetry Collector、Tempo（链路）、Prometheus（指标）、Loki（日志）和 Grafana。
+  # 属于 profile `obs`，平时 make up 和 CI 不启动；make obs-up 启动，make obs-down 删除。
+  # 服务进程设了 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 就把链路和指标推过来（scripts/lib/obs.sh）。
+  # 数据不持久化：没有挂卷，容器删除或重建后全部丢失，只用来看。
+  # 端口只绑 127.0.0.1：OTLP gRPC 4317、OTLP HTTP 4318、Grafana 3000（默认账号 admin，密码 admin，镜像自带）。
+  # 就绪判断：Grafana 的 /api/health 返回 200 说明 Grafana 已起来；Collector 在它之后启动，
+  # 镜像自己的就绪标志是日志里的 "The OpenTelemetry collector and the Grafana LGTM stack are up and running."，
+  # 所以健康检查同时要求 Grafana 健康和 Collector 的 4317 端口在监听。
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.41.0
+    profiles: ["obs"]
+    # 内存：不设上限实测，空闲时约 450 MiB，几个请求、半分钟的数据之后约 740 MiB（Tempo、Prometheus、Loki、Grafana 和 Collector 各占一份）。
+    # 上限定 1536 MB，给长时间运行和压测时的采样数据留余量；超了容器会被 OOM 杀掉，数据丢失，重新 make obs-up 即可。
+    mem_limit: 1536m
+    ports:
+      - 127.0.0.1:${OTEL_GRPC_PORT:-4317}:4317
+      - 127.0.0.1:${OTEL_HTTP_PORT:-4318}:4318
+      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/api/health > /dev/null && (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
 volumes:
   mysql-data:
   mysql-order-0-data:
