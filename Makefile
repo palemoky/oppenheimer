@@ -186,9 +186,13 @@ down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 
 .PHONY: envoy-validate
 envoy-validate: ## 用 Envoy 自己的校验模式检查 deploy/envoy/ 下每个边车的配置（需要 docker，不需要 make up）
 	@for f in deploy/envoy/*.yaml; do \
-		printf '%s: ' "$$f"; \
-		docker run --rm -v "$(ROOT)/$$f:/etc/envoy/envoy.yaml:ro" envoyproxy/envoy:v1.40.2 \
-			--mode validate -c /etc/envoy/envoy.yaml 2>&1 | tail -1 | grep OK || exit 1; \
+		out=$$(docker run --rm -v "$(ROOT)/$$f:/etc/envoy/envoy.yaml:ro" envoyproxy/envoy:v1.40.2 \
+			--mode validate -c /etc/envoy/envoy.yaml 2>&1); code=$$?; \
+		if [ $$code = 0 ] && printf '%s\n' "$$out" | grep -q "' OK$$"; then \
+			printf '%s: %s\n' "$$f" "$$(printf '%s\n' "$$out" | grep "' OK$$")"; \
+		else \
+			printf '%s: validation failed (docker exit %s), full output:\n%s\n' "$$f" "$$code" "$$out"; exit 1; \
+		fi; \
 	done
 
 .PHONY: expand-up

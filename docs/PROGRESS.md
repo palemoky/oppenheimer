@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已做完，**改动没有提交**；之后是步骤六（埋点）。1c 五步全部完成并已合并进 `main`
+- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交；下一步是步骤六（埋点）。1c 五步全部完成并已合并进 `main`
 - **当前分支**：`phase-1d`（从 `main` 开出，已推送并开 draft PR）。1c 的 PR #6 已于 2026-11-14 合并进 `main`（合并提交 `aa5df0a`），main 上 CI 全绿
 - **最后更新**：2026-11-14
 
@@ -89,12 +89,13 @@
            - **本机的变化**：gateway 多了管理端口 `127.0.0.1:8089`（`ADMIN_ADDR`），降级开关在上面；其他服务的开关在各自的内部端口（8081 到 8084）的 `/degrade`。新的环境变量：`DEGRADE`（开关初始值，名字写错拒绝启动）、`DRAIN_DELAY`、`ORDER_READ_MAX_LAG`。`make fault` 会暂停本机共享的 Redis 和订单库的从库（结束时恢复，中途失败也会兜底恢复），跑它之前不要有别的东西在用。
            - 没做的见设计文档 6.17、6.18 末尾。要点：闸门脚本出错和 Redis 连不上分不开、payment 的扫描错误，这两种在数据损坏时会永久挡住分区；inventory 进程里的闸门没有熔断器；`Retry-After` 固定 5 秒；“Redis 暂停时还没被认领的订单恢复后落库”和回收任务的等待只有按模块的测试；`make fault` 没进 CI。
            - 一次没有解释的偶发失败：`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在整包运行时失败过一次（回源 2 次，耗时 1.15 秒），之后重跑十几轮没有复现；耗时特征像本机容器网络的 1 秒停顿让一次读超时。order 的 `TestSubmitConcurrentWarmUpIsCoalesced` 也失败过一次，当时的输出没有留下，之后没有复现。
-           - **1d 步骤五（对账）已实现、验收并实测，改动都没有提交**（2026-11-14）。设计文档 1d 第 7 节，ADR-0022（已采纳），实测结果在 7.12，发现在 7.15，没做的在 7.16。`make lint test e2e` 通过（e2e 18 个），`make chaos` 一次 PASS（`load verify` 和 `recon` 都通过）。
+           - **1d 步骤五（对账）已实现、验收并实测，已分 4 个提交推送到 PR #7（`c8e8c9c` 到 `b09a74e`）**（2026-11-14）。设计文档 1d 第 7 节，ADR-0022（已采纳），实测结果在 7.12，发现在 7.15，没做的在 7.16。`make lint test e2e` 通过（e2e 18 个），`make chaos` 一次 PASS（`load verify` 和 `recon` 都通过）。
              - 主人定的（7.14）：摘要在数据库里算；节点摘要用行哈希的和，不是教科书式的 H(子节点)；闸门和 MySQL 的库存不纳入，维持 inventory 的 `reconcile`；只有商家索引可以自动修复。
              - 做了什么：`pkg/merkle`（`Digest`、规范编码和对应的 SQL 片段、订单号上的基数树、自上而下的 `Diff`）；新模块 `services/recon`（已进 `go.work`）：五对的投影（`replica`、`index`、`payment`、`stock`、`archive`，在 `internal/recon/pairs.go`）、数据源、比对、复查、报告、索引修复、命令行；`scripts/recon.sh`、`make recon`；`scripts/chaos.sh` 在 `load verify` 之后加跑 `recon -pairs payment,stock`，有差异时判失败。`pkg/merkle`、投影由 Fable 写，引擎由 Opus 写、Fable 评审后改了三处（修复改成按主键删、全量模式的分段、`archive` 改读主库）。
              - 用法：`ORDER_DBS=4 make recon`（默认比 `replica`、`index`、`payment`、`stock`，只读）；`RECON_ARGS="-pairs index -repair"` 修商家索引；归档的前后对比是三步：`RECON_ARGS="-pairs archive -snapshot-out F"`、归档、`RECON_ARGS="-pairs archive -against F"`，都要在归档任务不在跑的时候做。退出码 0 无差异、1 有差异、2 出错。
              - 实测要点（490 万行的 `index`）：无差异时树 4.8 秒、传约 1.7 万个摘要，全量归并 7.8 秒、545 MB；1 行差异多 0.3 秒；9612 行均匀散布的差异打中 95% 的节点，树比归并慢。交叉点取决于差异落在多少个节点里。
-             - 下一步：主人确认后提交并推送（建议分 4 个提交：`pkg/merkle`、`services/recon`、脚本和 chaos、文档），推送后派 Haiku 看 CI（会多出 `services/recon` 这个模块的 lint、build、test job）。然后是 1d 步骤六（埋点），动工前先细化设计文档。
+             - 推送后的 CI（`b09a74e`）：27 项里 26 项通过，新模块的 `lint (./services/recon)` 30 秒、`test (./services/recon)` 1 分 39 秒。失败的一项是 `envoy`（`make envoy-validate`）：前三个配置 OK，`deploy/envoy/orderindex.yaml` 那一次什么也没输出就失败了。这次推送没有改 `deploy/envoy/`，本机五个配置都通过。**根因没有找到**：原来的写法是 `docker run ... | tail -1 | grep OK`，失败时把校验器的输出丢掉了，日志里没有可看的东西。已把 `envoy-validate` 改成失败时打印 docker 的退出码和完整输出并重新推送；再出现时看那段输出（怀疑是 `docker run` 本身偶发失败，没有证据）。
+             - 下一步：确认重新推送后的 CI 结果（见“当前状态”之后的记录，或 `gh pr checks 7`）。然后是 1d 步骤六（埋点），动工前先细化设计文档。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
