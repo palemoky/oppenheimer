@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"log/slog"
 	"maps"
 	"runtime/debug"
@@ -66,6 +67,24 @@ type ConsumerConfig struct {
 	// 取得太短，一次长的 GC 暂停或网络抖动就会触发不必要的重平衡；不能低于 broker 的
 	// group.min.session.timeout.ms（默认 6 秒）。
 	SessionTimeout time.Duration
+
+	// Concurrency 是一个分区内同时处理的消息数，默认 1（分区内严格串行）。
+	//
+	// 大于 1 时分区内开这么多条 lane：消息按 key 的哈希分到 lane，lane 内串行，lane 之间并行。
+	// 同一个 key 的消息总在同一条 lane 上，所以“同一个 key 按位点顺序处理”仍然成立；
+	// 不同 key 之间不再有先后。只有当处理一条消息碰到的数据都属于它的 key 时才应当打开
+	// （设计文档 1d 的 2.2、ADR-0017）。
+	//
+	// 打开之后提交的是“连续完成的前缀”（见 prefixTracker），前缀之后已经完成的消息在重启或
+	// 再平衡后会重复投递，handler 必须幂等。延迟消费者不支持。
+	Concurrency int
+	// MaxUncommitted 只在 Concurrency > 1 时有意义：一个分区里已分发、位点还不能提交的消息数上限，
+	// 默认 1024。到达上限时停止分发，等最前面那条完成。
+	//
+	// 没有这个上限的话，一条一直重试的消息会让其他 lane 不停地往前处理而位点一动不动，
+	// 重启后要重放的范围和内存里的记录都无限增长。有了它，最坏情况是重放这么多条，
+	// 之后这个分区停住，和串行时“一条卡住、分区停住”的行为一致。
+	MaxUncommitted int
 }
 
 const (
@@ -74,6 +93,7 @@ const (
 	defaultRetryMax       = 5 * time.Second
 	defaultDLQSuffix      = ".dlq"
 	defaultSessionTimeout = 10 * time.Second
+	defaultMaxUncommitted = 1024
 
 	// maxPollRecords 限制一次拉取的条数，让拉取循环尽快把记录分发出去并允许再平衡。
 	maxPollRecords = 500
@@ -112,7 +132,9 @@ const (
 //   - 关闭自动提交，handler 返回 nil（或消息已成功送入死信）之后才提交它的位点。
 //     自动提交按“已拉取”而不是“已处理”提交，进程在处理中途崩溃时，已提交但没处理完的消息就丢了。
 //   - 每个分区一个 goroutine，分区内严格按位点串行处理；不同分区并行。
+//     Concurrency > 1 时分区内按 key 分成多条 lane 并行，同一个 key 仍然串行，见 ConsumerConfig.Concurrency。
 //   - 失败原地重试，不跳过：跳过意味着提交了后面的位点，前面那条就再也不会被投递。
+//     并发时重试只停住它所在的 lane，位点停在它前面，直到它成功或进入死信。
 //
 // 并发结构：
 //   - 拉取循环（Start 所在的 goroutine）只负责把记录分发到各分区的 worker 队列。
@@ -127,6 +149,8 @@ type Consumer struct {
 	log     *slog.Logger
 	client  *kgo.Client
 	dlq     *Producer
+	// laneSeed 是把 key 分到 lane 的哈希种子，见 laneOf。
+	laneSeed maphash.Seed
 	// clock 只在延迟消费者里非空。
 	clock Clock
 
@@ -182,6 +206,19 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 	if cfg.SessionTimeout <= 0 {
 		cfg.SessionTimeout = defaultSessionTimeout
 	}
+	if cfg.Concurrency < 0 {
+		return nil, fmt.Errorf("kafkax: consumer concurrency %d is negative", cfg.Concurrency)
+	}
+	cfg.Concurrency = max(cfg.Concurrency, 1)
+	if cfg.Concurrency > 1 && clock != nil {
+		// 延迟 topic 依赖“分区内按到期时间有序、队首没到期就整个分区等着”，并发会让后面的消息越过队首。
+		return nil, errors.New("kafkax: a delay consumer cannot process a partition concurrently")
+	}
+	if cfg.MaxUncommitted <= 0 {
+		cfg.MaxUncommitted = defaultMaxUncommitted
+	}
+	// 窗口比 lane 数还小的话，有的 lane 永远轮不到。
+	cfg.MaxUncommitted = max(cfg.MaxUncommitted, cfg.Concurrency)
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -192,6 +229,7 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 		handler:  handler,
 		log:      logger.With("group", cfg.Group),
 		clock:    clock,
+		laneSeed: maphash.MakeSeed(),
 		workers:  make(map[topicPartition]*worker),
 		commitCh: make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
@@ -385,6 +423,14 @@ func (c *Consumer) workerFor(hardCtx context.Context, tp topicPartition) *worker
 		stop:   make(chan struct{}),
 		exited: make(chan struct{}),
 	}
+	if n := c.cfg.Concurrency; n > 1 {
+		w.lanes = make([]chan *kgo.Record, n)
+		for i := range w.lanes {
+			// 容量等于窗口：分发前已经确认未提交的记录数低于窗口，所以往 lane 里放永远不会阻塞。
+			w.lanes[i] = make(chan *kgo.Record, c.cfg.MaxUncommitted)
+		}
+		w.progress = make(chan struct{}, 1)
+	}
 	c.workers[tp] = w
 	go w.run(hardCtx)
 	return w
@@ -514,7 +560,16 @@ func (c *Consumer) commitLocked(ctx context.Context, ws []*worker) {
 	}
 }
 
-// worker 串行处理一个分区的消息。
+// laneOf 返回 key 所在的 lane。同一个 key 总是得到同一条 lane，这是并发消费仍然保持同 key 有序的全部依据。
+//
+// 用带随机种子的 maphash，而不是生产者分区用的那个哈希（murmur2）：一个分区里的 key 本来就是
+// “murmur2 取模后相等”的那一批，再用同一个哈希对 lane 数取模，lane 数和分区数有公因数时
+// 它们会挤进少数几条 lane。种子每个进程不同也没有关系，lane 的分配不需要跨重启稳定。
+func (c *Consumer) laneOf(key []byte) int {
+	return int(maphash.Bytes(c.laneSeed, key) % uint64(c.cfg.Concurrency)) //nolint:gosec // 取模后小于 Concurrency
+}
+
+// worker 处理一个分区的消息：默认串行；并发消费时它是分发者，把消息交给各条 lane。
 type worker struct {
 	c   *Consumer
 	tp  topicPartition
@@ -533,6 +588,13 @@ type worker struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 	exited   chan struct{}
+
+	// 以下只在并发消费（Concurrency > 1）时使用。
+	// lanes[i] 是第 i 条 lane 的队列。tracker 记录已分发、还不能提交的记录，由 mu 保护。
+	// progress 在可提交的前缀前进时收到通知，唤醒因为窗口已满而等待的分发循环。
+	lanes    []chan *kgo.Record
+	tracker  prefixTracker
+	progress chan struct{}
 }
 
 // enqueue 追加拉到的记录。积压超过高水位时暂停该分区的拉取。
@@ -615,6 +677,10 @@ func (w *worker) sleep(ctx context.Context, d time.Duration) bool {
 // run 是 worker 的主循环。ctx 交给 handler，只在强制停止时取消。
 func (w *worker) run(ctx context.Context) {
 	defer close(w.exited)
+	if len(w.lanes) > 0 {
+		w.runLanes(ctx)
+		return
+	}
 	for {
 		rec, ok := w.next(ctx)
 		if !ok {
@@ -625,6 +691,98 @@ func (w *worker) run(ctx context.Context) {
 			return
 		}
 		w.markDone(rec)
+	}
+}
+
+// runLanes 是并发消费时的主循环：按位点顺序取记录，登记到 tracker，再交给 key 对应的 lane。
+// 返回前等所有 lane 退出，所以 exited 关闭时这个分区已经没有 handler 在运行。
+//
+// 停止时（halt 或强制取消）不再分发；各 lane 做完手上的那一条就退出，已经在 lane 队列里、
+// 还没开始的记录直接放弃。它们留在 tracker 里没有完成，可提交的前缀到不了它们，位点也就不会越过它们。
+func (w *worker) runLanes(ctx context.Context) {
+	var lanes sync.WaitGroup
+	defer lanes.Wait()
+	for _, ch := range w.lanes {
+		lanes.Go(func() { w.runLane(ctx, ch) })
+	}
+	for {
+		if !w.waitWindow(ctx) {
+			return
+		}
+		rec, ok := w.next(ctx)
+		if !ok {
+			return
+		}
+		// 先登记再分发：lane 可能在这个 goroutine 往下走之前就把它处理完了。
+		w.mu.Lock()
+		w.tracker.add(rec)
+		w.mu.Unlock()
+		select {
+		case w.lanes[w.c.laneOf(rec.Key)] <- rec:
+		case <-w.stop:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// waitWindow 等到未提交的记录数低于窗口。被 halt 或强制取消时返回 false。
+func (w *worker) waitWindow(ctx context.Context) bool {
+	for {
+		w.mu.Lock()
+		n := w.tracker.len()
+		w.mu.Unlock()
+		if n < w.c.cfg.MaxUncommitted {
+			return true
+		}
+		select {
+		case <-w.progress:
+		case <-w.stop:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// runLane 串行处理一条 lane 上的记录。
+func (w *worker) runLane(ctx context.Context, ch <-chan *kgo.Record) {
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-ctx.Done():
+			return
+		case rec := <-ch:
+			// 两个分支同时就绪时 select 随机选一个，所以取到记录之后再确认一次没有被要求停止。
+			if w.stopping(ctx) {
+				return
+			}
+			if !w.c.process(ctx, w, rec) {
+				// 被打断：这条消息没有处理完，不标记完成，位点不会越过它。
+				return
+			}
+			w.complete(rec)
+		}
+	}
+}
+
+// complete 是并发消费时的 markDone：标记 rec 处理完，可提交的前缀前进时更新 last。
+func (w *worker) complete(rec *kgo.Record) {
+	w.mu.Lock()
+	if last := w.tracker.complete(rec.Offset); last != nil {
+		w.last = last
+		// 非阻塞：已经有一个通知在等着被取走就够了，分发循环醒来后会自己重新读未提交的数量。
+		select {
+		case w.progress <- struct{}{}:
+		default:
+		}
+	}
+	idle := w.tracker.len() == 0 && len(w.queue) == 0
+	w.mu.Unlock()
+	if idle {
+		w.c.triggerCommit()
 	}
 }
 
