@@ -35,6 +35,8 @@ type Deps struct {
 type Config struct {
 	Logger      *slog.Logger
 	CallTimeout time.Duration
+	// RateLimit 为 nil 时不限流。
+	RateLimit *RateLimit
 }
 
 // server 必须实现规范生成的接口。规范新增或修改了接口而这里没跟上时，编译失败。
@@ -45,6 +47,8 @@ type server struct {
 	logger *slog.Logger
 	// callTimeout 在中间件里转成 context 截止时间，handler 不必各自处理。
 	callTimeout time.Duration
+	// rl 为 nil 时不限流。
+	rl *rateLimiter
 }
 
 // New 构造路由。返回 http.Handler 而不是 *gin.Engine，不让 gin 泄漏到装配层。
@@ -77,7 +81,22 @@ func New(deps Deps, cfg Config) http.Handler {
 
 	// 路由由规范生成的代码注册，路径和方法以 api/openapi/gateway.yaml 为准。
 	// 规范里的路径已经带 /api/v1 前缀，所以分组的前缀为空，分组只用来挂中间件。
-	api := r.Group("", s.requireUser, s.withDeadline)
+	// 限流挂在这个分组上，只作用于规范里的接口：没匹配到路由的 404 不经过它，
+	// 健康检查挂在外层的 mux 上（cmd/gateway），也不经过它。
+	// 顺序：按 IP 在识别用户之前（最便宜，挡没有身份的洪水）；按用户和接口在识别用户之后、设置下游时限之前
+	// （限流器有自己的时限，不占用下游调用的预算）。
+	rl, limitIP, limitShared := newRateLimiter(cfg.RateLimit)
+	s.rl = rl
+	var mw []gin.HandlerFunc
+	if limitIP {
+		mw = append(mw, s.limitIP)
+	}
+	mw = append(mw, s.requireUser)
+	if limitShared {
+		mw = append(mw, s.limitUserAndRoute)
+	}
+	mw = append(mw, s.withDeadline)
+	api := r.Group("", mw...)
 	oas.RegisterHandlersWithOptions(api, s, oas.GinServerOptions{ErrorHandler: bindError})
 	return r
 }

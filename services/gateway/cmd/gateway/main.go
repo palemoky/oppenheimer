@@ -37,6 +37,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	inventoryAddr := cmp.Or(os.Getenv("INVENTORY_ADDR"), "127.0.0.1:9082")
 	paymentAddr := cmp.Or(os.Getenv("PAYMENT_ADDR"), "127.0.0.1:9083")
 	orderIndexAddr := cmp.Or(os.Getenv("ORDERINDEX_ADDR"), "127.0.0.1:9084")
+	// 限流的配置先读：写错了就不启动，不必等连下游。
+	rlCfg, err := loadRateLimitConfig(os.LookupEnv)
+	if err != nil {
+		return err
+	}
 
 	// Dial 是惰性的，下游暂时不可达不会阻止 gateway 启动。
 	orderConn, err := grpcx.Dial(orderAddr)
@@ -60,12 +65,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer orderIndexConn.Close()
 
+	// 限流的 Redis 连不上不阻止启动，见 newRateLimitRedis。defer 逆序执行：它在所有组件停止之后关闭。
+	rateLimit, rlReporter, closeRateLimit := newRateLimit(ctx, logger, rlCfg)
+	defer closeRateLimit()
+
 	api := httpapi.New(httpapi.Deps{
 		Order:      orderv1.NewOrderServiceClient(orderConn),
 		Payment:    paymentv1.NewPaymentServiceClient(paymentConn),
 		Inventory:  inventoryv1.NewInventoryServiceClient(inventoryConn),
 		OrderIndex: orderindexv1.NewOrderIndexServiceClient(orderIndexConn),
-	}, httpapi.Config{Logger: logger})
+	}, httpapi.Config{Logger: logger, RateLimit: rateLimit})
 
 	// 健康检查探针很频繁，单独挂在 mux 上，不经过 API 的鉴权和请求日志。
 	mux := http.NewServeMux()
@@ -78,5 +87,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.Info("listening", "addr", httpServer.Addr().String())
 
-	return app.Run(ctx, logger, httpServer)
+	components := []app.Component{}
+	if rlReporter != nil {
+		// 排在 HTTP 服务前面：停止时逆序，HTTP 服务先停，汇总日志最后输出停止前的那一段。
+		components = append(components, rlReporter)
+	}
+	components = append(components, httpServer)
+	return app.Run(ctx, logger, components...)
 }

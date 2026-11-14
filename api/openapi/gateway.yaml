@@ -14,6 +14,7 @@ info:
     - 时间是 RFC 3339 格式的 UTC 时间。
     - 请求体里出现未定义的字段会被拒绝（400）。
     - 所有错误响应的结构相同，见 `Error`。500 的响应不透出内部错误消息。
+    - 网关按客户端地址、按用户加接口、按接口限流，超出时返回 429（`RATE_LIMITED`），见 `TooManyRequests`。
     - 存活探测 `GET /healthz` 由各服务统一提供，不属于本接口。
 servers:
   - url: http://localhost:8080
@@ -81,6 +82,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -138,6 +141,8 @@ paths:
                 $ref: '#/components/schemas/Error'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -161,6 +166,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -187,6 +194,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -223,6 +232,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -246,6 +257,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -269,6 +282,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -322,6 +337,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         default:
           $ref: '#/components/responses/Error'
 
@@ -370,6 +387,15 @@ components:
         type: string
         pattern: '^[1-9][0-9]*$'
 
+  headers:
+    RetryAfter:
+      description: |
+        多少秒之后再重试（正整数，向上取整，至少 1）。它是下界：这段时间里别的请求也在消耗配额，
+        到时重试仍可能被拒绝。原因码是 `RATE_LIMITED` 时一定有；`BACKLOGGED` 时不一定有。
+      schema:
+        type: integer
+        minimum: 1
+
   responses:
     BadRequest:
       description: 请求参数非法（`INVALID_ARGUMENT`）
@@ -401,11 +427,25 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: |
+        请求被拒绝，没有产生任何效果（没有调用下游，没有创建或修改任何东西）。原因码有两种，客户端的处理不同：
+
+        - `RATE_LIMITED`：调用方自己太快了，超出了配额。按 `Retry-After` 等待之后再重试，不要立刻重试。
+          `message` 里说明是哪一维的限制：`ip`（同一个客户端地址的所有请求）、`user`（同一个用户对这个接口）、
+          `route`（这个接口所有用户的总量）。其他用户、其他接口通常不受影响。
+        - `BACKLOGGED`：只在下单时出现。系统忙（等待落库的订单积压过多），与调用方的速率无关，所有人都应当退避；
+          稍后用同一个 `Idempotency-Key` 重试即可。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     Error:
       description: |
         其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
-        下单时等待落库的订单积压过多返回 429，原因码 `BACKLOGGED`：请求没有产生任何效果，
-        稍后用同一个 `Idempotency-Key` 重试即可。
       content:
         application/json:
           schema:
