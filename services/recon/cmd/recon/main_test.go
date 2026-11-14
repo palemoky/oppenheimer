@@ -28,6 +28,9 @@ func TestParseFlags(t *testing.T) {
 		{"-snapshot-out", "a", "-against", "b"},
 		{"-mode", "fast"},
 		{"-settle", "-1s"},
+		{"-since", "-1s"},
+		{"-since", "10m"},
+		{"-since", "24h", "-against", "f.json"},
 		{"-max-rows", "0"},
 		{"extra"},
 	} {

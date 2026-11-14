@@ -34,6 +34,10 @@ type Options struct {
 	Mode Mode
 	// Bound 是水位线：只比订单号小于它的行。0 表示不设上界。
 	Bound int64
+	// Since 是窗口的下界：只比订单号不小于它的行。0 表示不设下界（全量）。
+	// 设了下界就是增量对账：代价和窗口里的数据量成正比，窗口之前的数据后来被改坏不会被发现，
+	// 所以要配合定期的全量（设计文档 7.17）。右侧是存下来的树时不支持。
+	Since int64
 	// MaxRows 是两侧行数都不超过它的差异节点直接逐行比；0 取 DefaultMaxRows。
 	MaxRows uint64
 	// MinShift 是 Diff 最细的一层；0 取 DefaultMinShift。
@@ -81,16 +85,22 @@ func (o Options) withDefaults() Options {
 func Compare(ctx context.Context, c Comparison, o Options) (*ComparisonReport, error) {
 	o = o.withDefaults()
 	start := time.Now()
-	rep := &ComparisonReport{Name: c.Name, Mode: o.Mode, Bound: o.Bound, Counts: map[Class]int{}}
+	rep := &ComparisonReport{Name: c.Name, Mode: o.Mode, Bound: o.Bound, Since: o.Since, Counts: map[Class]int{}}
+	if o.Since > 0 {
+		rep.SinceTime = idgen.Time(o.Since)
+	}
+	if o.Since > 0 && o.Bound > 0 && o.Since >= o.Bound {
+		return nil, fmt.Errorf("recon: window is empty: since %d is not below bound %d", o.Since, o.Bound)
+	}
 	if o.Bound > 0 {
 		rep.BoundTime = idgen.Time(o.Bound)
 	}
 	log := o.Logger.With("comparison", c.Name, "mode", string(o.Mode))
 
-	left := newSideSource(&c.Left, o.Bound, o.Limiter)
+	left := newSideSource(&c.Left, o.Since, o.Bound, o.Limiter)
 	var right *sideSource
 	if c.Right != nil {
-		right = newSideSource(c.Right, o.Bound, o.Limiter)
+		right = newSideSource(c.Right, o.Since, o.Bound, o.Limiter)
 	}
 	defer func() {
 		left.report(&rep.Left)
@@ -101,6 +111,9 @@ func Compare(ctx context.Context, c Comparison, o Options) (*ComparisonReport, e
 	}()
 
 	if right == nil {
+		if o.Since > 0 {
+			return nil, fmt.Errorf("recon: comparison %s compares against a saved tree and does not support a lower bound", c.Name)
+		}
 		against := o.Against[c.Name]
 		if against == nil {
 			return nil, fmt.Errorf("recon: comparison %s needs a saved tree to compare against", c.Name)
@@ -369,7 +382,7 @@ func Snapshot(ctx context.Context, c Comparison, bound int64, lim *Limiter) (*me
 	if lim == nil {
 		lim = NewLimiter(0)
 	}
-	s := newSideSource(&c.Left, bound, lim)
+	s := newSideSource(&c.Left, 0, bound, lim)
 	var rep SideReport
 	if err := s.scan(ctx); err != nil {
 		return nil, rep, err

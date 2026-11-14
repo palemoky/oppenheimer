@@ -40,6 +40,8 @@ type sideStats struct {
 type sideSource struct {
 	side  *Side
 	bound int64
+	// since 是窗口的下界（含），0 表示没有。和 bound 一样，这一侧的每条语句都带。
+	since int64
 	lim   *Limiter
 	st    *sideStats
 	tree  *merkle.Tree
@@ -48,8 +50,8 @@ type sideSource struct {
 	preloaded map[int][]row
 }
 
-func newSideSource(s *Side, bound int64, lim *Limiter) *sideSource {
-	return &sideSource{side: s, bound: bound, lim: lim, st: &sideStats{}}
+func newSideSource(s *Side, since, bound int64, lim *Limiter) *sideSource {
+	return &sideSource{side: s, since: since, bound: bound, lim: lim, st: &sideStats{}}
 }
 
 // query 在 t 的库上执行一条语句，受 Limiter 约束，逐行调用 scan。
@@ -95,7 +97,11 @@ func (s *sideSource) digests(ctx context.Context, t Table, shift uint, c *cond) 
 
 // edge 返回 t 里水位线以下最小（desc 为 false）或最大的订单号，没有行时 ok 为 false。
 func (s *sideSource) edge(ctx context.Context, t Table, desc bool) (k int64, ok bool, err error) {
+	// 带上窗口：有下界时分段从下界开始，不会为窗口之前的几年数据各发一条读不到行的语句。
 	c := &cond{}
+	if s.since > 0 {
+		c.add(s.side.Key+" >= ?", s.since)
+	}
 	if s.bound > 0 {
 		c.add(s.side.Key+" < ?", s.bound)
 	}
@@ -151,7 +157,7 @@ func (s *sideSource) scan(ctx context.Context) error {
 		g.Go(func() error {
 			if !t.RangeIndexed {
 				// 按订单号分段也是全表扫描，只能一条语句。
-				es, err := s.digests(gctx, t, TopShift, baseCond(s.side, t, s.bound))
+				es, err := s.digests(gctx, t, TopShift, baseCond(s.side, t, s.since, s.bound))
 				add(es)
 				return err
 			}
@@ -162,7 +168,7 @@ func (s *sideSource) scan(ctx context.Context) error {
 			sg, sctx := newGroup(gctx)
 			for _, seg := range segments(r, segmentShift) {
 				sg.Go(func() error {
-					c := baseCond(s.side, t, s.bound)
+					c := baseCond(s.side, t, s.since, s.bound)
 					if !addRange(c, s.side.Key, seg) {
 						return nil
 					}
@@ -221,7 +227,7 @@ func (s *sideSource) Children(ctx context.Context, parents []merkle.Node) ([]mer
 			// 一段连续的父节点一条范围语句。
 			for _, r := range ranges {
 				g.Go(func() error {
-					c := baseCond(s.side, t, s.bound)
+					c := baseCond(s.side, t, s.since, s.bound)
 					if !addRange(c, s.side.Key, r) {
 						return nil
 					}
@@ -235,7 +241,7 @@ func (s *sideSource) Children(ctx context.Context, parents []merkle.Node) ([]mer
 		// 按订单号取数是全表扫描：这一层所有的父节点合成一条语句，一层一次全表扫描。
 		for chunk := range slices.Chunk(parents, maxListArgs) {
 			g.Go(func() error {
-				c := baseCond(s.side, t, s.bound)
+				c := baseCond(s.side, t, s.since, s.bound)
 				args := []any{shift}
 				for _, p := range chunk {
 					args = append(args, p.Index)

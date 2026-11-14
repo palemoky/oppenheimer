@@ -64,9 +64,13 @@ func (c *cond) where() string {
 	return " WHERE " + strings.Join(c.parts, " AND ")
 }
 
-// baseCond 是一张表上所有语句都带的条件：水位线和表自己的过滤条件。bound 为 0 时不设上界。
-func baseCond(s *Side, t Table, bound int64) *cond {
+// baseCond 是一张表上所有语句都带的条件：订单号的窗口 [since, bound) 和表自己的过滤条件。
+// since 为 0 时不设下界，bound 为 0 时不设上界。
+func baseCond(s *Side, t Table, since, bound int64) *cond {
 	c := &cond{}
+	if since > 0 {
+		c.add(s.Key+" >= ?", since)
+	}
 	if bound > 0 {
 		c.add(s.Key+" < ?", bound)
 	}

@@ -38,6 +38,9 @@ type ComparisonReport struct {
 	// Bound 是水位线（订单号的上界，不含），0 表示没有上界。BoundTime 是它对应的时间。
 	Bound     int64     `json:"bound"`
 	BoundTime time.Time `json:"bound_time,omitzero"`
+	// Since 是窗口的下界（订单号，含），0 表示没有下界。SinceTime 是它对应的时间。
+	Since     int64     `json:"since,omitzero"`
+	SinceTime time.Time `json:"since_time,omitzero"`
 
 	Left  SideReport `json:"left"`
 	Right SideReport `json:"right"`
@@ -226,7 +229,11 @@ func (c *ComparisonReport) writeText(b *strings.Builder) {
 	if c.Bound > 0 {
 		bound = fmt.Sprintf("%d (%s)", c.Bound, c.BoundTime.Format(time.RFC3339))
 	}
-	fmt.Fprintf(b, "== %s  mode=%s  bound=%s\n", c.Name, c.Mode, bound)
+	since := "none"
+	if c.Since > 0 {
+		since = fmt.Sprintf("%d (%s)", c.Since, c.SinceTime.Format(time.RFC3339))
+	}
+	fmt.Fprintf(b, "== %s  mode=%s  since=%s  bound=%s\n", c.Name, c.Mode, since, bound)
 	side := func(tag string, s SideReport) {
 		fmt.Fprintf(b, "  %-5s %s: rows=%d root=%s statements=%d digests=%d rows_read=%d bytes=%d\n",
 			tag, s.Name, s.Rows, cmp.Or(s.Root, "-"), s.Statements, s.Digests, s.RowsRead, s.Bytes)

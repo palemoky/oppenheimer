@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/merkle"
 	"github.com/palemoky/oppenheimer/pkg/sharding"
 )
@@ -416,6 +417,55 @@ func TestBound(t *testing.T) {
 	}
 	// 不设上界时两个都报告。
 	compareAll(t, c, 0, want{orderKey(dense): Mismatch, orderKey(late): Mismatch})
+}
+
+// 下界之前的差异不报告，行数也只算窗口里的行；窗口 [since, bound) 两头都生效。
+func TestSince(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, false)
+	sparse := f.pick(0, where("sparse", false, statusPaid))
+	dense := f.pick(0, where("dense", false, statusPaid))
+	late := f.pick(0, where("late", false, statusPaid))
+	for _, o := range []*testOrder{sparse, dense, late} {
+		db, table := f.indexDB(o.merchant)
+		f.exec(db, "UPDATE "+table+" SET total_amount = total_amount + 1 WHERE order_id = ?", o.id)
+	}
+	// 在 sparse 之后、dense 之前。
+	since := idgen.LowerBound(time.Date(2025, 5, 1, 0, 0, 0, 0, time.UTC))
+	if sparse.id >= since || dense.id < since {
+		t.Fatalf("fixture changed: sparse %d dense %d since %d", sparse.id, dense.id, since)
+	}
+	var rows uint64
+	for _, o := range f.orders {
+		if o.merchant != 0 && o.id >= since && o.id < testBound {
+			rows++
+		}
+	}
+	c := f.pair(PairIndex).Comparisons[0]
+	for _, cf := range configs(testBound) {
+		cf.o.Since = since
+		rep := compareWith(t, c, []config{cf}, want{orderKey(dense): Mismatch})[0]
+		if rep.Left.Rows != rows || rep.Right.Rows != rows {
+			t.Errorf("%s: rows left %d right %d, want %d", cf.name, rep.Left.Rows, rep.Right.Rows, rows)
+		}
+	}
+	// 只有下界：dense 和 late。
+	for _, cf := range configs(0) {
+		cf.o.Since = since
+		compareWith(t, c, []config{cf}, want{orderKey(dense): Mismatch, orderKey(late): Mismatch})
+	}
+	// 空窗口和对着存下来的树都拒绝。
+	if _, err := Compare(t.Context(), c, Options{Since: testBound, Bound: since}); err == nil {
+		t.Error("empty window: no error")
+	}
+	ac := f.pair(PairArchive).Comparisons[0]
+	tree, _, err := Snapshot(t.Context(), ac, testBound, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compare(t.Context(), ac, Options{Since: since, Bound: testBound, Against: map[string]*merkle.Tree{ac.Name: tree}}); err == nil {
+		t.Error("lower bound against a saved tree: no error")
+	}
 }
 
 // 复查：逐行比之后、复查之前改回一致的丢掉，又变了的进 unstable，不动的确认。

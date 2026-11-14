@@ -71,7 +71,7 @@ func (s *sideSource) readRanges(ctx context.Context, ranges []keyRange, merge bo
 		if t.RangeIndexed {
 			for _, r := range ranges {
 				g.Go(func() error {
-					c := baseCond(s.side, t, s.bound)
+					c := baseCond(s.side, t, s.since, s.bound)
 					if !addRange(c, s.side.Key, r) {
 						return nil
 					}
@@ -84,7 +84,7 @@ func (s *sideSource) readRanges(ctx context.Context, ranges []keyRange, merge bo
 		}
 		for chunk := range slices.Chunk(ranges, maxListArgs) {
 			g.Go(func() error {
-				c := baseCond(s.side, t, s.bound)
+				c := baseCond(s.side, t, s.since, s.bound)
 				if !addRanges(c, s.side.Key, chunk) {
 					return nil
 				}
@@ -121,7 +121,7 @@ func (s *sideSource) readKeys(ctx context.Context, keys []int64) ([]row, error) 
 	for _, t := range s.side.Tables {
 		for chunk := range slices.Chunk(keys, maxListArgs) {
 			g.Go(func() error {
-				c := baseCond(s.side, t, s.bound)
+				c := baseCond(s.side, t, s.since, s.bound)
 				args := make([]any, len(chunk))
 				for i, k := range chunk {
 					args[i] = k
@@ -147,7 +147,7 @@ func (s *sideSource) preload(ctx context.Context) error {
 			continue
 		}
 		g.Go(func() error {
-			rs, err := s.readRows(gctx, t, baseCond(s.side, t, s.bound))
+			rs, err := s.readRows(gctx, t, baseCond(s.side, t, s.since, s.bound))
 			if err != nil {
 				return err
 			}

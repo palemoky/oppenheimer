@@ -144,7 +144,7 @@ archive-reclaim: ## 归档删行之后，回收热表的表空间（只做回收
 
 # 对账（ADR-0022）：比对主从、订单对商家索引、订单对支付单、订单对预占。DSN 的生成见 scripts/recon.sh（ORDER_DBS 同 run-local.sh）。
 .PHONY: recon
-recon: ## 对账：在系统运行中比对几份应当一致的数据并定位到行，参数用 RECON_ARGS 传，例如 RECON_ARGS="-pairs index -settle 10m"；ORDER_DBS=4 表示订单库已扩成 4 个
+recon: ## 对账：在系统运行中比对几份应当一致的数据并定位到行，参数用 RECON_ARGS 传，例如 RECON_ARGS="-pairs index -since 26h"（只比最近 26 小时，不带 -since 是全量）；ORDER_DBS=4 表示订单库已扩成 4 个
 	scripts/recon.sh $(RECON_ARGS)
 
 .PHONY: seed-report

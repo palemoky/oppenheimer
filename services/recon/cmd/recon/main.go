@@ -49,6 +49,7 @@ type options struct {
 	pairs         []string
 	pairsSet      bool
 	settle        time.Duration
+	since         time.Duration
 	recheck       time.Duration
 	maxRows       uint64
 	mode          recon.Mode
@@ -94,6 +95,7 @@ func parseFlags(args []string) (options, error) {
 	fs := flag.NewFlagSet(serviceName, flag.ContinueOnError)
 	fs.StringVar(&pairs, "pairs", "replica,index,payment,stock", "comma separated pairs to compare: "+strings.Join(recon.PairNames, ", ")+" (archive must be given explicitly)")
 	fs.DurationVar(&o.settle, "settle", 30*time.Minute, "compare only orders created before now minus this; 0 means no upper bound")
+	fs.DurationVar(&o.since, "since", 0, "incremental run: compare only orders created within this long before now, e.g. 26h; 0 means no lower bound (full run). Not for the archive pair")
 	fs.DurationVar(&o.recheck, "recheck", recon.DefaultRecheck, "wait this long and re-read the differences; 0 skips the recheck")
 	fs.Uint64Var(&o.maxRows, "max-rows", recon.DefaultMaxRows, "compare row by row the differing nodes with at most this many rows on each side")
 	fs.StringVar(&mode, "mode", string(recon.ModeTree), "tree (compare digests first) or full (read both sides entirely, the baseline)")
@@ -131,8 +133,12 @@ func parseFlags(args []string) (options, error) {
 		return o, fmt.Errorf("unknown mode %q", mode)
 	}
 	switch {
-	case o.settle < 0, o.recheck < 0, o.timeout < 0:
-		return o, errors.New("-settle, -recheck and -timeout must not be negative")
+	case o.settle < 0, o.recheck < 0, o.timeout < 0, o.since < 0:
+		return o, errors.New("-settle, -since, -recheck and -timeout must not be negative")
+	case o.since > 0 && o.since <= o.settle:
+		return o, errors.New("-since must be longer than -settle, otherwise the window is empty")
+	case o.since > 0 && (slices.Contains(o.pairs, recon.PairArchive) || o.against != "" || o.snapshotOut != ""):
+		return o, errors.New("-since cannot be used with the archive pair: a saved tree covers everything up to its bound")
 	case o.maxExamples <= 0, o.dbConcurrency <= 0, o.maxRows == 0:
 		return o, errors.New("-max-examples, -db-concurrency and -max-rows must be positive")
 	case o.snapshotOut != "" && o.against != "":
@@ -160,8 +166,13 @@ func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) 
 		bound   int64
 		against map[string]*merkle.Tree
 	)
+	now := time.Now()
 	if o.settle > 0 {
-		bound = idgen.LowerBound(time.Now().Add(-o.settle))
+		bound = idgen.LowerBound(now.Add(-o.settle))
+	}
+	var since int64
+	if o.since > 0 {
+		since = idgen.LowerBound(now.Add(-o.since))
 	}
 	if o.against != "" {
 		f, err := os.Open(o.against)
@@ -207,7 +218,7 @@ func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) 
 		for _, c := range p.Comparisons {
 			logger.Info("comparing", "comparison", c.Name)
 			r, err := recon.Compare(ctx, c, recon.Options{
-				Mode: o.mode, Bound: bound, MaxRows: o.maxRows, Recheck: o.recheck, MaxExamples: o.maxExamples,
+				Mode: o.mode, Since: since, Bound: bound, MaxRows: o.maxRows, Recheck: o.recheck, MaxExamples: o.maxExamples,
 				Limiter: lim, Against: against, Repairer: repairer, Logger: logger,
 			})
 			if err != nil {
