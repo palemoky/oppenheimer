@@ -79,7 +79,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。
-- 所有跨进程调用带 `context` 和超时。时限逐跳收紧：总时限只在入口设一次，每一跳给下一跳单独设一个更短的时限（服务之间用 `grpcx.WithHopTimeout`），同一个数也写在 Envoy 边车的出站路由上（`deploy/envoy/`），两处要一致。见 ADR-0020。
+- 所有跨进程调用带 `context` 和超时。时限逐跳收紧：总时限只在入口设一次，每一跳给下一跳单独设一个更短的时限（服务之间用 `grpcx.WithHopTimeout`）。这一跳的预算写在 Envoy 边车的出站路由上（`deploy/envoy/`），进程里的时限等于它加 `grpcx.SidecarMargin`（500 毫秒）：两个数不能相等，边车要先超时，慢下游才会被摘除。有测试核对两处。见 ADR-0020、设计文档 1d 的 5.6。
 - 重试的规则：只重试幂等的操作；一条调用链上只有一层重试（同步调用链上不重试，由客户端带幂等键重试；异步的由消费者重试）；退避带抖动；重试有上限，耗尽后的去向要明确。客户端库可能自己重试（go-redis 默认会），非幂等的操作要先确认它被执行两次的后果。
 - “自己是好的、依赖坏了或功能被关掉”时返回 `errx.Degraded`（`FAILED_PRECONDITION` 加降级原因码），不要返回 `UNAVAILABLE`：调用方的边车会把 `UNAVAILABLE` 算成这个服务的失败，连续 5 次就把整个服务摘掉。gateway 按原因码映射成 503。见设计文档 1d 的 6.16。
 - 边车看不到的依赖（Redis、MySQL 的从库和冷库）用 `pkg/breaker` 熔断；可以降级的功能在 `pkg/degrade` 登记开关，自动降级和人工开关走同一条代码路径。可选的依赖不能挡住启动（`redisx.OpenLazy`、`mysqlx.OpenLazy`）。
