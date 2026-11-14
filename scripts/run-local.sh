@@ -143,4 +143,5 @@ if [ "${1:-}" = "--" ]; then
 fi
 
 echo "gateway listening on http://127.0.0.1:8080 — press Ctrl-C to stop"
+echo "gateway admin (degrade switches) on http://127.0.0.1:8089/degrade"
 wait

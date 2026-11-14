@@ -166,7 +166,7 @@ trap on_signal INT TERM
 # ---------- 准备 ----------
 
 sidecar_setup
-for p in 8080 8081 8082 8083; do
+for p in 8080 8081 8082 8083 8089; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2
     exit 2
