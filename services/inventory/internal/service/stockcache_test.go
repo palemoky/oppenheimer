@@ -105,6 +105,11 @@ func TestGetStockCacheDisabled(t *testing.T) {
 	}
 }
 
+// TestReserveDoesNotInvalidateOrReadCache：Reserve 不失效 GetStock 的缓存，自己也不读它。
+//
+// 以前“不读缓存”是这样验证的：缓存里还是 10，库里只剩 7，再要 8 必须 INSUFFICIENT_STOCK。
+// ADR-0018 之后 Reserve 不再检查可售数，那个断言不再成立。Reserve 仍然从库里读、并且必须读对的
+// 是单价和商家（价格快照），所以改用单价验证：库里改了价，缓存里还是旧价，Reserve 返回的是库里的新价。
 func TestReserveDoesNotInvalidateOrReadCache(t *testing.T) {
 	e := newCacheEnv(t, time.Minute)
 	e.seed(t, 1, 100, 10)
@@ -121,10 +126,17 @@ func TestReserveDoesNotInvalidateOrReadCache(t *testing.T) {
 	if got, err := e.get(t, 1); err != nil || got.GetAvailable() != 10 || got.GetReserved() != 0 {
 		t.Fatalf("after reserve = %v, %v; want stale (10, 0)", got, err)
 	}
-	// Reserve 自己读库：库存只剩 7，再要 8 必须失败，不会被缓存里的 10 骗过。
-	_, err := e.cached.Reserve(t.Context(), &inventoryv1.ReserveRequest{
-		OrderId: 2, Items: []*inventoryv1.ReserveItem{{SkuId: 1, Quantity: 8}},
+	// Reserve 自己读库：改价之后的预占拿到新价，不会被缓存里的旧价骗过。
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET unit_price = 150 WHERE sku_id = 1`)
+	resp, err := e.cached.Reserve(t.Context(), &inventoryv1.ReserveRequest{
+		OrderId: 2, Items: []*inventoryv1.ReserveItem{{SkuId: 1, Quantity: 2}},
 	})
-	assertErr(t, err, codes.FailedPrecondition, errx.ReasonInsufficientStock)
-	e.assertStock(t, 1, 7, 3, 0)
+	mustOK(t, err)
+	if got := resp.GetItems()[0].GetUnitPrice().GetAmount(); got != 150 {
+		t.Errorf("reserve after price change: unit price %d, want 150 from mysql", got)
+	}
+	if got, err := e.get(t, 1); err != nil || got.GetUnitPrice().GetAmount() != 100 || got.GetAvailable() != 10 {
+		t.Fatalf("cache after second reserve = %v, %v; want stale (price 100, available 10)", got, err)
+	}
+	e.assertStock(t, 1, 5, 5, 0)
 }

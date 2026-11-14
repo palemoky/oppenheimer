@@ -24,6 +24,8 @@ func gateErr(err error) error { return fmt.Errorf("%w: %w", errGate, err) }
 // 读 MySQL 和 Load 之间不加锁也不开事务：Load 只在未装载时写入数量，
 // 所以多个实例并发预热同一个 SKU，只有第一个写入生效，之后的只更新限购。
 // 未装载的 SKU 不可能有占用（Hold 要求 SKU 已装载），此刻 MySQL 的 available 就是闸门该有的数量。
+// 这里的 available 是 store.GetStock 返回的真实值，已经加上了还没应用到 sku_stock 的增量（ADR-0018）；
+// 直接读 sku_stock 的话，刚预占、还没应用的数量会被重新装进闸门，卖两次。
 func (s *Service) WarmUp(ctx context.Context, req *inventoryv1.WarmUpRequest) (*inventoryv1.WarmUpResponse, error) {
 	ids := slices.Clone(req.GetSkuIds())
 	if len(ids) == 0 {
@@ -48,13 +50,23 @@ func (s *Service) WarmUp(ctx context.Context, req *inventoryv1.WarmUpRequest) (*
 			resp.Missing = append(resp.Missing, id)
 			continue
 		}
-		loaded, err := s.gate.Load(ctx, id, stock.Available, stock.PurchaseLimit)
+		// 真实可售数在超卖时是负数（闸门曾经放行了超过 MySQL 里有的数量，见 ADR-0018）。
+		// 装进闸门的数量不能为负：按 0 装载，这个 SKU 从此不再放行，并把情况报出来。
+		// 不能把负数原样传给闸门：它会当作参数错误拒绝，对外就成了“闸门不可用，请重试”，
+		// 调用方会对一个数据问题无休止地重试。
+		avail := stock.Available
+		if avail < 0 {
+			s.logger.ErrorContext(ctx, "sku is oversold in mysql, loading it into the stock gate with nothing to sell",
+				"sku_id", id, "available", stock.Available, "reserved", stock.Reserved, "sold", stock.Sold)
+			avail = 0
+		}
+		loaded, err := s.gate.Load(ctx, id, avail, stock.PurchaseLimit)
 		if err != nil {
 			return nil, s.toStatus(ctx, "warm up", gateErr(err), "sku_id", id)
 		}
 		if loaded {
 			s.logger.InfoContext(ctx, "sku loaded into stock gate",
-				"sku_id", id, "avail", stock.Available, "limit", stock.PurchaseLimit)
+				"sku_id", id, "avail", avail, "limit", stock.PurchaseLimit)
 		}
 	}
 	return resp, nil

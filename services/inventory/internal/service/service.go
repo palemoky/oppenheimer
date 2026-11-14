@@ -26,7 +26,7 @@ import (
 // 事务遇到死锁时的重试参数。
 //
 // 按 sku_id 排序消除了库存行之间的死锁，Release 在冲突时直接加排他锁消除了锁升级死锁，
-// 但还剩一种无法在应用层排除的情况：同一订单的 Reserve 插入者回滚（例如库存不足）时，
+// 但还剩一种无法在应用层排除的情况：同一订单的 Reserve 插入者回滚（例如 SKU 不存在）时，
 // 排队等它的重复请求在记录消失后都继承了同一个间隙锁，又都要插入，彼此的插入意向锁
 // 与对方的间隙锁冲突，InnoDB 会判定死锁并回滚其中一些。三个操作都幂等，整个事务重来
 // 是安全的；退避加随机抖动，让重来的请求错开，不再同时撞到同一个间隙上。
@@ -103,26 +103,7 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 			return err
 		}
 
-		// 所有事务按同一顺序锁 sku_stock 的行，避免交叉购买时死锁。
-		for _, it := range want {
-			ok, err := tx.ReserveStock(ctx, it.SKUID, it.Quantity)
-			if err != nil {
-				return err
-			}
-			if ok {
-				continue
-			}
-			exists, err := tx.SKUExists(ctx, it.SKUID)
-			if err != nil {
-				return err
-			}
-			// 返回错误让整个事务回滚，连同上面插入的头记录和已扣的其他 SKU。
-			if !exists {
-				return errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", it.SKUID)
-			}
-			return errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "insufficient stock for sku %d", it.SKUID)
-		}
-
+		// 读单价和商家，同时确认 SKU 都存在。普通的快照读，不锁 sku_stock 的行。
 		skuIDs := make([]int64, len(want))
 		for i, it := range want {
 			skuIDs[i] = it.SKUID
@@ -135,12 +116,12 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		for i := range items {
 			sku, ok := skus[items[i].SKUID]
 			if !ok {
-				// 刚刚成功扣减过的行不可能消失，出现就是数据被破坏。
-				return errors.New("sku missing after reserve")
+				// 返回错误让整个事务回滚，连同上面插入的头记录。
+				return errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", items[i].SKUID)
 			}
 			items[i].UnitPrice = sku.UnitPrice
 		}
-		// 一个订单只属于一个商家（ADR-0014）。返回错误让整个事务回滚，连同已扣的库存。
+		// 一个订单只属于一个商家（ADR-0014）。返回错误让整个事务回滚。
 		merchant, err := singleMerchant(skus)
 		if err != nil {
 			return err
@@ -150,6 +131,14 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		}
 		if err := tx.InsertReservationItems(ctx, orderID, items); err != nil {
 			return err
+		}
+		// 库存的变化只记增量，不改 sku_stock（ADR-0018）：买同一个 SKU 的订单不再抢同一行的锁，
+		// 后台的应用者按 SKU 合并后一次更新。这里不检查可售数够不够：能不能卖由库存闸门在受理时
+		// 原子地判断过了。闸门和 MySQL 对不上时，以前是这里返回库存不足，现在是应用者发现并报错。
+		for _, it := range items {
+			if err := tx.PendReserve(ctx, orderID, it.SKUID, it.Quantity); err != nil {
+				return err
+			}
 		}
 		result, merchantID = items, merchant
 		return nil
@@ -285,7 +274,7 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 		case store.StatusReleased:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "reservation of order %d has been released", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusConfirmed, tx.ConfirmStock)
+			return settle(ctx, tx, orderID, store.StatusConfirmed, tx.PendConfirm)
 		default:
 			return errors.New("unknown reservation status")
 		}
@@ -332,16 +321,19 @@ func (s *Service) release(ctx context.Context, orderID int64) error {
 		case store.StatusConfirmed:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationConfirmed, "reservation of order %d has been confirmed", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusReleased, tx.ReleaseStock)
+			return settle(ctx, tx, orderID, store.StatusReleased, tx.PendRelease)
 		default:
 			return errors.New("unknown reservation status")
 		}
 	})
 }
 
-// settle 把 RESERVED 的预占转为 to，并对每一项按 sku_id 升序执行 move。
+// settle 把 RESERVED 的预占转为 to，并对每一项记一笔库存增量（pend）。
 // 调用方必须已对 reservation 记录持有排他锁。
-func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, move func(context.Context, int64, int32) (bool, error)) error {
+//
+// 状态的条件更新保证一个订单只会被确认或释放一次，所以每笔增量只记一次。
+// 增量应用到 sku_stock 时如果预占量不够扣，说明恒等式已被破坏，由应用者发现并报错（见 store.ApplyPending）。
+func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, pend func(ctx context.Context, orderID, skuID int64, qty int32) error) error {
 	ok, err := tx.UpdateReservationStatus(ctx, orderID, store.StatusReserved, to)
 	if err != nil {
 		return err
@@ -358,14 +350,8 @@ func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, m
 		return errors.New("reserved reservation has no items")
 	}
 	for _, it := range items {
-		ok, err := move(ctx, it.SKUID, it.Quantity)
-		if err != nil {
+		if err := pend(ctx, orderID, it.SKUID, it.Quantity); err != nil {
 			return err
-		}
-		if !ok {
-			// 预占量不够扣，说明 available + reserved + sold 的恒等式已被破坏，
-			// 宁可整单失败报警，也不能继续写出错误的库存。
-			return errors.New("stock invariant violated")
 		}
 	}
 	return nil
@@ -400,7 +386,9 @@ func (s *Service) loadStock(ctx context.Context, skuID int64) (*inventoryv1.GetS
 		return nil, false, err
 	}
 	return &inventoryv1.GetStockResponse{
-		SkuId:     stock.SKUID,
+		SkuId: stock.SKUID,
+		// 照实返回，超卖时 available 是负数（ADR-0018）：这个接口也给对账和排查用，
+		// 在这里截断会让 available + reserved + sold 对不上入库总量。面向买家的展示由 gateway 截到 0。
 		Available: stock.Available,
 		Reserved:  stock.Reserved,
 		Sold:      stock.Sold,

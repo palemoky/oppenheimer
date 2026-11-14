@@ -156,10 +156,16 @@ func (r *Reconciler) check(ctx context.Context, sku int64, next map[int64]streak
 		return nil
 	}
 
+	// 闸门里可放行数量的上限。MySQL 的真实可售数（含未应用的增量，见 store.GetStock）在超卖时是负数：
+	// 闸门放行的数量超过了 MySQL 里有的（ADR-0018 之后 MySQL 不再当场拒绝）。闸门的数量不能为负，
+	// 上限取 0。这正是最需要对账起作用的时候：偏差为正，下面的修正会把闸门收到 0，不再继续卖。
+	// 直接把负数传给闸门的话它会报参数错误，对账反而在超卖时失效。
+	maxAvail := max(ms.Available, 0)
+
 	if gs.Limit != ms.PurchaseLimit {
 		// 限购数量是配置，以 MySQL 为准。订单服务只在 SKU 未装载时才触发装载，
 		// 之后在 MySQL 里改了限购，要靠这里同步过去。Load 对已装载的 SKU 只更新限购、不动数量。
-		if _, err := r.gate.Load(ctx, sku, ms.Available, ms.PurchaseLimit); err != nil {
+		if _, err := r.gate.Load(ctx, sku, maxAvail, ms.PurchaseLimit); err != nil {
 			return fmt.Errorf("reconcile sku %d: sync purchase limit: %w", sku, err)
 		}
 		r.logger.InfoContext(ctx, "purchase limit synced to stock gate",
@@ -185,7 +191,7 @@ func (r *Reconciler) check(ctx context.Context, sku int64, next map[int64]streak
 
 	// 连续 rounds 轮得到同一个 d，认定为真实偏差。修正后不再记入 next：
 	// 修正如果没有完全消除偏差（被上限截住），下一轮重新从 1 开始数，而不是每轮都修。
-	after, ok, err := r.gate.Adjust(ctx, sku, -d, ms.Available)
+	after, ok, err := r.gate.Adjust(ctx, sku, -d, maxAvail)
 	if err != nil {
 		next[sku] = s // 没修成，保留计数，下一轮再试
 		return fmt.Errorf("reconcile sku %d: %w", sku, err)

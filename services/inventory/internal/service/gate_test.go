@@ -202,7 +202,8 @@ func TestHandleOrderEventGate(t *testing.T) {
 	}
 }
 
-// TestHandleOrderEventGateEmptyRollback：Reserve 没有成功（超时或 MySQL 库存不足）的订单失败时，
+// TestHandleOrderEventGateEmptyRollback：Reserve 没有成功（超时、SKU 不存在、多商家）的订单失败时，
+// （ADR-0018 之前还有“MySQL 库存不足”，现在 Reserve 不再因此失败。）
 // MySQL 只留下空回滚标记，闸门里受理时扣的数量照样归还。
 func TestHandleOrderEventGateEmptyRollback(t *testing.T) {
 	e := newEnv(t)

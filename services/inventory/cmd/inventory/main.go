@@ -27,6 +27,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
 	"github.com/palemoky/oppenheimer/pkg/worker"
 	"github.com/palemoky/oppenheimer/services/inventory"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/apply"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/reconcile"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/service"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
@@ -60,6 +61,10 @@ type config struct {
 
 	reconcileInterval time.Duration
 	reconcileRounds   int
+
+	// 库存增量的应用（ADR-0018），见 apply.Config。
+	applyInterval time.Duration
+	applyBatch    int
 }
 
 func loadConfig() (config, error) {
@@ -77,6 +82,23 @@ func loadConfig() (config, error) {
 
 		reconcileInterval: reconcile.DefaultInterval,
 		reconcileRounds:   reconcile.DefaultRounds,
+
+		applyInterval: apply.DefaultInterval,
+		applyBatch:    apply.DefaultBatch,
+	}
+	if v := os.Getenv("STOCK_APPLY_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return config{}, fmt.Errorf("STOCK_APPLY_INTERVAL: invalid duration %q", v)
+		}
+		cfg.applyInterval = d
+	}
+	if v := os.Getenv("STOCK_APPLY_BATCH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > store.MaxApplyBatch {
+			return config{}, fmt.Errorf("STOCK_APPLY_BATCH: want an integer in 1..%d, got %q", store.MaxApplyBatch, v)
+		}
+		cfg.applyBatch = n
 	}
 	if v := os.Getenv("STOCK_CACHE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -178,6 +200,16 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		return err
 	}
 
+	// 把库存增量合并进 sku_stock 的后台任务（ADR-0018）。每个实例各跑一个，不用 leader 锁。
+	applier, err := apply.New(st, apply.Config{Interval: cfg.applyInterval, Batch: cfg.applyBatch, Logger: logger})
+	if err != nil {
+		return err
+	}
+	applyLoop, err := apply.NewLoop(applier)
+	if err != nil {
+		return fmt.Errorf("new stock apply loop: %w", err)
+	}
+
 	// 先绑定两个端口，任何一个冲突都在开始服务前暴露。
 	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.HealthHandler(serviceName))
 	if err != nil {
@@ -196,8 +228,17 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	//      收尾时（消费者最后几条事件在改 MySQL 和闸门）读到半途的状态去修正。
 	//   2. 消费者其次，在途事件处理完（MySQL 和闸门两步都做完或返回错误）、位点提交后再往下走。
 	//   3. 然后 gRPC、HTTP。
+	//   4. 库存增量的应用最后停：gRPC 的预占、消费者的确认和释放在收尾时还在写增量。
+	//      它停了之后再收一次尾（下面的 Drain），尽量不把没应用的增量留到下次启动。留下了也没有错：
+	//      读库存的地方都会把它们加上，下次启动接着应用。
 	// Redis 和 MySQL 的连接在 app.Run 返回、所有组件都停了之后才关（见上面的 defer）。
-	return app.Run(ctx, logger, httpServer, grpcServer, consumer, reconciler)
+	runErr := app.Run(ctx, logger, applyLoop, httpServer, grpcServer, consumer, reconciler)
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := applier.Drain(dctx); err != nil {
+		logger.Warn("apply remaining stock deltas on shutdown", "error", err)
+	}
+	return runErr
 }
 
 // newStockCache 创建 GetStock 的查询缓存；STOCK_CACHE_TTL 为 0 时返回 nil（不缓存）。
