@@ -45,3 +45,4 @@
 | [0016](0016-cold-archive.md) | 冷订单按订单号里的时间归档到独立的压缩库，先写冷、校验、再删热 | 已采纳 |
 | [0017](0017-keyed-concurrent-consume.md) | 消费者在分区内按 key 并发，提交连续前缀 | 已采纳 |
 | [0018](0018-async-stock-deduction.md) | MySQL 侧的库存计数改为异步合并更新，闸门是防超卖的唯一关口 | 已采纳 |
+| [0019](0019-gateway-rate-limiting.md) | 网关用令牌桶限流，按 IP 在进程内、按用户和接口在 Redis 里 | 已采纳 |
