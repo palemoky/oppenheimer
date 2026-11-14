@@ -117,5 +117,16 @@ export E2E_ORDER_READ_PIN_TTL="$ORDER_READ_PIN_TTL"
 export E2E_ARCHIVE_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_order_archive_db"
 export E2E_ARCHIVER_BIN="$ROOT/bin/archiver"
 
+# 链路导出到测试进程里的接收端（test/e2e/otlp_test.go），不连本机的 otel-lgtm（ADR-0023）。
+# obs.sh 在调用方已设 OTEL_EXPORTER_OTLP_ENDPOINT 且 OBS 不是 off 时原样使用它，不检查容器，
+# 所以这里设成接收端的地址并保持 OBS 默认；不能设 OBS=off（那会 unset 这个变量）。
+# 服务先于测试进程启动，这段时间接收端还没监听：导出器连不上只丢那一批，之后自动重连。
+# OTEL_BSP_SCHEDULE_DELAY 是批处理的发送间隔（毫秒），调小让 span 尽快到达，断言不用等久。
+E2E_OTLP_PORT="${E2E_OTLP_PORT:-14317}"
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:${E2E_OTLP_PORT}"
+export OTEL_BSP_SCHEDULE_DELAY=200
+unset OBS
+export E2E_OTLP_ENDPOINT="$OTEL_EXPORTER_OTLP_ENDPOINT"
+
 cd "$ROOT/test/e2e"
 "$ROOT/scripts/run-local.sh" -- go test -race -count=1 -v ./... "$@"

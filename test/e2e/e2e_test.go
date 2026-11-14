@@ -74,6 +74,16 @@ func run(m *testing.M) int {
 		return 1
 	}
 
+	// 链路的接收端：服务把 span 导出到这里，trace_test.go 据此断言。没设就不起，对应的用例跳过。
+	if ep := os.Getenv(otlpAddrEnv); ep != "" {
+		otlp, err = startCollector(ep)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "start OTLP receiver: %v\n", err)
+			return 1
+		}
+		defer otlp.stop()
+	}
+
 	// 以时间为基数，重复运行时不会撞上之前的 SKU 和用户。
 	base := time.Now().UnixMilli() % 1_000_000_000 * 1000
 	nextSKU.Store(base)
