@@ -41,7 +41,7 @@
    - 步骤四已分 6 个提交推送（`baa80e3` 到 `e2a01c8`，在 draft PR #6 里），CI 的 24 项检查全部通过（2026-11-14）。
    - **CI 偶发失败，根因没有找到**：文档提交 `9a219ff` 的那次运行里，`test (./pkg)` 的 `TestMigrateConcurrentOnEmptyDB` 失败一次，8 个并发迁移中的一个报 `missing zero version migration`（goose 在版本表存在但没有 0 号记录时报这个错）。这次提交只改了文档，前一次运行（`e2a01c8`，代码相同）是通过的；本机带 `-race` 连跑 150 次没有复现。已经排除的：迁移锁的加锁、解锁和锁名（`pkg/mysqlx` 的 `getLockLocker`）读下来没有问题；goose v3.30.0 的 `up` 是先拿锁再建版本表、再读版本。一个没有证实的怀疑：MySQL 的建表会隐式提交，goose 把“建版本表”和“插入 0 号记录”放在一个事务里并带重试，如果插入那一步失败过一次，重试时看到表已存在就直接往下走，读到的是空表。再出现时先看失败的是不是第一个拿到锁的迁移。这关系到多实例同时在空库上启动，不只是测试问题。
    - 步骤四的结果在设计文档 5.11。最后一次 `make lint test e2e` 通过（2026-11-14，扩容之后）。`make chaos` 这次没有跑。
-   - **补商家索引这一半的造数报告**：索引消费者只有约 2000 行/秒，演练结束时积压约 547 万条。追上后（`kafka-consumer-groups.sh --describe --group orderindex.cdc-orders` 的 lag 归零）跑 `make seed-report SEED_ARGS="-order-dsns <4 个库的 DSN，见 scripts/expand.sh env>"`，把索引的均匀度和商家列表的延迟补进 5.11，勾掉计划里对应的一项。
+   - 商家索引这一半的造数报告已补（索引追平后量的，设计文档 5.11 的“商家索引”一段）。
    - 然后做 **1c 步骤五**（冷热归档），动工前先细化设计文档第 6 节并写 ADR，主人确认后再实现。归档就用本机现在这批 500 万单的数据。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
@@ -85,7 +85,8 @@
   - 启动服务要 `ORDER_DBS=4 make run`。直接 `make run` 会因为 `shard_meta` 不符而拒绝启动，这是有意的。
   - 想回到干净的 2 库环境：`make down-volumes && make up`（会清掉全部数据，包括造的数）。
   - `make e2e`、`make test` 不受影响，它们用旧的两个实例上独立的库。
-- 当前依赖和六个服务都处于**运行**状态（`ORDER_DBS=4 make run` 在后台，日志在 `tmp/make-run.log` 和 `tmp/logs/`），留着是为了让商家索引追上。停止：`pkill -f scripts/run-local.sh`。
+- 当前依赖和六个服务都处于**运行**状态（`ORDER_DBS=4 make run` 在后台，日志在 `tmp/make-run.log` 和 `tmp/logs/`）。商家索引已经追平，不用再留着，停止：`pkill -f scripts/run-local.sh`。
+- Kafka 的 Web 界面：`make kafka-ui` 启动 kafbat-ui（compose 的 `ui` profile，只读，http://127.0.0.1:8090），`make kafka-ui-down` 停止。看消费组的 lag 要点进具体的消费组。消息体是 protobuf，没有配置解码，看到的是原始字节。当前处于运行状态。
 - 造数：`make seed-orders`（可中断续跑）、`make seed-report`。扩容：`scripts/expand.sh`（不带参数看用法），演练的状态文件在 `tmp/expand/`。
 - order 的读模式由 `ORDER_READ_MODE` 控制（`primary`、`window`、`gtid`），`make e2e` 默认 `gtid`，`make run` 会连上从库但默认是 `primary`，要读从库时自己设这个变量。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
@@ -190,5 +191,7 @@
 评审后合入。扩容脚本改了三处（等待超时自动撤围栏、建从库移出窗口、校验不怕新写入）。灌了 500 万单并出报告，带流量演练了 2 库扩 4 库：窗口 9.3 秒，8181 个订单全部落库，对账和数据校验通过，结果在设计文档 5.11。做完后分 6 个提交推送（git 操作和看 CI 派给 Haiku），CI 全绿。
 
 同日按主人要求在路线图里加了可选的阶段 9（eBPF），并回答了两个设计问题，要点记进了阶段计划的考点：为什么用 CHECK 而不是 UNSIGNED，`SKIP LOCKED` 适合什么场景。
+
+同日商家索引追平，补了索引这一半的造数报告；按主人要求加了 kafbat-ui（Sonnet 子 Agent）。CI 在一次只改文档的提交上偶发失败过一次（并发迁移用例），重跑通过，根因未找到，记在“下一步”里。
 
 教训：直接在模块目录里跑 `go test` 时集成测试会因为没有环境变量而全部跳过，看起来是通过。要用 `make test MODULES=$PWD/<模块>`。
