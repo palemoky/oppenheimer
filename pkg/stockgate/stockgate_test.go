@@ -457,6 +457,43 @@ func TestHoldsBefore(t *testing.T) {
 	}
 }
 
+// Queued 数的是背压比较的那个队列：受理加一个未认领的，认领把它移到已认领，结束（回收、结清、归还）把它去掉；
+// 被背压拒绝的受理不进队列。
+func TestQueued(t *testing.T) {
+	e := newEnv(t)
+	want := func(unclaimed, claimed int64) {
+		t.Helper()
+		u, c, err := e.gate.Queued(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u != unclaimed || c != claimed {
+			t.Fatalf("Queued = %d unclaimed, %d claimed; want %d, %d", u, c, unclaimed, claimed)
+		}
+	}
+	want(0, 0)
+	e.load(1, 100, 0)
+	now := time.Now()
+	ids := e.admit(now, 5, stockgate.BacklogLimit{})
+	want(5, 0)
+	for _, id := range ids[:3] {
+		e.claim(id, now)
+	}
+	e.claim(ids[0], now) // 重复认领不重复计数
+	want(2, 3)
+
+	// 背压按同一个数拒绝：上限取现在的未认领数，下一个受理被拒，拒绝时报的也是这个数。
+	if res := e.holdAt(now, stockgate.BacklogLimit{MaxQueue: 2}); res.Outcome != stockgate.Backlogged || res.Queued != 2 {
+		t.Fatalf("hold at the queue limit = %+v, want Backlogged with 2 queued", res)
+	}
+	want(2, 3)
+
+	e.reap(ids[3:4])
+	must[bool](t)(e.gate.Settle(t.Context(), ids[0]))
+	must[bool](t)(e.gate.Return(t.Context(), ids[1]))
+	want(1, 1)
+}
+
 // 防止：重复装载用 MySQL 的值覆盖闸门里的数量，抹掉还没落到 MySQL 的占用。
 func TestLoadOnlyOnce(t *testing.T) {
 	e := newEnv(t)

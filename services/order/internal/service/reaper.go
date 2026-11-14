@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
@@ -53,7 +54,22 @@ type Reaper struct {
 	// failing 表示上一轮列占用时闸门不可用；holdUntil 之前不回收未认领的占用，见 RunOnce。
 	failing   bool
 	holdUntil time.Time
+
+	// queued 是最近一次读到的闸门队列长度（refreshQueued），给 order.gate.* 指标用；从没读到过时为 nil。
+	// RunOnce 写，导出指标的 goroutine 读。
+	queued atomic.Pointer[queuedHolds]
 }
+
+// queuedHolds 是某一时刻闸门里的占用个数，见 stockgate.Gate.Queued。
+type queuedHolds struct {
+	unclaimed, claimed int64
+	// at 是读到它的时刻（Service 的时钟）。
+	at time.Time
+}
+
+// queuedStaleRounds 是 queued 多少个回收间隔没有更新就不再上报：这个实例不是 leader 了（回收任务不跑），
+// 或者闸门一直不可用。上报一个旧值会让人以为队列停在那里，不如不报。
+const queuedStaleRounds = 3
 
 // NewReaper 返回使用 svc 的闸门和时钟的回收任务。
 func NewReaper(svc *Service, cfg ReaperConfig) (*Reaper, error) {
@@ -104,7 +120,10 @@ type ReapStats struct {
 // “闸门不可用过”有两个来源：本进程里闸门的熔断器打开过（受理、查询、落库都会喂它），
 // 或者回收任务自己上一轮列占用失败（这个实例可能只跑周期任务，没有别的调用去喂熔断器）。
 // 两个都是本进程的见闻：消费者在别的实例上、而只有那个实例连不上 Redis 时，这里看不到，不会等。
+//
+// 每轮最后还顺带读一次闸门的队列长度给指标用（refreshQueued），它不影响这一轮的结果。
 func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
+	defer r.refreshQueued(ctx)
 	var stats ReapStats
 	now := r.svc.now()
 	ids, err := r.holdsBefore(ctx, now.Add(-r.cfg.Grace))
@@ -184,4 +203,36 @@ func (r *Reaper) returnIfUnclaimed(ctx context.Context, orderID int64) (res stoc
 		return err
 	})
 	return res, err
+}
+
+// refreshQueued 读闸门里的占用个数存进 r.queued，给 order.gate.unclaimed_holds 和 claimed_holds 用（metrics.go）。
+// 只在回收任务这里读：它每轮本来就要访问闸门，受理、落库、查询的路径上不加任何查询。
+//
+// 和别的闸门调用一样经过熔断器。这一轮列占用已经失败（r.failing）时不读，闸门坏着不多等一次时限、
+// 也不多给熔断器记一次失败。读失败只记 DEBUG，不影响回收；值不更新，过一会儿指标就不再上报（queuedStaleRounds）。
+func (r *Reaper) refreshQueued(ctx context.Context) {
+	if r.failing {
+		return
+	}
+	var unclaimed, claimed int64
+	err := r.svc.gateCallWithin(ctx, reapCallTimeout, func(ctx context.Context) error {
+		var err error
+		unclaimed, claimed, err = r.svc.gate.Queued(ctx)
+		return err
+	})
+	if err != nil {
+		r.logger.DebugContext(ctx, "count queued holds failed", "error", err)
+		return
+	}
+	r.queued.Store(&queuedHolds{unclaimed: unclaimed, claimed: claimed, at: r.svc.clock()})
+}
+
+// queuedNow 返回最近一次读到的占用个数。ok 为 false 表示从没读到过，或者已经 queuedStaleRounds 个
+// 回收间隔没有更新（不知道现在是多少）。只读原子变量，可以在导出指标的 goroutine 里调用。
+func (r *Reaper) queuedNow() (q queuedHolds, ok bool) {
+	p := r.queued.Load()
+	if p == nil || r.svc.clock().Sub(p.at) > queuedStaleRounds*r.cfg.Interval {
+		return queuedHolds{}, false
+	}
+	return *p, true
 }

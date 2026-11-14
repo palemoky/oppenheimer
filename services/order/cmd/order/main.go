@@ -54,6 +54,13 @@ const redisStartTimeout = 5 * time.Second
 // 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
 const closeDelayMaxAttempts = 10
 
+// defaultRedisPoolSize 是 REDIS_POOL_SIZE 的默认值：闸门 Redis 的连接池大小。
+//
+// 原来用 redisx 的默认值 32。受理、落库（并发度乘分区数个在途）、回收和查询共用这个池子，开环每秒 2000 个
+// 下单请求时在用数一直顶在 32，每轮有几万次调用在池子上排队（设计文档 1d 的 8.18）。Redis 的连接很便宜，
+// 服务端单线程处理，连接多了不会让它变慢，所以直接给够。
+const defaultRedisPoolSize = 128
+
 // defaultAdmitMaxQueue 是 ADMIT_MAX_QUEUE 的默认值：等待落库的订单数上限。
 //
 // 它应当约等于“落库吞吐 × 允许的等待”，允许的等待要明显短于回收宽限期（默认 1 分钟）。
@@ -149,6 +156,9 @@ type config struct {
 	mysqlMaxOpenConns int
 	// readMaxConcurrency 是每个订单库上展示读的并发上限，见 service.DefaultReadMaxConcurrency。
 	readMaxConcurrency int
+	// redisPoolSize 是闸门 Redis 的连接池大小，readGateMaxConcurrency 是展示读能同时占用的连接数。
+	redisPoolSize          int
+	readGateMaxConcurrency int
 	// archiveMaxConcurrency 是冷库读的并发上限，见 service.DefaultArchiveMaxConcurrency。
 	archiveMaxConcurrency int
 	// submitConcurrency 是落库消费者每个分区的并发度，见 defaultSubmitConcurrency。
@@ -252,6 +262,21 @@ func loadConfig() (config, error) {
 			"otherwise queries can take every connection and leave none for order landing", readMax, maxOpen)
 	}
 	cfg.readMaxConcurrency = int(readMax)
+	// 闸门的 Redis 连接池和展示读能占用的份额（设计文档 1d 的 8.18）。池子是受理、落库、回收、查询共用的，
+	// 查询的份额必须小于池子，否则查询仍然能把它占满。
+	poolSize, err := envInt("REDIS_POOL_SIZE", defaultRedisPoolSize)
+	if err != nil {
+		return cfg, err
+	}
+	readGateMax, err := envInt("READ_GATE_MAX_CONCURRENCY", service.DefaultReadGateMaxConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if poolSize < 2 || readGateMax < 1 || readGateMax >= poolSize {
+		return cfg, fmt.Errorf("READ_GATE_MAX_CONCURRENCY (%d) must be at least 1 and less than REDIS_POOL_SIZE (%d), "+
+			"otherwise queries can take every stock gate connection and stall order landing", readGateMax, poolSize)
+	}
+	cfg.redisPoolSize, cfg.readGateMaxConcurrency = int(poolSize), int(readGateMax)
 	// 冷库上没有在线写入，上限不超过连接池即可；超过了就不起作用（多出来的查询在连接池上排队）。
 	archiveMax, err := envInt("ARCHIVE_MAX_CONCURRENCY", service.DefaultArchiveMaxConcurrency)
 	if err != nil {
@@ -519,7 +544,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 				order.NewArchiveMigrationData())
 		}
 	}
-	logger.Info("order archive", "configured", cold != nil)
+	logger.InfoContext(ctx, "order archive", "configured", cold != nil)
 
 	ids, err := idgen.New(cfg.workerID)
 	if err != nil {
@@ -536,7 +561,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer rcancel()
 	// Redis 此刻连不上也照样启动（设计文档 1d 的 6.10）：受理会被闸门的熔断器拒绝，查询已落库的订单、
 	// 支付结果、取消都不依赖它。Redis 故障期间重启或发布的实例要能回来承担这些。
-	rdb, err := redisx.OpenLazy(rctx, redisx.Config{Addr: cfg.redisAddr}, logger)
+	rdb, err := redisx.OpenLazy(rctx, redisx.Config{Addr: cfg.redisAddr, PoolSize: cfg.redisPoolSize}, logger)
 	if err != nil {
 		return err
 	}
@@ -613,7 +638,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		relays[i], kickers[i] = r, r
 	}
 
-	logger.Info("order read mode", "read_mode", cfg.readMode.String(), "replicas", st.HasReplicas())
+	logger.InfoContext(ctx, "order read mode", "read_mode", cfg.readMode.String(), "replicas", st.HasReplicas())
 	svc, err := service.New(service.Deps{
 		Store:      st,
 		Gate:       gate,
@@ -642,8 +667,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		ReadGTIDTTL:       cfg.readGTIDTTL,
 		ReadGTIDWait:      cfg.readGTIDWait,
 		// 设计文档 1d 的 5.7：展示读对每个订单库、读冷库各有并发上限，满了答 RESOURCE_EXHAUSTED。
-		ReadMaxConcurrency:    cfg.readMaxConcurrency,
-		ArchiveMaxConcurrency: cfg.archiveMaxConcurrency,
+		ReadMaxConcurrency:     cfg.readMaxConcurrency,
+		ReadGateMaxConcurrency: cfg.readGateMaxConcurrency,
+		GateFailureSpan:        service.DefaultGateFailureSpan,
+		ArchiveMaxConcurrency:  cfg.archiveMaxConcurrency,
 	})
 	if err != nil {
 		return err
@@ -669,6 +696,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 闸门里排队的占用数，由回收任务每轮顺带读一次；只有在跑回收任务的实例（leader）上报。
+	unregisterQueueMetrics, err := reaper.RegisterQueueMetrics()
+	if err != nil {
+		return fmt.Errorf("register stock gate queue metrics: %w", err)
+	}
+	defer unregisterQueueMetrics()
 
 	paymentConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
 		Config: kcfg,
@@ -756,7 +789,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if m := svc.ArchiveMigrator(); m != nil {
 		background = append(background, m)
 	}
-	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
+	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// 停止顺序与列出的顺序相反：
 	//  0. 收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查变成不可用，继续正常服务
@@ -791,7 +824,7 @@ func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb re
 ) {
 	closeFn = func() {}
 	if cfg.orderCacheTTL == 0 {
-		logger.Info("order query cache disabled")
+		logger.InfoContext(ctx, "order query cache disabled")
 		return nil, closeFn, nil
 	}
 	client := rdb
@@ -832,7 +865,7 @@ func releaseLeaders(ctx context.Context, logger *slog.Logger, leaders map[string
 	for name, ld := range leaders {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaderReleaseTimeout)
 		if err := ld.Close(rctx); err != nil {
-			logger.Warn("release leader lock failed", "lock", name, "error", err)
+			logger.WarnContext(ctx, "release leader lock failed", "lock", name, "error", err)
 		}
 		cancel()
 	}
