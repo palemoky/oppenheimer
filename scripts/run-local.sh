@@ -9,7 +9,9 @@
 # 以及 order 分片的四个端口 MYSQL_ORDER_{0,1}_PORT、MYSQL_ORDER_{0,1}_REPLICA_PORT，
 # 和各服务自己的配置（PAYMENT_TIMEOUT、SWEEP_INTERVAL 等）。
 # ORDER_DBS=4 表示订单库已经扩成 4 个（scripts/expand.sh 做完之后，ADR-0015）：order 连 4 主 4 从，
-# cdc 读 4 个源。默认 2。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
+# cdc 读 4 个源。默认 2。
+# order 带 ARCHIVE_DSN，指向单实例 mysql 上的 order_archive_db（冷库，ADR-0016）：启动时自己建表，热库查不到的旧订单去冷库查。
+# 冷库要先建好（make up 会建；e2e、chaos、bench 各自建带前缀的）。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -101,7 +103,7 @@ case "$ORDER_DBS" in
   exit 2
   ;;
 esac
-start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" WORKER_ID=2
+start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2
 start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
 # 商家维度的订单索引（ADR-0014）。两个索引库在单实例 mysql 上。
 start orderindex 8084 MYSQL_DSNS="$(dsn merchant_index_db_0),$(dsn merchant_index_db_1)"

@@ -33,7 +33,8 @@ run_sql mysql "$MYSQL_PORT" "
   DROP DATABASE IF EXISTS e2e_inventory_db; CREATE DATABASE e2e_inventory_db;
   DROP DATABASE IF EXISTS e2e_payment_db; CREATE DATABASE e2e_payment_db;
   DROP DATABASE IF EXISTS e2e_merchant_index_db_0; CREATE DATABASE e2e_merchant_index_db_0;
-  DROP DATABASE IF EXISTS e2e_merchant_index_db_1; CREATE DATABASE e2e_merchant_index_db_1;"
+  DROP DATABASE IF EXISTS e2e_merchant_index_db_1; CREATE DATABASE e2e_merchant_index_db_1;
+  DROP DATABASE IF EXISTS e2e_order_archive_db; CREATE DATABASE e2e_order_archive_db;"
 # CDC 的账号只有 order_db_N 的 SELECT 权限（复制脚本给的），e2e 的库要另外授权。授权也在主库上做，靠复制到从库。
 for i in 0 1; do
   port_var="MYSQL_ORDER_${i}_PORT"
@@ -101,6 +102,10 @@ export E2E_ORDER_PRIMARY_DSNS="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL
 export E2E_ORDER_REPLICA_DSNS="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_0_REPLICA_PORT})/,root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_ORDER_1_REPLICA_PORT})/"
 export E2E_ORDER_READ_MODE="$ORDER_READ_MODE"
 export E2E_ORDER_READ_PIN_TTL="$ORDER_READ_PIN_TTL"
+
+# 归档用例（ADR-0016）：冷库 DSN 和 archiver 可执行文件（make build 产出）。订单主库的 DSN 复用 E2E_ORDER_DSNS。
+export E2E_ARCHIVE_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_order_archive_db"
+export E2E_ARCHIVER_BIN="$ROOT/bin/archiver"
 
 cd "$ROOT/test/e2e"
 "$ROOT/scripts/run-local.sh" -- go test -race -count=1 -v ./... "$@"

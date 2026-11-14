@@ -142,7 +142,7 @@ start_svc() {
   local s="$1" dir="$2" i pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >"$dir/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
     payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >"$dir/payment.log" 2>&1 & ;;
     gateway) "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
   esac
@@ -224,7 +224,7 @@ run_one() {
   export REDIS_PREFIX="bench-$run_ts-$c-$n:"
 
   local q=""
-  for db in inventory_db order_db_0 order_db_1 payment_db; do
+  for db in inventory_db order_db_0 order_db_1 order_archive_db payment_db; do
     q="$q DROP DATABASE IF EXISTS ${DB_PREFIX}${db}; CREATE DATABASE ${DB_PREFIX}${db};"
   done
   sql -e "$q"

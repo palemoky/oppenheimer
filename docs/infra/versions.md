@@ -45,7 +45,7 @@
 
 | compose 服务 | 用途 | 宿主机端口 | server-id |
 |---|---|---|---|
-| `mysql` | inventory、payment，`make test` 的临时库，chaos 和 bench 的库 | 3306 | 1 |
+| `mysql` | inventory、payment、`order_archive_db`（订单冷库，ADR-0016），`make test` 的临时库，chaos 和 bench 的库 | 3306 | 1 |
 | `mysql-order-0` | `order_db_0` 主库 | 3311 | 11 |
 | `mysql-order-0-replica` | `order_db_0` 从库 | 3312 | 12 |
 | `mysql-order-1` | `order_db_1` 主库 | 3321 | 21 |

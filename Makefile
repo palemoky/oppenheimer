@@ -125,6 +125,19 @@ seed-orders: ## 直接向订单主库灌历史订单（order 至少启动过一�
 		-order-dsns "root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3311)/order_db_0,root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3321)/order_db_1" \
 		$(SEED_ARGS)
 
+# 归档（ADR-0016）：把受理超过 -older-than 的终态订单从热库搬到冷库。DSN 的生成见 scripts/archive.sh（ORDER_DBS 同 run-local.sh）。
+.PHONY: archive
+archive: ## 把旧的终态订单从订单热库归档到冷库 order_archive_db，参数用 ARCHIVE_ARGS 传，例如 ARCHIVE_ARGS="-older-than 744h -rate 200"；ORDER_DBS=4 表示订单库已扩成 4 个
+	scripts/archive.sh $(ARCHIVE_ARGS)
+
+.PHONY: archive-dry-run
+archive-dry-run: ## 归档的试运行：只统计会归档多少订单，不写冷库也不删热库
+	scripts/archive.sh -dry-run $(ARCHIVE_ARGS)
+
+.PHONY: archive-reclaim
+archive-reclaim: ## 归档删行之后，回收热表的表空间（只做回收，不搬订单）
+	scripts/archive.sh -reclaim $(ARCHIVE_ARGS)
+
 .PHONY: seed-report
 seed-report: ## 灌数之后量分片均匀度、查询延迟、偏移量对游标（只读），参数用 SEED_ARGS 传，例如 SEED_ARGS="-analyze -json tmp/seed-report.json"
 	go run ./test/load seed-report \
@@ -143,8 +156,9 @@ up-core: ## 只启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪
 	$(COMPOSE) up -d --wait $(CORE_SERVICES)
 	@$(COMPOSE) exec -T mysql mysql -uroot -p$(MYSQL_ROOT_PASSWORD) -e \
 		"CREATE DATABASE IF NOT EXISTS inventory_db; CREATE DATABASE IF NOT EXISTS payment_db; \
-		 CREATE DATABASE IF NOT EXISTS merchant_index_db_0; CREATE DATABASE IF NOT EXISTS merchant_index_db_1;" 2>/dev/null
-	@echo "databases ready: inventory_db payment_db merchant_index_db_0 merchant_index_db_1"
+		 CREATE DATABASE IF NOT EXISTS merchant_index_db_0; CREATE DATABASE IF NOT EXISTS merchant_index_db_1; \
+		 CREATE DATABASE IF NOT EXISTS order_archive_db;" 2>/dev/null
+	@echo "databases ready: inventory_db payment_db merchant_index_db_0 merchant_index_db_1 order_archive_db"
 
 .PHONY: up
 up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka 并等待就绪
