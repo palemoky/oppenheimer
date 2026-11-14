@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一（分片）、步骤二（主从与读写分离）已完成并推送；步骤三（CDC 索引表）已完成并推送
+- **当前阶段**：1c（分库分表与主从），步骤一到三已完成并推送；**步骤四（跨分片查询、造数、扩容演练）已完成，改动都在工作区里，没有提交**。剩步骤五（冷热归档）
 - **当前分支**：`phase-1c`（已推送，draft PR 已开）
-- **最后更新**：2026-11-13
+- **最后更新**：2026-11-14
 
 ## 上次做到哪
 
@@ -38,8 +38,17 @@
 **1c 步骤三（CDC 加商家索引表）已完成并推送（5 个提交，`400a97e` 到 `4b34bb7`，另有一个修 e2e 的提交）。** 设计在设计文档 1c 第 4 节，决定在 ADR-0014，实现中的发现在 4.13，结果在 4.14。`make lint test e2e` 通过，`make chaos` 两次 PASS。步骤一、二已推送，在 draft PR #6（`phase-1c`）里。
 
 1. 下一步：
-   - 先确认 PR #6 的 CI 是否全绿（`gh pr checks 6`）。步骤三第一次推送后 e2e 的 `TestPayRacingCancelEndsConsistent` 失败过：40 个订单全部被取消，没有一个走到已支付，一致性断言都通过。原因是用例把取消撒在固定的 0 到 800 毫秒里，而 CI 上支付结果本来就要六七百毫秒（此前四次运行只有 5 到 16 个已支付），多了两个进程和 5 个并行用例后全部超出窗口。窗口已加宽到 0 到 2 秒，本机两遍是已支付约 30、取消约 10。
-   - 然后做 **1c 步骤四**（跨分片查询的取舍、造数工具、扩容演练），动工前先细化设计文档第 5 节的要点并写 ADR，主人确认后再实现。
+   - **提交并推送步骤四**（等主人发话）。工作区里约 50 个文件，建议分成几个提交：文档（设计文档 1c 第 5 节、ADR-0015、计划、本文件）；共享改动（`pkg/sharding`、`pkg/idgen` 的 Epoch、`pkg/mysqlx`、order 的 `shard_meta` 和 00003 迁移、proto）；按用户列出订单（openapi、gateway、order）；围栏期间的行为（支付结果无限重试、`Unavailable`、`fence_test.go`）；造数工具（`test/load` 的 `seed`、`seed-report`，对账跳过造数订单）；扩容脚本（compose 的 `expand` profile、`scripts/expand.sh`、`scripts/expand-cdc-wait.sh`、`run-local.sh` 的 `ORDER_DBS`、cdc 的 `-print-checkpoint`）。推送后按规则派 Haiku 看 CI。
+   - 步骤四的结果在设计文档 5.11。最后一次 `make lint test e2e` 通过（2026-11-14，扩容之后）。`make chaos` 这次没有跑。
+   - **补商家索引这一半的造数报告**：索引消费者只有约 2000 行/秒，演练结束时积压约 547 万条。追上后（`kafka-consumer-groups.sh --describe --group orderindex.cdc-orders` 的 lag 归零）跑 `make seed-report SEED_ARGS="-order-dsns <4 个库的 DSN，见 scripts/expand.sh env>"`，把索引的均匀度和商家列表的延迟补进 5.11，勾掉计划里对应的一项。
+   - 然后做 **1c 步骤五**（冷热归档），动工前先细化设计文档第 6 节并写 ADR，主人确认后再实现。归档就用本机现在这批 500 万单的数据。
+   - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
+     - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
+     - 造数的进度表不跟着 slot 走，扩容后不能用原参数续灌。
+     - 多个 order 实例滚动切换没有验证（阶段 2）；CI 和 e2e 仍只跑 2 个库。
+     - orderindex 消费者改成按批写，挂到了 1d。
+     - 支付结果改成无限重试只有 `fence_test.go` 在 handler 层守着（返回可重试的错误），消费者配置本身（`MaxAttempts`）没有测试。
+     - 面试笔记仍然没有写，考点已经补进阶段计划。
    - 步骤三留下、没有做的：
      - 把 CDC 和 orderindex 加进 `scripts/chaos.sh` 的击杀名单，并在对账前等索引追上（verify 的第 20 项现在在 chaos 里是跳过的）。“杀掉 CDC 再启动”目前只有 cdc 模块自己的集成测试覆盖。
      - 延迟的指标、告警和源库心跳，挪到阶段 3（见计划变更）。
@@ -69,10 +78,17 @@
 
 - `make tools` 安装 buf、proto 插件和 `oapi-codegen` 到 `./bin`（已装）。
 - `make up-core` 只启动现有的 `mysql`、Redis、Kafka，够跑 `make test`。
-- `make up` 启动依赖：现有的 `mysql`（inventory_db、payment_db 和测试用的临时库）、order 的两主两从（`order_db_0`、`order_db_1`，端口见 `docs/infra/versions.md`）、Redis、Kafka，并建立复制。`make down` 停止并保留数据。当前依赖处于**运行**状态。
+- `make up` 启动依赖：现有的 `mysql`（inventory_db、payment_db、商家索引库和测试用的临时库）、order 的两主两从（端口见 `docs/infra/versions.md`）、Redis、Kafka，并建立复制。`make down` 停止并保留数据。
+- **本机的订单库已经扩成 4 个**（2026-11-14 的演练）：`order_db_0` 到 `order_db_3`，各在自己的实例上，各带一个从库，里面有 500 万条造出来的历史订单（用户号从 2^40 起）。多出来的 4 个实例属于 compose 的 `expand` profile，`make up` 不会启动它们：
+  - 启动依赖要 `make up && make expand-up`。
+  - 启动服务要 `ORDER_DBS=4 make run`。直接 `make run` 会因为 `shard_meta` 不符而拒绝启动，这是有意的。
+  - 想回到干净的 2 库环境：`make down-volumes && make up`（会清掉全部数据，包括造的数）。
+  - `make e2e`、`make test` 不受影响，它们用旧的两个实例上独立的库。
+- 当前依赖和六个服务都处于**运行**状态（`ORDER_DBS=4 make run` 在后台，日志在 `tmp/make-run.log` 和 `tmp/logs/`），留着是为了让商家索引追上。停止：`pkill -f scripts/run-local.sh`。
+- 造数：`make seed-orders`（可中断续跑）、`make seed-report`。扩容：`scripts/expand.sh`（不带参数看用法），演练的状态文件在 `tmp/expand/`。
 - order 的读模式由 `ORDER_READ_MODE` 控制（`primary`、`window`、`gtid`），`make e2e` 默认 `gtid`，`make run` 会连上从库但默认是 `primary`，要读从库时自己设这个变量。
 - `make test` 的集成测试连接 `make up` 启动的 MySQL，每个测试自建临时库。
-- `make run` 启动六个服务（gateway 8080、order 8081、inventory 8082、payment 8083、orderindex 8084、cdc 8085；gRPC 端口是 HTTP 端口加 1000），`make seed` 写入示例 SKU（1001 到 1003 属于商家 1，2001 属于商家 2），`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
+- `make run` 启动六个服务（订单库是 4 个时加 `ORDER_DBS=4`；gateway 8080、order 8081、inventory 8082、payment 8083、orderindex 8084、cdc 8085；gRPC 端口是 HTTP 端口加 1000），`make seed` 写入示例 SKU（1001 到 1003 属于商家 1，2001 属于商家 2），`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
 
 ## 阻塞项与待确认
 
@@ -116,6 +132,10 @@
 | 2026-11-13 | 步骤三：CDC 同步延迟的指标、告警和源库心跳挪到阶段 3；两个可选项（CDC 替换 outbox 中继、ES）不做 | 现在没有指标体系；主人确认 |
 | 2026-11-13 | 步骤三的并行任务没有用 worktree，三个子 Agent 在主工作目录里各改一个目录 | 主线的共享改动没有提交，worktree 里看不到 |
 | 2026-11-13 | `super_read_only` 改由复制脚本在复制建立后设置，不写在 compose 启动参数里 | 官方镜像首次初始化会失败 |
+| 2026-11-14 | 步骤四新增“按用户列出订单”接口；订单号 Epoch 提前到 2020-01-01 并清空本机开发库；订单库数由 `MYSQL_DSNS` 个数决定（修改 ADR-0012 第 4 条） | 见设计文档 1c 第 5 节、ADR-0015；主人确认 |
+| 2026-11-14 | order 消费支付结果改为无限重试 | 读代码发现默认 5 次重试（约 1.5 秒）后支付结果进死信，订单库短暂不可用就会丢；扩容的围栏窗口必然触发 |
+| 2026-11-14 | 路线图增加阶段 9：eBPF（可选），计划文件只到里程碑粒度 | 主人要求 |
+| 2026-11-14 | 步骤四的三个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 主线的共享改动没有提交 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -159,3 +179,13 @@
 同日收尾：步骤二分三个提交推送，CI 全绿；加了 `make up-core`，CI 的按模块测试 job 改用它。下一个会话从步骤三的设计开始。
 
 同日写了步骤三的设计（设计文档 1c 第 4 节、ADR-0014），主人确认后开始实施：主线完成了商家模型、行版本号和共享契约，修了容器重建后复制起不来的问题，三个子 Agent 并行实现 cdc、orderindex 和 gateway 的接口（中途因用量限制中断过一次），Fable 评审后合入；e2e 用例和对账项派给 Sonnet。步骤三完成并推送；CI 的 e2e 有一个竞争用例因取消窗口太窄失败，加宽后重新推送。
+
+### 2026-11-14
+
+确认 PR #6 的 CI 全绿。写了步骤四的设计（设计文档 1c 第 5 节，原第 5 节的步骤五要点挪到第 6 节）和 ADR-0015，主人确认了四项（Epoch 提前到 2020、改表名做围栏、散发加归并只放在造数工具里、默认 500 万单）。
+
+主线（Fable）做了共享部分：库数由 DSN 个数决定加 `shard_meta` 校验、00003 迁移、`ListUserOrders` 的 proto、Epoch，清空了本机开发库。然后三个子 Agent 并行：按用户列出订单（Opus）、造数工具（Opus）、扩容脚本和 compose（Sonnet）。主线同时读代码确认围栏期间的行为，发现支付结果的消费者 1.5 秒后进死信并修掉，给 cdc 加了 `-print-checkpoint`。
+
+评审后合入。扩容脚本改了三处（等待超时自动撤围栏、建从库移出窗口、校验不怕新写入）。灌了 500 万单并出报告，带流量演练了 2 库扩 4 库：窗口 9.3 秒，8181 个订单全部落库，对账和数据校验通过，结果在设计文档 5.11。全程没有提交。
+
+教训：直接在模块目录里跑 `go test` 时集成测试会因为没有环境变量而全部跳过，看起来是通过。要用 `make test MODULES=$PWD/<模块>`。
