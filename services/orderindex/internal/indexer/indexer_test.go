@@ -254,21 +254,19 @@ func TestDuplicateMessageKeepsSyncedAt(t *testing.T) {
 	}
 }
 
-// merchant_id 为 NULL 跳过；DELETE 忽略并计数；别的表、不认识的 op 忽略；都不写库。
+// merchant_id 为 NULL 跳过；别的表、不认识的 op 忽略；都不写库。
 func TestSkipsAndIgnores(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
 	other := change(cdcv1.Op_OP_INSERT, image(3, 60, 1))
 	other.Table = "order_items"
 	unknownOp := change(cdcv1.Op(99), image(3, 61, 1))
-	del := &cdcv1.RowChange{Table: "orders", Op: cdcv1.Op_OP_DELETE, Before: image(3, 62, 4)}
 	cases := []struct {
 		msg  *cdcv1.RowChange
 		want Result
 	}{
 		{change(cdcv1.Op_OP_INSERT, image(0, 63, 0)), SkippedNoMerchant},
 		{change(cdcv1.Op_OP_READ, image(0, 64, 0)), SkippedNoMerchant},
-		{del, IgnoredDelete},
 		{other, Ignored},
 		{unknownOp, Ignored},
 	}
@@ -277,13 +275,13 @@ func TestSkipsAndIgnores(t *testing.T) {
 			t.Errorf("case %d: %v, %v; want %v", i, r, err, c.want)
 		}
 	}
-	for _, order := range []int64{60, 61, 62} {
+	for _, order := range []int64{60, 61} {
 		if _, err := st.Get(t.Context(), 3, order); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("order %d was written: %v", order, err)
 		}
 	}
 	w := ix.Stats().take()
-	if w.SkippedNoMerchant != 2 || w.Deletes != 1 || w.Ignored != 2 || w.Changed+w.Stale != 0 {
+	if w.SkippedNoMerchant != 2 || w.Archived != 0 || w.Ignored != 2 || w.Changed+w.Stale != 0 {
 		t.Errorf("stats = %+v", w)
 	}
 }
@@ -323,5 +321,160 @@ func TestHandlerErrors(t *testing.T) {
 	}
 	if _, err := st.Get(t.Context(), 5, 71); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// deletion 返回归档产生的 DELETE：只有 before，没有 after。
+func deletion(before map[string]*cdcv1.Value) *cdcv1.RowChange {
+	ch := change(cdcv1.Op_OP_DELETE, nil)
+	ch.Before = before
+	return ch
+}
+
+// 终态的版本：image 里 status = 1 + version%6，版本 5 是 6（终态之一），具体取值对索引无所谓，
+// 只要 DELETE 的 before 原样落进索引。
+const finalVersion = 5
+
+// 索引里已经是版本 v：同一订单 v 的 DELETE 是空操作，行逐列不变（含 synced_at），归为 Stale，归档计数加一。
+func TestDeleteOfCurrentVersionIsNoop(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	first := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
+	ix.now = func() time.Time { return first }
+	if r, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(7, 80, finalVersion))); err != nil || r != Changed {
+		t.Fatalf("update = %v, %v", r, err)
+	}
+	before, err := st.Get(t.Context(), 7, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix.Stats().take()
+
+	ix.now = func() time.Time { return first.Add(time.Hour) }
+	if r, err := ix.Apply(t.Context(), deletion(image(7, 80, finalVersion))); err != nil || r != Stale {
+		t.Fatalf("delete = %v, %v; want Stale", r, err)
+	}
+	after, err := st.Get(t.Context(), 7, 80)
+	if err != nil {
+		t.Fatalf("index row gone after DELETE: %v", err)
+	}
+	if after != before {
+		t.Errorf("row changed by DELETE:\n got %+v\nwant %+v", after, before)
+	}
+	if w := ix.Stats().take(); w.Stale != 1 || w.Archived != 1 || w.Changed+w.SkippedNoMerchant+w.Ignored != 0 {
+		t.Errorf("stats = %+v", w)
+	}
+}
+
+// 索引为空（从头重建，压缩后的 topic 里这个归档订单只剩 DELETE）：DELETE 的 before 建出索引行，
+// 商家列表能查到它。
+func TestDeleteRebuildsMissingRow(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	if r, err := ix.Apply(t.Context(), deletion(image(8, 90, finalVersion))); err != nil || r != Changed {
+		t.Fatalf("delete = %v, %v; want Changed", r, err)
+	}
+	got, err := st.Get(t.Context(), 8, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := wantRow(t, 8, 90, finalVersion); !sameImage(got, want) {
+		t.Errorf("row = %+v, want %+v", got, want)
+	}
+	if w := ix.Stats().take(); w.Changed != 1 || w.Archived != 1 || w.LagCount != 1 {
+		t.Errorf("stats = %+v", w)
+	}
+
+	for _, q := range []store.ListQuery{
+		{MerchantID: 8, Limit: 10},
+		{MerchantID: 8, Status: got.Status, Limit: 10},
+	} {
+		rows, err := st.List(t.Context(), q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].OrderID != 90 || !sameImage(rows[0], got) {
+			t.Errorf("list %+v = %+v, want the archived order", q, rows)
+		}
+	}
+}
+
+// 乱序：DELETE（v=5）先到，迟到的 UPDATE（v=3）后到，索引停在 v=5；DELETE 也不会把更高版本拉回去。
+func TestDeleteOrdersByVersion(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	if r, err := ix.Apply(t.Context(), deletion(image(9, 100, 5))); err != nil || r != Changed {
+		t.Fatalf("delete = %v, %v", r, err)
+	}
+	if r, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(9, 100, 3))); err != nil || r != Stale {
+		t.Fatalf("late update = %v, %v; want Stale", r, err)
+	}
+	got, err := st.Get(t.Context(), 9, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := wantRow(t, 9, 100, 5); !sameImage(got, want) {
+		t.Errorf("row = %+v, want v5 %+v", got, want)
+	}
+
+	// 反过来：索引已是 v=6，旧的 DELETE（v=4，重放的一段）不改行。
+	if _, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(9, 101, 6))); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := ix.Apply(t.Context(), deletion(image(9, 101, 4))); err != nil || r != Stale {
+		t.Fatalf("old delete = %v, %v; want Stale", r, err)
+	}
+	if got, err := st.Get(t.Context(), 9, 101); err != nil || !sameImage(got, wantRow(t, 9, 101, 6)) {
+		t.Errorf("row = %+v, %v; want v6", got, err)
+	}
+}
+
+// before 里 merchant_id 为 NULL：和 after 一样跳过，不建行，归档仍计数。
+func TestDeleteWithoutMerchantSkipped(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	if r, err := ix.Apply(t.Context(), deletion(image(0, 110, 3))); err != nil || r != SkippedNoMerchant {
+		t.Fatalf("delete = %v, %v; want SkippedNoMerchant", r, err)
+	}
+	rows, err := st.List(t.Context(), store.ListQuery{MerchantID: 1, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows written: %+v", rows)
+	}
+	if w := ix.Stats().take(); w.SkippedNoMerchant != 1 || w.Archived != 1 || w.Changed+w.Stale != 0 {
+		t.Errorf("stats = %+v", w)
+	}
+}
+
+// 没有 before 的 DELETE 和没有 after 的 INSERT 走同一条错误路径：非 Permanent 的 ErrSchema（原地重试、
+// 分区停住），不写库、不计数。
+func TestImageMissingIsSchemaError(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	h := ix.Handler(DefaultWriteTimeout)
+	for name, msg := range map[string]*cdcv1.RowChange{
+		"insert without after": change(cdcv1.Op_OP_INSERT, nil),
+		"delete without before": func() *cdcv1.RowChange {
+			ch := deletion(nil)
+			ch.After = image(10, 120, 2) // 有 after 也没用：DELETE 只看 before
+			return ch
+		}(),
+	} {
+		value, err := proto.Marshal(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = h(t.Context(), kafkax.Message{Value: value})
+		if !errors.Is(err, ErrSchema) || kafkax.IsPermanent(err) {
+			t.Errorf("%s: err = %v, want non-permanent ErrSchema", name, err)
+		}
+	}
+	if _, err := st.Get(t.Context(), 10, 120); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("row written from after of a DELETE: %v", err)
+	}
+	if w := ix.Stats().take(); !w.empty() || w.Archived != 0 {
+		t.Errorf("stats = %+v", w)
 	}
 }

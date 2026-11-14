@@ -11,7 +11,7 @@ import (
 const DefaultReportInterval = 10 * time.Second
 
 // Reporter 每隔一段时间输出一行同步汇总日志：应用的条数（改了行的、因版本旧被忽略的分开计）、
-// 跳过和忽略的条数、端到端延迟的最大值和平均值。这段时间没有消息时不输出。实现 app.Component。
+// 跳过和忽略的条数、其中来自归档 DELETE 的条数、端到端延迟的最大值和平均值。这段时间没有消息时不输出。实现 app.Component。
 //
 // 已知的不足（设计文档 1c 4.10）：没有写入就没有延迟可算，“没有变更”和“同步卡住了”在日志上分不开，
 // 要靠消费组的积压来区分。
@@ -73,8 +73,9 @@ func (r *Reporter) Flush() {
 		"changed", w.Changed,
 		"stale", w.Stale,
 		"skipped_no_merchant", w.SkippedNoMerchant,
-		"deletes_ignored", w.Deletes,
 		"ignored", w.Ignored,
+		// archived 是其中来自 DELETE（归档）的条数，已经算在 changed/stale/skipped_no_merchant 里。
+		"archived", w.Archived,
 		"lag_samples", w.LagCount,
 	}
 	if w.LagCount > 0 {

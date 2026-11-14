@@ -2,8 +2,12 @@
 //
 // 规则（设计文档 1c 4.6、4.8）：
 //   - 只处理逻辑表 orders；INSERT、UPDATE、READ 一视同仁，只看 after 映像。
+//   - DELETE 用 before 映像，和上面走完全相同的带版本号的 upsert，绝不删除索引行（设计文档 1c 6.7）。
+//     约定：orders 的 DELETE 只表示“这一行离开了热库”（归档），before 是它的最终映像；订单在业务上从不删除，
+//     商家索引保留归档订单的行。平时这次 upsert 是空操作（索引里已是这个版本）；但 topic 是压缩保留的，
+//     归档订单在 topic 里只剩这条 DELETE，而 CDC 的全量只读热库，索引从头重建时它是这个订单唯一的来源，
+//     所以不能忽略。
 //   - merchant_id 为 NULL 的订单不进索引（还没预占成功）。
-//   - DELETE 忽略并计数：现在没有任何路径删除订单，归档（步骤五）时再定。
 //   - 幂等和定序靠源行的 version 列：只接受更高版本的映像，不依赖到达顺序（见 store.Upsert）。
 //   - 需要的列缺失或类型不对是源表结构被改坏了，返回 ErrSchema，消费停住，不跳过。
 //   - 不认识的列、表、op 忽略。
@@ -40,8 +44,6 @@ const (
 	Stale
 	// SkippedNoMerchant 表示 merchant_id 为 NULL，不进索引。
 	SkippedNoMerchant
-	// IgnoredDelete 表示这是一条 DELETE，按约定忽略。
-	IgnoredDelete
 	// Ignored 表示表名或 op 不认识，忽略。
 	Ignored
 )
@@ -71,26 +73,35 @@ func (ix *Indexer) Stats() *Stats { return ix.stats }
 // Apply 把一条变更应用到索引。返回的错误包着 ErrSchema 时说明消息与表结构不符，重试不会成功。
 func (ix *Indexer) Apply(ctx context.Context, ch *cdcv1.RowChange) (Result, error) {
 	if ch.GetTable() != SourceTable {
-		ix.stats.add(Ignored, 0, false)
+		ix.stats.add(Ignored, false, 0, false)
 		return Ignored, nil
 	}
+	// archived 表示这是一条归档产生的 DELETE：结果照常归入 Changed/Stale/SkippedNoMerchant，另外单独计数，
+	// 用来观察归档对索引消费的冲击（设计文档 1c 6.7）。
+	var (
+		img      map[string]*cdcv1.Value
+		imgName  string
+		archived bool
+	)
 	switch ch.GetOp() {
 	case cdcv1.Op_OP_INSERT, cdcv1.Op_OP_UPDATE, cdcv1.Op_OP_READ:
+		img, imgName = ch.GetAfter(), "after"
 	case cdcv1.Op_OP_DELETE:
-		ix.stats.add(IgnoredDelete, 0, false)
-		return IgnoredDelete, nil
+		// before 缺失时 decodeRow 报 ErrSchema，和 INSERT 缺 after 一样停住消费：缺映像说明 CDC 或
+		// binlog_row_image 的配置不对，跳过的话重建时这个归档订单会悄悄丢掉。
+		img, imgName, archived = ch.GetBefore(), "before", true
 	default:
-		ix.stats.add(Ignored, 0, false)
+		ix.stats.add(Ignored, false, 0, false)
 		return Ignored, nil
 	}
 
-	row, ok, err := decodeRow(ch.GetAfter())
+	row, ok, err := decodeRow(img)
 	if err != nil {
-		return 0, fmt.Errorf("indexer: %s op=%s slot=%d gtid=%q: %w",
-			ch.GetSource(), ch.GetOp(), ch.GetSlot(), ch.GetGtid(), err)
+		return 0, fmt.Errorf("indexer: %s op=%s slot=%d gtid=%q %s image: %w",
+			ch.GetSource(), ch.GetOp(), ch.GetSlot(), ch.GetGtid(), imgName, err)
 	}
 	if !ok {
-		ix.stats.add(SkippedNoMerchant, 0, false)
+		ix.stats.add(SkippedNoMerchant, archived, 0, false)
 		return SkippedNoMerchant, nil
 	}
 
@@ -100,6 +111,7 @@ func (ix *Indexer) Apply(ctx context.Context, ch *cdcv1.RowChange) (Result, erro
 		return 0, fmt.Errorf("indexer: %w", err)
 	}
 	// 端到端延迟：写库时刻减去事务在主库上的提交时刻。全量阶段读到的行没有提交时间，不计入。
+	// DELETE 也计入：归档期间它们排在在线变更前面，延迟上升正是要量的东西。
 	var lag time.Duration
 	c := ch.GetCommitMicros()
 	if c > 0 {
@@ -109,7 +121,7 @@ func (ix *Indexer) Apply(ctx context.Context, ch *cdcv1.RowChange) (Result, erro
 	if outcome.Changed() {
 		res = Changed
 	}
-	ix.stats.add(res, lag, c > 0)
+	ix.stats.add(res, archived, lag, c > 0)
 	return res, nil
 }
 
@@ -147,17 +159,22 @@ type window struct {
 	Changed           int64
 	Stale             int64
 	SkippedNoMerchant int64
-	Deletes           int64
 	Ignored           int64
+	// Archived 是应用了的 DELETE（归档）条数。它们同时计在 Changed/Stale/SkippedNoMerchant 里，
+	// 不是另一类结果，所以不参与 empty 的求和。
+	Archived int64
 	// LagCount 是计入延迟的条数（commit_micros 非 0 的写库），LagSum、LagMax 是它们的合计和最大值。
 	LagCount int64
 	LagSum   time.Duration
 	LagMax   time.Duration
 }
 
-func (s *Stats) add(r Result, lag time.Duration, hasLag bool) {
+func (s *Stats) add(r Result, archived bool, lag time.Duration, hasLag bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if archived {
+		s.Archived++
+	}
 	switch r {
 	case Changed:
 		s.Changed++
@@ -165,8 +182,6 @@ func (s *Stats) add(r Result, lag time.Duration, hasLag bool) {
 		s.Stale++
 	case SkippedNoMerchant:
 		s.SkippedNoMerchant++
-	case IgnoredDelete:
-		s.Deletes++
 	case Ignored:
 		s.Ignored++
 	}
@@ -187,5 +202,5 @@ func (s *Stats) take() window {
 }
 
 func (w window) empty() bool {
-	return w.Changed+w.Stale+w.SkippedNoMerchant+w.Deletes+w.Ignored == 0
+	return w.Changed+w.Stale+w.SkippedNoMerchant+w.Ignored == 0
 }
