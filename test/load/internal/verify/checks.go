@@ -129,6 +129,7 @@ func Check(in Input) *Result {
 	c.logs()           // 19
 	c.merchantIndex()  // 20
 	c.archive()        // 21
+	c.stockPending()   // 22
 
 	slices.SortStableFunc(c.res.Violations, func(a, b Violation) int {
 		return cmp.Or(cmp.Compare(a.Check, b.Check), cmp.Compare(a.Subject, b.Subject))
@@ -164,6 +165,13 @@ func (c *checker) stockInternal() {
 		if total := st.Available + st.Reserved + st.Sold; total != c.s.Initial[sku] {
 			c.fail(1, skuSubj(sku), "available %d + reserved %d + sold %d = %d, initial %d",
 				st.Available, st.Reserved, st.Sold, total, c.s.Initial[sku])
+		}
+		// 每条增量自身三项之和为零，所以 sku_stock 的原始值也必须守恒。
+		if raw, ok := c.s.RawStock[sku]; ok {
+			if total := raw.Available + raw.Reserved + raw.Sold; total != c.s.Initial[sku] {
+				c.fail(1, skuSubj(sku), "sku_stock row itself (without stock_pending): available %d + reserved %d + sold %d = %d, initial %d",
+					raw.Available, raw.Reserved, raw.Sold, total, c.s.Initial[sku])
+			}
 		}
 	}
 	for _, sku := range sortedKeys(c.s.Stock) {

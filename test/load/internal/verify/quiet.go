@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -29,6 +30,25 @@ type QuietState struct {
 	// UnclaimedHolds、ClaimedHolds 是 gate:holds、gate:claimed 的成员数。
 	UnclaimedHolds int64
 	ClaimedHolds   int64
+	// StockPending 是 inventory 的 stock_pending 里还没有应用到 sku_stock 的增量。
+	StockPending PendingState
+}
+
+// PendingState 是 stock_pending 的当前值。
+type PendingState struct {
+	Rows int64
+	// OldestAge 是最老一行写入到现在的时长，SKUs 是涉及的 SKU（至多 10 个，升序）。
+	OldestAge time.Duration
+	SKUs      []int64
+}
+
+func (p PendingState) String() string {
+	more := ""
+	if p.Rows > 0 && len(p.SKUs) == pendingProbeSKUs {
+		more = ", ..."
+	}
+	return fmt.Sprintf("stock_pending has %d rows not applied to sku_stock: oldest written %s ago, skus %s%s",
+		p.Rows, p.OldestAge.Round(time.Millisecond), strings.Trim(fmt.Sprint(p.SKUs), "[]"), more)
 }
 
 // Problems 列出没有归零的项，全部归零时返回空。
@@ -57,6 +77,9 @@ func (q QuietState) Problems() []string {
 	add(q.PendingPayments, "payments in PENDING")
 	add(q.UnclaimedHolds, "holds in gate:holds")
 	add(q.ClaimedHolds, "holds in gate:claimed")
+	if q.StockPending.Rows != 0 {
+		out = append(out, q.StockPending.String())
+	}
 	return out
 }
 
@@ -100,6 +123,11 @@ func Probe(ctx context.Context, src Sources) (QuietState, error) {
 	if q.ClaimedHolds, err = src.Redis.ZCard(ctx, src.RedisPrefix+"gate:claimed").Result(); err != nil {
 		return q, fmt.Errorf("count gate:claimed: %w", err)
 	}
+	pp, err := probePending(ctx, src.InventoryDB)
+	if err != nil {
+		return q, err
+	}
+	q.StockPending = PendingState(pp)
 	if src.Kafka != nil {
 		if err := probeLag(ctx, src, &q); err != nil {
 			return q, err
@@ -167,6 +195,13 @@ func probeLag(ctx context.Context, src Sources, q *QuietState) error {
 	return nil
 }
 
+// stuckPolls 是 stock_pending 的行数连续这么多次轮询都没有变化（而且其余条件都已归零）时判定为卡住。
+// 变量而不是常量，测试里调小。
+var stuckPolls = 10
+
+// ErrStockPendingStuck 表示 stock_pending 不再减少：有 SKU 的增量合并进去会让某个数变负（超卖或账不平）。
+var ErrStockPendingStuck = errors.New("stock_pending is stuck")
+
 // WaitQuiet 每隔 interval 读一次静止条件，直到全部归零或超过 timeout。
 // 返回等待的时长和最后一次读到的状态；超时返回错误，调用方用 last.Problems() 打印没有归零的项。
 func WaitQuiet(ctx context.Context, src Sources, timeout, interval time.Duration, logger *slog.Logger) (time.Duration, QuietState, error) {
@@ -175,6 +210,8 @@ func WaitQuiet(ctx context.Context, src Sources, timeout, interval time.Duration
 	defer cancel()
 	var last QuietState
 	lastLog := time.Time{}
+	var stuckRows int64 // 上一次轮询的行数
+	same := 0           // 行数连续没有变化的次数
 	for {
 		pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
 		q, err := Probe(pctx, src)
@@ -186,10 +223,24 @@ func WaitQuiet(ctx context.Context, src Sources, timeout, interval time.Duration
 			if len(problems) == 0 {
 				return time.Since(start), q, nil
 			}
+			// 只有其余条件都已归零、stock_pending 的行数却连续不变，才说明是它自己卡住了；
+			// 其余条件还没归零时，行数不变可能只是消费者还没把增量送来。
+			if q.StockPending.Rows > 0 && q.StockPending.Rows == stuckRows && len(problems) == 1 {
+				same++
+			} else {
+				same = 0
+			}
+			stuckRows = q.StockPending.Rows
+			if same >= stuckPolls {
+				return time.Since(start), q, fmt.Errorf("%w: %s (unchanged for %d polls); applying them would make a number negative "+
+					"(oversold) or the books do not balance, check 22 of verify shows the detail", ErrStockPendingStuck, q.StockPending, same)
+			}
 			if time.Since(lastLog) >= 10*time.Second {
 				logger.Info("waiting for quiet", "elapsed", time.Since(start).Round(time.Second).String(), "pending", problems)
 				lastLog = time.Now()
 			}
+		case errors.Is(err, errNoStockPending):
+			return time.Since(start), last, err
 		case ctx.Err() == nil:
 			logger.Warn("probe failed, retrying", "error", err)
 		}

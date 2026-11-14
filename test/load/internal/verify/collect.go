@@ -124,15 +124,7 @@ func Collect(ctx context.Context, src Sources, initial map[int64]int64) (*Snapsh
 
 func collectInventory(ctx context.Context, src Sources, s *Snapshot) error {
 	db := src.InventoryDB
-	s.Stock = map[int64]SKUStock{}
-	if err := queryEach(ctx, db, "SELECT sku_id, available, reserved, sold FROM sku_stock", func(r *sql.Rows) error {
-		var st SKUStock
-		if err := r.Scan(&st.SKUID, &st.Available, &st.Reserved, &st.Sold); err != nil {
-			return err
-		}
-		s.Stock[st.SKUID] = st
-		return nil
-	}); err != nil {
+	if err := collectStock(ctx, db, s); err != nil {
 		return err
 	}
 

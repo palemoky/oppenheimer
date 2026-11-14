@@ -278,28 +278,38 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 		p("sku %d: initial %d available %d reserved %d sold %d | gate avail %d held %d limit %d",
 			sku, snap.Initial[sku], st.Available, st.Reserved, st.Sold, g.Avail, g.Held, g.Limit)
 	}
-	last := 19
+	var skipped []string
 	if mi := c.MerchantIndex; mi != nil {
-		last = verify.CheckMerchantIndex
 		p("[20] merchant index: %d orders with a merchant, %d index rows; missing %d, extra %d, mismatched %d, misplaced %d",
 			mi.Orders, mi.Rows, mi.Missing, mi.Extra, mi.Mismatch, mi.Misplaced)
 	} else {
 		p("[20] merchant index: skipped (no -merchant-index-dsns)")
+		skipped = append(skipped, "20")
 	}
 	if a := snap.Archive; a != nil {
-		last = verify.CheckArchive
 		p("[21] cold archive: %d orders in the cold db (%d in the hot dbs); non-final %d, too new %d, also in the hot dbs %d, without items %d, "+
 			"orphan items %d, orphan payment results %d; hot orphan items %d, hot orphan payment results %d (archive settled: %t)",
 			a.ColdOrders, a.HotOrders, a.NonFinal.N, a.TooNew.N, a.Both.N, a.NoItems.N,
 			a.ItemOrphans.N, a.PaymentOrphans.N, a.HotItemOrphans.N, a.HotPaymentOrphans.N, archiveSettled)
 	} else {
 		p("[21] cold archive: skipped (no -archive-dsn)")
+		skipped = append(skipped, "21")
 	}
+	var pendingRows int64
+	for _, ps := range snap.Pending {
+		pendingRows += ps.Rows
+	}
+	p("[22] stock_pending: %d rows for %d skus not applied to sku_stock (the sku lines above are sku_stock plus these deltas)",
+		pendingRows, len(snap.Pending))
 	for _, n := range res.Notes {
 		p("note: %s", n)
 	}
 	if !res.Failed() {
-		p("RESULT: PASS (checks 1-%d)", last)
+		if len(skipped) > 0 {
+			p("RESULT: PASS (checks 1-%d, skipped %s)", verify.CheckStockPending, strings.Join(skipped, ", "))
+		} else {
+			p("RESULT: PASS (checks 1-%d)", verify.CheckStockPending)
+		}
 		return
 	}
 	p("== violations (%d) ==", len(res.Violations))
