@@ -9,6 +9,7 @@
 package degrade
 
 import (
+	"context"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -18,6 +19,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Env 是存放开关初始值的环境变量名。格式见 Set.Apply。
@@ -87,7 +92,25 @@ func (s *Set) Switch(name, desc string) *Switch {
 	sw := &Switch{name: name, desc: desc}
 	s.switches[name] = sw
 	s.order = append(s.order, name)
+	s.observe(name, false)
 	return sw
+}
+
+// 指标（设计文档 1d 的 8.8）：每个开关现在是不是被人关掉了。登记时报一次，之后每次改动报一次。
+// 自动降级（熔断器打开）不在这里，看 breaker.state。
+var switchOff, _ = otel.Meter("github.com/palemoky/oppenheimer/pkg/degrade").Int64Gauge("degrade.switch.off",
+	metric.WithDescription("降级开关的状态：1 表示被人工关掉，0 表示自动"))
+
+// metricCtx 是记指标时用的 ctx：开关的登记和改动都不带 ctx，指标也用不到它。
+var metricCtx = context.Background()
+
+//nolint:contextcheck // 见 metricCtx：这里不需要调用方的 ctx
+func (s *Set) observe(name string, off bool) {
+	var v int64
+	if off {
+		v = 1
+	}
+	switchOff.Record(metricCtx, v, metric.WithAttributes(attribute.String("switch", name)))
 }
 
 // ErrUnknownSwitch 表示没有这个名字的开关。
@@ -105,11 +128,16 @@ func (s *Set) SetMode(name, mode string) error {
 	}
 	s.mu.Lock()
 	sw, ok := s.switches[name]
-	s.mu.Unlock()
 	if !ok {
+		s.mu.Unlock()
 		return fmt.Errorf("%w: %q", ErrUnknownSwitch, name)
 	}
-	if sw.off.Swap(off) != off {
+	// 改值和报指标在同一把锁里：两个并发的 SetMode 各自“先改后报”时，后报的那个可能是先改的，
+	// 指标就和实际的值相反，而且一直错到下一次改动。
+	changed := sw.off.Swap(off) != off
+	s.observe(name, off)
+	s.mu.Unlock()
+	if changed {
 		// 人工降级是要留痕的操作：谁在什么时候把什么关了，事后要查得到。
 		s.logger.Warn("degrade switch changed", "switch", name, "mode", mode)
 	}

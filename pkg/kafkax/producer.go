@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Record 是要发送的一条消息。
@@ -70,11 +72,20 @@ func (p *Producer) Send(ctx context.Context, recs ...Record) ([]error, error) {
 	if len(recs) == 0 {
 		return nil, nil
 	}
+	// 每条消息一个 PRODUCER span，链路上下文写进 header，消费者从那里接上（见 telemetry.go）。
+	start := time.Now()
 	krs := make([]*kgo.Record, len(recs))
+	spans := make([]trace.Span, len(recs))
 	for i, r := range recs {
-		krs[i] = &kgo.Record{Topic: r.Topic, Key: r.Key, Value: r.Value, Headers: toKgoHeaders(r.Headers)}
+		headers, span := startSend(ctx, r)
+		spans[i] = span
+		krs[i] = &kgo.Record{Topic: r.Topic, Key: r.Key, Value: r.Value, Headers: toKgoHeaders(headers)}
 	}
-	return p.sendRaw(ctx, krs)
+	errs, err := p.sendRaw(ctx, krs)
+	for i, span := range spans {
+		endSend(ctx, span, recs[i].Topic, start, errs[i])
+	}
+	return errs, err
 }
 
 // sendRaw 发送已经构造好的 kgo 记录，结果按输入顺序返回。

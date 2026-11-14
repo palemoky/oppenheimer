@@ -6,19 +6,24 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"path"
+	"strings"
 	"testing/fstest"
 	"text/template"
 	"time"
 
+	"github.com/XSAM/otelsql"
 	"github.com/go-sql-driver/mysql"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // MySQL 错误码。
@@ -85,7 +90,27 @@ func OpenLazy(cfg Config) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mysqlx: new connector: %w", err)
 	}
-	db := sql.OpenDB(connector)
+	// 链路和指标（设计文档 1d 的 8.4）：每条语句、每次开事务和提交各一个 span，并记录调用耗时。
+	attrs := otelsql.WithAttributes(attribute.String("db.system.name", "mysql"), attribute.String("db.namespace", parsed.DBName))
+	db := otelsql.OpenDB(connector, attrs,
+		otelsql.WithSpanNameFormatter(spanName),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			// 这几类 span 每条语句都会多出来一两个，没有信息量：连接放回池子时的重置、遍历结果集、建连接。
+			OmitConnResetSession: true,
+			OmitRows:             true,
+			OmitConnectorConnect: true,
+			// 没有父 span 的语句不建 span。中继、sweeper、应用者这些后台循环每秒都在查，ctx 里没有 span，
+			// 不过滤的话每条语句都是一条孤立的链路。后台循环看指标。
+			SpanFilter: func(ctx context.Context, _ otelsql.Method, _ string, _ []driver.NamedValue) bool {
+				return trace.SpanContextFromContext(ctx).IsValid()
+			},
+		}),
+	)
+	// 连接池的指标：在用、空闲、等待次数和等待时长。连接池满是最常见的“慢但数据库不忙”的原因。
+	if _, err := otelsql.RegisterDBStatsMetrics(db, attrs); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("mysqlx: register pool metrics: %w", err)
+	}
 
 	maxOpen := cfg.MaxOpenConns
 	if maxOpen <= 0 {
@@ -100,6 +125,30 @@ func OpenLazy(cfg Config) (*sql.DB, error) {
 	db.SetConnMaxLifetime(orDefault(cfg.ConnMaxLifetime, 30*time.Minute))
 	db.SetConnMaxIdleTime(orDefault(cfg.ConnMaxIdleTime, 5*time.Minute))
 	return db, nil
+}
+
+// spanName 给数据库的 span 起名：有语句时用它的第一个词（SELECT、INSERT、UPDATE），没有时用操作本身
+// （开事务、提交）。完整的语句在 span 的 db.query.text 属性里；语句全部用 ? 占位，不含参数值。
+//
+// 名字里不能带表名以外的变量：span 名是后端做聚合的维度，要是有限的几个。
+var spanVerbs = map[string]struct{}{
+	"SELECT": {}, "INSERT": {}, "UPDATE": {}, "DELETE": {}, "REPLACE": {},
+	"BEGIN": {}, "COMMIT": {}, "ROLLBACK": {}, "SET": {}, "DO": {}, "WITH": {},
+}
+
+func spanName(_ context.Context, method otelsql.Method, query string) string {
+	// 语句常常是多行的反引号字符串，第一个词后面跟的可能是换行；也可能以注释开头。
+	// 只认下面这几个动词，其余一律叫 query：名字必须落在一个有限的集合里。
+	if fields := strings.Fields(query); len(fields) > 0 {
+		verb := strings.ToUpper(fields[0])
+		if _, ok := spanVerbs[verb]; ok {
+			return "mysql " + verb
+		}
+		return "mysql query"
+	}
+	// method 形如 sql.conn.begin_tx、sql.tx.commit，取最后一段。
+	m := string(method)
+	return "mysql " + m[strings.LastIndexByte(m, '.')+1:]
 }
 
 func orDefault(d, def time.Duration) time.Duration {

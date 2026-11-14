@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -111,7 +112,19 @@ func newClient(cfg Config) (client *redis.Client, minIdle int, err error) {
 		opts.MinIdleConns = opts.PoolSize
 	}
 	opts.MinIdleConns = min(opts.MinIdleConns, opts.PoolSize)
-	return redis.NewClient(opts), opts.MinIdleConns, nil
+	client = redis.NewClient(opts)
+	// 链路和指标（设计文档 1d 的 8.4）：每条命令一个 CLIENT span，名字是命令名；连接池的统计进指标。
+	// 不记命令的内容：key 里有用户号和幂等键，Lua 脚本很长。
+	// 没有父 span 的命令（后台循环发的）由采样器丢掉，见 otelx 的 dropRootClient。
+	if err := redisotel.InstrumentTracing(client, redisotel.WithDBStatement(false), redisotel.WithDialFilter(true),
+		// 不记调用位置：它要每条命令做一次 runtime.Caller，而位置总是落在我们自己的封装里，没有信息量。
+		redisotel.WithCallerEnabled(false)); err != nil {
+		return nil, 0, fmt.Errorf("redisx: instrument tracing: %w", err)
+	}
+	if err := redisotel.InstrumentMetrics(client); err != nil {
+		return nil, 0, fmt.Errorf("redisx: instrument metrics: %w", err)
+	}
+	return client, opts.MinIdleConns, nil
 }
 
 func cmp(v, def time.Duration) time.Duration {

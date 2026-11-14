@@ -251,6 +251,7 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 		// 这个选项同时决定 broker 丢数据、位点越界时从哪里继续：也选最早，宁可重复不可跳过。
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.FetchMaxWait(fetchMaxWait),
+		kgo.OnPartitionsAssigned(c.onAssigned),
 		kgo.OnPartitionsRevoked(c.onRevoked),
 		kgo.OnPartitionsLost(c.onLost),
 	}
@@ -395,6 +396,7 @@ func (c *Consumer) pollLoop(pollCtx, hardCtx context.Context) {
 			if len(p.Records) == 0 {
 				return
 			}
+			stampPolled(p.Records, time.Now())
 			c.workerFor(hardCtx, topicPartition{p.Topic, p.Partition}).enqueue(p.Records)
 		})
 		c.client.AllowRebalance()
@@ -438,6 +440,16 @@ func (c *Consumer) workerFor(hardCtx context.Context, tp topicPartition) *worker
 	c.workers[tp] = w
 	go w.run(hardCtx)
 	return w
+}
+
+// onAssigned 是分到分区时的回调，只记日志。
+//
+// 进程被 kill -9 后重启，新实例要等旧成员的会话过期才分到分区；有这条日志，
+// “启动之后多久才开始消费”就能直接从日志里读出来，不用靠推断。
+func (c *Consumer) onAssigned(ctx context.Context, _ *kgo.Client, assigned map[string][]int32) {
+	if len(assigned) > 0 {
+		c.log.InfoContext(ctx, "kafka partitions assigned", "partitions", assigned)
+	}
 }
 
 // onRevoked 是分区被收回时的回调（也在离开组时调用）。
@@ -854,7 +866,15 @@ func (c *Consumer) process(ctx context.Context, w *worker, rec *kgo.Record) bool
 
 	msg := toMessage(rec)
 	for attempt := 1; ; attempt++ {
-		err := c.invoke(ctx, msg, log)
+		// 每次尝试一个 span（见 startProcess）。handler 拿到的是带着这个 span 的 ctx，
+		// 它里面的数据库、Redis、gRPC 调用都接在下面；下面的日志用同一个 ctx，带 trace id。
+		start := time.Now()
+		spanCtx, span := c.startProcess(ctx, rec, msg, attempt)
+		if attempt == 1 {
+			c.observeStart(spanCtx, span, rec, start)
+		}
+		err := c.invoke(spanCtx, msg, log)
+		c.endProcess(spanCtx, span, rec.Topic, start, err)
 		if err == nil {
 			return true
 		}
@@ -862,11 +882,13 @@ func (c *Consumer) process(ctx context.Context, w *worker, rec *kgo.Record) bool
 			return false
 		}
 		if IsPermanent(err) || attempt >= c.cfg.MaxAttempts {
-			log.Error("kafka message sent to dlq", "attempt", attempt, "permanent", IsPermanent(err), "error", err)
+			log.ErrorContext(spanCtx, "kafka message sent to dlq", "attempt", attempt, "permanent", IsPermanent(err), "error", err)
+			dlqCount.Add(spanCtx, 1, c.metricAttrs(rec.Topic))
 			return c.sendDLQ(ctx, w, rec, err, attempt, log)
 		}
 		backoff := c.backoff(attempt)
-		log.Warn("kafka handler failed, retrying", "attempt", attempt, "backoff", backoff, "error", err)
+		retryCount.Add(spanCtx, 1, c.metricAttrs(rec.Topic))
+		log.WarnContext(spanCtx, "kafka handler failed, retrying", "attempt", attempt, "backoff", backoff, "error", err)
 		if !w.sleep(ctx, backoff) {
 			return false
 		}
@@ -893,7 +915,7 @@ func (c *Consumer) backoff(attempt int) time.Duration {
 func (c *Consumer) invoke(ctx context.Context, msg Message, log *slog.Logger) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("kafka handler panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			log.ErrorContext(ctx, "kafka handler panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			err = fmt.Errorf("kafkax: handler panic: %v", r)
 		}
 	}()

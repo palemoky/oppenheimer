@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -156,15 +157,20 @@ func (w *worker) nextBatch(ctx context.Context, limit int) ([]*kgo.Record, bool)
 
 // invokeBatch 调用按批的 handler，把 panic 转成错误。
 func (c *Consumer) invokeBatch(ctx context.Context, recs []*kgo.Record, log *slog.Logger) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("kafka batch handler panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
-			err = fmt.Errorf("kafkax: batch handler panic: %v", r)
-		}
-	}()
 	msgs := make([]Message, len(recs))
 	for i, rec := range recs {
 		msgs[i] = toMessage(rec)
 	}
+	// 整批一个 span，用 link 指向各条消息的生产者（见 startBatch）。排队时长按批里最早的那条记。
+	start := time.Now()
+	ctx, span := c.startBatch(ctx, recs, msgs)
+	c.observeStart(ctx, span, recs[0], start)
+	defer func() {
+		if r := recover(); r != nil {
+			log.ErrorContext(ctx, "kafka batch handler panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			err = fmt.Errorf("kafkax: batch handler panic: %v", r)
+		}
+		c.endProcess(ctx, span, recs[0].Topic, start, err)
+	}()
 	return c.batch(ctx, msgs)
 }

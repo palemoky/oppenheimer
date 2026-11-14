@@ -19,9 +19,14 @@ package breaker
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // ErrOpen 表示熔断器没有放行这次调用。
@@ -109,6 +114,8 @@ type Breaker struct {
 }
 
 // New 返回一个处于关闭状态的熔断器。
+//
+//nolint:contextcheck // 见 metricCtx：记指标不需要调用方的 ctx
 func New(cfg Config) *Breaker {
 	b := &Breaker{
 		name:     cfg.Name,
@@ -123,6 +130,8 @@ func New(cfg Config) *Breaker {
 	if b.now == nil {
 		b.now = time.Now
 	}
+	// 一建出来就报一次“关闭”：从没变过状态的熔断器在后端里也要有一条线，否则分不清“一直是好的”和“没接上”。
+	stateGauge.Record(metricCtx, int64(Closed), metric.WithAttributes(attribute.String("breaker", b.name)))
 	return b
 }
 
@@ -241,8 +250,12 @@ func (b *Breaker) failed() {
 }
 
 // setState 在持有锁时调用。
+//
+//nolint:contextcheck // 见 metricCtx：记指标不需要调用方的 ctx
 func (b *Breaker) setState(s State) {
 	b.state = s
+	// 在锁里报状态：放到解锁之后的话，两次紧挨着的变化可能后发生的先报，指标停在旧状态上。Record 不阻塞。
+	stateGauge.Record(metricCtx, int64(s), metric.WithAttributes(attribute.String("breaker", b.name)))
 	b.gen++
 	b.fails = 0
 	b.probing = false
@@ -252,11 +265,31 @@ func (b *Breaker) setState(s State) {
 	}
 }
 
+//nolint:contextcheck // 见 metricCtx：记指标不需要调用方的 ctx
 func (b *Breaker) notify(from, to State) {
-	if from != to && b.onChange != nil {
+	if from == to {
+		return
+	}
+	transitions.Add(metricCtx, 1, metric.WithAttributes(attribute.String("breaker", b.name), attribute.String("to", to.String())))
+	if b.onChange != nil {
 		b.onChange(b.name, from, to)
 	}
 }
+
+// 指标（设计文档 1d 的 8.8）：每个熔断器现在的状态，和状态变化的次数。标签只有名字和状态，都是有限的。
+// 全局的 meter 是代理，otelx.Setup 之前建的仪表在那之后自动生效；没有装配时是空操作。
+var (
+	meter = otel.Meter("github.com/palemoky/oppenheimer/pkg/breaker")
+	// 0 关闭、1 打开、2 半开，和 State 的取值一致。
+	stateGauge, _ = meter.Int64Gauge("breaker.state",
+		metric.WithDescription("熔断器的状态：0 关闭，1 打开，2 半开"))
+	transitions, _ = meter.Int64Counter("breaker.transitions",
+		metric.WithDescription("熔断器状态变化的次数，按变化后的状态分"))
+)
+
+// metricCtx 是记指标时用的 ctx。状态变化发生在 Allow、Report 这些不带 ctx 的方法里；
+// 指标的 ctx 只用来带 baggage 和采样 exemplar，这里都用不到。
+var metricCtx = context.Background()
 
 // State 返回当前状态。打开状态在冷却时间过后要等下一次 Allow 才会变成半开，
 // 所以长时间没有调用时这里看到的仍然是 Open。

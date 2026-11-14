@@ -10,11 +10,13 @@ import (
 	"runtime/debug"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -39,12 +41,17 @@ func Listen(ctx context.Context, logger *slog.Logger, name, addr string, registe
 		return nil, fmt.Errorf("listen %s on %s: %w", name, addr, err)
 	}
 
-	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		// 顺序：日志在最外层，能记录到 recover 转换后的错误。
-		loggingInterceptor(logger),
-		sanitizeInterceptor(logger),
-		recoveryInterceptor(logger),
-	))
+	srv := grpc.NewServer(
+		// 链路和指标（设计文档 1d 的 8.4）：从请求的元数据里取出调用方的链路上下文，给每次调用建一个 SERVER span，
+		// 并记录调用次数、耗时和状态码。它是 stats handler，在拦截器之前就把 span 放进了 ctx，
+		// 所以下面的日志拦截器打出来的日志带 trace id。
+		grpc.StatsHandler(otelgrpc.NewServerHandler(otelgrpc.WithFilter(traceFilter))),
+		grpc.ChainUnaryInterceptor(
+			// 顺序：日志在最外层，能记录到 recover 转换后的错误。
+			loggingInterceptor(logger),
+			sanitizeInterceptor(logger),
+			recoveryInterceptor(logger),
+		))
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(srv, hs)
 	register(srv)
@@ -88,6 +95,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		<-done
 		return fmt.Errorf("grpc server %s: graceful stop interrupted: %w", s.name, context.Cause(ctx))
 	}
+}
+
+// traceFilter 决定一次调用要不要埋点：健康检查不要。边车和探针每隔几秒查一次，全是没有信息量的链路。
+func traceFilter(info *stats.RPCTagInfo) bool {
+	return info.FullMethodName != healthpb.Health_Check_FullMethodName &&
+		info.FullMethodName != healthpb.Health_Watch_FullMethodName
 }
 
 func recoveryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
@@ -171,6 +184,9 @@ func isServerFault(code codes.Code) bool {
 func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	base := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// 给每次调用建一个 CLIENT span，把链路上下文写进请求的元数据（traceparent），下游接着往下接。
+		// 中间的 Envoy 边车原样转发这个头（实测，设计文档 1d 的 8.4）。
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler(otelgrpc.WithFilter(traceFilter))),
 		grpc.WithChainUnaryInterceptor(timeoutInterceptor(DefaultCallTimeout)),
 	}
 	conn, err := grpc.NewClient(target, append(base, opts...)...)
