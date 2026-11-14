@@ -85,7 +85,8 @@ func listMerchantPage(ctx context.Context, merchant int64, status string, limit 
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
-	r, err := call(ctx, http.MethodGet, path, 1, "", nil)
+	// 每次用新的用户号，理由同 getStock：不共用一个按用户的限流桶。
+	r, err := call(ctx, http.MethodGet, path, newUser(), "", nil)
 	if err != nil {
 		return merchantOrderPage{}, fmt.Errorf("list merchant %d orders: %w", merchant, err)
 	}

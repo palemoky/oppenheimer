@@ -101,7 +101,10 @@ start_svc() {
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >>"$RUN_DIR/inventory.log" 2>&1 & ;;
     order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
     payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
-    gateway) "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
+    # 限流关掉：这个脚本验证杀进程后的数据一致性。被限流的请求（429 RATE_LIMITED）会让压测工具的重试
+    # 和账本的判断变复杂，又与要验证的东西无关；默认的按 IP 限额（每秒 200）还会把压力直接压下去。
+    # 重启 gateway 也走这个函数，用的是同一组环境变量。
+    gateway) env RATE_LIMIT=off "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
   esac
   pid=$!
   setv "pid_$s" "$pid"

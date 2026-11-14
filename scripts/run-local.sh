@@ -11,6 +11,12 @@
 # ORDER_DBS=4 表示订单库已经扩成 4 个（scripts/expand.sh 做完之后，ADR-0015）：order 连 4 主 4 从，
 # cdc 读 4 个源。默认 2。
 # order 带 ARCHIVE_DSN，指向单实例 mysql 上的 order_archive_db（冷库，ADR-0016）：启动时自己建表，热库查不到的旧订单去冷库查。
+# gateway 的限流（ADR-0019）默认开启，按 IP（进程内）和按用户加接口（Redis）。按 IP 的限额是每秒 200，
+# 从本机用很多用户号压测会被限住，现象是吞吐上不去或随机得到 429；压测和测试脚本会自己设置下面的变量。
+# RATE_LIMIT（on/off）、RATE_LIMIT_IP、RATE_LIMIT_USER、RATE_LIMIT_ROUTE、TRUSTED_PROXIES：已经设置（并 export）就原样传给 gateway，
+# 没设就由 gateway 用自己的默认值。
+# RATE_LIMIT_REDIS_ADDR 默认指向缓存实例（和其他服务的 CACHE_REDIS_ADDR 同一个），RATE_LIMIT_REDIS_PREFIX 默认跟随 REDIS_PREFIX；
+# 设为空字符串表示限流不用 Redis。
 # 冷库要先建好（make up 会建；e2e、chaos、bench 各自建带前缀的）。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
 set -euo pipefail
 
@@ -48,6 +54,9 @@ export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:${REDIS_PORT:-6379}}"
 export CACHE_REDIS_ADDR="${CACHE_REDIS_ADDR:-127.0.0.1:${CACHE_REDIS_PORT:-6380}}"
 export KAFKA_PREFIX="${KAFKA_PREFIX:-}"
 export REDIS_PREFIX="${REDIS_PREFIX:-}"
+# 限流状态放在缓存实例里（丢了只是桶重新装满，可以接受）。用 - 而不是 :-，让调用者能显式设为空来关掉 Redis。
+export RATE_LIMIT_REDIS_ADDR="${RATE_LIMIT_REDIS_ADDR-$CACHE_REDIS_ADDR}"
+export RATE_LIMIT_REDIS_PREFIX="${RATE_LIMIT_REDIS_PREFIX-$REDIS_PREFIX}"
 
 mkdir -p "$LOG_DIR"
 pids=()

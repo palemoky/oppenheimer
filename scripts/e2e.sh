@@ -90,6 +90,16 @@ export SWEEP_INTERVAL=1m
 export GATE_RECONCILE_INTERVAL=1s
 export LOG_LEVEL=warn
 
+# gateway 的限流（ADR-0019）保持开启，ratelimit_test.go 要验证它。
+# 按 IP 的限额关掉：所有用例都从 127.0.0.1 来，默认每秒 200 会把并发用例几乎全部限住。
+# 按用户加接口的限额保持默认值：用例里每个用户号的请求量都在默认限额之内（轮询间隔 50ms，不超过 getOrder 的 20/s；
+# getStock 和商家列表的辅助函数每次用新的用户号，不共用一个桶），用到同一个用户号高频下单的地方在用例里已经按 createOrder 的 5/10 调整。
+# 限流的 Redis 地址和前缀由 run-local.sh 按缓存实例和 REDIS_PREFIX 填，这里不重复设置。
+# 清掉调用者环境里可能残留的覆盖，保证跑的就是这里说的配置。
+export RATE_LIMIT=on
+export RATE_LIMIT_IP=off
+unset RATE_LIMIT_USER RATE_LIMIT_ROUTE
+
 export E2E_GATEWAY_URL=http://127.0.0.1:8080
 export E2E_INVENTORY_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_inventory_db"
 export E2E_PAYMENT_TIMEOUT=3s

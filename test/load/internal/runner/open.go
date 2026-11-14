@@ -117,7 +117,7 @@ func (s *scheduler) run(ctx context.Context) scheduleResult {
 const (
 	outAccepted   = "accepted"          // 201/202
 	outBacklogged = "backlogged"        // 429 BACKLOGGED：受理端背压，请求没有任何效果
-	outRateLimit  = "rate_limited"      // 其他 429：网关限流（目前网关不返回，分类先留着）
+	outRateLimit  = "rate_limited"      // 其他 429：网关限流（RATE_LIMITED）
 	outBusiness   = "rejected_business" // 409 库存不足、超出限购
 	outTimeout    = "timeout"           // 请求超时，结果未知
 	outHTTPError  = "http_error"        // 其他状态码（含 5xx）

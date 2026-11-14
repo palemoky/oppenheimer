@@ -53,6 +53,19 @@
 #   BENCH_POLL_RECENT     load poll 从最近受理的多少个订单里随机选，默认 2000
 #   BENCH_POLL_REPEAT     对比重复次数（每次含无查询和有查询各一轮），默认 1
 #   BENCH_OPEN_QUIET_TIMEOUT  开环和对比各轮结束后等落库停止的上限（秒），默认 1200
+#
+# gateway 的限流（ADR-0019）：上面所有的轮次都以 RATE_LIMIT=off 启动 gateway，量的是下单和落库的吞吐，
+# 限流会把结果盖住。下面的对比单独量限流本身：
+#   BENCH_RATELIMIT       设为 1 加一组限流对比，默认不跑。同样的开环下单压力跑两轮：
+#                         RATE_LIMIT=on（默认的按用户限额，按 IP 关掉，限流的 Redis 是缓存实例）和 RATE_LIMIT=off 作对照。
+#                         压力只用很少的用户号，速率远超这些用户的配额总和（默认 20 个用户 x 每秒 5 单 = 100 单/秒，速率 1000），
+#                         预期开着限流时受理速率稳定在配额附近、其余被限流（429 RATE_LIMITED）、受理延迟不升高。
+#                         每轮输出计划速率、受理速率、被限流和被背压拒绝（429 BACKLOGGED）的比例、受理延迟 p50/p99、落库吞吐。
+#                         汇总在 $BENCH_OUT/summary-ratelimit.tsv
+#   BENCH_RATELIMIT_RATE      对比里的开环下单速率，默认 1000
+#   BENCH_RATELIMIT_USERS     对比里的用户数（用户号取 [1, N]），默认 20
+#   BENCH_RATELIMIT_DURATION  对比里每轮的下单时长，默认同 BENCH_DURATION
+#   BENCH_RATELIMIT_REPEAT    对比重复次数（每次含限流开和关各一轮），默认 1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,6 +113,11 @@ POLL_CONC="${BENCH_POLL_CONCURRENCY:-64}"
 POLL_REQ_INTERVAL="${BENCH_POLL_INTERVAL_REQ:-10ms}"
 POLL_RECENT="${BENCH_POLL_RECENT:-2000}"
 POLL_REPEAT="${BENCH_POLL_REPEAT:-1}"
+RATELIMIT="${BENCH_RATELIMIT:-0}"
+RL_RATE="${BENCH_RATELIMIT_RATE:-1000}"
+RL_USERS="${BENCH_RATELIMIT_USERS:-20}"
+RL_DURATION="${BENCH_RATELIMIT_DURATION:-}"
+RL_REPEAT="${BENCH_RATELIMIT_REPEAT:-1}"
 case "$MODE" in
   closed) QUIET_TIMEOUT="${QUIET_TIMEOUT:-180}" ;;
   fire) POLL_INTERVAL=1ms POLL_TIMEOUT=1ms QUIET_TIMEOUT="${QUIET_TIMEOUT:-1200}" ;;
@@ -109,7 +127,9 @@ esac
 for v in "$SWEEP" "$OPEN" "$POLL"; do
   case "$v" in 0|1) ;; *) echo "BENCH_SWEEP, BENCH_OPEN and BENCH_POLL must be 0 or 1" >&2; exit 2 ;; esac
 done
+case "$RATELIMIT" in 0|1) ;; *) echo "BENCH_RATELIMIT must be 0 or 1" >&2; exit 2 ;; esac
 POLL_DURATION="${POLL_DURATION:-$DURATION}"
+RL_DURATION="${RL_DURATION:-$DURATION}"
 
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT="${BENCH_OUT:-$ROOT/tmp/bench/$TS-$ARCH-$MODE}"
@@ -117,6 +137,7 @@ mkdir -p "$OUT"
 SUMMARY="$OUT/summary.tsv"
 SUMMARY_OPEN="$OUT/summary-open.tsv"
 SUMMARY_POLL="$OUT/summary-poll.tsv"
+SUMMARY_RL="$OUT/summary-ratelimit.tsv"
 
 export LOG_LEVEL="${LOG_LEVEL:-warn}"
 export KAFKA_BROKERS="${KAFKA_BROKERS:-127.0.0.1:9092}"
@@ -183,13 +204,24 @@ on_exit() {
 trap on_exit EXIT
 trap 'log interrupted; exit 130' INT TERM
 
+# gateway 的限流开关，默认关；BENCH_RATELIMIT 的对比轮次在启动前把它设为 on，轮次结束后设回 off。
+GW_RATE_LIMIT=off
+
 start_svc() {
   local s="$1" dir="$2" i pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >"$dir/inventory.log" 2>&1 & ;;
     order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
     payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >"$dir/payment.log" 2>&1 & ;;
-    gateway) "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
+    # gateway 默认以 RATE_LIMIT=off 启动：这个脚本量的是下单和落库的吞吐，默认的限流（按 IP 每秒 200）
+    # 会把结果盖住，看起来像“吞吐上不去”。只有 BENCH_RATELIMIT 的对比轮次（GW_RATE_LIMIT=on）才开限流，
+    # 那时按 IP 的限额仍然关掉（压力全部来自 127.0.0.1，开着就只剩按 IP 的效果），按用户的用默认值，
+    # 状态放在缓存实例上（和服务里缓存用的是同一个 Redis，前缀跟本轮的 REDIS_PREFIX，轮次结束时一并清理）。
+    # 调用者 shell 里残留的 RATE_LIMIT_USER、RATE_LIMIT_ROUTE 会改变限额，这里清掉。
+    gateway) env -u RATE_LIMIT_USER -u RATE_LIMIT_ROUTE \
+      RATE_LIMIT="$GW_RATE_LIMIT" RATE_LIMIT_IP=off \
+      RATE_LIMIT_REDIS_ADDR="$CACHE_REDIS_ADDR" RATE_LIMIT_REDIS_PREFIX="$REDIS_PREFIX" \
+      "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
   esac
   pid=$!
   eval "pid_$s=$pid"
@@ -266,6 +298,9 @@ summarize_open() {
   if [ "$ROUND_KIND" = poll ]; then
     out="$SUMMARY_POLL"
     if [ "$ROUND_POLLER" = 1 ]; then label=polled; else label=baseline; fi
+  elif [ "$ROUND_KIND" = rl ]; then
+    out="$SUMMARY_RL"
+    label="$GW_RATE_LIMIT"
   fi
   python3 -I - "$ROUND_KIND" "$dir" "$label" "$n" "$t0" >>"$out" <<'PY'
 import json, sys, datetime
@@ -287,7 +322,11 @@ cnt = int(cnt)
 start = r.get("started_at")
 st = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() if start else float(t0)
 land = round(cnt / (float(hi) - st), 1) if cnt and hi != "NULL" and float(hi) > st else 0
-if kind == "open":
+if kind == "rl":
+    lim_pct = round(100.0 * oc.get("rate_limited", 0) / sent, 2) if sent else 0
+    row = [label, n, o.get("rate", 0), o.get("planned", 0), sent, acc, acc_rate, lim_pct, back_pct,
+           lat.get("p50_ms", 0), lat.get("p99_ms", 0), cnt, land]
+elif kind == "open":
     row = [label, n, o.get("planned", 0), sent, o.get("dropped", 0), acc, acc_rate, back_pct,
            oc.get("rate_limited", 0), oc.get("timeout", 0), lat.get("p50_ms", 0), lat.get("p99_ms", 0), cnt, land]
 else:
@@ -311,10 +350,12 @@ ROUND_KIND=sweep
 ROUND_NAME=""
 ROUND_RATE=""
 ROUND_POLLER=0
+ROUND_USERS=""
 run_one() {
   local c="$1" n="$2" name dir run_ts s pid t0 t1 last stable deadline count prev quiet="$QUIET_TIMEOUT" poll_pid=""
   name="${ROUND_NAME:-c${c}-r${n}}"
   if [ "$ROUND_KIND" != sweep ]; then quiet="$OPEN_QUIET_TIMEOUT"; fi
+  local users="${ROUND_USERS:-$USERS}"
   dir="$OUT/$name"
   mkdir -p "$dir"
   run_ts="$(date +%s)"
@@ -341,6 +382,7 @@ run_one() {
     sweep) log "$name: load run c=$c duration $DURATION" ;;
     open) log "$name: load run -mode open rate $ROUND_RATE duration $DURATION" ;;
     poll) log "$name: load run -mode open rate $ROUND_RATE duration $POLL_DURATION, poller $ROUND_POLLER" ;;
+    rl) log "$name: load run -mode open rate $ROUND_RATE duration $RL_DURATION, users $users, rate limit $GW_RATE_LIMIT" ;;
   esac
   ( sleep 15; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' >"$dir/docker-stats.txt" 2>&1 ) &
   local stats_pid=$!
@@ -355,11 +397,15 @@ run_one() {
         -ledger "$dir/ledger.jsonl" -json "$dir/report.json" ${BENCH_LOAD_ARGS:-} \
         >"$dir/report.txt" 2>"$dir/load.log"
       ;;
-    open|poll)
+    open|poll|rl)
       local dur="$DURATION" drain="$OPEN_DRAIN"
       if [ "$ROUND_KIND" = poll ]; then
         # 对比的两轮都只在下单结束后查一下（drain 1s），避免收尾阶段的轮询变成额外的查询压力。
         dur="$POLL_DURATION" drain=1s
+      fi
+      if [ "$ROUND_KIND" = rl ]; then
+        # 开限流时用户号很少，收尾轮询自己的 getOrder 也会被限流，drain 没有意义，查一下就结束。
+        dur="$RL_DURATION" drain=1s
       fi
       if [ "$ROUND_POLLER" = 1 ]; then
         # 先于下单起动：load poll 会等账本出现，并随账本的增长追最近受理的订单。
@@ -370,7 +416,7 @@ run_one() {
       fi
       # shellcheck disable=SC2086 # BENCH_LOAD_ARGS 故意按空格拆分
       /usr/bin/time -p "$LOAD" run -mode open -rate "$ROUND_RATE" -max-in-flight "$OPEN_MAX_IN_FLIGHT" \
-        -duration "$dur" -drain "$drain" -skus "$SKU_LIST" -users "$USERS" -qty "$QTY" \
+        -duration "$dur" -drain "$drain" -skus "$SKU_LIST" -users "$users" -qty "$QTY" \
         -poll-interval "$OPEN_POLL_INTERVAL" \
         -log-level "$LOG_LEVEL" -progress 0 -run-id "b$run_ts$c$n" \
         -ledger "$dir/ledger.jsonl" -json "$dir/report.json" ${BENCH_LOAD_ARGS:-} \
@@ -453,7 +499,7 @@ print("\t".join(str(x) for x in row))
 PY
     log "$name: $(tail -n 1 "$SUMMARY")"
     ;;
-  open|poll)
+  open|poll|rl)
     summarize_open "$dir" "$n" "$t0"
     ;;
   esac
@@ -516,4 +562,22 @@ print("landing throughput without poll pressure: %.1f orders/s" % base)
 print("landing throughput with poll pressure:    %.1f orders/s" % polled)
 print("ratio (with / without): %s" % ("%.3f" % (polled / base) if base else "n/a"))
 PY
+fi
+
+# 限流对比：同样的开环下单压力（很少的用户号、速率远超他们的配额），gateway 的限流开和关各一轮。
+if [ "$RATELIMIT" = 1 ]; then
+  {
+    echo "# rate limit: open rate $RL_RATE for $RL_DURATION, users $RL_USERS (per-user create quota 5/s, burst 10), per-IP limit off; variant on = RATE_LIMIT=on, off = RATE_LIMIT=off"
+    printf 'rate_limit\trun\trate\tplanned\tsent\taccepted\taccept_per_s\trate_limited_pct\tbacklogged_pct\taccept_p50_ms\taccept_p99_ms\tlanded_db\tland_db_per_s\n'
+  } >"$SUMMARY_RL"
+  ROUND_KIND=rl ROUND_RATE="$RL_RATE" ROUND_USERS="$RL_USERS"
+  for n in $(seq 1 "$RL_REPEAT"); do
+    for v in on off; do
+      GW_RATE_LIMIT="$v" ROUND_NAME="ratelimit-$v-n${n}"
+      run_one "rl$v" "$n"
+    done
+  done
+  GW_RATE_LIMIT=off ROUND_KIND=sweep ROUND_NAME="" ROUND_RATE="" ROUND_USERS=""
+  log "rate limit comparison done, summary $SUMMARY_RL"
+  grep -v '^#' "$SUMMARY_RL" | column -t -s "$(printf '\t')" >&2 || true
 fi
