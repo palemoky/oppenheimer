@@ -33,6 +33,7 @@ import (
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/oppenheimer/pkg/breaker"
+	"github.com/palemoky/oppenheimer/pkg/bulkhead"
 	"github.com/palemoky/oppenheimer/pkg/cache"
 	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
@@ -104,6 +105,9 @@ type Config struct {
 	// 默认 breaker.DefaultFailures、breaker.DefaultCooldown。测试里调小。
 	BreakerFailures int
 	BreakerCooldown time.Duration
+	// GateFailureSpan 是闸门的熔断器打开之前，连续失败至少要持续的时间（breaker.Config.MinFailureSpan）。
+	// 零值表示只数次数（测试用；cmd/order 给 DefaultGateFailureSpan）。
+	GateFailureSpan time.Duration
 	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
 	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
 	Backlog stockgate.BacklogLimit
@@ -120,6 +124,9 @@ type Config struct {
 	// ReadMaxConcurrency 是每个订单库上展示读（GetOrder 读订单行、ListUserOrders）的并发上限，
 	// 见 DefaultReadMaxConcurrency。零值表示不限制（测试用；cmd/order 总会给一个值）。
 	ReadMaxConcurrency int
+	// ReadGateMaxConcurrency 是展示读同时访问库存闸门（读占用）的上限，见 DefaultReadGateMaxConcurrency。
+	// 零值表示不限制（测试用；cmd/order 总会给一个值）。
+	ReadGateMaxConcurrency int
 	// ArchiveMaxConcurrency 是读冷库的并发上限，见 DefaultArchiveMaxConcurrency。零值表示不限制。
 	ArchiveMaxConcurrency int
 }
@@ -277,6 +284,14 @@ func New(d Deps, cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.ReadGateMaxConcurrency < 0 {
+		return nil, fmt.Errorf("service: read gate concurrency limit must not be negative, got %d", cfg.ReadGateMaxConcurrency)
+	}
+	if cfg.ReadGateMaxConcurrency > 0 {
+		if limits.gate, err = bulkhead.New(cfg.ReadGateMaxConcurrency); err != nil {
+			return nil, fmt.Errorf("service: read gate limit: %w", err)
+		}
+	}
 	set := d.Degrade
 	if set == nil {
 		set = degrade.New("order", logger)
@@ -310,7 +325,10 @@ func New(d Deps, cfg Config) (*Service, error) {
 		degrade:        set,
 	}
 	cooldown := cmp.Or(cfg.BreakerCooldown, breaker.DefaultCooldown)
-	s.gateBreaker = s.newBreaker(gateBreakerName, cfg.BreakerFailures, cooldown)
+	s.gateBreaker = breaker.New(breaker.Config{
+		Name: gateBreakerName, Failures: cfg.BreakerFailures, Cooldown: cooldown, MinFailureSpan: cfg.GateFailureSpan,
+		Now: s.clock, OnChange: s.breakerChanged,
+	})
 	s.landingCooldown = cooldown
 	s.landing = make([]*landingHealth, dbs)
 	for i := range s.landing {
@@ -794,14 +812,15 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 //
 // 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
-	hold, held, err := s.gateGet(ctx, orderID)
+	hold, held, err := s.fetchHold(ctx, orderID, display)
 	if err != nil {
 		if ctx.Err() != nil {
 			// 调用方已经取消或超时：不必再去读订单行，按调用方的原因作答（不记 ERROR）。
 			return nil, false, s.internal(ctx, "read hold", err, "order_id", orderID)
 		}
 		// 熔断器打开期间闸门根本没被访问，每个查询都记一条的话会刷屏；打开和恢复各有一条日志（breakerChanged）。
-		if !isBreakerOpen(err) {
+		// 展示读的名额满了也一样不逐条记，拒绝次数在 order.bulkhead.rejected 里。
+		if !isBreakerOpen(err) && !errors.Is(err, errReadBusy) {
 			s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
 		}
 		if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
@@ -832,6 +851,27 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 		s.readDone(ctx, readFromCold, false)
 	}
 	return o, ok, err
+}
+
+// fetchHold 读订单在闸门里的占用。展示读（display）先占一个名额，占不到就不读，返回 errReadBusy，
+// fetch 按“读占用失败”处理：已经落库的订单照常查得到，还没落库的答“稍后再试”。
+//
+// 为什么要这个名额（设计文档 1d 的 8.18）：闸门的 Redis 连接池是受理、落库、回收和查询共用的。
+// 查询的量不受控（客户端在轮询），一拥而上时把连接池占满，别的调用在池子上排队；排队的时间也算在
+// 闸门调用的 300 毫秒时限里，超时被当成闸门的失败，连续几次就把闸门的熔断器打开，落库跟着停 5 秒。
+// 也就是查询多了会让落库停摆，而 Redis 本身一点事没有。名额把查询能占的连接限制在池子的一小部分，
+// 而且占不到名额不经过熔断器：它说明的是查询太多，不是 Redis 坏了。
+// 做决定的读（落库、取消、支付结果里的 fetch）不占名额，它们的并发本来就有上限。
+func (s *Service) fetchHold(ctx context.Context, orderID int64, display bool) (stockgate.HoldInfo, bool, error) {
+	if !display {
+		return s.gateGet(ctx, orderID)
+	}
+	release, err := acquire(s.limits.gate)
+	if err != nil {
+		return stockgate.HoldInfo{}, false, err
+	}
+	defer release()
+	return s.gateGet(ctx, orderID)
 }
 
 // loadConfirmed 读已落库的订单行。ok 为 false 时“没有这一行”是主库确认过的：

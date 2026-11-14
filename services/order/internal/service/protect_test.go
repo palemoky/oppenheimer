@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/bulkhead"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
@@ -653,4 +654,48 @@ func TestSubmitHandlerCanceledMidwayIsRetried(t *testing.T) {
 	}
 	e.mustLand(t, o2.GetOrderId())
 	wantStatus(t, e.load(t, o2.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
+}
+
+// 展示读读闸门的名额占满时：已经落库的订单照常查得到（只读订单行），不存在或还没落库的答“稍后再试”，
+// 而且这些都不经过闸门的熔断器。查询太多不是 Redis 坏了，不能因此把熔断器打开、让落库停摆
+// （设计文档 1d 的 8.18：压测时查询把连接池占满，排队超时被算成闸门失败）。
+func TestDisplayReadGateLimitDoesNotTripBreaker(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	svc := e.serviceWith(t, func(_ *Deps, c *Config) { c.ReadGateMaxConcurrency = 1 })
+	user := userOn(t, e.router, 0)
+	landed := e.mustPending(t, user, "landed")
+
+	// 占住唯一的名额，相当于有一个查询正在读闸门。
+	release, err := svc.limits.gate.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tries = 20 // 远多于熔断器的阈值
+	for range tries {
+		resp, err := svc.GetOrder(t.Context(), &orderv1.GetOrderRequest{OrderId: landed.GetOrderId(), UserId: user})
+		if err != nil {
+			t.Fatalf("landed order with the gate slot taken: %v", err)
+		}
+		if got := resp.GetOrder().GetStatus(); got != orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT {
+			t.Fatalf("status = %v, want PENDING_PAYMENT", got)
+		}
+		_, err = svc.GetOrder(t.Context(), &orderv1.GetOrderRequest{OrderId: landed.GetOrderId() + 1, UserId: user})
+		if got := errx.Reason(err); got != errx.ReasonStockGateUnavailable {
+			t.Fatalf("missing order with the gate slot taken: reason = %q (err %v), want %q", got, err, errx.ReasonStockGateUnavailable)
+		}
+	}
+	if st := svc.gateBreaker.State(); st != breaker.Closed {
+		t.Errorf("gate breaker is %v after %d rejected reads, want closed", st, 2*tries)
+	}
+	if got := svc.limits.gate.Rejected(); got != 2*tries {
+		t.Errorf("rejected = %d, want %d", got, 2*tries)
+	}
+
+	// 放开之后恢复：不存在的订单由闸门和主库确认，答 NOT_FOUND。
+	release()
+	_, err = svc.GetOrder(t.Context(), &orderv1.GetOrderRequest{OrderId: landed.GetOrderId() + 1, UserId: user})
+	if got := errx.Reason(err); got != errx.ReasonOrderNotFound {
+		t.Errorf("missing order after release: reason = %q (err %v), want %q", got, err, errx.ReasonOrderNotFound)
+	}
 }
