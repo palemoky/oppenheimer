@@ -32,6 +32,58 @@ tags:
 
 paths:
   /api/v1/orders:
+    get:
+      operationId: listOrders
+      tags: [orders]
+      summary: 列出当前用户的订单
+      description: |
+        按创建时间从新到旧列出当前用户（`X-User-Id`）的订单，游标分页。
+
+        订单按用户分片，一个用户的订单都在同一个分片里，所以这个列表只查用户自己的分片。
+
+        一致性强于商家的订单列表：这里直接读订单库，不经过异步同步的索引，订单落库之后就能在列表里看到，
+        状态与订单详情一致。但**已受理、还没落库的订单不在列表里**：下单返回 202 之后，订单要等队列消费、
+        写入订单库才会出现，这段时间里用 `GET /api/v1/orders/{order_id}` 能查到 `creating`，列表里还没有它。
+
+        每一行只有列表页要显示的字段，没有商品明细；完整内容用订单详情接口。
+        同一毫秒内创建的订单先后顺序不严格。用户没有订单时返回空数组，不是错误。
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 只返回这个状态的订单；不传表示不筛选。
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: limit
+          in: query
+          required: false
+          description: 每页条数，1 到 100，默认 20。
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: 不透明的分页游标，传上一页响应里的 `next_cursor`。不传表示从最新的开始。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 一页订单
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSummaryList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/Error'
+
     post:
       operationId: createOrder
       tags: [orders]
@@ -438,6 +490,42 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/OrderItem'
+        create_time:
+          type: string
+          format: date-time
+        expire_time:
+          description: 支付截止时间，过期未支付的订单会被关闭
+          type: string
+          format: date-time
+        pay_time:
+          description: 支付成功的时间，未支付时不出现
+          type: string
+          format: date-time
+
+    OrderSummaryList:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderSummary'
+        next_cursor:
+          description: 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
+          type: string
+
+    OrderSummary:
+      description: 用户订单列表里的一行，只有列表页要显示的字段。完整内容用订单详情接口。
+      type: object
+      required: [order_id, status, total, create_time, expire_time]
+      properties:
+        order_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total:
+          description: 订单总额。预占成功之前（`creating`）和创建失败（`failed`）的订单为 0。
+          $ref: '#/components/schemas/Money'
         create_time:
           type: string
           format: date-time

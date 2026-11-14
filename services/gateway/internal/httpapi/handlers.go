@@ -247,6 +247,81 @@ const (
 	maxListLimit     = 100
 )
 
+// listQuery 是两个列表接口共用的查询参数解析结果。
+type listQuery struct {
+	pageSize int32
+	before   int64
+	status   orderv1.OrderStatus
+}
+
+// parseListQuery 解析列表接口的 limit、cursor、status，失败时已写出 400。
+// cursor 对客户端不透明，实际是下一页的 before_order_id（正整数的十进制字符串）。
+func parseListQuery(c *gin.Context, limit *int32, cursor *string, status *oas.OrderStatus) (listQuery, bool) {
+	q := listQuery{pageSize: defaultListLimit}
+	if limit != nil {
+		q.pageSize = *limit
+		if q.pageSize < 1 || q.pageSize > maxListLimit {
+			badRequest(c, "limit must be between 1 and "+strconv.Itoa(maxListLimit))
+			return listQuery{}, false
+		}
+	}
+
+	if cursor != nil && *cursor != "" {
+		n, ok := parseID(*cursor)
+		if !ok {
+			badRequest(c, "invalid cursor")
+			return listQuery{}, false
+		}
+		q.before = n
+	}
+
+	// 对外状态名到 proto 枚举；unspecified 和不传一样，表示不筛选。
+	if status != nil {
+		v, found := orderv1.OrderStatus_value["ORDER_STATUS_"+strings.ToUpper(string(*status))]
+		if !found {
+			badRequest(c, "invalid status")
+			return listQuery{}, false
+		}
+		q.status = orderv1.OrderStatus(v)
+	}
+	return q, true
+}
+
+// nextCursor 把下一页的 before_order_id 编码成对外的游标；0 表示没有下一页。
+func nextCursor(next int64) *string {
+	if next <= 0 {
+		return nil
+	}
+	cur := strconv.FormatInt(next, 10)
+	return &cur
+}
+
+// ListOrders 实现 GET /api/v1/orders。
+// 直接读订单库（只查用户所在的分片），一致性强于商家列表；已受理但还没落库的订单不在列表里。
+func (s *server) ListOrders(c *gin.Context, params oas.ListOrdersParams) {
+	q, ok := parseListQuery(c, params.Limit, params.Cursor, params.Status)
+	if !ok {
+		return
+	}
+	resp, err := s.deps.Order.ListUserOrders(c.Request.Context(), &orderv1.ListUserOrdersRequest{
+		UserId:        userID(c),
+		Status:        q.status,
+		PageSize:      q.pageSize,
+		BeforeOrderId: q.before,
+	})
+	if err != nil {
+		s.writeGRPCError(c, err)
+		return
+	}
+
+	out := oas.OrderSummaryList{Orders: make([]oas.OrderSummary, 0, len(resp.GetOrders()))}
+	for _, o := range resp.GetOrders() {
+		out.Orders = append(out.Orders, toOrderSummary(o))
+	}
+	out.NextCursor = nextCursor(resp.GetNextBeforeOrderId())
+	writeJSON(c, http.StatusOK, out)
+}
+
 // ListMerchantOrders 实现 GET /api/v1/merchants/{merchant_id}/orders。
 // 数据来自异步同步的索引，是最终一致的；cursor 对客户端不透明，实际是下一页的 before_order_id。
 func (s *server) ListMerchantOrders(c *gin.Context, rawMerchantID oas.MerchantId, params oas.ListMerchantOrdersParams) {
@@ -254,42 +329,16 @@ func (s *server) ListMerchantOrders(c *gin.Context, rawMerchantID oas.MerchantId
 	if !ok {
 		return
 	}
-
-	limit := int32(defaultListLimit)
-	if params.Limit != nil {
-		limit = *params.Limit
-		if limit < 1 || limit > maxListLimit {
-			badRequest(c, "limit must be between 1 and "+strconv.Itoa(maxListLimit))
-			return
-		}
-	}
-
-	var before int64
-	if params.Cursor != nil && *params.Cursor != "" {
-		n, ok := parseID(*params.Cursor)
-		if !ok {
-			badRequest(c, "invalid cursor")
-			return
-		}
-		before = n
-	}
-
-	// 对外状态名到 proto 枚举；unspecified 和不传一样，表示不筛选。
-	var status orderv1.OrderStatus
-	if params.Status != nil {
-		v, found := orderv1.OrderStatus_value["ORDER_STATUS_"+strings.ToUpper(string(*params.Status))]
-		if !found {
-			badRequest(c, "invalid status")
-			return
-		}
-		status = orderv1.OrderStatus(v)
+	q, ok := parseListQuery(c, params.Limit, params.Cursor, params.Status)
+	if !ok {
+		return
 	}
 
 	resp, err := s.deps.OrderIndex.ListMerchantOrders(c.Request.Context(), &orderindexv1.ListMerchantOrdersRequest{
 		MerchantId:    merchantID,
-		Status:        status,
-		PageSize:      limit,
-		BeforeOrderId: before,
+		Status:        q.status,
+		PageSize:      q.pageSize,
+		BeforeOrderId: q.before,
 	})
 	if err != nil {
 		s.writeGRPCError(c, err)
@@ -300,9 +349,6 @@ func (s *server) ListMerchantOrders(c *gin.Context, rawMerchantID oas.MerchantId
 	for _, o := range resp.GetOrders() {
 		out.Orders = append(out.Orders, toMerchantOrder(o))
 	}
-	if next := resp.GetNextBeforeOrderId(); next > 0 {
-		cur := strconv.FormatInt(next, 10)
-		out.NextCursor = &cur
-	}
+	out.NextCursor = nextCursor(resp.GetNextBeforeOrderId())
 	writeJSON(c, http.StatusOK, out)
 }

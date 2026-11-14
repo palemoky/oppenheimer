@@ -19,9 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	OrderService_SubmitOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/SubmitOrder"
-	OrderService_GetOrder_FullMethodName    = "/oppenheimer.order.v1.OrderService/GetOrder"
-	OrderService_CancelOrder_FullMethodName = "/oppenheimer.order.v1.OrderService/CancelOrder"
+	OrderService_SubmitOrder_FullMethodName    = "/oppenheimer.order.v1.OrderService/SubmitOrder"
+	OrderService_GetOrder_FullMethodName       = "/oppenheimer.order.v1.OrderService/GetOrder"
+	OrderService_ListUserOrders_FullMethodName = "/oppenheimer.order.v1.OrderService/ListUserOrders"
+	OrderService_CancelOrder_FullMethodName    = "/oppenheimer.order.v1.OrderService/CancelOrder"
 )
 
 // OrderServiceClient is the client API for OrderService service.
@@ -50,6 +51,15 @@ type OrderServiceClient interface {
 	// 错误：
 	//   NOT_FOUND  reason=ORDER_NOT_FOUND
 	GetOrder(ctx context.Context, in *GetOrderRequest, opts ...grpc.CallOption) (*GetOrderResponse, error)
+	// ListUserOrders 按创建时间从新到旧列出一个用户的订单，游标分页。只查用户所在的一个分片。
+	//
+	// 返回的每一行只有列表页要显示的字段，没有商品明细；详情用 GetOrder。
+	// 已受理但还没落库的订单不在列表里（它们还在队列中，GetOrder 能查到 CREATING）。
+	// 用户没有订单时返回空列表，不是错误。
+	//
+	// 错误：
+	//   INVALID_ARGUMENT  reason=INVALID_ARGUMENT  user_id、page_size 或 before_order_id 不合法
+	ListUserOrders(ctx context.Context, in *ListUserOrdersRequest, opts ...grpc.CallOption) (*ListUserOrdersResponse, error)
 	// CancelOrder 取消待支付的订单。对已取消的订单重复调用返回成功。
 	//
 	// 错误：
@@ -80,6 +90,16 @@ func (c *orderServiceClient) GetOrder(ctx context.Context, in *GetOrderRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetOrderResponse)
 	err := c.cc.Invoke(ctx, OrderService_GetOrder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orderServiceClient) ListUserOrders(ctx context.Context, in *ListUserOrdersRequest, opts ...grpc.CallOption) (*ListUserOrdersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListUserOrdersResponse)
+	err := c.cc.Invoke(ctx, OrderService_ListUserOrders_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +142,15 @@ type OrderServiceServer interface {
 	// 错误：
 	//   NOT_FOUND  reason=ORDER_NOT_FOUND
 	GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error)
+	// ListUserOrders 按创建时间从新到旧列出一个用户的订单，游标分页。只查用户所在的一个分片。
+	//
+	// 返回的每一行只有列表页要显示的字段，没有商品明细；详情用 GetOrder。
+	// 已受理但还没落库的订单不在列表里（它们还在队列中，GetOrder 能查到 CREATING）。
+	// 用户没有订单时返回空列表，不是错误。
+	//
+	// 错误：
+	//   INVALID_ARGUMENT  reason=INVALID_ARGUMENT  user_id、page_size 或 before_order_id 不合法
+	ListUserOrders(context.Context, *ListUserOrdersRequest) (*ListUserOrdersResponse, error)
 	// CancelOrder 取消待支付的订单。对已取消的订单重复调用返回成功。
 	//
 	// 错误：
@@ -143,6 +172,9 @@ func (UnimplementedOrderServiceServer) SubmitOrder(context.Context, *SubmitOrder
 }
 func (UnimplementedOrderServiceServer) GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetOrder not implemented")
+}
+func (UnimplementedOrderServiceServer) ListUserOrders(context.Context, *ListUserOrdersRequest) (*ListUserOrdersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListUserOrders not implemented")
 }
 func (UnimplementedOrderServiceServer) CancelOrder(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CancelOrder not implemented")
@@ -204,6 +236,24 @@ func _OrderService_GetOrder_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OrderService_ListUserOrders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListUserOrdersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).ListUserOrders(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_ListUserOrders_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).ListUserOrders(ctx, req.(*ListUserOrdersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OrderService_CancelOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CancelOrderRequest)
 	if err := dec(in); err != nil {
@@ -236,6 +286,10 @@ var OrderService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetOrder",
 			Handler:    _OrderService_GetOrder_Handler,
+		},
+		{
+			MethodName: "ListUserOrders",
+			Handler:    _OrderService_ListUserOrders_Handler,
 		},
 		{
 			MethodName: "CancelOrder",

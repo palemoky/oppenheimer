@@ -107,6 +107,11 @@ func (o *Orders) SubmitOrder(context.Context, *orderv1.SubmitOrderRequest, ...gr
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
+// ListUserOrders 实现 OrderServiceClient，payment 不会调用。
+func (o *Orders) ListUserOrders(context.Context, *orderv1.ListUserOrdersRequest, ...grpc.CallOption) (*orderv1.ListUserOrdersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
 // CancelOrder 实现 OrderServiceClient，payment 不会调用。
 func (o *Orders) CancelOrder(context.Context, *orderv1.CancelOrderRequest, ...grpc.CallOption) (*orderv1.CancelOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")

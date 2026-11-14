@@ -29,6 +29,16 @@ service OrderService {
   //   NOT_FOUND  reason=ORDER_NOT_FOUND
   rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
 
+  // ListUserOrders 按创建时间从新到旧列出一个用户的订单，游标分页。只查用户所在的一个分片。
+  //
+  // 返回的每一行只有列表页要显示的字段，没有商品明细；详情用 GetOrder。
+  // 已受理但还没落库的订单不在列表里（它们还在队列中，GetOrder 能查到 CREATING）。
+  // 用户没有订单时返回空列表，不是错误。
+  //
+  // 错误：
+  //   INVALID_ARGUMENT  reason=INVALID_ARGUMENT  user_id、page_size 或 before_order_id 不合法
+  rpc ListUserOrders(ListUserOrdersRequest) returns (ListUserOrdersResponse);
+
   // CancelOrder 取消待支付的订单。对已取消的订单重复调用返回成功。
   //
   // 错误：
@@ -97,6 +107,36 @@ message GetOrderRequest {
 
 message GetOrderResponse {
   Order order = 1;
+}
+
+message ListUserOrdersRequest {
+  // 必须大于 0。
+  int64 user_id = 1;
+  // 只返回这个状态的订单；ORDER_STATUS_UNSPECIFIED 表示不筛选。
+  OrderStatus status = 2;
+  // 每页条数，1 到 100；0 表示用默认值 20。
+  int32 page_size = 3;
+  // 只返回订单号小于它的订单；0 表示从最新的开始。传上一页响应里的 next_before_order_id。
+  int64 before_order_id = 4;
+}
+
+message ListUserOrdersResponse {
+  repeated OrderSummary orders = 1;
+  // 下一页的游标；0 表示没有更多了。
+  int64 next_before_order_id = 2;
+}
+
+// OrderSummary 是用户订单列表里的一行。
+message OrderSummary {
+  int64 order_id = 1;
+  OrderStatus status = 2;
+  // 预占成功之前（CREATING）和创建失败的订单金额为 0。
+  oppenheimer.common.v1.Money total = 3;
+  google.protobuf.Timestamp create_time = 4;
+  // 支付截止时间。
+  google.protobuf.Timestamp expire_time = 5;
+  // 仅已支付的订单有值。
+  google.protobuf.Timestamp pay_time = 6;
 }
 
 message CancelOrderRequest {

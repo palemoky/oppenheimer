@@ -100,3 +100,18 @@ func toMerchantOrder(o *orderindexv1.MerchantOrder) oas.MerchantOrder {
 	}
 	return d
 }
+
+func toOrderSummary(o *orderv1.OrderSummary) oas.OrderSummary {
+	d := oas.OrderSummary{
+		OrderId:    oas.ID(o.GetOrderId()),
+		Status:     oas.OrderStatus(enumName(o.GetStatus().String(), "ORDER_STATUS_")),
+		Total:      toMoney(o.GetTotal()),
+		CreateTime: utc(o.GetCreateTime()),
+		ExpireTime: utc(o.GetExpireTime()),
+	}
+	if o.GetPayTime() != nil {
+		t := utc(o.GetPayTime())
+		d.PayTime = &t
+	}
+	return d
+}

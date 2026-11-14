@@ -35,7 +35,9 @@ type fakeOrder struct {
 	create     func(*orderv1.SubmitOrderRequest) (*orderv1.SubmitOrderResponse, error)
 	get        func(*orderv1.GetOrderRequest) (*orderv1.GetOrderResponse, error)
 	cancel     func(*orderv1.CancelOrderRequest) (*orderv1.CancelOrderResponse, error)
+	list       func(*orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error)
 	lastCreate *orderv1.SubmitOrderRequest
+	lastList   *orderv1.ListUserOrdersRequest
 	lastGet    *orderv1.GetOrderRequest
 	lastCancel *orderv1.CancelOrderRequest
 	calls      int
@@ -57,6 +59,12 @@ func (f *fakeOrder) CancelOrder(_ context.Context, in *orderv1.CancelOrderReques
 	f.calls++
 	f.lastCancel = in
 	return f.cancel(in)
+}
+
+func (f *fakeOrder) ListUserOrders(_ context.Context, in *orderv1.ListUserOrdersRequest, _ ...grpc.CallOption) (*orderv1.ListUserOrdersResponse, error) {
+	f.calls++
+	f.lastList = in
+	return f.list(in)
 }
 
 type fakePayment struct {
@@ -680,6 +688,134 @@ func TestListMerchantOrdersDownstreamError(t *testing.T) {
 				return nil, tt.err
 			}
 			r := do(t, e.h, "GET", "/api/v1/merchants/3/orders", "7", "")
+			if r.status != tt.wantStatus || errCode(t, r) != tt.wantCode || strings.Contains(r.raw, "secret") {
+				t.Errorf("status = %d, body %s", r.status, r.raw)
+			}
+		})
+	}
+}
+
+func TestListOrders(t *testing.T) {
+	e := newEnv(t)
+	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	e.order.list = func(*orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
+		return &orderv1.ListUserOrdersResponse{
+			Orders: []*orderv1.OrderSummary{
+				{
+					OrderId: bigID, Status: orderv1.OrderStatus_ORDER_STATUS_PAID,
+					Total:      &commonv1.Money{Amount: 1999, Currency: "CNY"},
+					CreateTime: timestamppb.New(created), ExpireTime: timestamppb.New(created.Add(15 * time.Minute)),
+					PayTime: timestamppb.New(created.Add(time.Minute)),
+				},
+				{
+					OrderId: 5, Status: orderv1.OrderStatus_ORDER_STATUS_CREATING,
+					Total:      &commonv1.Money{Amount: 0, Currency: "CNY"},
+					CreateTime: timestamppb.New(created), ExpireTime: timestamppb.New(created.Add(15 * time.Minute)),
+				},
+			},
+			NextBeforeOrderId: 5,
+		}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/orders", "7", "")
+	if r.status != http.StatusOK {
+		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	want := `{"orders":[
+		{"order_id":"9007199254741994","status":"paid","total":{"amount":1999,"currency":"CNY"},
+		 "create_time":"2026-01-02T03:04:05Z","expire_time":"2026-01-02T03:19:05Z","pay_time":"2026-01-02T03:05:05Z"},
+		{"order_id":"5","status":"creating","total":{"amount":0,"currency":"CNY"},
+		 "create_time":"2026-01-02T03:04:05Z","expire_time":"2026-01-02T03:19:05Z"}],
+		"next_cursor":"5"}`
+	if !jsonEqual(t, []byte(r.raw), []byte(want)) {
+		t.Errorf("body = %s", r.raw)
+	}
+	// 用户只取自 X-User-Id。
+	got := e.order.lastList
+	if got.GetUserId() != 7 || got.GetPageSize() != 20 || got.GetBeforeOrderId() != 0 || got.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_UNSPECIFIED {
+		t.Errorf("request = %v", got)
+	}
+}
+
+func TestListOrdersFilterAndPaging(t *testing.T) {
+	e := newEnv(t)
+	e.order.list = func(*orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
+		return &orderv1.ListUserOrdersResponse{NextBeforeOrderId: bigID}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/orders?status=pending_payment&limit=100&cursor=999", "7", "")
+	if r.status != http.StatusOK {
+		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	got := e.order.lastList
+	if got.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT || got.GetPageSize() != 100 || got.GetBeforeOrderId() != 999 {
+		t.Errorf("request = %v", got)
+	}
+	// 游标往返：响应里的 next_cursor 原样回传，下游拿到同一个订单号（超过 2^53 也不丢精度）。
+	cur, _ := r.body["next_cursor"].(string)
+	if cur != "9007199254741994" {
+		t.Fatalf("next_cursor = %q", cur)
+	}
+	do(t, e.h, "GET", "/api/v1/orders?limit=1&cursor="+cur, "7", "")
+	if e.order.lastList.GetBeforeOrderId() != bigID || e.order.lastList.GetPageSize() != 1 {
+		t.Errorf("request = %v", e.order.lastList)
+	}
+	// status=unspecified 与不传一样，不筛选；cursor 为空串与不传一样。
+	do(t, e.h, "GET", "/api/v1/orders?status=unspecified&cursor=", "7", "")
+	if e.order.lastList.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_UNSPECIFIED || e.order.lastList.GetBeforeOrderId() != 0 {
+		t.Errorf("request = %v", e.order.lastList)
+	}
+}
+
+func TestListOrdersEmpty(t *testing.T) {
+	e := newEnv(t)
+	e.order.list = func(*orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
+		return &orderv1.ListUserOrdersResponse{}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/orders", "7", "")
+	if r.status != http.StatusOK || !jsonEqual(t, []byte(r.raw), []byte(`{"orders":[]}`)) {
+		t.Errorf("status = %d, body %s", r.status, r.raw)
+	}
+}
+
+func TestListOrdersInvalidInput(t *testing.T) {
+	for _, q := range []string{
+		"limit=0", "limit=101", "limit=-1", "limit=abc",
+		"cursor=abc", "cursor=0", "cursor=-5", "cursor=1.5",
+		"status=bogus",
+	} {
+		t.Run(q, func(t *testing.T) {
+			e := newEnv(t)
+			r := do(t, e.h, "GET", "/api/v1/orders?"+q, "7", "")
+			if r.status != http.StatusBadRequest || errCode(t, r) != "INVALID_ARGUMENT" {
+				t.Errorf("status = %d, body %s", r.status, r.raw)
+			}
+			if e.order.lastList != nil {
+				t.Error("downstream must not be called")
+			}
+		})
+	}
+	e := newEnv(t)
+	r := do(t, e.h, "GET", "/api/v1/orders", "", "")
+	if r.status != http.StatusUnauthorized || e.order.lastList != nil {
+		t.Errorf("missing user: status = %d, body %s", r.status, r.raw)
+	}
+}
+
+func TestListOrdersDownstreamError(t *testing.T) {
+	for _, tt := range []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, "bad"), 400, "INVALID_ARGUMENT"},
+		{errx.New(codes.Unavailable, "", "down"), 503, "UNAVAILABLE"},
+		{status.Error(codes.Internal, "sql: secret"), 500, "INTERNAL"},
+	} {
+		t.Run(tt.wantCode, func(t *testing.T) {
+			e := newEnv(t)
+			e.order.list = func(*orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
+				return nil, tt.err
+			}
+			r := do(t, e.h, "GET", "/api/v1/orders", "7", "")
 			if r.status != tt.wantStatus || errCode(t, r) != tt.wantCode || strings.Contains(r.raw, "secret") {
 				t.Errorf("status = %d, body %s", r.status, r.raw)
 			}
