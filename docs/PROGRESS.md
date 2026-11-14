@@ -5,8 +5,8 @@
 ## 当前状态
 
 - **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交（`1ac7c1c`）和增量对账的两个提交（到 `4e0f4ca`），CI 27 项全部通过；步骤六（埋点）已分 6 个提交推送（`7826840` 到 `493e983`），CI 27 项全部通过；1d 的六步都做完了。1c 五步全部完成并已合并进 `main`
-- **当前分支**：`phase-1-wrapup`（从 `main` 开出，改动没有提交，没有推送）。1d 的 PR #7 已于 2026-11-14 合并进 `main`（合并提交 `d04e118`）
-- **最后更新**：2026-11-14
+- **当前分支**：`phase-1-wrapup`（从 `main` 开出，已推送并开 draft PR #8，CI 27 项全部通过）。1d 的 PR #7 已于 2026-11-14 合并进 `main`（合并提交 `d04e118`）
+- **最后更新**：2026-11-15
 
 ## 上次做到哪
 
@@ -106,7 +106,7 @@
                - **本机的变化**：`make obs-up` 启动 `otel-lgtm`（Grafana 在 http://127.0.0.1:3000 ，admin/admin；OTLP 4317/4318；内存上限 1.5 GiB，全量采样压测后到过 1.33 GiB）。它在运行时 `make run`、`bench.sh` 自动导出（`OBS=off` 关闭；`bench.sh` 默认 1% 采样）；e2e 把链路发给测试进程自己的接收端（14317），chaos、fault 不导出。**当前 `otel-lgtm` 容器在运行**，不用时 `make obs-down`。查链路和指标的命令在 8.10 之外另记在这里：Tempo 用 `curl -s -u admin:admin -G localhost:3000/api/datasources/proxy/uid/tempo/api/search --data-urlencode 'q={ resource.service.name = "order" }'`，Prometheus 用同样的前缀换成 `uid/prometheus/api/v1/query`。拆落库时间的脚本没有入库（在会话的临时目录里），压测的原始输出在 `tmp/bench/otel-overhead/`。
                - 新的约定（已写进 AGENTS.md 的“可观测”）：带 ctx 的日志；业务代码不手工建 span；指标的标签只能是有限的枚举；只有服务端故障标 Error；加指标不改行为、不新增查询。
                - 没做的见设计文档 8.17。要点：`sloglint` 没有打开；`order.gate.unclaimed_holds` 和 `inventory.stock_pending.backlog` 两个指标没有做；`make fault` 里指标对不对得上没有抽查；后端长时间不在时的表现没有跑过。
-             - **阶段 1 收尾（2026-11-14，分支 `phase-1-wrapup`，从合并后的 `main` 开出，改动都没有提交）。** PR #7 已合并进 `main`（合并提交 `d04e118`）。主人要求的四件事：
+             - **阶段 1 收尾（2026-11-14，分支 `phase-1-wrapup`，从合并后的 `main` 开出）。已分 4 个提交推送（`a829857` 到 `7686015`），draft PR #8，CI 27 项全部通过（最长的是 `test (./services/order)` 4 分 20 秒、e2e 4 分 18 秒、`test (./pkg)` 3 分 14 秒；e2e 比 PR #7 的 3 分 21 秒慢了约 1 分钟，只看了这一次，没有查是波动还是变慢）。** PR #7 已合并进 `main`（合并提交 `d04e118`）。主人要求的四件事：
                - 合并 PR #7：已做。
                - 阶段计划里 1d 的四项旧条目（orderindex 按批写、落库性能、开环模式、1b 遗留的小问题）逐项在代码里核对过，已勾。1c 里有两项没勾的是有意留着的（读模式的定量对比等阶段 3；归档后自动重建分区没做）。
                - 面试笔记：`docs/notes/1c-sharding.md`（824 行）和 `docs/notes/1d-protection.md`（约 800 行，覆盖 104 条考点）由 Sonnet 写、主会话抽查。两份里按通用知识补充的段落都标了“通用知识”，设计文档里没有出处，面试前要对照官方文档核对。写笔记时查出的几处文档问题已改：**AGENTS.md 里边车时限的规则原来写反了**（“两处要一致”，实际是进程里的时限等于边车的数加 500 毫秒）；设计 1c 的 5.7、设计 1d 的 4.6 和 5.7、ADR-0014 里过时的内容加了注。
@@ -118,7 +118,7 @@
                - 新的环境变量（order）：`REDIS_POOL_SIZE`、`READ_GATE_MAX_CONCURRENCY`。
                - 8.17 里仍然没做的：`make fault` 里抽查指标、后端长时间不在时的表现、压测工具用 `X-Trace-Id`、cdc 发 Kafka 没有 span、orderindex 的 `ListMerchantOrders` 错误映射。
                - 收尾的全部改动之后：`make lint` 各模块 0 issues，`make test` 全部通过，`make e2e` 通过，`make fault` 14 个场景全过（`make fault` 是在加指标和改日志之前跑的）。`make chaos` 这一轮没有跑。`pkg/lock` 的 `TestExperimentNaiveDelDeletesOthersLock` 在整仓库的 `make test` 里失败过一次，单独重跑通过，原因没有看。
-               - 下一步：等主人说提交（建议分：修复、指标、日志、笔记和文档），推送后开 PR、派 Haiku 看 CI。之后阶段 1 的完成标准都满足了，可以进阶段 2（要先请主人开 Ubuntu 3900X 和 DS218+，装 helm）。
+               - 下一步：PR #8 等主人说合并。之后阶段 1 的完成标准都满足了，可以进阶段 2（要先请主人开 Ubuntu 3900X 和 DS218+，装 helm）。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
