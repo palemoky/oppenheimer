@@ -42,7 +42,7 @@
      ├── Redis Cluster：库存预扣、幂等、限流、分布式锁
      └── Kafka：异步下单、outbox 事件、延迟关单
 
-可观测：OpenTelemetry SDK → Collector → Prometheus（指标）· Loki（日志）· SkyWalking（链路）
+可观测：OpenTelemetry SDK → Collector → Prometheus（指标）· Loki（日志）· Tempo（链路）
         Grafana + Alertmanager
 对账：Merkle Tree 定位差异
 故障注入：Chaos Mesh        诊断：Agent（Go + Claude API）

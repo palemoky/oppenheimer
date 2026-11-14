@@ -38,14 +38,14 @@
 | Redis Cluster：6 节点 | 1.5GB |
 | Kafka：3 broker | 4.5GB |
 | Prometheus、Grafana、Alertmanager、Loki | 4GB |
-| SkyWalking OAP + BanyanDB | 4GB |
+| Tempo（单体模式，链路；ADR-0024 之前这里是 SkyWalking OAP 加 BanyanDB 的 4GB） | 1GB（粗估，阶段 3a 实测） |
 | OpenTelemetry Collector | 0.5GB |
 | Chaos Mesh | 0.5GB |
 | 业务服务（多副本，含 CDC） | 3GB |
 | 归档 MySQL 实例 | 1GB |
-| 余量 | 约 3GB |
+| 余量 | 约 6GB |
 
-不够时的处理顺序：缩短监控数据保留期并下调采样率 → 把 SkyWalking 或 Loki 的存储挪到 NAS 或 Mac mini → 降低中间件副本规格。
+不够时的处理顺序：缩短监控数据保留期并下调采样率 → 把 Tempo 或 Loki 的存储挪到 NAS 或 Mac mini → 降低中间件副本规格。
 
 ## 网络
 

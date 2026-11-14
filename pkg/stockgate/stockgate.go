@@ -526,6 +526,27 @@ func (g *Gate) ClaimedBefore(ctx context.Context, before time.Time, limit int) (
 	return g.listBefore(ctx, "gate:claimed", before, limit)
 }
 
+// Queued 返回现有占用的个数：unclaimed 是已受理、还没被落库认领的（gate:holds），
+// claimed 是已认领、订单还没结束的（gate:claimed）。只读，给监控用。
+//
+// unclaimed 就是受理端背压比较的那个量：holdScript 的第一条拿 ZCARD gate:holds 和 MaxQueue 比，
+// 第三条也是拿它和 MaxStale 比，没有再加减别的。所以 MaxQueue - unclaimed 就是离背压拒绝还有多远。
+// （第二条比的是其中受理时间早于 Now - MaxWait 的个数，那个要按时间算，这里不读。）
+//
+// 两个 ZCARD 都是 O(1)，放在一个 MULTI/EXEC 里一次往返，两个数取自同一时刻：
+// 一笔占用被认领时从一个集合移到另一个，分两次读可能把它数两次或一次都没数到。
+func (g *Gate) Queued(ctx context.Context) (unclaimed, claimed int64, err error) {
+	var u, c *redis.IntCmd
+	if _, err := g.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		u = p.ZCard(ctx, g.prefix+"gate:holds")
+		c = p.ZCard(ctx, g.prefix+"gate:claimed")
+		return nil
+	}); err != nil {
+		return 0, 0, fmt.Errorf("stockgate: count holds: %w", err)
+	}
+	return u.Val(), c.Val(), nil
+}
+
 func (g *Gate) listBefore(ctx context.Context, key string, before time.Time, limit int) ([]int64, error) {
 	members, err := g.client.ZRangeByScore(ctx, g.prefix+key, &redis.ZRangeBy{
 		Min:   "-inf",

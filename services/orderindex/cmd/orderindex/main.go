@@ -237,7 +237,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
+	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// 收到退出信号后先摘流：就绪探测和 gRPC 健康检查变成不可用，继续正常服务 DRAIN_DELAY 这么久（本机默认 0），
 	// 然后按与列出的顺序相反的顺序停止：先停 gRPC（等在途查询做完），再停消费者（处理完在途消息、提交位点），

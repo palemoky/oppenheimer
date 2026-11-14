@@ -197,7 +197,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		defer cancel()
 		for name, l := range map[string]*lock.Leader{relayLockName: relayLeader, processorLockName: procLeader} {
 			if err := l.Close(ctx); err != nil {
-				logger.Warn("release leader lock", "lock", name, "error", err)
+				logger.WarnContext(ctx, "release leader lock", "lock", name, "error", err)
 			}
 		}
 	}()
@@ -281,7 +281,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
+	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// app.RunWith 按相反顺序停止。收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查
 	// 变成不可用，继续正常服务 DRAIN_DELAY 这么久，让负载均衡把流量挪走（本机默认 0）。然后

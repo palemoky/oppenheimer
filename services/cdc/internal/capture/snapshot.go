@@ -37,7 +37,7 @@ func (p *Pipeline) beginSnapshot(ctx context.Context) (*cdcv1.Checkpoint, error)
 	if err := p.saveCheckpoint(ctx, cp); err != nil {
 		return nil, err
 	}
-	p.log.Info("snapshot started", "gtid_set", cp.GetGtidSet(), "tables", len(tables))
+	p.log.InfoContext(ctx, "snapshot started", "gtid_set", cp.GetGtidSet(), "tables", len(tables))
 	return cp, nil
 }
 
@@ -85,7 +85,7 @@ func (p *Pipeline) snapshot(ctx context.Context, cp *cdcv1.Checkpoint) (stopped 
 		}
 		for {
 			if p.stopping() {
-				p.log.Info("snapshot stopped", "table", table, "last_key", last)
+				p.log.InfoContext(ctx, "snapshot stopped", "table", table, "last_key", last)
 				return true, nil
 			}
 			n, maxKey, err := p.snapshotBatch(ctx, rule, slot, table, last)
@@ -110,13 +110,13 @@ func (p *Pipeline) snapshot(ctx context.Context, cp *cdcv1.Checkpoint) (stopped 
 				break
 			}
 		}
-		p.log.Info("snapshot table done", "table", table)
+		p.log.InfoContext(ctx, "snapshot table done", "table", table)
 	}
 	cp.Snapshot = nil
 	if err := p.saveCheckpoint(ctx, cp); err != nil {
 		return false, err
 	}
-	p.log.Info("snapshot finished", "gtid_set", cp.GetGtidSet())
+	p.log.InfoContext(ctx, "snapshot finished", "gtid_set", cp.GetGtidSet())
 	return false, nil
 }
 

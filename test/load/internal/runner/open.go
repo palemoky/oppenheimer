@@ -341,7 +341,7 @@ func (o *openRunner) progressLoop(ctx context.Context, s *scheduler) {
 			o.mu.Lock()
 			acc, back := o.outcomes[outAccepted], o.outcomes[outBacklogged]
 			o.mu.Unlock()
-			o.log.Info("progress", "planned", s.planned.Load(), "sent", s.sent.Load(), "dropped", s.dropped.Load(),
+			o.log.InfoContext(ctx, "progress", "planned", s.planned.Load(), "sent", s.sent.Load(), "dropped", s.dropped.Load(),
 				"accepted", acc, "backlogged", back)
 		}
 	}
@@ -367,7 +367,7 @@ func runOpen(ctx context.Context, cfg Config, led *ledger.Writer) (*Report, erro
 		perSec:   make([]int64, int(math.Ceil(cfg.Duration.Seconds()))),
 		start:    startAt,
 	}
-	o.log.Info("load run starting", "mode", ModeOpen, "run_id", cfg.RunID, "seed", cfg.Seed, "rate", cfg.Rate,
+	o.log.InfoContext(ctx, "load run starting", "mode", ModeOpen, "run_id", cfg.RunID, "seed", cfg.Seed, "rate", cfg.Rate,
 		"duration", cfg.Duration, "max_in_flight", cfg.MaxInFlight, "skus", cfg.SKUs)
 
 	s := &scheduler{

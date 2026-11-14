@@ -214,7 +214,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 	// 指标登记失败不影响同步，只记一条日志。
 	if unregister, err := otelx.ObserveGauge(meter, "cdc.lag_ms", lagDesc, p.lagMillis,
 		attribute.String("pipeline", p.cfg.Name)); err != nil {
-		p.log.Warn("register cdc lag gauge", "error", err)
+		p.log.WarnContext(ctx, "register cdc lag gauge", "error", err)
 	} else {
 		defer unregister()
 	}
@@ -228,7 +228,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		return err
 	}
 	if cp == nil {
-		p.log.Info("no checkpoint, starting snapshot")
+		p.log.InfoContext(ctx, "no checkpoint, starting snapshot")
 		if cp, err = p.beginSnapshot(ctx); err != nil {
 			return err
 		}
@@ -257,7 +257,7 @@ func (p *Pipeline) loadCheckpoint(ctx context.Context) (*cdcv1.Checkpoint, error
 		return nil, fmt.Errorf("load checkpoint: %w", err)
 	}
 	if cp != nil {
-		p.log.Info("loaded checkpoint", "gtid_set", cp.GetGtidSet(),
+		p.log.InfoContext(ctx, "loaded checkpoint", "gtid_set", cp.GetGtidSet(),
 			"snapshot_table", cp.GetSnapshot().GetTable(), "snapshot_last_key", cp.GetSnapshot().GetLastKey())
 	}
 	return cp, nil

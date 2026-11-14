@@ -83,6 +83,14 @@ type Config struct {
 	// Cooldown 是打开多久之后进入半开，默认 DefaultCooldown。
 	// 半开时放出去的探测超过这么久没有结果，也会再放一个，防止一个丢失的探测把熔断器永远卡在半开。
 	Cooldown time.Duration
+	// MinFailureSpan 不为零时，连续失败除了要达到 Failures 次，还要持续这么久（从这一串的第一次失败算起）才打开。
+	//
+	// 它区分“依赖坏了”和“抖了一下”。并发的调用方很多时，一次几百毫秒的停顿会让当时在途的几十个调用
+	// 在同一刻一起超时，光数次数的话这一下就满足了“连续 N 次”，熔断器打开一个冷却期：停顿了 300 毫秒，
+	// 功能却停了 5 秒，是熔断器自己把故障放大了（设计文档 1d 的 8.18）。依赖真的坏了，失败会持续下去，
+	// 过了这段时间照样打开；代价是打开之前的这段时间里，每个调用还要各自等满自己的时限。
+	// 取值要比预期的抖动长、比 Cooldown 短。默认 0，只数次数。
+	MinFailureSpan time.Duration
 	// Now 是时钟，默认 time.Now。
 	Now func() time.Time
 	// OnChange 在状态变化后调用（不持有锁），用来记日志。并发的变化之间不保证调用的先后。
@@ -94,13 +102,15 @@ type Breaker struct {
 	name     string
 	failures int
 	cooldown time.Duration
+	minSpan  time.Duration
 	now      func() time.Time
 	onChange func(name string, from, to State)
 
 	mu    sync.Mutex
 	state State
-	// fails 是关闭状态下的连续失败次数。
-	fails int
+	// fails 是关闭状态下的连续失败次数，firstFailAt 是这一串里第一次失败的时刻。
+	fails       int
+	firstFailAt time.Time
 	// openedAt 是进入打开状态（或者打开状态下最近一次被报告失败）的时刻。
 	openedAt time.Time
 	// gen 在每次状态变化时加一。Allow 放行时记下当时的 gen，结果回来时 gen 变了就丢弃：
@@ -121,6 +131,7 @@ func New(cfg Config) *Breaker {
 		name:     cfg.Name,
 		failures: cfg.Failures,
 		cooldown: cmp.Or(cfg.Cooldown, DefaultCooldown),
+		minSpan:  cfg.MinFailureSpan,
 		now:      cfg.Now,
 		onChange: cfg.OnChange,
 	}
@@ -239,8 +250,11 @@ func (b *Breaker) succeeded() {
 func (b *Breaker) failed() {
 	switch b.state {
 	case Closed:
+		if b.fails == 0 {
+			b.firstFailAt = b.now()
+		}
 		b.fails++
-		if b.fails >= b.failures {
+		if b.fails >= b.failures && (b.minSpan <= 0 || b.now().Sub(b.firstFailAt) >= b.minSpan) {
 			b.setState(Open)
 		}
 	case HalfOpen:

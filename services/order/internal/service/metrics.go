@@ -314,6 +314,7 @@ func (s *Service) RegisterLimitMetrics() (unregister func(), err error) {
 		errs = append(errs, add("read_db_"+strconv.Itoa(i), b))
 	}
 	errs = append(errs, add("cold", s.limits.cold))
+	errs = append(errs, add("read_gate", s.limits.gate))
 	if err := errors.Join(errs...); err != nil {
 		unregister()
 		return nil, err
@@ -333,6 +334,40 @@ func observeCounter(m metric.Meter, name, desc string, read func() int64, attrs 
 		o.ObserveInt64(c, read(), opt)
 		return nil
 	}, c)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = reg.Unregister() }, nil
+}
+
+// ---------- 闸门的队列 ----------
+
+// RegisterQueueMetrics 登记闸门里的占用个数：order.gate.unclaimed_holds 是已受理、还没被落库认领的
+// （受理端的背压拿它和 ADMIT_MAX_QUEUE 比），order.gate.claimed_holds 是已认领、订单还没结束的。没有标签。
+//
+// 值由回收任务每轮顺带读一次（Reaper.refreshQueued），这里只读它存下的结果。回收任务只在 leader 上跑，
+// 别的实例上没有人更新这个数，所以没读到过或者已经不新鲜时不上报（而不是报 0）：后端看到的只有 leader 的值。
+// 返回的 unregister 在服务停止时调用。
+func (r *Reaper) RegisterQueueMetrics() (unregister func(), err error) {
+	unclaimed, err := meter.Int64ObservableGauge("order.gate.unclaimed_holds",
+		metric.WithDescription("Holds admitted but not yet claimed by order landing (the queue the admission backlog limit counts)"))
+	if err != nil {
+		return nil, err
+	}
+	claimed, err := meter.Int64ObservableGauge("order.gate.claimed_holds",
+		metric.WithDescription("Holds claimed by order landing whose orders have not ended yet"))
+	if err != nil {
+		return nil, err
+	}
+	reg, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		q, ok := r.queuedNow()
+		if !ok {
+			return nil
+		}
+		o.ObserveInt64(unclaimed, q.unclaimed)
+		o.ObserveInt64(claimed, q.claimed)
+		return nil
+	}, unclaimed, claimed)
 	if err != nil {
 		return nil, err
 	}

@@ -169,13 +169,13 @@ func run(ctx context.Context, logger *slog.Logger, opts Options, force <-chan st
 	var wg sync.WaitGroup
 	for _, c := range components {
 		wg.Go(func() {
-			logger.Info("component starting", "component", c.Name())
+			logger.InfoContext(ctx, "component starting", "component", c.Name())
 			if err := c.Start(runCtx); err != nil {
 				// 只有第一个失败会成为 cause，后续调用无效。
 				cancel(&ComponentError{Component: c.Name(), Err: err})
 				return
 			}
-			logger.Info("component exited", "component", c.Name())
+			logger.InfoContext(ctx, "component exited", "component", c.Name())
 		})
 	}
 	// 监听的端口在构造组件时就已经绑定（ListenHTTP、grpcx.Listen），这时发来的请求已经能排进队列，
@@ -187,11 +187,11 @@ func run(ctx context.Context, logger *slog.Logger, opts Options, force <-chan st
 	var errs []error
 	failed := false
 	if cerr, ok := errors.AsType[*ComponentError](context.Cause(ctx)); ok {
-		logger.Error("component failed, shutting down", "component", cerr.Component, "error", cerr.Err)
+		logger.ErrorContext(ctx, "component failed, shutting down", "component", cerr.Component, "error", cerr.Err)
 		errs = append(errs, cerr)
 		failed = true
 	} else {
-		logger.Info("shutdown requested")
+		logger.InfoContext(ctx, "shutdown requested")
 	}
 
 	// 摘流：先对外宣布不再就绪，同时继续正常服务，等负载均衡把流量挪走。
@@ -203,7 +203,7 @@ func run(ctx context.Context, logger *slog.Logger, opts Options, force <-chan st
 	}
 	forced := false
 	if opts.DrainDelay > 0 && !failed {
-		logger.Info("draining before stop", "drain_delay", opts.DrainDelay.String())
+		logger.InfoContext(ctx, "draining before stop", "drain_delay", opts.DrainDelay.String())
 		t := time.NewTimer(opts.DrainDelay)
 		select {
 		case <-t.C:
@@ -233,7 +233,7 @@ func run(ctx context.Context, logger *slog.Logger, opts Options, force <-chan st
 
 	// 相反顺序：先停入口（不再接新请求），再停它依赖的下游组件。
 	for _, c := range slices.Backward(components) {
-		logger.Info("component stopping", "component", c.Name())
+		logger.InfoContext(ctx, "component stopping", "component", c.Name())
 		if err := c.Stop(stopCtx); err != nil {
 			errs = append(errs, fmt.Errorf("stop component %s: %w", c.Name(), err))
 		}

@@ -107,7 +107,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("listening", "addr", httpServer.Addr().String(), "admin_addr", adminServer.Addr().String())
+	logger.InfoContext(ctx, "listening", "addr", httpServer.Addr().String(), "admin_addr", adminServer.Addr().String())
 
 	// 停止顺序与列出的顺序相反：
 	//  0. 收到退出信号后先摘流（设计文档 1d 的 6.11）：/readyz 变成 503，继续正常服务 DRAIN_DELAY 这么久，

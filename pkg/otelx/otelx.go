@@ -270,6 +270,6 @@ func Traceparent(ctx context.Context) string {
 // ctx 这时多半已经取消了（进程在退出），所以只沿用它带的值，不沿用它的取消；时限由 shutdown 自己设。
 func Shutdown(ctx context.Context, shutdown func(context.Context) error, logger *slog.Logger) {
 	if err := shutdown(context.WithoutCancel(ctx)); err != nil {
-		logger.Warn("telemetry shutdown did not finish cleanly, some spans or metrics may be lost", "error", err)
+		logger.WarnContext(ctx, "telemetry shutdown did not finish cleanly, some spans or metrics may be lost", "error", err)
 	}
 }

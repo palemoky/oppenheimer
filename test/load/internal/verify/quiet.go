@@ -236,13 +236,13 @@ func WaitQuiet(ctx context.Context, src Sources, timeout, interval time.Duration
 					"(oversold) or the books do not balance, check 22 of verify shows the detail", ErrStockPendingStuck, q.StockPending, same)
 			}
 			if time.Since(lastLog) >= 10*time.Second {
-				logger.Info("waiting for quiet", "elapsed", time.Since(start).Round(time.Second).String(), "pending", problems)
+				logger.InfoContext(ctx, "waiting for quiet", "elapsed", time.Since(start).Round(time.Second).String(), "pending", problems)
 				lastLog = time.Now()
 			}
 		case errors.Is(err, errNoStockPending):
 			return time.Since(start), last, err
 		case ctx.Err() == nil:
-			logger.Warn("probe failed, retrying", "error", err)
+			logger.WarnContext(ctx, "probe failed, retrying", "error", err)
 		}
 		t := time.NewTimer(interval)
 		select {

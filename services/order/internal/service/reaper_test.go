@@ -191,3 +191,93 @@ func TestReaperStartStop(t *testing.T) {
 	}
 	e.wantGate(t, skuA, 1000, 0)
 }
+
+// 回收任务每轮顺带读闸门的队列长度：和闸门里实际的数一致，指标报的就是它；
+// 没读到过、或者超过几个回收间隔没更新（这个实例不再是 leader）时不上报。
+func TestReaperRefreshesQueueMetrics(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	unregister, err := e.reaper.RegisterQueueMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unregister()
+	gauge := func(name string) (int64, bool) {
+		t.Helper()
+		return metricValue(t, name, nil)
+	}
+	if _, found := gauge("order.gate.unclaimed_holds"); found {
+		t.Fatal("unclaimed_holds reported before the reaper ran")
+	}
+
+	ids := make([]int64, 0, 3)
+	for i := range 3 {
+		ids = append(ids, e.submit(t, 1, "queued-"+strconv.Itoa(i), items(skuA, 1)).GetOrderId())
+	}
+	e.mustLand(t, ids[0])
+	e.reaper.RunOnce(t.Context())
+
+	unclaimed, claimed, err := e.gate.Queued(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unclaimed != 2 || claimed != 1 {
+		t.Fatalf("gate Queued = %d, %d; want 2 unclaimed and 1 claimed", unclaimed, claimed)
+	}
+	q, ok := e.reaper.queuedNow()
+	if !ok || q.unclaimed != unclaimed || q.claimed != claimed {
+		t.Fatalf("reaper queued = %+v (ok %v), want %d unclaimed and %d claimed", q, ok, unclaimed, claimed)
+	}
+	if v, found := gauge("order.gate.unclaimed_holds"); !found || v != unclaimed {
+		t.Fatalf("unclaimed_holds = %d (found %v), want %d", v, found, unclaimed)
+	}
+	if v, found := gauge("order.gate.claimed_holds"); !found || v != claimed {
+		t.Fatalf("claimed_holds = %d (found %v), want %d", v, found, claimed)
+	}
+
+	// 回收任务不再跑：几个间隔之后不上报，而不是一直报那个旧值。
+	e.clock.Advance(queuedStaleRounds*DefaultReapInterval + time.Second)
+	if v, found := gauge("order.gate.unclaimed_holds"); found {
+		t.Fatalf("unclaimed_holds = %d reported after the reaper stopped refreshing it", v)
+	}
+	if _, found := gauge("order.gate.claimed_holds"); found {
+		t.Fatal("claimed_holds reported after the reaper stopped refreshing it")
+	}
+}
+
+// 闸门不可用时读队列长度失败：回收任务这一轮照常结束，存下的值不变（不变成 0）。
+func TestReaperQueueCountWithGateUnavailable(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	svc := degradeService(t, e, 3, nil)
+	r, err := NewReaper(svc, ReaperConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submitWith(t, svc, 1, "queued"); err != nil {
+		t.Fatal(err)
+	}
+	r.RunOnce(t.Context())
+	before, ok := r.queuedNow()
+	if !ok || before.unclaimed != 1 || before.claimed != 0 {
+		t.Fatalf("queued = %+v (ok %v), want 1 unclaimed", before, ok)
+	}
+
+	// 队列变了，但闸门的熔断器打开着：读不到，值不更新。
+	if _, err := submitWith(t, svc, 1, "queued-2"); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		svc.gateBreaker.Report(false)
+	}
+	// 列占用就失败的一轮：不再去读队列长度。
+	if st := r.RunOnce(t.Context()); st != (ReapStats{}) {
+		t.Fatalf("stats with the gate breaker open = %+v, want nothing", st)
+	}
+	// 列占用成功、只有读队列长度失败（这里直接调用）：同样只是不更新。
+	r.failing = false
+	r.refreshQueued(t.Context())
+	if after, ok := r.queuedNow(); !ok || after != before {
+		t.Fatalf("queued = %+v (ok %v) after failed reads, want unchanged %+v", after, ok, before)
+	}
+}

@@ -220,7 +220,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
 		if err := leader.Close(ctx); err != nil {
-			logger.Warn("release reconcile leader lock", "error", err)
+			logger.WarnContext(ctx, "release reconcile leader lock", "error", err)
 		}
 	}()
 
@@ -238,6 +238,12 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if err != nil {
 		return fmt.Errorf("new stock apply loop: %w", err)
 	}
+	// 未应用的增量行数，由应用者自己定期数。defer 在下面的 Drain 之后执行。
+	unregisterApplyMetrics, err := applier.RegisterMetrics()
+	if err != nil {
+		return fmt.Errorf("register stock apply metrics: %w", err)
+	}
+	defer unregisterApplyMetrics()
 
 	// 先绑定两个端口，任何一个冲突都在开始服务前暴露。
 	// 内部端口：存活和就绪探测、降级开关。不经过 gateway。
@@ -254,7 +260,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
+	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// app.RunWith 按相反顺序停止：
 	//   0. 收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查变成不可用，继续正常服务
@@ -272,7 +278,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := applier.Drain(dctx); err != nil {
-		logger.Warn("apply remaining stock deltas on shutdown", "error", err)
+		logger.WarnContext(ctx, "apply remaining stock deltas on shutdown", "error", err)
 	}
 	return runErr
 }
@@ -284,7 +290,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 func newStockCache(ctx context.Context, logger *slog.Logger, cfg config, rdb *redis.Client, switches *degrade.Set) (c *cache.Cache[*inventoryv1.GetStockResponse], closeFn func(), err error) {
 	closeFn = func() {}
 	if cfg.stockCacheTTL <= 0 {
-		logger.Info("stock query cache disabled")
+		logger.InfoContext(ctx, "stock query cache disabled")
 		return nil, closeFn, nil
 	}
 	client := rdb
@@ -299,7 +305,7 @@ func newStockCache(ctx context.Context, logger *slog.Logger, cfg config, rdb *re
 		client = dedicated
 		closeFn = func() {
 			if err := dedicated.Close(); err != nil {
-				logger.Warn("close cache redis", "error", err)
+				logger.WarnContext(ctx, "close cache redis", "error", err)
 			}
 		}
 	}

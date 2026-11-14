@@ -334,3 +334,50 @@ func TestConcurrentUse(t *testing.T) {
 		t.Fatalf("state = %s, want closed", got)
 	}
 }
+
+// 设了 MinFailureSpan 时，同一刻的一批失败不打开熔断器；失败持续超过这段时间才打开；中间有一次成功就重新算。
+func TestMinFailureSpan(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	b := breaker.New(breaker.Config{Failures: 3, MinFailureSpan: time.Second, Now: func() time.Time { return now }})
+	fail := func() {
+		t.Helper()
+		done, err := b.Allow()
+		if err != nil {
+			t.Fatalf("Allow: %v", err)
+		}
+		done(breaker.Failure)
+	}
+	// 一次停顿：20 个在途的调用同时失败。
+	for range 20 {
+		fail()
+	}
+	if got := b.State(); got != breaker.Closed {
+		t.Fatalf("state after a burst of simultaneous failures = %v, want closed", got)
+	}
+	// 还没到 1 秒，仍然关着。
+	now = now.Add(900 * time.Millisecond)
+	fail()
+	if got := b.State(); got != breaker.Closed {
+		t.Fatalf("state 900ms into the failure streak = %v, want closed", got)
+	}
+	// 一次成功说明依赖是好的，这一串作废。
+	done, err := b.Allow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done(breaker.Success)
+	now = now.Add(200 * time.Millisecond)
+	for range 20 {
+		fail()
+	}
+	if got := b.State(); got != breaker.Closed {
+		t.Fatalf("state after a new burst following a success = %v, want closed", got)
+	}
+	// 失败持续了 1 秒：打开。
+	now = now.Add(time.Second)
+	fail()
+	if got := b.State(); got != breaker.Open {
+		t.Fatalf("state after failures lasting over the span = %v, want open", got)
+	}
+}

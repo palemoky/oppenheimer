@@ -35,7 +35,7 @@ func (p *Pipeline) stream(ctx context.Context, gtidSet string) error {
 	if err != nil {
 		return fmt.Errorf("start binlog sync from %q: %w", gtidSet, err)
 	}
-	p.log.Info("streaming binlog", "gtid_set", gtidSet)
+	p.log.InfoContext(ctx, "streaming binlog", "gtid_set", gtidSet)
 
 	// 停止信号要能打断阻塞中的 GetEvent。
 	loopCtx, cancel := context.WithCancel(ctx)
@@ -136,7 +136,7 @@ func (p *Pipeline) handleEvent(ctx context.Context, ev replication.Event, st *st
 		}
 		p.recordCommit(st.commitMicros)
 		if query != "COMMIT" {
-			p.log.Info("ddl", "schema", string(e.Schema), "query", query, "gtid", st.gtid)
+			p.log.InfoContext(ctx, "ddl", "schema", string(e.Schema), "query", query, "gtid", st.gtid)
 		}
 	case *replication.TransactionPayloadEvent:
 		// 开了 binlog_transaction_compression 时，整个事务压缩在一个事件里。

@@ -157,7 +157,7 @@ func Compare(ctx context.Context, c Comparison, o Options) (*ComparisonReport, e
 		rep.Unstable = len(unstable)
 		rep.UnstableExamples = examples(unstable, &c.Left, o.MaxExamples)
 		rep.Timings.Recheck = ms(time.Since(t))
-		log.Info("recheck done", "first", len(first), "confirmed", len(confirmed), "unstable", len(unstable), "dropped", rep.Dropped)
+		log.InfoContext(ctx, "recheck done", "first", len(first), "confirmed", len(confirmed), "unstable", len(unstable), "dropped", rep.Dropped)
 	}
 	rep.Findings = confirmed
 	for _, f := range confirmed {
@@ -176,7 +176,7 @@ func Compare(ctx context.Context, c Comparison, o Options) (*ComparisonReport, e
 		}
 		rep.Repair = rp
 		rep.Timings.Repair = ms(time.Since(t))
-		log.Info("repair done", "orders", rp.Orders, "fixed", rp.Fixed, "remaining", rp.Remaining)
+		log.InfoContext(ctx, "repair done", "orders", rp.Orders, "fixed", rp.Fixed, "remaining", rp.Remaining)
 	}
 	return rep, nil
 }
@@ -194,7 +194,7 @@ func compareTree(ctx context.Context, left, right *sideSource, o Options, rep *C
 	lr, rr := left.tree.Root(), right.tree.Root()
 	rep.Left.Rows, rep.Left.Root = lr.Count, lr.String()
 	rep.Right.Rows, rep.Right.Root = rr.Count, rr.String()
-	log.Info("first pass done", "left_rows", lr.Count, "right_rows", rr.Count, "ms", rep.Timings.FirstPass)
+	log.InfoContext(ctx, "first pass done", "left_rows", lr.Count, "right_rows", rr.Count, "ms", rep.Timings.FirstPass)
 	if lr == rr {
 		rep.RootsEqual = true
 		return nil, nil
@@ -208,7 +208,7 @@ func compareTree(ctx context.Context, left, right *sideSource, o Options, rep *C
 	rep.Levels = stats.Levels
 	rep.DiffNodes = len(diffs)
 	rep.Timings.Diff = ms(time.Since(t))
-	log.Info("diff done", "nodes", len(diffs), "compared", stats.Compared(), "ms", rep.Timings.Diff)
+	log.InfoContext(ctx, "diff done", "nodes", len(diffs), "compared", stats.Compared(), "ms", rep.Timings.Diff)
 
 	t = time.Now()
 	ranges := make([]keyRange, len(diffs))
@@ -291,7 +291,7 @@ func compareFull(ctx context.Context, left, right *sideSource, rep *ComparisonRe
 	rep.Left.Rows = uint64(left.st.rows.Load())   //nolint:gosec // 计数不为负
 	rep.Right.Rows = uint64(right.st.rows.Load()) //nolint:gosec // 计数不为负
 	rep.Timings.Rows = ms(time.Since(t))
-	log.Info("full scan done", "left_rows", rep.Left.Rows, "right_rows", rep.Right.Rows, "findings", len(out), "ms", rep.Timings.Rows)
+	log.InfoContext(ctx, "full scan done", "left_rows", rep.Left.Rows, "right_rows", rep.Right.Rows, "findings", len(out), "ms", rep.Timings.Rows)
 	return out, nil
 }
 
@@ -324,7 +324,7 @@ func compareAgainst(ctx context.Context, left *sideSource, against *merkle.Tree,
 		rep.Nodes = append(rep.Nodes, nodeDiff(d))
 	}
 	rep.Timings.Diff = ms(time.Since(t))
-	log.Info("diff against saved tree done", "nodes", len(diffs))
+	log.InfoContext(ctx, "diff against saved tree done", "nodes", len(diffs))
 	return nil
 }
 

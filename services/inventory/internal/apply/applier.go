@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
@@ -35,6 +36,13 @@ const (
 	maxBatchesPerRound = 100
 	// summaryInterval 是汇总日志的最小间隔。
 	summaryInterval = 10 * time.Second
+	// backlogEvery 是多久数一次 stock_pending 的行数（给 inventory.stock_pending.backlog 用）。
+	// 空闲时一轮只隔 Interval（默认 20 毫秒），有积压时一轮接一轮，每轮都数太频繁。
+	backlogEvery = 5 * time.Second
+	// backlogTimeout 是数一次的时限。
+	backlogTimeout = time.Second
+	// backlogStale 是行数多久没更新就不再上报：应用者卡在一批里出不来，或者一直数不出来。
+	backlogStale = 4 * backlogEvery
 )
 
 // Config 是 Applier 的配置，零值取默认。
@@ -67,6 +75,20 @@ type Applier struct {
 	// 汇总日志的累计值。
 	sinceSummary summary
 	lastSummary  time.Time
+
+	// backlog 是最近一次数到的 stock_pending 行数（refreshBacklog），从没数到过时为 nil。
+	// Round 写，导出指标的 goroutine 读。lastBacklog 是上次去数的时刻（不论成败），backlogFailing 表示上次没数出来，
+	// 这两个只在 Round 里读写。
+	backlog        atomic.Pointer[backlogSample]
+	lastBacklog    time.Time
+	backlogFailing bool
+}
+
+// backlogSample 是某一时刻 stock_pending 的行数。
+type backlogSample struct {
+	rows int64
+	// at 是数到它的时刻（应用者的时钟）。
+	at time.Time
 }
 
 type summary struct {
@@ -119,8 +141,11 @@ func NewLoop(a *Applier) (*worker.Loop, error) {
 }
 
 // Round 应用到没有积压为止（最多 maxBatchesPerRound 批，留出响应停止的机会）。
+//
+// 每一批之前顺带看一眼要不要数一次积压的行数（refreshBacklog），它不影响这一轮。
 func (a *Applier) Round(ctx context.Context) error {
 	for range maxBatchesPerRound {
+		a.refreshBacklog(ctx)
 		more, err := a.once(ctx)
 		if err != nil {
 			return err
@@ -226,6 +251,45 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 	// 推迟只在有写入方并发时才会发生，所以不会在静止的表上空转。
 	// 满批里如果一行都没应用（全是卡住的 SKU），再来一批也是同样的行，不算“还有”。
 	return (full && res.Applied > 0) || len(res.Deferred) > 0, nil
+}
+
+// refreshBacklog 最多每 backlogEvery 数一次 stock_pending 的行数，存进 a.backlog。
+//
+// 放在每一批之前而不是每轮一次：有积压时一轮最多连着做 maxBatchesPerRound 批，可能很久，
+// 而那正是最想看积压的时候。数失败不影响应用（不返回错误），值不更新，过 backlogStale 就不再上报；
+// 日志只在开始失败时记一条，恢复时记一条，不每次都记。
+func (a *Applier) refreshBacklog(ctx context.Context) {
+	now := a.now()
+	if !a.lastBacklog.IsZero() && now.Sub(a.lastBacklog) < backlogEvery {
+		return
+	}
+	a.lastBacklog = now
+	qctx, cancel := context.WithTimeout(ctx, backlogTimeout)
+	defer cancel()
+	rows, _, err := a.store.PendingBacklog(qctx)
+	switch {
+	case err == nil:
+		if a.backlogFailing {
+			a.backlogFailing = false
+			a.logger.InfoContext(ctx, "counting stock_pending rows works again")
+		}
+		a.backlog.Store(&backlogSample{rows: rows, at: now})
+	case ctx.Err() != nil:
+		// 在停止，不算失败。
+	case !a.backlogFailing:
+		a.backlogFailing = true
+		a.logger.WarnContext(ctx, "count stock_pending rows failed, the backlog metric is not updated", "error", err)
+	}
+}
+
+// Backlog 返回最近一次数到的 stock_pending 行数。ok 为 false 表示从没数到过，或者已经 backlogStale 没有更新
+// （不知道现在是多少）。只读原子变量，可以在导出指标的 goroutine 里调用。
+func (a *Applier) Backlog() (rows int64, ok bool) {
+	b := a.backlog.Load()
+	if b == nil || a.now().Sub(b.at) > backlogStale {
+		return 0, false
+	}
+	return b.rows, true
 }
 
 func (a *Applier) maybeLogSummary(ctx context.Context) {

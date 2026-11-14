@@ -169,6 +169,15 @@ const (
 	// DefaultReadMaxConcurrency 是每个订单库上展示读的并发上限。订单库连接池默认 25，给落库、支付结果、
 	// 取消、关单这些写路径留 9 个：查询再多也只能占满 16 个，写路径总有连接可用。
 	DefaultReadMaxConcurrency = 16
+	// DefaultGateFailureSpan 是闸门的熔断器打开之前连续失败至少要持续的时间。
+	//
+	// 闸门的调用方并发很高（每秒上千次受理加落库），一次停顿会让在途的十几个调用同时超时。压测里量到的停顿
+	// 是 300 多毫秒一次（设计文档 1d 的 8.18），1 秒足够把它和“Redis 真的不可用”分开，又远小于 5 秒的冷却。
+	DefaultGateFailureSpan = time.Second
+	// DefaultReadGateMaxConcurrency 是展示读同时访问库存闸门的上限。闸门的连接池（REDIS_POOL_SIZE）默认 128，
+	// 查询最多占其中 16 个，其余留给受理、落库和回收。一次读占用不到 1 毫秒，16 个名额每秒能过一万多次查询；
+	// 占不到名额说明查询的量已经远超这个数。
+	DefaultReadGateMaxConcurrency = 16
 	// DefaultArchiveMaxConcurrency 是冷库读的并发上限。冷库连接池是 10，留 2 个给支付结果在冷库上的复查。
 	DefaultArchiveMaxConcurrency = 8
 )
@@ -177,6 +186,8 @@ const (
 type readLimits struct {
 	dbs  []*bulkhead.Bulkhead
 	cold *bulkhead.Bulkhead
+	// gate 是展示读同时读闸门占用的名额，见 fetchHold。
+	gate *bulkhead.Bulkhead
 }
 
 // newReadLimits 按配置建名额。perDB、cold 为 0 表示不限制。

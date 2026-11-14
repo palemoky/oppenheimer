@@ -185,7 +185,7 @@ func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) 
 			return exitError, err
 		}
 		bound, against = snap.Bound, trees
-		logger.Info("loaded snapshot", "path", o.against, "created_at", snap.CreatedAt, "bound", bound, "trees", len(trees))
+		logger.InfoContext(ctx, "loaded snapshot", "path", o.against, "created_at", snap.CreatedAt, "bound", bound, "trees", len(trees))
 	}
 
 	topo, closeAll, err := connect(ctx, o)
@@ -216,7 +216,7 @@ func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) 
 	report := &recon.Report{StartedAt: time.Now().UTC()}
 	for _, p := range pairs {
 		for _, c := range p.Comparisons {
-			logger.Info("comparing", "comparison", c.Name)
+			logger.InfoContext(ctx, "comparing", "comparison", c.Name)
 			r, err := recon.Compare(ctx, c, recon.Options{
 				Mode: o.mode, Since: since, Bound: bound, MaxRows: o.maxRows, Recheck: o.recheck, MaxExamples: o.maxExamples,
 				Limiter: lim, Against: against, Repairer: repairer, Logger: logger,
@@ -253,7 +253,7 @@ func snapshot(ctx context.Context, logger *slog.Logger, pairs []recon.Pair, boun
 			if err := snap.Add(c.Name, t); err != nil {
 				return err
 			}
-			logger.Info("snapshot taken", "comparison", c.Name, "rows", rep.Rows, "statements", rep.Statements)
+			logger.InfoContext(ctx, "snapshot taken", "comparison", c.Name, "rows", rep.Rows, "statements", rep.Statements)
 			fmt.Fprintf(stdout, "%s: rows=%d root=%s leaves=%d statements=%d\n", c.Name, rep.Rows, rep.Root, t.Len(), rep.Statements)
 		}
 	}
