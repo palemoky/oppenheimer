@@ -4,6 +4,8 @@
 //	load verify [flags]       用账本和服务端数据对账（7.3.3 节）
 //	load wait-quiet [flags]   等系统静止（7.3.2 节第 3 步）
 //	load warmup [flags]       通过库存服务把 SKU 装载进闸门
+//	load seed [flags]         直接向订单主库灌历史订单（1c 设计 5.3）
+//	load seed-report [flags]  灌数之后量分片均匀度和查询延迟，只读（1c 设计 5.3）
 //
 // 设计见 docs/design/1b-high-concurrency.md 的 7.3.1 节。
 package main
@@ -39,6 +41,8 @@ commands:
   verify       reconcile a ledger against server data (design 7.3.3)
   wait-quiet   wait until outboxes, consumer lag, unfinished orders and gate holds are all zero
   warmup       load skus into the stock gate through the inventory service
+  seed         write historical orders straight into the order primaries (design 1c 5.3)
+  seed-report  measure shard balance and query latency after seeding, read only
 
 run "load <command> -h" for the flags of a command.
 `
@@ -57,6 +61,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return waitQuietCmd(args[1:], stdout, stderr)
 	case "warmup":
 		return warmupCmd(args[1:], stdout, stderr)
+	case "seed":
+		return seedCmd(args[1:], stdout, stderr)
+	case "seed-report":
+		return seedReportCmd(args[1:], stdout, stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

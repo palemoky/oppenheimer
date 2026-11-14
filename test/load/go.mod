@@ -3,6 +3,7 @@ module github.com/palemoky/oppenheimer/test/load
 go 1.27
 
 require (
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/palemoky/oppenheimer/api v0.0.0
 	github.com/palemoky/oppenheimer/pkg v0.0.0
 	github.com/redis/go-redis/v9 v9.23.0
@@ -15,7 +16,6 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/go-sql-driver/mysql v1.10.1 // indirect
 	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.33 // indirect
