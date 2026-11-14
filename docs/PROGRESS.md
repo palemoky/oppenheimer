@@ -5,7 +5,7 @@
 ## 当前状态
 
 - **当前阶段**：1d（限流、熔断、降级与对账）步骤一进行中。1c 五步全部完成并已合并进 `main`
-- **当前分支**：`phase-1d`（从 `main` 开出，还没有推送、没有开 PR；推送时用 `git push -u origin phase-1d`）。1c 的 PR #6 已于 2026-11-14 合并进 `main`（合并提交 `aa5df0a`），main 上 CI 全绿
+- **当前分支**：`phase-1d`（从 `main` 开出，已推送并开 draft PR）。1c 的 PR #6 已于 2026-11-14 合并进 `main`（合并提交 `aa5df0a`），main 上 CI 全绿
 - **最后更新**：2026-11-14
 
 ## 上次做到哪
@@ -59,7 +59,8 @@
      - 三个子 Agent 的工作已验收合入：order 落库消费者开并发（`SUBMIT_CONCURRENCY`，默认 8）和并发落库测试，产品代码没有发现并发缺陷；orderindex 开并发（`INDEX_CONCURRENCY`，默认 16），测试库上约 7600 到 9000 条/秒见顶，瓶颈是每次提交的刷盘；压测工具的开环模式（`load run -mode open`）、`load poll` 子命令和 `scripts/bench.sh` 的 `BENCH_OPEN`、`BENCH_POLL`。
      - 共享的 `mysql` 实例的 `max_connections` 在 compose 里提到了 400（各服务的池加起来 164，超过默认的 151，服务开着时跑测试会报 1040）。
      - `make lint test e2e` 通过（2026-11-14）。以上改动已提交到本地的 `phase-1d`，**没有推送**。
-     - 之后要做：实测（设计文档 2.8 第 3 条：落库吞吐对并发度、有无轮询压力、索引追平速度，`make chaos` 两次）；按实测重设 `ADMIT_MAX_QUEUE`；结果写回设计文档。
+     - 实测已做完，结果在设计文档 1d 的 2.10。`make chaos` 两次 PASS。要点：落库吞吐随并发度从 316 升到 686 单/秒就平了，`performance_schema` 显示瓶颈是 inventory 预占时 `sku_stock` 热门行的行锁（平均等 48 毫秒）加上每次提交约 7 毫秒；有查询压力时落库是没有时的 75%；商家索引在测试库上 7600 到 9000 行/秒见顶，瓶颈是提交刷盘。
+     - 主人的决定（2026-11-14）：热门 SKU 的扣减改成 **MySQL 异步扣减**（Redis 闸门加 Kafka 已经在用，吞吐高，接受架构更复杂），作为步骤一的延续现在做，先写设计和 ADR 给主人确认；商家索引**接着做按批写**；`phase-1d` 推送并开 draft PR；提交署名不用统一。
    - 1d 的划分是六步：阶段计划的清单里有一项埋点（OpenTelemetry），第一次划分时漏了，补成了步骤六，主人已确认（设计文档 1d 第 1 节）。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
@@ -103,7 +104,8 @@
   - 启动服务要 `ORDER_DBS=4 make run`。直接 `make run` 会因为 `shard_meta` 不符而拒绝启动，这是有意的。
   - 想回到干净的 2 库环境：`make down-volumes && make up`（会清掉全部数据，包括造的数）。
   - `make e2e`、`make test` 不受影响，它们用旧的两个实例上独立的库。
-- 当前依赖和六个服务都处于**运行**状态（`ORDER_DBS=4 make run` 在后台，用的是步骤五的新代码，日志在 `tmp/make-run.log` 和 `tmp/logs/`）。商家索引已经追平，不用再留着，停止：`pkill -f scripts/run-local.sh`。
+- 依赖在运行，六个服务**已停止**（2026-11-14 跑 1d 的压测前停的）。要起来用 `ORDER_DBS=4 make run`。停止时按进程号杀 `scripts/run-local.sh`，不要用 `pkill -f`（见会话日志的教训）。
+- 共享的 `mysql` 实例的 `max_connections` 是 400（compose 里设的）。
 - 归档：`ORDER_DBS=4 make archive`（本机是 4 个库，不带 `ORDER_DBS=4` 会被 `shard_meta` 校验拒绝），`make archive-dry-run` 只数不搬，`make archive-reclaim` 重建热表回收空间，参数用 `ARCHIVE_ARGS` 传。这次实跑的原始输出在 `tmp/archive/`。
 - Kafka 的 Web 界面：`make kafka-ui` 启动 kafbat-ui（compose 的 `ui` profile，只读，http://127.0.0.1:8090），`make kafka-ui-down` 停止。看消费组的 lag 要点进具体的消费组。消息体是 protobuf，没有配置解码，看到的是原始字节。当前处于运行状态。
 - 造数：`make seed-orders`（可中断续跑）、`make seed-report`。扩容：`scripts/expand.sh`（不带参数看用法），演练的状态文件在 `tmp/expand/`。
