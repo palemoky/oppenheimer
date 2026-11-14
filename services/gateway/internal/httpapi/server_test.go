@@ -440,6 +440,25 @@ func TestGetStock(t *testing.T) {
 	}
 }
 
+// 超卖的 SKU 在 inventory 那里的真实可售数是负数（ADR-0018），展示给买家的是 0。
+func TestGetStockNeverShowsNegativeAvailable(t *testing.T) {
+	e := newEnv(t)
+	e.inventory.getStock = func(_ context.Context, in *inventoryv1.GetStockRequest) (*inventoryv1.GetStockResponse, error) {
+		return &inventoryv1.GetStockResponse{
+			SkuId: in.GetSkuId(), Available: -3, Reserved: 5, Sold: 0,
+			UnitPrice: &commonv1.Money{Amount: 999, Currency: "CNY"},
+		}, nil
+	}
+	r := do(t, e.h, "GET", "/api/v1/skus/42/stock", "7", "")
+	if r.status != http.StatusOK {
+		t.Fatalf("status = %d, body %s", r.status, r.raw)
+	}
+	want := `{"sku_id":"42","available":0,"reserved":5,"sold":0,"unit_price":{"amount":999,"currency":"CNY"}}`
+	if !jsonEqual(t, []byte(r.raw), []byte(want)) {
+		t.Errorf("body = %s, want available clamped to 0", r.raw)
+	}
+}
+
 func TestInvalidPathIDs(t *testing.T) {
 	for _, p := range []string{"abc", "0", "-1", "1.5", "99999999999999999999"} {
 		for _, rt := range []struct{ method, path string }{

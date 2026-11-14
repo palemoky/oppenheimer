@@ -18,3 +18,6 @@ func MigrateWithLockTimeout(ctx context.Context, db *sql.DB, fsys fs.FS, dir str
 
 // LockNameFor 导出 lockNameFor 供测试使用。
 var LockNameFor = lockNameFor
+
+// SpanName 导出 spanName 供测试使用。
+var SpanName = spanName

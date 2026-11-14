@@ -9,6 +9,7 @@ use (
 	./services/order
 	./services/orderindex
 	./services/payment
+	./services/recon
 	./test/e2e
 	./test/load
 )

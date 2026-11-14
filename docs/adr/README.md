@@ -43,3 +43,10 @@
 | [0014](0014-cdc-merchant-index.md) | 商家维度查询用自研的 Go CDC 同步到索引表，从从库读，靠行版本号做幂等 | 已采纳 |
 | [0015](0015-shard-expansion.md) | 成倍扩容用从库提升，切换时改表名做围栏；库数由配置决定并由库内元数据校验 | 已采纳 |
 | [0016](0016-cold-archive.md) | 冷订单按订单号里的时间归档到独立的压缩库，先写冷、校验、再删热 | 已采纳 |
+| [0017](0017-keyed-concurrent-consume.md) | 消费者在分区内按 key 并发，提交连续前缀 | 已采纳 |
+| [0018](0018-async-stock-deduction.md) | MySQL 侧的库存计数改为异步合并更新，闸门是防超卖的唯一关口 | 已采纳 |
+| [0019](0019-gateway-rate-limiting.md) | 网关用令牌桶限流，按 IP 在进程内、按用户和接口在 Redis 里 | 已采纳 |
+| [0020](0020-service-protection.md) | 服务之间的熔断和并发隔离用 Envoy 边车，时限逐跳收紧，同步链路不重试 | 已采纳 |
+| [0021](0021-degradation-and-lifecycle.md) | 闸门不可用时拒绝下单而不退回数据库扣减；依赖不可用时消息不进死信；就绪和存活分开 | 已采纳 |
+| [0022](0022-reconciliation-hash-tree.md) | 对账用订单号上的基数哈希树，摘要是行哈希的和，在数据库里算 | 已采纳 |
+| [0023](0023-instrumentation.md) | 埋点：链路过 outbox 靠表里的一列，异步一跳以父子为主，指标走 OTLP | 已采纳 |

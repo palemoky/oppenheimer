@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从）五步全部做完。步骤一到四已推送；步骤五（冷热归档）已实现、在本机实跑，并分 7 个提交推送到 draft PR #6（`phase-1c`）
-- **当前分支**：`phase-1c`（已推送，draft PR 已开）
+- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交（`1ac7c1c`）和增量对账的两个提交（到 `4e0f4ca`），CI 27 项全部通过；步骤六（埋点）已分 6 个提交推送（`7826840` 到 `493e983`），CI 27 项全部通过；1d 的六步都做完了。1c 五步全部完成并已合并进 `main`
+- **当前分支**：`phase-1d`（从 `main` 开出，已推送并开 draft PR）。1c 的 PR #6 已于 2026-11-14 合并进 `main`（合并提交 `aa5df0a`），main 上 CI 全绿
 - **最后更新**：2026-11-14
 
 ## 上次做到哪
@@ -52,7 +52,62 @@
      - 用户列表落到冷库的比例没有量。
      - `load verify` 的第 4 到 15 项只读热库，长期运行的环境里会把已归档的真实订单当成不存在。
      - 面试笔记（`docs/notes/`）仍然没有写，考点已经补进阶段计划。
-   - 1c 的验收项都已满足。之后是 **1d**（限流、熔断、降级与对账），动工前先写设计文档和 ADR。1d 的清单里已经挂了：orderindex 按批写、落库性能、开环压测、Merkle 对账（归档的校验到时接上）。
+   - 步骤五推送后 CI 的 24 项检查全部通过（2026-11-14）。
+   - 1c 的验收项都已满足。
+   - **1d 步骤一（吞吐的欠账）进行中，改动都没有提交。** 设计在 [design/1d-protection.md](design/1d-protection.md) 第 2 节，决定在 ADR-0017（已采纳）。主人确认了：按步骤的顺序做、落库用分区内按 key 并发、商家索引先复用并发消费（达不到 1 万行/秒再做按批写）。
+     - 主线已完成：`pkg/kafkax` 的 `Concurrency` 和 `MaxUncommitted`（`inflight.go`、`concurrent_test.go`）；order 的 `fetch` 改成先读占用再读订单行（`fetch_order_test.go`）。order 模块和 kafkax 的测试、lint 通过。
+     - 三个子 Agent 的工作已验收合入：order 落库消费者开并发（`SUBMIT_CONCURRENCY`，默认 8）和并发落库测试，产品代码没有发现并发缺陷；orderindex 开并发（`INDEX_CONCURRENCY`，默认 16），测试库上约 7600 到 9000 条/秒见顶，瓶颈是每次提交的刷盘；压测工具的开环模式（`load run -mode open`）、`load poll` 子命令和 `scripts/bench.sh` 的 `BENCH_OPEN`、`BENCH_POLL`。
+     - 共享的 `mysql` 实例的 `max_connections` 在 compose 里提到了 400（各服务的池加起来 164，超过默认的 151，服务开着时跑测试会报 1040）。
+     - `make lint test e2e` 通过（2026-11-14）。以上改动已提交到本地的 `phase-1d`，**没有推送**。
+     - 实测已做完，结果在设计文档 1d 的 2.10。`make chaos` 两次 PASS。要点：落库吞吐随并发度从 316 升到 686 单/秒就平了，`performance_schema` 显示瓶颈是 inventory 预占时 `sku_stock` 热门行的行锁（平均等 48 毫秒）加上每次提交约 7 毫秒；有查询压力时落库是没有时的 75%；商家索引在测试库上 7600 到 9000 行/秒见顶，瓶颈是提交刷盘。
+     - 步骤一的前半已推送：draft PR #7（`phase-1d`），CI 的 29 项检查全部通过（2026-11-14，到提交 `9697914`）。
+     - **步骤一的延续，进行中，都没有提交**（主人 2026-11-14 的决定）：
+       - 商家索引按批写：设计在 1d 设计文档 2.11，ADR-0017 末尾有补充。要做 `kafkax.NewBatchConsumer`（Fable）和 orderindex 的改造（Opus）。
+       - MySQL 侧库存扣减改成异步（方案 A：`stock_pending` 增量表加单个应用者合并更新）：设计在 1d 设计文档第 3 节，ADR-0018（已采纳）。主人接受了“MySQL 从阻止超卖变成发现超卖”的代价；方案 B（经 Kafka、order 不再调 Reserve）等 A 做完量过再定。产品代码由 Fable 写，测试铺开派 Opus，脚本和 verify 派 Sonnet（设计文档 3.6）。
+       - 现状（2026-11-14）：两项都已实现、验收并实测，已提交并推送到 PR #7。`make lint test e2e` 通过，`make chaos` 两次 PASS（22 项）。
+         - 商家索引按批写：测试库上批大小 500 时 4.8 万行/秒（带 `-race`），结果在设计文档 2.11。`INDEX_CONCURRENCY` 换成了 `INDEX_MAX_BATCH`。kafkax 的按批消费在暂时性错误时先整批重试 3 次再退回逐条。
+         - 异步扣减：热点行的锁消失，落库吞吐在并发度 8 时从 642 到 789、16 时从 686 到 870；新的瓶颈是提交（每个订单三次，每次约 9 毫秒）。放宽刷盘后停在约 1050 单/秒，剩下的时间不在 MySQL 里，原因没有找到。结果在设计文档 3.9，测试铺开时发现并修掉的两个缺陷（超卖时预热失败、对账失效）在 3.8。
+         - `load verify` 现在有 22 项，第 22 项是“库存增量都已应用”；wait-quiet 把 `stock_pending` 为空加进了静止条件。
+         - 主人的决定（2026-11-14）：这一批提交并推送到 PR #7；**方案 B 先不做**，等有了埋点（步骤六）或上了集群再判断。步骤一的延续已分 6 个提交推送（`84b58d5` 到 `7b37be2`），PR #7 的 CI 30 项全部通过。
+         - **1d 步骤二（网关限流）已实现、验收并实测，已提交并推送到 PR #7。** 设计在设计文档 1d 第 4 节，ADR-0019（已采纳），发现在 4.15、4.16，结果在 4.17。`make lint test e2e` 通过（e2e 18 个），`make chaos` 一次 PASS。
+           - `pkg/ratelimit`（Fable）：进程内、Redis（Lua）、`Fallback`。网关的中间件、配置、客户端地址、规范（Opus，Fable 评审）。脚本、`bench.sh` 的 `BENCH_RATELIMIT`、e2e 用例（Sonnet）。
+           - 各脚本的限流配置：`make run` 用默认值；e2e 关掉按 IP 的；chaos 和 bench 整体关闭。**从本机压网关而忘了关限流，现象是吞吐上不去或随机 429。**
+           - 做限流时发现并修掉两个旧问题（设计文档 4.16）：受理的 `Hold` 被 Redis 客户端重试后不发落库消息、订单凭空消失（1b 起就有，`hold_retry_test.go` 钉住）；`redisx` 的客户端不遵守 ctx 的截止时间（已开 `ContextTimeoutEnabled`）。没改的：分布式锁的加锁脚本被重试时调用方以为没拿到锁。
+           - 推送后 CI 失败两项，都已做根因分析并修掉（设计文档 3.10、4.16）：inventory 的应用者把“取到的增量先后不全”误报成超卖（设计漏洞：按 id 加锁扫描不是快照；改成被拒绝时用该 SKU 的全部增量重算，再用快照判断）；`pkg/lock` 的测试租期太短（`redisx` 的超时生效之后续期只有 100 毫秒）。应用者那个机制是推断的，本机没有复现。修复后的一轮 CI 里这两处都通过了，另有一个 kafkax 测试因为辅助函数查位点时遇到 `COORDINATOR_NOT_AVAILABLE` 而失败（测试辅助函数没有重试，不是被测逻辑），已改成重试到时限。
+           - 步骤二最终的 CI：提交 `4db959f`，24 项检查全部通过。
+         - **1d 步骤三（服务侧保护、超时与重试规范）已实现、验收并实测，改动没有提交。** 设计文档 1d 第 5 节，ADR-0020（已采纳），实测的 Envoy 行为和三个坑在 5.3，发现在 5.13，结果在 5.14。`make lint test e2e` 通过（e2e 18 个，经边车），`make fault` 五个场景全过，`make chaos` 一次 PASS。
+           - 主人定的：不用 sentinel-go（停更五年）；服务之间的熔断和并发隔离用 **Envoy v1.40.2 边车，每个服务一个**；保护范围是全部下游调用；客户端断开时 gateway 返回 499。
+           - 做了什么：五个边车的配置（`deploy/envoy/`）和 compose、`make envoy-validate`（进了 CI）；`grpcx.WithHopTimeout` 和 `grpcx.SidecarMargin`（进程里的时限 = 边车的路由超时 + 500 毫秒，三个服务各有测试核对）；`pkg/bulkhead`；order 的展示读并发上限（`READ_MAX_CONCURRENCY`，默认每库 16）、冷库上限和 1 秒时限、闸门调用 300 毫秒、从库读 500 毫秒；order 和 payment 的取消与超时映射；gateway 的热点参数限流（`RATE_LIMIT_HOT`、`RATE_LIMIT_HOT_ITEMS`）、499、按跳时限；`kafkax` 退避加抖动；`worker` 的 Guard 时限；`scripts/lib/sidecar.sh`（run-local、chaos、bench、fault 共用，`SIDECAR=off` 直连）；`scripts/fault.sh`（`make fault`）。
+           - 实测：inventory 挂住时查库存前 5 次各约 3 秒、之后毫秒级 503，查订单和下单受理不受影响，解除后 5.5 秒恢复；同时 300 个请求时恰好 172 个被并发上限立刻拒绝；边车让受理延迟的 p50 多 0.7 毫秒、p99 多约 15 毫秒，落库吞吐不变。
+           - 没做的（设计文档 5.13、5.14）：受理超时后清理和受理乱序留下的占用（要改闸门脚本）；`pkg/grpcx` 的日志拦截器对超时仍记 ERROR；预热被 1 秒封顶是否够用；按错误比例和慢调用比例的熔断（Envoy 单实例下没有）；`make fault` 没进 CI。
+           - **本机现在多了五个 Envoy 容器**（`make up` 启动）。`make run`、e2e、chaos、bench 默认经过它们，它们没起来时脚本会提示先 `make up`。管理端口 19901 到 19905。
+           - 已提交并推送（PR #7，HEAD `17cd38b`，五个提交），CI 25 项全部通过（新的 `envoy` job 17 秒；e2e 带五个边车 3 分 47 秒，是最长的 job）。第一次运行因私有仓库的 Actions 额度用完没有启动，主人把仓库改为公开后重跑通过。
+         - **1d 步骤四（降级预案和优雅启停）已实现、验收并实测，已分 6 个提交推送到 PR #7（`5d30230` 到 `98ca954`），CI 25 项全部通过（2026-11-14；最长的是 e2e 3 分 42 秒，没有明显变慢的 job）。** 设计文档 1d 第 6 节，ADR-0021（已采纳），发现在 6.16，没做的在 6.17，结果在 6.18。`make lint test e2e` 通过（e2e 18 个），`make fault` 14 个场景全过，`make chaos` 一次 PASS（都是 2026-11-14）。
+           - 主人定的：闸门的 Redis 不可用时**拒绝下单，不退回数据库扣减**（改了原计划）；开关在进程内、运行中可改；熔断器自己写；落库健康和列表的部分结果都做。
+           - 做了什么：`pkg/breaker`、`pkg/degrade`、`pkg/app` 的 `/readyz`、`DRAIN_DELAY` 和第二次信号退出、`redisx.OpenLazy`、`mysqlx.OpenLazy`、`pkg/cache` 的熔断器和读时限、`lock.FailOpen` 的冷却、`errx.Degraded`；order 的闸门熔断器、落库健康（按订单库，受理时拒绝落不了库的订单）、回收任务在闸门恢复后等半个宽限期、从库健康探测、冷库的后台迁移和熔断、用户列表的部分结果（`archive_unavailable`）；order、inventory、payment 消费者对普通错误不设重试上限；inventory、payment 的启动和错误码；gateway 的降级错误映射（503 加 `Retry-After`）、三个开关和管理端口；`scripts/fault.sh` 的场景 F 到 N。
+           - **新的约定（已写进 AGENTS.md）**：依赖坏了时返回 `errx.Degraded`（`FAILED_PRECONDITION` 加原因码），不返回 `UNAVAILABLE`，否则调用方的边车会把整个服务摘掉；消费者不设重试上限，handler 里重试无用的错误必须标 `Permanent`。
+           - **本机的变化**：gateway 多了管理端口 `127.0.0.1:8089`（`ADMIN_ADDR`），降级开关在上面；其他服务的开关在各自的内部端口（8081 到 8084）的 `/degrade`。新的环境变量：`DEGRADE`（开关初始值，名字写错拒绝启动）、`DRAIN_DELAY`、`ORDER_READ_MAX_LAG`。`make fault` 会暂停本机共享的 Redis 和订单库的从库（结束时恢复，中途失败也会兜底恢复），跑它之前不要有别的东西在用。
+           - 没做的见设计文档 6.17、6.18 末尾。要点：闸门脚本出错和 Redis 连不上分不开、payment 的扫描错误，这两种在数据损坏时会永久挡住分区；inventory 进程里的闸门没有熔断器；`Retry-After` 固定 5 秒；“Redis 暂停时还没被认领的订单恢复后落库”和回收任务的等待只有按模块的测试；`make fault` 没进 CI。
+           - 一次没有解释的偶发失败：`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在整包运行时失败过一次（回源 2 次，耗时 1.15 秒），之后重跑十几轮没有复现；耗时特征像本机容器网络的 1 秒停顿让一次读超时。order 的 `TestSubmitConcurrentWarmUpIsCoalesced` 也失败过一次，当时的输出没有留下，之后没有复现。
+           - **1d 步骤五（对账）已实现、验收并实测，已分 4 个提交推送到 PR #7（`c8e8c9c` 到 `b09a74e`）**（2026-11-14）。设计文档 1d 第 7 节，ADR-0022（已采纳），实测结果在 7.12，发现在 7.15，没做的在 7.16。`make lint test e2e` 通过（e2e 18 个），`make chaos` 一次 PASS（`load verify` 和 `recon` 都通过）。
+             - 主人定的（7.14）：摘要在数据库里算；节点摘要用行哈希的和，不是教科书式的 H(子节点)；闸门和 MySQL 的库存不纳入，维持 inventory 的 `reconcile`；只有商家索引可以自动修复。
+             - 做了什么：`pkg/merkle`（`Digest`、规范编码和对应的 SQL 片段、订单号上的基数树、自上而下的 `Diff`）；新模块 `services/recon`（已进 `go.work`）：五对的投影（`replica`、`index`、`payment`、`stock`、`archive`，在 `internal/recon/pairs.go`）、数据源、比对、复查、报告、索引修复、命令行；`scripts/recon.sh`、`make recon`；`scripts/chaos.sh` 在 `load verify` 之后加跑 `recon -pairs payment,stock`，有差异时判失败。`pkg/merkle`、投影由 Fable 写，引擎由 Opus 写、Fable 评审后改了三处（修复改成按主键删、全量模式的分段、`archive` 改读主库）。
+             - 用法：`ORDER_DBS=4 make recon`（默认比 `replica`、`index`、`payment`、`stock`，只读）；`RECON_ARGS="-pairs index -repair"` 修商家索引；归档的前后对比是三步：`RECON_ARGS="-pairs archive -snapshot-out F"`、归档、`RECON_ARGS="-pairs archive -against F"`，都要在归档任务不在跑的时候做。退出码 0 无差异、1 有差异、2 出错。
+             - 实测要点（490 万行的 `index`）：无差异时树 4.8 秒、传约 1.7 万个摘要，全量归并 7.8 秒、545 MB；1 行差异多 0.3 秒；9612 行均匀散布的差异打中 95% 的节点，树比归并慢。交叉点取决于差异落在多少个节点里。
+             - 推送后的 CI（`b09a74e`）：27 项里 26 项通过，新模块的 `lint (./services/recon)` 30 秒、`test (./services/recon)` 1 分 39 秒。失败的一项是 `envoy`（`make envoy-validate`）：前三个配置 OK，`deploy/envoy/orderindex.yaml` 那一次什么也没输出就失败了。这次推送没有改 `deploy/envoy/`，本机五个配置都通过。**根因没有找到**：原来的写法是 `docker run ... | tail -1 | grep OK`，失败时把校验器的输出丢掉了，日志里没有可看的东西。已把 `envoy-validate` 改成失败时打印 docker 的退出码和完整输出并重新推送；再出现时看那段输出（怀疑是 `docker run` 本身偶发失败，没有证据）。
+             - 重新推送后（`1ac7c1c`）CI 27 项全部通过，`envoy` 这次也过了，所以那次失败的原因仍然不知道（最长的是 e2e 3 分 52 秒，其次 `test (./services/order)` 3 分 44 秒）。
+             - **增量对账（窗口的下界）已加，已分 2 个提交推送到 PR #7**（2026-11-14，主人提出）：`recon -since 26h` 只比最近 26 小时的订单，和 `-settle` 合成一个窗口；`archive` 不支持。设计文档 7.17，ADR-0022 有补充。`make lint` 和 recon 模块的测试通过；本机 `index` 全量 4.7 秒、`-since 26h` 0.27 秒。改的文件：`services/recon/` 下的 `sql.go`、`source.go`、`rows.go`、`compare.go`、`report.go`、`cmd/recon/main.go` 和测试，`Makefile` 的帮助，三份文档。
+             - 这次推送（`4e0f4ca`）的 CI 27 项全部通过（最长的是 `test (./services/order)` 4 分 1 秒和 e2e 4 分；`envoy` 没有再失败）。
+             - **1d 步骤六（埋点）已实现、验收并实测，已分 6 个提交推送到 PR #7（`7826840` 到 `493e983`），CI 27 项全部通过**（2026-11-14；最长的是 `test (./services/order)` 4 分 27 秒、e2e 3 分 21 秒、`test (./services/gateway)` 3 分 13 秒，没有明显变慢的 job）。设计文档 1d 第 8 节，ADR-0023（已采纳），发现在 8.15，结果在 8.16，没做的在 8.17。`make lint`、`make test`（55 个包）、`make e2e` 通过，`make chaos` 一次 PASS（杀进程 18 次，`load verify` 和 `recon` 都通过）。
+               - 主人定的（8.14，四项都按建议）：本机后端用 `grafana/otel-lgtm`（compose 的 `obs` profile）；`outbox` 加一列 `trace_context` 传递链路；异步一跳以父子为主，延迟关单和按批消费用 link；指标经 OTLP 推。
+               - 做了什么：`pkg/otelx`（`Setup`、采样器、建指标和给 span 加属性的小工具）；`logx` 的日志带 `trace_id`、`span_id`；`grpcx`（`otelgrpc`）、`mysqlx`（`otelsql`）、`redisx`（`redisotel`）；`kafkax/telemetry.go`（生产和消费的 span、排队时长、重试和死信的计数）和分到分区的日志；`outbox` 的列加 order 的 `00004`、payment 的 `00003` 迁移（可重跑）；`breaker`、`degrade`、`cache` 的指标；gateway 入口的中间件（没有用 `otelgin`，原因在 8.4）、`X-Trace-Id`、限流和降级的指标；order、inventory、payment、orderindex、cdc 的业务指标和 span 属性；payment 的处理器在出结果处开一条链路（`payment.complete`）；e2e 的 `TestTraceSpansAllServices`（测试进程里起 OTLP 接收端）；`scripts/lib/obs.sh`、`make obs-up`、`make obs-down`。公共库和 payment 的那一处由 Fable 写；gateway、order、inventory 等四个服务派 Opus，order、inventory、payment 的 diff 由 Fable 逐行评审（只加观测，没有改行为）；公共库的测试、本机后端和脚本、e2e 用例派 Sonnet。
+               - 实测要点：1% 采样的开销量不出来，全量采样落库吞吐低约 7%；一个订单是三条链路（下单到落库约 70 个 span、发起支付、支付结果），靠 span 上的订单号关联。**3.9 的悬案有了答案**：那 54 毫秒不在 order 进程里（子 span 没覆盖的时间中位数 0.15 毫秒），是“一次落库约 30 次往返乘以本机每次往返的代价”加上偶发的 200 毫秒 TCP 重传造成的长尾（中位数 27 毫秒、平均 55 毫秒）。
+               - **新发现、没有查原因**：过载（开环每秒 2000 个请求）时，12 次运行里 5 次出现闸门的 Redis 调用成批超过 300 毫秒、熔断器打开、几百条消息重试，那一轮落库吞吐低 15% 到 25%，订单没有丢。和埋点无关（`always_off` 时也出现）。
+               - **本机的变化**：`make obs-up` 启动 `otel-lgtm`（Grafana 在 http://127.0.0.1:3000 ，admin/admin；OTLP 4317/4318；内存上限 1.5 GiB，全量采样压测后到过 1.33 GiB）。它在运行时 `make run`、`bench.sh` 自动导出（`OBS=off` 关闭；`bench.sh` 默认 1% 采样）；e2e 把链路发给测试进程自己的接收端（14317），chaos、fault 不导出。**当前 `otel-lgtm` 容器在运行**，不用时 `make obs-down`。查链路和指标的命令在 8.10 之外另记在这里：Tempo 用 `curl -s -u admin:admin -G localhost:3000/api/datasources/proxy/uid/tempo/api/search --data-urlencode 'q={ resource.service.name = "order" }'`，Prometheus 用同样的前缀换成 `uid/prometheus/api/v1/query`。拆落库时间的脚本没有入库（在会话的临时目录里），压测的原始输出在 `tmp/bench/otel-overhead/`。
+               - 新的约定（已写进 AGENTS.md 的“可观测”）：带 ctx 的日志；业务代码不手工建 span；指标的标签只能是有限的枚举；只有服务端故障标 Error；加指标不改行为、不新增查询。
+               - 没做的见设计文档 8.17。要点：`sloglint` 没有打开；`order.gate.unclaimed_holds` 和 `inventory.stock_pending.backlog` 两个指标没有做；`make fault` 里指标对不对得上没有抽查；后端长时间不在时的表现没有跑过。
+               - 下一步：1d 的六步都做完了。阶段计划的 1d 清单里还有三项没勾的旧条目（orderindex 按批写、落库性能、开环模式），看上去都在步骤一做完了，勾之前逐项核对；然后是 8.17 里没做的几项要不要补（主人定）、1d 的面试笔记（`docs/notes/`），以及 PR #7 合并进 `main`（等主人说）。
+             - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
      - 造数的进度表不跟着 slot 走，扩容后不能用原参数续灌。
@@ -90,12 +145,14 @@
 - `make tools` 安装 buf、proto 插件和 `oapi-codegen` 到 `./bin`（已装）。
 - `make up-core` 只启动现有的 `mysql`、Redis、Kafka，够跑 `make test`。
 - `make up` 启动依赖：现有的 `mysql`（inventory_db、payment_db、商家索引库和测试用的临时库）、order 的两主两从（端口见 `docs/infra/versions.md`）、Redis、Kafka，并建立复制。`make down` 停止并保留数据。
-- **本机的订单库已经扩成 4 个**（2026-11-14 的演练）：`order_db_0` 到 `order_db_3`，各在自己的实例上，各带一个从库。500 万条造出来的历史订单（用户号从 2^40 起）**已经归档**：热库只剩约 18.7 万单（近 90 天的），其余 482 万单在 `mysql` 实例的 `order_archive_db` 里；热表已重建回收过空间。要重新得到“归档前”的状态只能清库重灌。多出来的 4 个实例属于 compose 的 `expand` profile，`make up` 不会启动它们：
+- **本机的订单库已经扩成 4 个**（2026-11-14 的演练）：`order_db_0` 到 `order_db_3`，各在自己的实例上，各带一个从库。500 万条造出来的历史订单（用户号从 2^40 起）**已经归档**：热库只剩约 16.7 万单（近 80 天的；1d 步骤五的演练又归档了 20717 单），其余 484 万单在 `mysql` 实例的 `order_archive_db` 里；热表已重建回收过空间。要重新得到“归档前”的状态只能清库重灌。多出来的 4 个实例属于 compose 的 `expand` profile，`make up` 不会启动它们：
   - 启动依赖要 `make up && make expand-up`。
   - 启动服务要 `ORDER_DBS=4 make run`。直接 `make run` 会因为 `shard_meta` 不符而拒绝启动，这是有意的。
   - 想回到干净的 2 库环境：`make down-volumes && make up`（会清掉全部数据，包括造的数）。
   - `make e2e`、`make test` 不受影响，它们用旧的两个实例上独立的库。
-- 当前依赖和六个服务都处于**运行**状态（`ORDER_DBS=4 make run` 在后台，用的是步骤五的新代码，日志在 `tmp/make-run.log` 和 `tmp/logs/`）。商家索引已经追平，不用再留着，停止：`pkill -f scripts/run-local.sh`。
+- 依赖在运行，六个服务**已停止**（2026-11-14 跑 1d 的压测前停的）。要起来用 `ORDER_DBS=4 make run`。停止时按进程号杀 `scripts/run-local.sh`，不要用 `pkill -f`（见会话日志的教训）。
+- 共享的 `mysql` 实例的 `max_connections` 是 400（compose 里设的）。
+- 对账：`ORDER_DBS=4 make recon`（只读，约 6 秒；增量用 `RECON_ARGS="-since 26h"`；不带 `ORDER_DBS=4` 会报 `orders_2` 不存在）。实测的原始输出和归档前的快照在 `tmp/recon/`。2026-11-14 最后一次运行四对加 `archive` 都没有差异。
 - 归档：`ORDER_DBS=4 make archive`（本机是 4 个库，不带 `ORDER_DBS=4` 会被 `shard_meta` 校验拒绝），`make archive-dry-run` 只数不搬，`make archive-reclaim` 重建热表回收空间，参数用 `ARCHIVE_ARGS` 传。这次实跑的原始输出在 `tmp/archive/`。
 - Kafka 的 Web 界面：`make kafka-ui` 启动 kafbat-ui（compose 的 `ui` profile，只读，http://127.0.0.1:8090），`make kafka-ui-down` 停止。看消费组的 lag 要点进具体的消费组。消息体是 protobuf，没有配置解码，看到的是原始字节。当前处于运行状态。
 - 造数：`make seed-orders`（可中断续跑）、`make seed-report`。扩容：`scripts/expand.sh`（不带参数看用法），演练的状态文件在 `tmp/expand/`。
@@ -153,6 +210,12 @@
 | 2026-11-14 | order 落库拒绝订单号早于 30 天的受理消息；针对已归档订单的支付结果从冷库推出答复 | 归档引入的两个一致性问题：旧订单号重新插入热库会盖住冷库里的订单；重放的支付结果会对付清的订单要求退款 |
 | 2026-11-14 | orderindex 对 DELETE 从“忽略”改为“把删除前的映像做带版本号的 upsert” | 归档在热库上是 DELETE；商家索引保留归档订单的行，索引重建时这条消息是它唯一的来源 |
 | 2026-11-14 | 步骤五的五个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 主线的共享改动没有提交 |
+| 2026-11-14 | 1d 分六步，先还吞吐的欠账；步骤一增加“MySQL 侧库存扣减改成异步”和“商家索引按批写” | 限流和熔断的阈值要对着实际容量定；实测发现瓶颈是热门 SKU 的行锁。见设计文档 1d 第 1 到 3 节、ADR-0017、ADR-0018 |
+| 2026-11-14 | 1d 的服务侧保护不用 sentinel-go，服务之间的熔断和并发隔离改用 Envoy | sentinel-go 最新正式版是 2021 年的；主人不想引入停更的库，并提出这类组件在生产里通常是独立的。见 ADR-0020 |
+| 2026-11-14 | 1d 步骤四：闸门的 Redis 不可用时拒绝下单，不退回数据库扣减；增加落库健康（受理时拒绝落不了库的订单）和列表的部分结果；落库和订单事件的消费者不设重试上限 | 退回数据库扣减在多实例下会超卖、切回要重新装载闸门，而 ADR-0018 之后 MySQL 已不阻止超卖。见设计文档 1d 第 6 节、ADR-0021；主人确认 |
+| 2026-11-14 | 步骤四的三个并行任务（order 读路径、inventory 和 payment、gateway）仍在主工作目录里各改各的目录，没有用 worktree；故障注入脚本在它们验收之后才派 | 主线的共享改动没有提交；故障注入要暂停共享的 Redis，不能和别的测试同时跑 |
+| 2026-11-14 | 1d 步骤五：闸门（Redis）和 MySQL 的库存不纳入 Merkle 对账，维持 inventory 现有的 `reconcile`；树的节点摘要用行哈希的和，不是教科书式的 H(子节点) | SKU 很少、数一直在变，逐个比就是对的做法；两边分片方式不同，摘要要能跨分片相加。见设计文档 1d 第 7 节、ADR-0022；主人确认 |
+| 2026-11-14 | 1d 步骤六：`outbox` 表加 `trace_context` 列；本机多一个可选的 `otel-lgtm` 容器（`obs` profile）；步骤六的五个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 链路要穿过 outbox 只能跟着数据走；埋点要被真实的后端收过才算数。见设计文档 1d 第 8 节、ADR-0023，主人确认。主线的共享改动没有提交，worktree 里看不到 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -213,6 +276,36 @@
 
 在本机 500 万单上实跑：482 万单 8 分 8 秒搬完，行数守恒，对账通过，从库延迟最大 1 秒；热库磁盘占用从 2273 MB 到 217 MB（要重建表才回来）；冷库刚归档完几乎没有压缩效果，重建分区后 906 MB。结果在设计文档 6.14。
 
+同日主人同意提交，步骤五分 7 个提交推送，CI 全绿；随后合并 PR #6 进 `main`，开了 `phase-1d`。写了 1d 的分步方案和步骤一的设计（`docs/design/1d-protection.md`、ADR-0017），主人确认后开始实现：主线写了 kafkax 的分区内并发消费和 `fetch` 的新读顺序，三个子 Agent 并行做落库并发、orderindex 并发和开环压测。
+
+同日继续 1d 步骤一的延续（主人定了 MySQL 异步扣减、商家索引按批写、推送并开 PR #7）。Fable 写了 kafkax 的按批消费和 inventory 的异步扣减（`stock_pending` 加应用者）；orderindex 按批写、inventory 测试的铺开派给 Opus，对账和脚本派给 Sonnet。测试铺开时发现超卖时预热和对账失效的两个缺陷，已修。实测见设计文档 2.11、3.9。
+
+同日做 1d 步骤二（网关限流）：设计经主人确认后，Fable 写 `pkg/ratelimit`，网关接入派 Opus、脚本和 e2e 派 Sonnet。网关的子 Agent 提醒了 Redis 客户端的两个默认行为，核实后修掉了一个 1b 起就有的缺陷（受理脚本被重试后订单消失）。实测见设计文档 4.17。
+
+同日做 1d 步骤三。查到 sentinel-go 停更五年，主人不想引入，并提出这类组件在生产里通常是独立的；最终定为每个服务一个 Envoy 边车。先在本机用可控的 gRPC 上游把 Envoy 的行为逐项验证（发现三个默认配置下不生效的坑），再写设计。Fable 写边车的配置和进程里的公共部分，gateway、order 和 payment 的接入派 Opus，脚本和故障注入派 Sonnet。实测见设计文档 5.14。
+
+教训：引入一个没用过的组件，先用最小的探测把它的行为跑出来再写设计，文档里的默认值和“应该会怎样”靠不住（单实例下摘除不生效、慢下游不计入摘除，都是跑出来才知道的）；即使跑过，设计时也可能没把两个事实连起来（“调用方先放手不计入”和“两处时限相同”），子 Agent 的独立检查补上了这一环。
+
+教训：并发测试本机通过不说明什么，CI 更慢、交错不同；论证“不会发生”时要分清一致性读（快照）和加锁读（不是快照）。
+
+教训：客户端库的默认行为（会不会重试、时限从哪来）要读源码确认；子 Agent 报告里“待核实”的提醒值得逐条查，这次查出的问题比任务本身重要。
+
+教训：一个值的取值范围变了（真实可售数可以为负），要把它所有的读者过一遍；改坏验证时测试没有失败，说明那条性质没有被断言（`SKIP LOCKED` 的害处是误报而不是算错，第一版测试只看了最终的数）。
+
 教训：`pkill -f <脚本路径>` 会连带杀掉命令行里出现这个路径的其他 shell（这次杀掉了启动归档的外层 shell，归档进程本身没事）。要按进程号杀。MySQL 9.7 的客户端在 `-e` 里不认 `\G`，用 `-E`。
 
 教训：直接在模块目录里跑 `go test` 时集成测试会因为没有环境变量而全部跳过，看起来是通过。要用 `make test MODULES=$PWD/<模块>`。
+
+同日做 1d 步骤四。先读代码摸清每个依赖坏掉时的现状（发现闸门不可用超过约 26 秒时已受理的订单会进死信后消失、可选依赖会挡住启动等），写设计和 ADR-0021，主人确认四项都按建议（闸门不可用时拒绝下单，不退回数据库扣减）。Fable 写公共库和 order 的受理、落库、回收；order 读路径、inventory 和 payment、gateway 派 Opus 并行，Fable 评审；故障注入的场景派 Sonnet。实测见设计文档 6.18。
+
+教训：一层保护的输出是另一层保护的输入。降级时返回的 `UNAVAILABLE` 会被调用方的边车当成服务故障、把整个服务摘掉；设计降级的错误时要把步骤三的熔断规则一起看。
+
+教训：把测试输出过滤得太狠会把编译失败也滤掉。这次有两轮“通过”其实是测试没编译过，过滤条件里要留着 `build failed` 和每个包的 `ok`。
+
+同日做 1d 步骤五（对账）。先在本机冷库上量了“行读到客户端”和“库里聚合摘要”的耗时，再写设计和 ADR-0022，主人确认四项都按建议。Fable 写 `pkg/merkle` 和五对的投影，引擎、修复、命令行派 Opus，Fable 评审后改了三处；脚本和 chaos 的接入很小，主会话直接写了。在 500 万单上实测并做了验收演练，结果在设计文档 7.12。
+
+教训：`DELETE` 走不了索引时是带锁的全表扫描，会挡住这张表的所有写入；先用不加锁的读找到主键，再按主键删。评审时对每条写语句都要问它走哪个索引。
+
+教训：性能对比的基线要先确认它自己没有被写慢（全量归并的第一版发了 2.9 万条大多读不到行的语句）；量之前先想清楚自变量是什么（这次是“差异落在多少个节点里”，不是“差异有多少行”）。
+
+教训：给“什么算成功”下定义要想反例。落库健康第一版把“消息处理完了”当成功，而依赖坏着时被 sweeper 置为失败的订单也会“处理完”。

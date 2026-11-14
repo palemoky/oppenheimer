@@ -32,12 +32,23 @@ const waitReplicaSlack = time.Second
 // （也可能多包含几个同时提交的事务，从库等它们也只是多等一点）。两个值在同一条语句里读，
 // 保证 At 对应的就是这个集合。
 func (s *Store) PrimaryPosition(ctx context.Context, orderID int64) (Position, error) {
-	slot := s.router.ForOrder(orderID)
+	p, err := s.PrimaryPositionOfDB(ctx, s.DBOfOrder(orderID))
+	if err != nil {
+		return Position{}, fmt.Errorf("order %d: %w", orderID, err)
+	}
+	return p, nil
+}
+
+// PrimaryPositionOfDB 和 PrimaryPosition 相同，按库号定位。给从库的健康探测用（设计文档 1d 的 6.7）。
+func (s *Store) PrimaryPositionOfDB(ctx context.Context, db int) (Position, error) {
+	if db < 0 || db >= len(s.dbs) {
+		return Position{}, fmt.Errorf("store: db %d out of range [0, %d)", db, len(s.dbs))
+	}
 	var p Position
-	err := s.dbOf(slot).QueryRowContext(ctx,
+	err := s.dbs[db].QueryRowContext(ctx,
 		"SELECT @@global.gtid_executed, CAST(UNIX_TIMESTAMP(NOW(6)) * 1000000 AS UNSIGNED)").Scan(&p.GTID, &p.At)
 	if err != nil {
-		return Position{}, fmt.Errorf("read primary position of order %d: %w", orderID, err)
+		return Position{}, fmt.Errorf("read primary position of db %d: %w", db, err)
 	}
 	// 集合有多个来源（例如主从切换过）时，MySQL 在逗号后面加换行。
 	p.GTID = strings.Map(func(r rune) rune {
@@ -61,28 +72,39 @@ func (s *Store) PrimaryPosition(ctx context.Context, orderID int64) (Position, e
 // 稍长的 ctx 时限，防止从库连上了却不响应。ctx 先到期时驱动关闭这条连接（连接池不会再用它），
 // 服务端的等待最多持续到 timeout 后自行结束，不会遗留。
 func (s *Store) WaitReplica(ctx context.Context, orderID int64, gtid string, timeout time.Duration) (bool, error) {
+	caught, err := s.WaitReplicaOfDB(ctx, s.DBOfOrder(orderID), gtid, timeout)
+	if err != nil {
+		return false, fmt.Errorf("order %d: %w", orderID, err)
+	}
+	return caught, nil
+}
+
+// WaitReplicaOfDB 和 WaitReplica 相同，按库号定位。给从库的健康探测用（设计文档 1d 的 6.7）。
+func (s *Store) WaitReplicaOfDB(ctx context.Context, db int, gtid string, timeout time.Duration) (bool, error) {
 	if s.replicas == nil {
 		return false, ErrNoReplica
+	}
+	if db < 0 || db >= len(s.replicas) {
+		return false, fmt.Errorf("store: db %d out of range [0, %d)", db, len(s.replicas))
 	}
 	if timeout <= 0 {
 		return false, fmt.Errorf("store: wait replica timeout must be positive, got %s", timeout)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout+waitReplicaSlack)
 	defer cancel()
-	slot := s.router.ForOrder(orderID)
 	var r sql.NullInt64
-	if err := s.replicaOf(slot).QueryRowContext(ctx, "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, ?)",
+	if err := s.replicas[db].QueryRowContext(ctx, "SELECT WAIT_FOR_EXECUTED_GTID_SET(?, ?)",
 		gtid, timeout.Seconds()).Scan(&r); err != nil {
-		return false, fmt.Errorf("wait replica of order %d: %w", orderID, err)
+		return false, fmt.Errorf("wait replica of db %d: %w", db, err)
 	}
 	switch {
 	case !r.Valid:
-		return false, fmt.Errorf("wait replica of order %d: got NULL", orderID)
+		return false, fmt.Errorf("wait replica of db %d: got NULL", db)
 	case r.Int64 == 0:
 		return true, nil
 	case r.Int64 == 1:
 		return false, nil
 	default:
-		return false, fmt.Errorf("wait replica of order %d: unexpected result %d", orderID, r.Int64)
+		return false, fmt.Errorf("wait replica of db %d: unexpected result %d", db, r.Int64)
 	}
 }

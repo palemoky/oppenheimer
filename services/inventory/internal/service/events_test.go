@@ -172,10 +172,16 @@ func TestHandleOrderEventWithoutOrderID(t *testing.T) {
 
 // TestHandleOrderEventConcurrentWithOnline 让事件消费与在线 gRPC 路径同时作用在同一批订单上：
 // 事件重复投递、与 Reserve 赛跑、与排障用的 gRPC Confirm/Release 撞在一起，
-// 最终库存不能超卖（seed 的清理检查恒等式和非负），也不能有悬挂的预占。
+// 最终恒等式成立、不为负（seed 的清理检查），也不能有悬挂的预占。
+//
+// 以前库存（50）少于订单数（80），一部分 Reserve 因 MySQL 库存不足失败，走“预占失败 → failed 事件”的分支。
+// ADR-0018 之后 Reserve 不再因库存不足失败，“不超卖”由闸门保证（这里没有闸门）；库存少于订单数时
+// MySQL 一侧可能短暂超卖（并发的预占先于各自的释放排进 stock_pending），应用者是否把它报成卡住
+// 取决于调度和分批的边界，结果不确定（实测多数时候不会）。所以库存改为等于订单数，相当于闸门放行了
+// 全部订单；case 0 的失败分支保留作防御，正常不会再走到。
 func TestHandleOrderEventConcurrentWithOnline(t *testing.T) {
 	e := newEnv(t)
-	const orders, stock = 80, 50
+	const orders, stock = 80, 80
 	e.seed(t, 1, 100, stock)
 
 	type result struct {
@@ -207,7 +213,7 @@ func TestHandleOrderEventConcurrentWithOnline(t *testing.T) {
 
 			switch i % 4 {
 			case 0:
-				// 正常下单：Reserve 成功才有 paid，否则订单失败。
+				// 正常下单：Reserve 成功才有 paid，否则订单失败（现在只有 SKU 不存在、多商家会失败，这里不会发生）。
 				_, r.reserveErr = e.reserve(t.Context(), orderID, 1, 1)
 				if r.reserveErr == nil {
 					r.confirmed = true
@@ -244,8 +250,8 @@ func TestHandleOrderEventConcurrentWithOnline(t *testing.T) {
 				t.Errorf("order %d: %v", orderID, err)
 			}
 		}
-		if err := r.reserveErr; err != nil &&
-			!errx.Is(err, errx.ReasonInsufficientStock) && !errx.Is(err, errx.ReasonReservationReleased) {
+		// 只有 case 1（Reserve 与 failed 事件赛跑）可能被空回滚的标记挡住；不再接受 INSUFFICIENT_STOCK。
+		if err := r.reserveErr; err != nil && !errx.Is(err, errx.ReasonReservationReleased) {
 			t.Errorf("order %d Reserve: %v", orderID, err)
 		}
 		if r.confirmed {

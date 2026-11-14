@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/palemoky/oppenheimer/api/eventx"
@@ -23,6 +24,7 @@ import (
 	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/pkg/app"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/outbox"
 	"github.com/palemoky/oppenheimer/pkg/worker"
 	"github.com/palemoky/oppenheimer/services/payment/internal/store"
@@ -147,7 +149,21 @@ func (p *Processor) RunOnce(ctx context.Context) error {
 
 // complete 在一个事务里完成状态转换并写入 PaymentEvent.completed。
 // 返回 false 说明另一个实例已经处理过（条件更新影响 0 行），这时不写事件，也不是错误。
-func (p *Processor) complete(ctx context.Context, pay store.Payment, now time.Time) (bool, error) {
+func (p *Processor) complete(ctx context.Context, pay store.Payment, now time.Time) (_ bool, err error) {
+	// 给“支付出结果”开一条链路（设计文档 1d 的 8.6）。这里是后台循环，ctx 里没有 span；而出结果是一个业务动作的
+	// 起点：它写的 PaymentEvent 经 outbox 到 order，再到 inventory。不在这里开头的话，outbox 里存不下上下文，
+	// 那条链路要从中继发消息的那一刻才开始，根 span 上没有订单号，这个事务也不在链路里。
+	// 真实系统里这一步是支付渠道的回调，本来就是一个新请求，和用户发起支付的那次请求不是同一条链路。
+	ctx, span := tracer.Start(ctx, "payment.complete")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "complete payment failed")
+		}
+		span.End()
+	}()
+	otelx.SetOrder(ctx, pay.OrderID, pay.UserID)
+
 	to := paymentv1.PaymentStatus_PAYMENT_STATUS_SUCCEEDED
 	if pay.Outcome == paymentv1.SimulatedOutcome_SIMULATED_OUTCOME_FAILURE {
 		to = paymentv1.PaymentStatus_PAYMENT_STATUS_FAILED
@@ -175,6 +191,13 @@ func (p *Processor) complete(ctx context.Context, pay store.Payment, now time.Ti
 	})
 	if err != nil {
 		return false, fmt.Errorf("complete payment %d: %w", pay.PaymentID, err)
+	}
+	if done {
+		if to == paymentv1.PaymentStatus_PAYMENT_STATUS_SUCCEEDED {
+			results.Add(ctx, 1, resultSucceeded)
+		} else {
+			results.Add(ctx, 1, resultFailed)
+		}
 	}
 	return done, nil
 }

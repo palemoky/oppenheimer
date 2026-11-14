@@ -11,6 +11,17 @@
 # ORDER_DBS=4 表示订单库已经扩成 4 个（scripts/expand.sh 做完之后，ADR-0015）：order 连 4 主 4 从，
 # cdc 读 4 个源。默认 2。
 # order 带 ARCHIVE_DSN，指向单实例 mysql 上的 order_archive_db（冷库，ADR-0016）：启动时自己建表，热库查不到的旧订单去冷库查。
+# gateway 的限流（ADR-0019）默认开启，按 IP（进程内）和按用户加接口（Redis）。按 IP 的限额是每秒 200，
+# 从本机用很多用户号压测会被限住，现象是吞吐上不去或随机得到 429；压测和测试脚本会自己设置下面的变量。
+# RATE_LIMIT（on/off）、RATE_LIMIT_IP、RATE_LIMIT_USER、RATE_LIMIT_ROUTE、TRUSTED_PROXIES：已经设置（并 export）就原样传给 gateway，
+# 没设就由 gateway 用自己的默认值。
+# RATE_LIMIT_REDIS_ADDR 默认指向缓存实例（和其他服务的 CACHE_REDIS_ADDR 同一个），RATE_LIMIT_REDIS_PREFIX 默认跟随 REDIS_PREFIX；
+# 设为空字符串表示限流不用 Redis。
+# 服务之间的 gRPC 调用经过各自的 Envoy 边车（ADR-0020，make up 会启动它们）：gateway、order、payment 的下游地址
+# 指向自己边车的出站端口，熔断、并发上限、路由超时都在边车的配置里（deploy/envoy/）。SIDECAR=off 时直连
+# （不经过边车，也就没有这些保护），用来对比或者在边车没起来的环境里跑。
+# 可观测（ADR-0023，scripts/lib/obs.sh）：OBS=auto（默认）时 otel-lgtm 容器（make obs-up）在运行就把链路和指标导出到它，
+# 默认全量采样；OBS=on 容器没起就报错，OBS=off 不导出。调用方自己设了 OTEL_EXPORTER_OTLP_ENDPOINT、OTEL_TRACES_SAMPLER 等就原样用。
 # 冷库要先建好（make up 会建；e2e、chaos、bench 各自建带前缀的）。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
 set -euo pipefail
 
@@ -48,6 +59,9 @@ export REDIS_ADDR="${REDIS_ADDR:-127.0.0.1:${REDIS_PORT:-6379}}"
 export CACHE_REDIS_ADDR="${CACHE_REDIS_ADDR:-127.0.0.1:${CACHE_REDIS_PORT:-6380}}"
 export KAFKA_PREFIX="${KAFKA_PREFIX:-}"
 export REDIS_PREFIX="${REDIS_PREFIX:-}"
+# 限流状态放在缓存实例里（丢了只是桶重新装满，可以接受）。用 - 而不是 :-，让调用者能显式设为空来关掉 Redis。
+export RATE_LIMIT_REDIS_ADDR="${RATE_LIMIT_REDIS_ADDR-$CACHE_REDIS_ADDR}"
+export RATE_LIMIT_REDIS_PREFIX="${RATE_LIMIT_REDIS_PREFIX-$REDIS_PREFIX}"
 
 mkdir -p "$LOG_DIR"
 pids=()
@@ -81,6 +95,20 @@ start() {
   exit 1
 }
 
+# 每个服务调用下游时连自己边车的出站端口（scripts/lib/sidecar.sh：端口、边车健康检查、SIDECAR=off 直连）。
+# shellcheck source=lib/sidecar.sh
+. "$ROOT/scripts/lib/sidecar.sh"
+sidecar_setup
+order_to_inventory="$SC_ORDER_INVENTORY"
+payment_to_order="$SC_PAYMENT_ORDER"
+gateway_addrs="$SC_GATEWAY_ADDRS"
+
+# 可观测后端在运行就导出（export 的变量由 start 里的 env 传给每个服务进程）；run-local.sh 默认全量采样，不设采样器。
+# shellcheck source=lib/obs.sh
+. "$ROOT/scripts/lib/obs.sh"
+obs_setup
+[ "$OBS_EXPORTING" = 1 ] && echo "exporting traces and metrics to $OTEL_EXPORTER_OTLP_ENDPOINT"
+
 # 启动顺序按依赖方向：被依赖的先起。
 start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
 # MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应。
@@ -103,14 +131,15 @@ case "$ORDER_DBS" in
   exit 2
   ;;
 esac
-start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2
-start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
+start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 INVENTORY_ADDR="$order_to_inventory"
+start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3 ORDER_ADDR="$payment_to_order"
 # 商家维度的订单索引（ADR-0014）。两个索引库在单实例 mysql 上。
 start orderindex 8084 MYSQL_DSNS="$(dsn merchant_index_db_0),$(dsn merchant_index_db_1)"
 # CDC 从 order 的两个从库读 binlog。排在 order 之后启动只是为了第一次全量时表已经建好；
 # 表在它启动之后才建也没关系，建表之后的写入都在 binlog 里。server-id 登记在 docs/infra/versions.md。
 start cdc 8085 CDC_SOURCE_NAMES="$cdc_names" CDC_SERVER_IDS="$cdc_ids" CDC_SOURCE_DSNS="$cdc_dsns"
-start gateway   8080
+# shellcheck disable=SC2086 # 有意按空格拆成几个 KEY=VALUE
+start gateway   8080 $gateway_addrs
 
 if [ "${1:-}" = "--" ]; then
   shift
@@ -122,4 +151,6 @@ if [ "${1:-}" = "--" ]; then
 fi
 
 echo "gateway listening on http://127.0.0.1:8080 — press Ctrl-C to stop"
+echo "gateway admin (degrade switches) on http://127.0.0.1:8089/degrade"
+[ "$OBS_EXPORTING" = 1 ] && echo "Grafana (traces, metrics) on $OBS_GRAFANA_URL"
 wait

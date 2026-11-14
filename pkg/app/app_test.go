@@ -74,7 +74,7 @@ func TestRunStopsInReverseOrderOnCancel(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(t.Context())
 		result := make(chan error, 1)
-		go func() { result <- run(ctx, discard, time.Second, components) }()
+		go func() { result <- run(ctx, discard, Options{StopTimeout: time.Second}, nil, components) }()
 
 		synctest.Wait() // 所有组件都已阻塞在 Start 里
 		cancel()
@@ -97,7 +97,7 @@ func TestRunReturnsComponentFailureAndStopsOthers(t *testing.T) {
 		failing.failErr = boom
 		components := []Component{newFake("db", rec), failing, newFake("http", rec)}
 
-		err := run(t.Context(), discard, time.Second, components)
+		err := run(t.Context(), discard, Options{StopTimeout: time.Second}, nil, components)
 
 		if !errors.Is(err, boom) {
 			t.Fatalf("run() = %v, want it to wrap %v", err, boom)
@@ -124,7 +124,7 @@ func TestRunTimesOutWhenComponentIgnoresStop(t *testing.T) {
 		cancel()
 
 		start := time.Now()
-		err := run(ctx, discard, 5*time.Second, []Component{stuck})
+		err := run(ctx, discard, Options{StopTimeout: 5 * time.Second}, nil, []Component{stuck})
 
 		if !errors.Is(err, ErrStopTimeout) {
 			t.Fatalf("run() = %v, want ErrStopTimeout", err)
@@ -146,7 +146,7 @@ func TestHTTPServerServesAndShutsDown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
-	go func() { result <- run(ctx, discard, 5*time.Second, []Component{srv}) }()
+	go func() { result <- run(ctx, discard, Options{StopTimeout: 5 * time.Second}, nil, []Component{srv}) }()
 
 	body := get(t, url)
 	var got healthResponse
@@ -211,4 +211,223 @@ func get(t *testing.T, url string) []byte {
 		t.Fatal(err)
 	}
 	return body
+}
+
+// drainFake 在 fake 的基础上记录 Drain 被调用时的就绪状态和时刻。
+type drainFake struct {
+	*fake
+	ready *Readiness
+
+	mu        sync.Mutex
+	drainedAt time.Time
+	// readyAtDrain 是 Drain 被调用时 Readiness 的值：那时应当已经是未就绪。
+	readyAtDrain bool
+	stoppedAt    time.Time
+}
+
+func (d *drainFake) Drain() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.drainedAt = time.Now()
+	d.readyAtDrain = d.ready.Ready()
+}
+
+func (d *drainFake) Stop(ctx context.Context) error {
+	d.mu.Lock()
+	d.stoppedAt = time.Now()
+	d.mu.Unlock()
+	return d.fake.Stop(ctx)
+}
+
+func (d *drainFake) times() (drainedAt time.Time, readyAtDrain bool, stoppedAt time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.drainedAt, d.readyAtDrain, d.stoppedAt
+}
+
+func TestReadinessAndDrainDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := &recorder{}
+		ready := &Readiness{}
+		c := &drainFake{fake: newFake("grpc", rec), ready: ready}
+		if ready.Ready() {
+			t.Fatal("ready before run")
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		opts := Options{Readiness: ready, DrainDelay: 8 * time.Second, StopTimeout: time.Second}
+		go func() { result <- run(ctx, discard, opts, nil, []Component{c}) }()
+
+		synctest.Wait()
+		if !ready.Ready() {
+			t.Fatal("not ready after components started")
+		}
+
+		start := time.Now()
+		cancel()
+		synctest.Wait()
+		// 收到退出请求：立刻未就绪、Drain 已调用，但组件还没有被停止（仍在服务）。
+		if ready.Ready() {
+			t.Fatal("still ready after shutdown was requested")
+		}
+		drainedAt, readyAtDrain, stoppedAt := c.times()
+		if drainedAt != start || readyAtDrain {
+			t.Fatalf("Drain at %v (shutdown at %v), ready at that time = %v; want immediately and not ready",
+				drainedAt, start, readyAtDrain)
+		}
+		if !stoppedAt.IsZero() {
+			t.Fatal("component stopped before the drain delay elapsed")
+		}
+
+		if err := <-result; err != nil {
+			t.Fatalf("run() = %v, want nil", err)
+		}
+		_, _, stoppedAt = c.times()
+		if got := stoppedAt.Sub(start); got != 8*time.Second {
+			t.Fatalf("component stopped %v after shutdown was requested, want the 8s drain delay", got)
+		}
+		if ready.Ready() {
+			t.Fatal("ready after run returned")
+		}
+	})
+}
+
+func TestComponentFailureSkipsDrainDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := &recorder{}
+		bad := newFake("consumer", rec)
+		bad.failErr, bad.failAfter = errors.New("boom"), time.Second
+		ok := newFake("http", rec)
+
+		start := time.Now()
+		err := run(t.Context(), discard, Options{DrainDelay: time.Minute, StopTimeout: time.Second}, nil, []Component{ok, bad})
+		if !errors.Is(err, bad.failErr) {
+			t.Fatalf("run() = %v, want it to wrap the component error", err)
+		}
+		if elapsed := time.Since(start); elapsed != time.Second {
+			t.Fatalf("run() returned after %v, want 1s (no drain delay after a component failure)", elapsed)
+		}
+	})
+}
+
+func TestSecondSignalDuringDrainDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := &recorder{}
+		c := newFake("http", rec)
+		ctx, cancel := context.WithCancel(t.Context())
+		force := make(chan struct{})
+		result := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			result <- run(ctx, discard, Options{DrainDelay: time.Minute, StopTimeout: 20 * time.Second}, force, []Component{c})
+		}()
+		synctest.Wait()
+		cancel()
+		time.Sleep(3 * time.Second)
+		close(force)
+
+		err := <-result
+		if !errors.Is(err, ErrForced) {
+			t.Fatalf("run() = %v, want ErrForced", err)
+		}
+		if elapsed := time.Since(start); elapsed != 3*time.Second {
+			t.Fatalf("run() returned after %v, want 3s (right after the second signal)", elapsed)
+		}
+	})
+}
+
+func TestSecondSignalDuringStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := &recorder{}
+		stuck := newFake("stuck", rec)
+		stuck.ignoreStop = true
+		defer close(stuck.done)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		force := make(chan struct{})
+		go func() {
+			time.Sleep(2 * time.Second)
+			close(force)
+		}()
+
+		start := time.Now()
+		err := run(ctx, discard, Options{StopTimeout: 20 * time.Second}, force, []Component{stuck})
+		if !errors.Is(err, ErrForced) || errors.Is(err, ErrStopTimeout) {
+			t.Fatalf("run() = %v, want ErrForced only", err)
+		}
+		if elapsed := time.Since(start); elapsed != 2*time.Second {
+			t.Fatalf("run() returned after %v, want 2s", elapsed)
+		}
+	})
+}
+
+func TestAdminMuxProbes(t *testing.T) {
+	t.Parallel()
+	ready := &Readiness{}
+	srv, err := ListenHTTP(t.Context(), "http", "127.0.0.1:0", AdminMux("order", ready))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Start(t.Context()) }()
+	defer func() { _ = srv.Stop(context.Background()) }()
+	base := "http://" + srv.Addr().String()
+
+	status := func(path string) int {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	// 启动中：活着，但未就绪。
+	if got := status("/healthz"); got != http.StatusOK {
+		t.Fatalf("/healthz while starting = %d, want 200", got)
+	}
+	if got := status("/readyz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while starting = %d, want 503", got)
+	}
+	ready.set(stateReady)
+	if got := status("/readyz"); got != http.StatusOK {
+		t.Fatalf("/readyz when ready = %d, want 200", got)
+	}
+	// 停止中：仍然活着，不再就绪。
+	ready.set(stateDraining)
+	if got := status("/readyz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while draining = %d, want 503", got)
+	}
+	if got := status("/healthz"); got != http.StatusOK {
+		t.Fatalf("/healthz while draining = %d, want 200", got)
+	}
+
+	// 没有接就绪状态的服务按一直就绪处理。
+	var none *Readiness
+	if !none.Ready() {
+		t.Fatal("nil Readiness is not ready")
+	}
+}
+
+func TestDrainDelayFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		val  string
+		want time.Duration
+		bad  bool
+	}{
+		{"", 0, false}, {"0s", 0, false}, {"7s", 7 * time.Second, false}, {"-1s", 0, true}, {"soon", 0, true},
+	} {
+		t.Setenv(DrainDelayEnv, tc.val)
+		got, err := DrainDelayFromEnv()
+		if (err != nil) != tc.bad || got != tc.want {
+			t.Errorf("DRAIN_DELAY=%q: got %v, %v; want %v, error=%v", tc.val, got, err, tc.want, tc.bad)
+		}
+	}
 }

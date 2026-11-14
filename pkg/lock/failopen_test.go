@@ -16,11 +16,15 @@ import (
 
 // stubGuard 按预设返回结果。
 type stubGuard struct {
-	ok  bool
-	err error
+	ok    bool
+	err   error
+	calls int
 }
 
-func (s *stubGuard) Allow(context.Context) (bool, error) { return s.ok, s.err }
+func (s *stubGuard) Allow(context.Context) (bool, error) {
+	s.calls++
+	return s.ok, s.err
+}
 
 func TestFailOpenPassesThroughDecisions(t *testing.T) {
 	inner := &stubGuard{}
@@ -84,6 +88,7 @@ func TestFailOpenLogsAreRateLimited(t *testing.T) {
 
 	// 恢复只记一次；再次故障时立即告警，不受限频影响。
 	inner.err = nil
+	now = now.Add(failOpenCooldown)
 	allow()
 	allow()
 	if n := count("lock available again"); n != 1 {
@@ -93,6 +98,33 @@ func TestFailOpenLogsAreRateLimited(t *testing.T) {
 	allow()
 	if n := count("lock unavailable"); n != 3 {
 		t.Fatalf("warn logged %d times after a second outage, want 3", n)
+	}
+}
+
+// 锁出错之后的一小段时间内不再去问它，直接放行；到时间再问一次。
+func TestFailOpenSkipsInnerDuringCooldown(t *testing.T) {
+	inner := &stubGuard{err: errors.New("redis down")}
+	g := FailOpen(inner, slog.New(slog.DiscardHandler))
+	now := time.Now()
+	g.now = func() time.Time { return now }
+
+	for range 50 {
+		if ok, err := g.Allow(t.Context()); err != nil || !ok {
+			t.Fatalf("got (%v, %v), want (true, nil)", ok, err)
+		}
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner guard asked %d times within the cooldown, want 1", inner.calls)
+	}
+
+	// 冷却过后锁恢复了：回到按锁的结果决定，包括“没拿到锁，这一轮不跑”。
+	now = now.Add(failOpenCooldown)
+	inner.err, inner.ok = nil, false
+	if ok, err := g.Allow(t.Context()); err != nil || ok {
+		t.Fatalf("after recovery got (%v, %v), want (false, nil)", ok, err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("inner guard asked %d times, want 2", inner.calls)
 	}
 }
 

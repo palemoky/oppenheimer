@@ -179,3 +179,52 @@ func TestStopForcesShutdownWhenContextExpires(t *testing.T) {
 		t.Error("in-flight call succeeded after forced shutdown")
 	}
 }
+
+// 逐跳收紧：这一跳的时限比调用方剩下的时间短时以它为准；调用方剩下的更短时以调用方为准。
+func TestHopTimeoutIsTheEarlierOfHopAndCaller(t *testing.T) {
+	_, _, srv := startServer(t)
+	conn, err := Dial(srv.Addr().String(), WithHopTimeout(100*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	// 调用方给了 5 秒，这一跳只等 100 毫秒：调用方在下游超时之后还剩很多时间可以处理。
+	caller, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = check(caller, conn, "slow")
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("slow call = %v, want DeadlineExceeded", err)
+	}
+	if el := time.Since(start); el < 80*time.Millisecond || el > time.Second {
+		t.Errorf("slow call returned after %v, want about the 100ms hop timeout", el)
+	}
+	if caller.Err() != nil {
+		t.Error("the caller's own context expired with the hop")
+	}
+
+	// 调用方只剩 30 毫秒：不会因为这一跳的时限是 100 毫秒而多等。
+	short, cancelShort := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancelShort()
+	start = time.Now()
+	if err := check(short, conn, "slow"); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("slow call = %v, want DeadlineExceeded", err)
+	}
+	if el := time.Since(start); el > 90*time.Millisecond {
+		t.Errorf("slow call took %v with 30ms left on the caller, want it to stop with the caller", el)
+	}
+
+	// 调用方没带截止时间时同样生效。
+	start = time.Now()
+	if err := check(context.Background(), conn, "slow"); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("slow call = %v, want DeadlineExceeded", err)
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Errorf("slow call without a caller deadline took %v, want about 100ms", el)
+	}
+	// 正常的调用不受影响。
+	if err := check(t.Context(), conn, "ok"); err != nil {
+		t.Fatalf("fast call: %v", err)
+	}
+}

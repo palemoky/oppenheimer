@@ -99,12 +99,31 @@ jobs:
         run: make up
       - name: Run end-to-end tests
         run: make e2e
+      - name: Collect Envoy sidecar logs
+        # 边车随 make up 启动（ADR-0020），服务间的调用失败时，熔断和超时的原因在它们的日志和统计里。
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-logs
+          for entry in gateway:19901 order:19902 payment:19903 inventory:19904 orderindex:19905; do
+            s="${entry%%:*}"
+            port="${entry##*:}"
+            docker logs "oppenheimer-envoy-$s-1" >"tmp/e2e-logs/envoy-$s.log" 2>&1 || true
+            curl -fsS -m 5 "127.0.0.1:$port/stats" >"tmp/e2e-logs/envoy-$s.stats" 2>&1 || true
+          done
       - name: Upload service logs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-logs
           path: tmp/e2e-logs/
+
+  # Envoy 边车配置的校验（deploy/envoy/，ADR-0020）：配置写错时在这里失败，不用等到 e2e 起不来。
+  envoy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Envoy configs
+        run: make envoy-validate
 
   # proto 的格式与规范检查，并确认入库的生成代码与 proto 定义一致。
   proto:

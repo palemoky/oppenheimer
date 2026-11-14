@@ -17,7 +17,12 @@ import (
 
 // testTTL 尽量短，让依赖过期的测试不用等太久；又不能太短，否则 -race 下调度延迟会让
 // 看门狗来不及续期。
-const testTTL = 300 * time.Millisecond
+//
+// 原来是 300 毫秒。看门狗每 TTL/3 续期一次，每次续期的超时也是 TTL/3，也就是 100 毫秒。
+// redisx 开始遵守 ctx 的截止时间之前，这个超时其实不起作用（客户端只认自己的 1 秒读超时），
+// 慢一点的续期照样成功；生效之后，CI 上别的包的测试同时在跑、续期连着几次超过 100 毫秒，
+// 锁就被判定丢失（TestLockOutlivesAcquireContext 在 CI 上失败过）。生产里租期是秒级的，不受影响。
+const testTTL = 900 * time.Millisecond
 
 // testCtx 给单个测试加超时保护，避免某个等待永远不返回。
 func testCtx(t *testing.T) context.Context {

@@ -74,6 +74,16 @@ func run(m *testing.M) int {
 		return 1
 	}
 
+	// 链路的接收端：服务把 span 导出到这里，trace_test.go 据此断言。没设就不起，对应的用例跳过。
+	if ep := os.Getenv(otlpAddrEnv); ep != "" {
+		otlp, err = startCollector(ep)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "start OTLP receiver: %v\n", err)
+			return 1
+		}
+		defer otlp.stop()
+	}
+
 	// 以时间为基数，重复运行时不会撞上之前的 SKU 和用户。
 	base := time.Now().UnixMilli() % 1_000_000_000 * 1000
 	nextSKU.Store(base)
@@ -118,6 +128,7 @@ type apiError struct {
 
 type response struct {
 	status int
+	header http.Header
 	body   []byte
 }
 
@@ -166,7 +177,7 @@ func call(ctx context.Context, method, path string, userID int64, idemKey string
 	if err != nil {
 		return response{}, err
 	}
-	return response{status: resp.StatusCode, body: b}, nil
+	return response{status: resp.StatusCode, header: resp.Header, body: b}, nil
 }
 
 func mustCall(t testing.TB, method, path string, userID int64, idemKey string, body any) response {
@@ -243,7 +254,9 @@ func getOrder(t testing.TB, userID int64, orderID string) order {
 
 func getStock(t testing.TB, skuID int64) stock {
 	t.Helper()
-	r := mustCall(t, http.MethodGet, "/api/v1/skus/"+strconv.FormatInt(skuID, 10)+"/stock", 1, "", nil)
+	// 每次用新的用户号：网关按用户加接口限流（getStock 默认 50/s），所有用例、所有轮询共用一个用户号会共用一个桶，
+	// 并行的用例一起轮询库存就会被限住。
+	r := mustCall(t, http.MethodGet, "/api/v1/skus/"+strconv.FormatInt(skuID, 10)+"/stock", newUser(), "", nil)
 	if r.status != http.StatusOK {
 		t.Fatalf("get stock %d: status %d: %s", skuID, r.status, r.body)
 	}
@@ -410,7 +423,10 @@ func TestFlashSaleNeverOversells(t *testing.T) {
 // 同一个幂等键被并发重复提交（用户连点、客户端重试），只能产生一个订单、扣一次库存。
 func TestConcurrentDuplicateSubmitCreatesOneOrder(t *testing.T) {
 	t.Parallel()
-	const attempts = 30
+	// 同一个用户的下单有按用户的限流（createOrder 默认 5/s、桶 10，限流在幂等之前，被限流的请求不会走到下单逻辑）。
+	// 并发发得太多，超出桶容量的请求会得到 429，而这个用例断言的是“每个请求都得到同一个订单”。
+	// 所以只发 8 个：加上最后一次换内容的请求共 9 个，不超过桶容量 10，任何一个都不会被限流；8 个并发足以打到去重的竞争。
+	const attempts = 8
 	sku, user, key := newSKU(t, 100), newUser(), newKey()
 
 	ids := make([]string, attempts)
@@ -647,6 +663,8 @@ func TestPurchaseLimit(t *testing.T) {
 		t.Fatalf("cancel: status %d: %s", r.status, r.body)
 	}
 	// 额度的恢复是异步的：库存服务消费取消事件，先释放 MySQL 的预占，再归还闸门里的占用。
+	// 这里每 50ms 下一次单，会超过 createOrder 的限额（5/s、桶 10）：被限流的请求得到 429，同样不是 202，
+	// 下一轮再试，令牌补充之后总能试到；429 的请求没有走到下单逻辑，不会误占额度。
 	eventually(t, 10*time.Second, "purchase quota to be restored after cancel", func() bool {
 		r := mustCall(t, http.MethodPost, "/api/v1/orders", user, newKey(), createOrderBody(sku, 2))
 		return r.status == http.StatusAccepted

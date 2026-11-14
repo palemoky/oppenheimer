@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// guardTimeout 是一次 Guard 调用的时限。
+const guardTimeout = time.Second
+
 // Guard 决定这一轮是否应该运行。用于“只在持有分布式锁时运行”。
 // 返回 false 表示跳过这一轮（不算错误）；返回 error 表示无法判断，也跳过并记 warn 日志。
 type Guard interface {
@@ -146,7 +149,11 @@ func (l *Loop) wait(ctx context.Context) {
 // round 执行一轮：先问 Guard，再调用 fn。fn 的错误和 panic 都不会让循环退出。
 func (l *Loop) round(ctx context.Context) {
 	if g := l.cfg.Guard; g != nil {
-		ok, err := g.Allow(ctx)
+		// Guard 通常是分布式锁（一次 Redis 调用）。给它单独的时限：它卡住时这一轮跳过，
+		// 而不是让周期任务跟着卡住、连停止都要等它（设计文档 1d 的 5.6）。
+		gctx, cancel := context.WithTimeout(ctx, guardTimeout)
+		ok, err := g.Allow(gctx)
+		cancel()
 		if err != nil {
 			l.logger.LogAttrs(ctx, slog.LevelWarn, "worker guard failed, skip round",
 				slog.String("component", l.cfg.Name), slog.Any("error", err))

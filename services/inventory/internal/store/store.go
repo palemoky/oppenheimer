@@ -84,17 +84,30 @@ func (s *Store) InTx(ctx context.Context, fn func(*Tx) error) error {
 	})
 }
 
-// GetStock 读取一个 SKU 的库存。不存在时 found 为 false。
+// GetStock 读取一个 SKU 的库存：sku_stock 里的数加上 stock_pending 里还没应用的增量。不存在时 found 为 false。
+//
+// 预占、确认、释放只往 stock_pending 里记增量，sku_stock 由后台的应用者异步更新（ADR-0018），
+// 所以 sku_stock 自己的三个数会落后。这里返回的是真实的数：任何据此做判断的地方（装载闸门、对账）
+// 都必须用它，不能直接读 sku_stock。
+//
+// 一条语句、一次一致性读：应用者是在一个事务里“更新 sku_stock、删掉已应用的增量”，
+// 这条语句要么看到它之前的状态，要么看到之后的，求出的和都一样，不会把同一笔增量算两次或漏掉。
 func (s *Store) GetStock(ctx context.Context, skuID int64) (stock Stock, found bool, err error) {
-	err = s.db.QueryRowContext(ctx,
-		`SELECT sku_id, available, reserved, sold, unit_price, currency, purchase_limit FROM sku_stock WHERE sku_id = ?`, skuID,
+	err = s.db.QueryRowContext(ctx, `
+		SELECT s.sku_id,
+		       s.available + COALESCE(p.da, 0), s.reserved + COALESCE(p.dr, 0), s.sold + COALESCE(p.ds, 0),
+		       s.unit_price, s.currency, s.purchase_limit
+		  FROM sku_stock s
+		  LEFT JOIN (SELECT sku_id, SUM(d_available) AS da, SUM(d_reserved) AS dr, SUM(d_sold) AS ds
+		               FROM stock_pending WHERE sku_id = ? GROUP BY sku_id) p ON p.sku_id = s.sku_id
+		 WHERE s.sku_id = ?`, skuID, skuID,
 	).Scan(&stock.SKUID, &stock.Available, &stock.Reserved, &stock.Sold, &stock.UnitPrice.Amount, &stock.UnitPrice.Currency,
 		&stock.PurchaseLimit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Stock{}, false, nil
 	}
 	if err != nil {
-		return Stock{}, false, fmt.Errorf("select sku_stock %d: %w", skuID, err)
+		return Stock{}, false, fmt.Errorf("select stock of sku %d: %w", skuID, err)
 	}
 	return stock, true, nil
 }
@@ -246,52 +259,35 @@ func (t *Tx) InsertReservationItems(ctx context.Context, orderID int64, items []
 	return nil
 }
 
-// ReserveStock 从可售转入预占。可售不足或 SKU 不存在时返回 false。
+// PendReserve 记一笔“从可售转入预占”的增量。qty 必须为正。
 //
-// 判断与扣减在同一条语句里，由行锁保证原子，这是防超卖的核心。
-func (t *Tx) ReserveStock(ctx context.Context, skuID int64, qty int32) (bool, error) {
-	res, err := t.tx.ExecContext(ctx,
-		`UPDATE sku_stock SET available = available - ?, reserved = reserved + ? WHERE sku_id = ? AND available >= ?`,
-		qty, qty, skuID, qty)
-	if err != nil {
-		return false, fmt.Errorf("reserve sku_stock %d: %w", skuID, err)
-	}
-	return affectedOne(res)
+// 这三个 Pend* 取代了直接改 sku_stock 的条件更新（ADR-0018）。它们不检查数量够不够：
+// 能不能卖由库存闸门在受理时原子地判断，这里只负责把已经发生的变化记下来。
+// 调用方（预占记录的状态机）保证每个订单的每次状态变化只发生一次，所以每笔增量只会被记一次。
+func (t *Tx) PendReserve(ctx context.Context, orderID, skuID int64, qty int32) error {
+	return t.pend(ctx, orderID, skuID, -int64(qty), int64(qty), 0)
 }
 
-// ConfirmStock 从预占转入已售。预占量不足或 SKU 不存在时返回 false。
-func (t *Tx) ConfirmStock(ctx context.Context, skuID int64, qty int32) (bool, error) {
-	res, err := t.tx.ExecContext(ctx,
-		`UPDATE sku_stock SET reserved = reserved - ?, sold = sold + ? WHERE sku_id = ? AND reserved >= ?`,
-		qty, qty, skuID, qty)
-	if err != nil {
-		return false, fmt.Errorf("confirm sku_stock %d: %w", skuID, err)
-	}
-	return affectedOne(res)
+// PendConfirm 记一笔“从预占转入已售”的增量。
+func (t *Tx) PendConfirm(ctx context.Context, orderID, skuID int64, qty int32) error {
+	return t.pend(ctx, orderID, skuID, 0, -int64(qty), int64(qty))
 }
 
-// ReleaseStock 从预占退回可售。预占量不足或 SKU 不存在时返回 false。
-func (t *Tx) ReleaseStock(ctx context.Context, skuID int64, qty int32) (bool, error) {
-	res, err := t.tx.ExecContext(ctx,
-		`UPDATE sku_stock SET reserved = reserved - ?, available = available + ? WHERE sku_id = ? AND reserved >= ?`,
-		qty, qty, skuID, qty)
-	if err != nil {
-		return false, fmt.Errorf("release sku_stock %d: %w", skuID, err)
-	}
-	return affectedOne(res)
+// PendRelease 记一笔“从预占退回可售”的增量。
+func (t *Tx) PendRelease(ctx context.Context, orderID, skuID int64, qty int32) error {
+	return t.pend(ctx, orderID, skuID, int64(qty), -int64(qty), 0)
 }
 
-// SKUExists 判断 SKU 是否存在。
-func (t *Tx) SKUExists(ctx context.Context, skuID int64) (bool, error) {
-	var one int
-	err := t.tx.QueryRowContext(ctx, `SELECT 1 FROM sku_stock WHERE sku_id = ?`, skuID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+func (t *Tx) pend(ctx context.Context, orderID, skuID, dAvailable, dReserved, dSold int64) error {
+	if dAvailable == 0 && dReserved == 0 && dSold == 0 {
+		return fmt.Errorf("pend sku %d of order %d: empty delta", skuID, orderID)
 	}
-	if err != nil {
-		return false, fmt.Errorf("select sku_stock %d: %w", skuID, err)
+	if _, err := t.tx.ExecContext(ctx,
+		`INSERT INTO stock_pending (sku_id, d_available, d_reserved, d_sold, order_id) VALUES (?, ?, ?, ?, ?)`,
+		skuID, dAvailable, dReserved, dSold, orderID); err != nil {
+		return fmt.Errorf("insert stock_pending for sku %d of order %d: %w", skuID, orderID, err)
 	}
-	return true, nil
+	return nil
 }
 
 // SKUs 读取一组 SKU 的单价和所属商家。不存在的 SKU 不出现在结果里。

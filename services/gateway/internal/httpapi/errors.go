@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json/v2"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -30,10 +32,49 @@ func writeError(c *gin.Context, status int, code, message string) {
 	writeJSON(c, status, oas.Error{Error: oas.ErrorDetail{Code: code, Message: message}})
 }
 
+// statusClientClosedRequest 是客户端在响应返回之前断开了连接时记下的状态码。它不是标准状态码，
+// 是 Nginx 的约定（client closed request），net/http 里没有对应的常量。客户端已经走了，这个响应没有人收，
+// 它的意义在访问日志和统计里：把“客户端放弃了”和“服务端出错了”（500）、“服务端超时了”（504）分开，
+// 否则客户端一断开，错误率和告警就跟着涨，而服务端其实没有问题。
+const statusClientClosedRequest = 499
+
+// codeClientClosedRequest 是 499 的原因码。
+const codeClientClosedRequest = "CLIENT_CLOSED_REQUEST"
+
+// clientClosed 报告客户端是否已经断开：请求自己的 ctx 被取消了。net/http 在连接断开时取消请求的 ctx。
+//
+// 判断依据只能是请求的 ctx，不能是下游返回的 Canceled：
+//   - withDeadline 设的总时限到期时，ctx 的错误是 DeadlineExceeded，不是 Canceled。那是服务端超时，仍然是 504。
+//   - 下游返回了 Canceled 而请求的 ctx 没有被取消，是下游自己的问题（比如它取消了它自己的调用），按原来的映射处理。
+func clientClosed(c *gin.Context) bool {
+	return errors.Is(c.Request.Context().Err(), context.Canceled)
+}
+
 // writeGRPCError 把下游错误转成 HTTP 响应。
-// code 优先用 errx 原因码，没有时用 gRPC 状态码名。
+// code 优先用 errx 原因码，没有时用 gRPC 状态码名。降级错误（errx.IsDegraded）一律是 503 加 Retry-After。
+//
+// 客户端已经断开时一律是 499，不看下游返回了什么：这时下游通常返回 Canceled，也可能恰好返回了别的错误，
+// 但不管是什么，都没有人在等这个响应了。
 func (s *server) writeGRPCError(c *gin.Context, err error) {
+	if clientClosed(c) {
+		// 记 INFO 而不是 ERROR（设计文档 1d 5.9）：客户端主动断开是正常现象（用户关了页面、客户端自己超时），
+		// 不是服务端的故障，不该触发告警。不完全不记：这一条带着断开时正在进行的下游调用和它的错误，
+		// 访问日志里只有一个 499，看不出请求当时卡在哪里。
+		s.logger.LogAttrs(c.Request.Context(), slog.LevelInfo, "client closed request",
+			slog.String("route", c.FullPath()), slog.Any("error", err))
+		writeError(c, statusClientClosedRequest, codeClientClosedRequest, "client closed request")
+		return
+	}
 	st, _ := status.FromError(err) // 非 gRPC 错误得到 Unknown 状态
+	if errx.IsDegraded(err) {
+		// 降级（设计文档 1d 的 6.2）：下游自己是好的，是它的依赖坏了或者功能被关掉了，这个请求现在做不了，什么都没有发生。
+		// 按原因码判断，不按 gRPC 码：降级错误的 gRPC 码是 FAILED_PRECONDITION（理由见 errx.Degraded），
+		// 按码映射会变成 409，客户端会以为是“当前状态不允许”而不再重试。
+		// 消息是下游特意写给调用方的（errx.Degraded 构造），可以透出。
+		// 不记日志：这是预期内的降级，不是 gateway 的故障；降级期间每个请求都会走到这里，状态在下游的 /degrade 里看。
+		writeDegraded(c, errx.Reason(err), st.Message())
+		return
+	}
 	code := errx.Reason(err)
 	if code == "" {
 		code = codeName(st.Code())
@@ -58,14 +99,19 @@ func httpStatusOf(c codes.Code) int {
 	case codes.AlreadyExists:
 		return http.StatusConflict
 	case codes.FailedPrecondition:
-		// INSUFFICIENT_STOCK 也属于此类，同为 409。
+		// INSUFFICIENT_STOCK 也属于此类，同为 409。降级错误的码也是 FAILED_PRECONDITION，但在 writeGRPCError 里先被拦下。
 		return http.StatusConflict
 	case codes.Unavailable:
+		// 也包括 Envoy 边车的路由超时（DownstreamHopTimeout）到期：边车回给 gateway 的是 Unavailable，
+		// 错误信息里有 upstream request timeout。这里不解析错误信息去把它改成 504：信息的格式是 Envoy 的实现细节，
+		// 而且进程里的同一个时限（WithHopTimeout）和边车的一样长，通常先到期的是进程里的那个，走下面的 504。
 		return http.StatusServiceUnavailable
 	case codes.ResourceExhausted:
 		// 目前只有下单的削峰（BACKLOGGED）。429 告诉客户端“稍后重试”，和下游故障的 503 分开。
 		return http.StatusTooManyRequests
 	case codes.DeadlineExceeded:
+		// 两种来源：gateway 的总时限（withDeadline，DefaultCallTimeout）到期，或者这一跳的时限
+		// （grpcx.WithHopTimeout，DownstreamHopTimeout）到期。对客户端都是“下游没有及时回答”。
 		return http.StatusGatewayTimeout
 	default:
 		return http.StatusInternalServerError

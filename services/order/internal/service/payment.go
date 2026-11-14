@@ -12,6 +12,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
@@ -64,6 +65,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	if ev.GetOrderId() <= 0 || ev.GetPaymentId() <= 0 {
 		return fmt.Errorf("%w: payment event without order_id or payment_id", ErrInvalidEvent)
 	}
+	otelx.SetOrder(ctx, ev.GetOrderId(), ev.GetUserId())
 	amount := completed.GetAmount()
 	if completed.GetSucceeded() && (amount == nil || amount.GetAmount() < 0 || amount.GetCurrency() == "") {
 		return fmt.Errorf("%w: succeeded payment %d without amount", ErrInvalidEvent, ev.GetPaymentId())
@@ -72,11 +74,12 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	var (
 		handled bool // false 表示该 payment_id 已经处理过，本次什么都没写
 		reply   *eventv1.PaymentResultHandled
+		paid    bool // 只给指标用：本次事务把订单置为了 PAID
 	)
 	now := s.now()
 	// 事务落在订单所在的分片上：订单行、payment_results 和 outbox 都在那个库里。
 	err := s.inTx(ctx, paymentTxRetry, ev.GetOrderId(), func(tx *store.Tx) error {
-		handled, reply = false, nil
+		handled, reply, paid = false, nil, false
 
 		// 先锁订单行：同一订单的重复投递在此排队，与取消、关单的条件更新也互斥。
 		o, err := tx.LockOrder(ctx, ev.GetOrderId())
@@ -149,9 +152,10 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 				// 行已被本事务锁住且状态刚读过，不应发生。
 				return fmt.Errorf("mark paid affected no rows for order %d", o.OrderID)
 			}
-			paid := newEvent(ref, now)
-			paid.Body = &eventv1.OrderEvent_Paid{Paid: &eventv1.OrderPaid{PaymentId: ev.GetPaymentId()}}
-			events = append(events, paid)
+			paidEv := newEvent(ref, now)
+			paidEv.Body = &eventv1.OrderEvent_Paid{Paid: &eventv1.OrderPaid{PaymentId: ev.GetPaymentId()}}
+			events = append(events, paidEv)
+			paid = true
 		}
 
 		if err := tx.InsertPaymentResult(ctx, &store.PaymentResult{
@@ -181,7 +185,11 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 		return nil
 	}
 	s.afterCommit(ctx, ev.GetOrderId())
+	if paid {
+		transitionDone(ctx, transPendingToPaid)
+	}
 	if reply.GetDisposition() == refundRequired {
+		otelx.SetReason(ctx, reply.GetReason())
 		s.logger.WarnContext(ctx, "payment requires refund",
 			"order_id", ev.GetOrderId(), "payment_id", ev.GetPaymentId(), "reason", reply.GetReason())
 	}
@@ -204,10 +212,17 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 // 会因为热库里订单和处理记录都没有了，而对一个正常付清的订单要求退款。
 //
 // 冷库查询失败时返回错误，消费者原地重试：不能在不知道订单是否存在的情况下给出涉及退款的答复。
+// 两次冷库查询经过冷库的熔断器（coldDecisionRead）：打开时立刻失败（错误不是 ErrNotFound，同样重试），
+// 每次最多 coldTimeout，不在热库的事务里等满事件的时限。只有 ErrNotFound 才算“冷库里没有”。
 func (s *Service) archivedReply(ctx context.Context, ev *eventv1.PaymentEvent) (
 	reply *eventv1.PaymentResultHandled, ref store.OrderRef, archived bool, err error,
 ) {
-	o, err := s.cold.GetOrder(ctx, ev.GetOrderId())
+	var o *store.Order
+	err = s.coldDecisionRead(ctx, func(ctx context.Context) error {
+		var err error
+		o, err = s.cold.GetOrder(ctx, ev.GetOrderId())
+		return err
+	})
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, ref, false, nil
 	}
@@ -215,7 +230,10 @@ func (s *Service) archivedReply(ctx context.Context, ev *eventv1.PaymentEvent) (
 		return nil, ref, false, fmt.Errorf("load archived order %d: %w", ev.GetOrderId(), err)
 	}
 	ref = store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}
-	switch _, err := s.cold.GetPaymentResult(ctx, ev.GetOrderId(), ev.GetPaymentId()); {
+	switch err := s.coldDecisionRead(ctx, func(ctx context.Context) error {
+		_, err := s.cold.GetPaymentResult(ctx, ev.GetOrderId(), ev.GetPaymentId())
+		return err
+	}); {
 	case err == nil:
 		return nil, ref, true, nil
 	case !errors.Is(err, store.ErrNotFound):

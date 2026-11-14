@@ -6,14 +6,18 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/oppenheimer/pkg/sharding"
 )
 
@@ -39,60 +43,52 @@ type Row struct {
 	SyncedAt time.Time
 }
 
-// Outcome 是一次 Upsert 的结果。
-type Outcome int
-
-const (
-	// Inserted 表示新插入了一行。
-	Inserted Outcome = iota + 1
-	// Updated 表示已有的行被更高版本的映像覆盖。
-	Updated
-	// Stale 表示已有的行版本不低于这次的映像，行没有任何变化（重复或乱序到达的旧消息）。
-	Stale
-)
-
-func (o Outcome) String() string {
-	switch o {
-	case Inserted:
-		return "inserted"
-	case Updated:
-		return "updated"
-	case Stale:
-		return "stale"
-	default:
-		return fmt.Sprintf("Outcome(%d)", int(o))
-	}
-}
-
-// Changed 报告这次写入是否改了行。
-func (o Outcome) Changed() bool { return o == Inserted || o == Updated }
-
 // Store 访问分片后的商家索引库。并发安全。
 type Store struct {
 	dbs    []*sql.DB
 	router *sharding.Router
 	stmts  []statements // 下标是 slot
+	// stmtRows 是一条写入语句最多带的行数，默认 MaxStatementRows。只有测试会改小它，用来覆盖切分。
+	stmtRows int
 }
 
 // statements 是一个 slot 上预先渲染好的语句，表名全部来自 sharding.Table。
 type statements struct {
-	upsert, list, listByStatus, get string
+	// upsertHead、upsertTail 是多行写入语句在 VALUES 元组前后的两段，中间按行数拼 (?, ...) 元组。
+	upsertHead, upsertTail  string
+	list, listByStatus, get string
 }
 
-// upsertTemplate 是索引表的写入语句，{T} 换成物理表名。
+// upsertColumns 是写入语句每行的列数（占位符个数）。
+const upsertColumns = 10
+
+// MaxStatementRows 是一条写入语句最多带的行数。
+//
+// MySQL 的预处理语句最多 65535 个占位符（协议里参数个数是 2 字节），每行 upsertColumns 个，
+// 所以一条语句最多 6553 行。驱动没有开 interpolateParams，参数走服务端预处理，这个限制是硬的。
+// 超过它的一组行在 UpsertRows 里切成几条语句，放在同一个事务里。
+const MaxStatementRows = math.MaxUint16 / upsertColumns
+
+// upsertHeadTemplate、upsertTailTemplate 是索引表的多行写入语句，{T} 换成物理表名，
+// 中间是 n 个 (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 元组（见 upsertSQL）。
 //
 // 幂等和定序全靠版本号（设计文档 1c 4.6）：消息至少一次投递，会重复、会重放旧的一段，全量和增量会交叠，
 // 所以不依赖到达顺序，只接受 src_version 更大的映像。版本相同或更小时每一列都保持原值，行完全不变，
 // 受影响行数为 0（mysqlx.Open 固定了“受影响行数 = 实际改变的行数”），synced_at 也不变。
+// 多行语句对每一行各自执行一遍 ON DUPLICATE KEY UPDATE，new 指的是这一行自己的 VALUES 元组，
+// 所以版本比较对每一行独立成立，和单行语句完全一样。
 //
 // ON DUPLICATE KEY UPDATE 的赋值从左到右执行，后面的表达式读到的是前面已经改过的值。
 // src_version 必须最后赋值：放在前面的话，后面每一列的比较都变成“新版本大于新版本”，永远为假，
 // 行就只有版本号在涨。TestUpsertAssignmentOrder 钉住这一点。
 //
 // merchant_id 是主键的一部分，写入后不变（设计文档 1c 4.2），不在更新列表里。
-const upsertTemplate = `INSERT INTO {T} (merchant_id, order_id, user_id, status, total_amount, currency,
+const (
+	upsertHeadTemplate = `INSERT INTO {T} (merchant_id, order_id, user_id, status, total_amount, currency,
     created_at, paid_at, src_version, synced_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new
+VALUES `
+	upsertTailTemplate = `
+AS new
 ON DUPLICATE KEY UPDATE
     user_id      = IF(new.src_version > {T}.src_version, new.user_id,      {T}.user_id),
     status       = IF(new.src_version > {T}.src_version, new.status,       {T}.status),
@@ -102,6 +98,8 @@ ON DUPLICATE KEY UPDATE
     paid_at      = IF(new.src_version > {T}.src_version, new.paid_at,      {T}.paid_at),
     synced_at    = IF(new.src_version > {T}.src_version, new.synced_at,    {T}.synced_at),
     src_version  = IF(new.src_version > {T}.src_version, new.src_version,  {T}.src_version)`
+	upsertTuple = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+)
 
 const rowColumns = `merchant_id, order_id, user_id, status, total_amount, currency, created_at, paid_at, src_version, synced_at`
 
@@ -145,13 +143,14 @@ func New(dbs []*sql.DB, router *sharding.Router) (*Store, error) {
 	for slot := range stmts {
 		t := sharding.Table(TableBase, slot)
 		stmts[slot] = statements{
-			upsert:       render(upsertTemplate, t),
+			upsertHead:   render(upsertHeadTemplate, t),
+			upsertTail:   render(upsertTailTemplate, t),
 			list:         render(listTemplate, t),
 			listByStatus: render(listByStatusTemplate, t),
 			get:          render(getTemplate, t),
 		}
 	}
-	return &Store{dbs: dbs, router: router, stmts: stmts}, nil
+	return &Store{dbs: dbs, router: router, stmts: stmts, stmtRows: MaxStatementRows}, nil
 }
 
 // Router 返回 Store 使用的分片布局。
@@ -163,37 +162,181 @@ func (s *Store) locate(merchantID int64) (*sql.DB, *statements) {
 	return s.dbs[s.router.DB(slot)], &s.stmts[slot]
 }
 
-// UpsertSQL 返回 slot 上的写入语句，只用于测试和排查。
-func (s *Store) UpsertSQL(slot int) string { return s.stmts[slot].upsert }
+// UpsertSQL 返回 slot 上带 n 行的写入语句，只用于测试和排查。
+func (s *Store) UpsertSQL(slot, n int) string { return upsertSQL(&s.stmts[slot], n) }
 
-// Upsert 把 r 写进它的商家所在的 slot，只有 r.Version 大于已有行的版本时才覆盖。syncedAt 写入 synced_at。
-func (s *Store) Upsert(ctx context.Context, r Row, syncedAt time.Time) (Outcome, error) {
-	db, st := s.locate(r.MerchantID)
-	var paidAt sql.NullTime
-	if !r.PaidAt.IsZero() {
-		paidAt = sql.NullTime{Time: r.PaidAt.UTC(), Valid: true}
+// upsertSQL 拼出带 n 个 VALUES 元组的写入语句。表名部分在 New 里渲染好，这里只重复固定的占位符元组。
+func upsertSQL(st *statements, n int) string {
+	var b strings.Builder
+	b.Grow(len(st.upsertHead) + n*(len(upsertTuple)+2) + len(st.upsertTail))
+	b.WriteString(st.upsertHead)
+	for i := range n {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(upsertTuple)
 	}
-	res, err := db.ExecContext(ctx, st.upsert,
-		r.MerchantID, r.OrderID, r.UserID, r.Status, r.TotalAmount, r.Currency,
-		r.CreatedAt.UTC(), paidAt, r.Version, syncedAt.UTC())
+	b.WriteString(st.upsertTail)
+	return b.String()
+}
+
+// WriteResult 是一次 UpsertRows 的结果。
+type WriteResult struct {
+	// Rows 是写入（发给 MySQL）的行数。
+	Rows int64
+	// Affected 是各条语句受影响行数之和。ON DUPLICATE KEY UPDATE 下每一行的贡献是：新插入 1，
+	// 被更高版本覆盖 2，版本不高、行没变 0（mysqlx.Open 固定了 ClientFoundRows=false，即“实际改变的行数”）。
+	// 所以 Affected = 插入数 + 2 × 更新数，只看它分不开插入和更新。
+	Affected int64
+	// Changed 是实际改变了索引的行数（插入数 + 更新数）的估计：每条语句取 min(受影响行数, 行数) 再求和。
+	//
+	// 一条语句里插入 I 行、更新 U 行、没变 S 行时，Rows = I+U+S，Affected = I+2U，
+	// 真实的 I+U 落在 [ceil(Affected/2), min(Affected, Rows)] 里。估计取上界，它在两种常见情况下是精确的：
+	//   - S = 0（正常消费，没有重放）：min 取到 Rows = I+U；
+	//   - U = 0（从头重建，只有插入和重放的旧版本）：min 取到 Affected = I。
+	// 只有同一条语句里同时有“被覆盖”和“没变”的行时才偏大，偏大的量是 min(U, S)。
+	// 要精确就得逐行看结果，多行语句给不了，为统计再读一次库不值得。
+	Changed int64
+}
+
+func (r *WriteResult) add(o WriteResult) {
+	r.Rows += o.Rows
+	r.Affected += o.Affected
+	r.Changed += o.Changed
+}
+
+// slotRows 是同一个 slot 上要写的一组行，按主键升序。
+type slotRows struct {
+	slot int
+	rows []Row
+}
+
+// UpsertRows 把 rows 写进各自商家所在的 slot，每一行只有版本大于已有行时才覆盖。syncedAt 写入 synced_at。
+// rows 里同一个 (merchant_id, order_id) 不能出现两次（调用方先合并，只留版本最高的）：出现时返回错误，什么也不写。
+// rows 为空时什么都不做。rows 本身不被修改。
+//
+// 写法：按库分组，每个库一个事务；库内按 slot 升序，每个 slot 一条多行语句，超过 MaxStatementRows 行时
+// 切成几条。一个库上只有一条语句时不开显式事务，直接自动提交，省掉 BEGIN 和 COMMIT 两次往返：
+// 没有积压时一批只有一条消息，这是最常见的情况。
+//
+// 两个库并行写、各自提交，不是原子的：一个成功一个失败时返回错误，调用方整批重做，
+// 成功的那一半靠版本比较成为空操作。返回错误时 WriteResult 为零值，不区分哪个库成功了。
+//
+// 锁（REPEATABLE READ）：多行语句逐行加锁，锁持有到事务提交。撞上已有行时对主键上那一行加 next-key 排他锁
+// （行和它前面的间隙），新行要在间隙里加插入意向锁，会被别人的间隙锁挡住。不同分区的批会同时写同一张表，
+// 如果两个事务以相反的顺序碰到两把锁（一个先 A 后 B，另一个先 B 后 A）就会死锁。
+// 所以每条语句里的行、每个事务里的表都按同一个全序排列：slot 升序，表内按主键 (merchant_id, order_id) 升序。
+// 这样在主键上每个事务都只会去等比自己已持有的锁更靠后的位置，形不成环。
+// 这只是把死锁降到最低，不是消除：二级索引 idx_merchant_status 按 (merchant_id, status, order_id) 排列，
+// 改状态时在它上面加锁的顺序跟着主键走，不是它自己的顺序，仍可能交叉。
+// 出现死锁或锁等待超时时整个事务回滚（锁等待超时 InnoDB 默认只回滚语句，这里由 InTx 回滚整个事务），
+// 错误原样包装返回，不是 Permanent，由消费者重试。
+func (s *Store) UpsertRows(ctx context.Context, rows []Row, syncedAt time.Time) (WriteResult, error) {
+	if len(rows) == 0 {
+		return WriteResult{}, nil
+	}
+	sorted := slices.Clone(rows)
+	slotOf := func(r Row) int { return s.router.ForMerchant(r.MerchantID) }
+	slices.SortFunc(sorted, func(a, b Row) int {
+		return cmp.Or(cmp.Compare(slotOf(a), slotOf(b)),
+			cmp.Compare(a.MerchantID, b.MerchantID), cmp.Compare(a.OrderID, b.OrderID))
+	})
+	// 排好序后按库、按 slot 切成连续的几段。
+	perDB := make([][]slotRows, len(s.dbs))
+	for i := 0; i < len(sorted); {
+		slot := slotOf(sorted[i])
+		j := i + 1
+		for ; j < len(sorted) && slotOf(sorted[j]) == slot; j++ {
+			if a, b := sorted[j-1], sorted[j]; a.MerchantID == b.MerchantID && a.OrderID == b.OrderID {
+				return WriteResult{}, fmt.Errorf("store: order %d of merchant %d appears more than once in one write",
+					b.OrderID, b.MerchantID)
+			}
+		}
+		db := s.router.DB(slot)
+		perDB[db] = append(perDB[db], slotRows{slot: slot, rows: sorted[i:j]})
+		i = j
+	}
+
+	results := make([]WriteResult, len(s.dbs))
+	errs := make([]error, len(s.dbs))
+	var wg sync.WaitGroup
+	for i, groups := range perDB {
+		if len(groups) == 0 {
+			continue
+		}
+		wg.Go(func() { results[i], errs[i] = s.writeDB(ctx, i, groups, syncedAt) })
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return WriteResult{}, err
+	}
+	var total WriteResult
+	for _, r := range results {
+		total.add(r)
+	}
+	return total, nil
+}
+
+// writeDB 把一个库上的几组行写进去：只有一条语句时自动提交，否则放在一个事务里。
+func (s *Store) writeDB(ctx context.Context, dbIndex int, groups []slotRows, syncedAt time.Time) (WriteResult, error) {
+	var chunks []slotRows
+	for _, g := range groups {
+		for c := range slices.Chunk(g.rows, s.stmtRows) {
+			chunks = append(chunks, slotRows{slot: g.slot, rows: c})
+		}
+	}
+	db := s.dbs[dbIndex]
+	if len(chunks) == 1 {
+		return s.execUpsert(ctx, db, chunks[0], syncedAt)
+	}
+	var total WriteResult
+	err := mysqlx.InTx(ctx, db, func(tx *sql.Tx) error {
+		for _, c := range chunks {
+			r, err := s.execUpsert(ctx, tx, c, syncedAt)
+			if err != nil {
+				return err
+			}
+			total.add(r)
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, fmt.Errorf("store: upsert order %d of merchant %d: %w", r.OrderID, r.MerchantID, err)
+		return WriteResult{}, fmt.Errorf("store: merchant index db %d: %w", dbIndex, err)
+	}
+	return total, nil
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// execUpsert 用一条多行语句写一组行（同一个 slot、已按主键排序、不超过 stmtRows 行）。
+func (s *Store) execUpsert(ctx context.Context, ex execer, c slotRows, syncedAt time.Time) (WriteResult, error) {
+	args := make([]any, 0, len(c.rows)*upsertColumns)
+	at := syncedAt.UTC()
+	for _, r := range c.rows {
+		var paidAt sql.NullTime
+		if !r.PaidAt.IsZero() {
+			paidAt = sql.NullTime{Time: r.PaidAt.UTC(), Valid: true}
+		}
+		args = append(args, r.MerchantID, r.OrderID, r.UserID, r.Status, r.TotalAmount, r.Currency,
+			r.CreatedAt.UTC(), paidAt, r.Version, at)
+	}
+	table := sharding.Table(TableBase, c.slot)
+	res, err := ex.ExecContext(ctx, upsertSQL(&s.stmts[c.slot], len(c.rows)), args...)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("store: upsert %d rows into %s (orders %d..%d): %w",
+			len(c.rows), table, c.rows[0].OrderID, c.rows[len(c.rows)-1].OrderID, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("store: rows affected: %w", err)
+		return WriteResult{}, fmt.Errorf("store: rows affected of %s: %w", table, err)
 	}
-	// INSERT ... ON DUPLICATE KEY UPDATE 的受影响行数：1 插入，2 更新了已有行，0 已有行没变。
-	switch n {
-	case 0:
-		return Stale, nil
-	case 1:
-		return Inserted, nil
-	case 2:
-		return Updated, nil
-	default:
-		return 0, fmt.Errorf("store: upsert order %d: unexpected rows affected %d", r.OrderID, n)
+	rows := int64(len(c.rows))
+	if n < 0 || n > 2*rows {
+		return WriteResult{}, fmt.Errorf("store: upsert %d rows into %s: unexpected rows affected %d", rows, table, n)
 	}
+	return WriteResult{Rows: rows, Affected: n, Changed: min(n, rows)}, nil
 }
 
 // ListQuery 是一次列表查询的条件。

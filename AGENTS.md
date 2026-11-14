@@ -79,7 +79,12 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。
-- 所有跨进程调用带 `context` 和超时。
+- 所有跨进程调用带 `context` 和超时。时限逐跳收紧：总时限只在入口设一次，每一跳给下一跳单独设一个更短的时限（服务之间用 `grpcx.WithHopTimeout`），同一个数也写在 Envoy 边车的出站路由上（`deploy/envoy/`），两处要一致。见 ADR-0020。
+- 重试的规则：只重试幂等的操作；一条调用链上只有一层重试（同步调用链上不重试，由客户端带幂等键重试；异步的由消费者重试）；退避带抖动；重试有上限，耗尽后的去向要明确。客户端库可能自己重试（go-redis 默认会），非幂等的操作要先确认它被执行两次的后果。
+- “自己是好的、依赖坏了或功能被关掉”时返回 `errx.Degraded`（`FAILED_PRECONDITION` 加降级原因码），不要返回 `UNAVAILABLE`：调用方的边车会把 `UNAVAILABLE` 算成这个服务的失败，连续 5 次就把整个服务摘掉。gateway 按原因码映射成 503。见设计文档 1d 的 6.16。
+- 边车看不到的依赖（Redis、MySQL 的从库和冷库）用 `pkg/breaker` 熔断；可以降级的功能在 `pkg/degrade` 登记开关，自动降级和人工开关走同一条代码路径。可选的依赖不能挡住启动（`redisx.OpenLazy`、`mysqlx.OpenLazy`）。
+- 消费者对普通错误不设重试上限（依赖不可用时让分区停住等它恢复），死信只收 handler 标成 `kafkax.Permanent` 的。所以 handler 里“数据本身不对、重试也不会成功”的错误必须标成 `Permanent`，否则会永久挡住分区。见 ADR-0021。
+- 服务之间的熔断和并发上限在 Envoy 边车的配置里，不在业务代码里；改之前先读设计文档 1d 的 5.3（实测的行为和三个坑）。
 - 并发代码必须有 `-race` 测试；一致性逻辑（幂等、扣减、状态机）必须有并发场景的测试。
 - 提交前通过 `make lint test`。CI（`.github/workflows/ci.yml`）会对每个 go module 跑 lint、build、vet 和带 `-race` 的测试。
 
@@ -93,7 +98,11 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 **可观测**
 
 - 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0004。
-- 日志用 `slog` 输出 JSON，带 trace id。
+- 日志用 `slog` 输出 JSON，带 trace id。手边有请求或消息处理的 ctx 时一律用带 ctx 的方法（`InfoContext` 这一类），trace id 是从 ctx 里取的。
+- 装配在 `pkg/otelx`（每个服务的 `run` 开头调用 `Setup`），gRPC、Kafka、MySQL、Redis、outbox 的链路和基础指标由 `pkg/` 里对应的包自动产生，业务代码不手工建 span、不重复记这些。业务指标用 `otelx.Counter` 等建在包级变量里。见设计文档 1d 第 8 节、ADR-0023。
+- **指标的标签只能是有限的枚举**（结果、原因码、规则名、topic）。订单号、用户号、SKU、IP、请求路径原文一律不进标签：每种标签组合是一条独立的时间序列。它们放在 span 上（`otelx.SetOrder`、`otelx.SetUser`）。
+- 只有服务端故障才把 span 标成 Error。库存不足、限流、降级是正常结果，用 `otelx.SetReason` 记原因码。
+- 加指标不能改业务行为，也不为了指标新增数据库或 Redis 查询；热路径上的标签组合预先建好，不要每次分配。
 
 **版本选择**
 

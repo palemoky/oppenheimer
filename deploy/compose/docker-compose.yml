@@ -15,6 +15,21 @@ x-mysql-shard: &mysql-shard
     retries: 30
     start_period: 20s
 
+# 每个服务一个 Envoy 边车（设计文档 1d 第 5 节、ADR-0020）。服务进程跑在宿主机上（make run 起的是二进制），
+# 边车在容器里：入站把请求转给 host.docker.internal 上的服务端口，出站的端口发布到宿主机的回环地址给服务用。
+# extra_hosts 让 host.docker.internal 在 Linux（CI）上也能解析；macOS 的容器运行时自带这个名字。
+# 镜像里没有 curl，健康检查用 bash 的 /dev/tcp 问管理端口的 /ready。
+x-envoy: &envoy
+  image: envoyproxy/envoy:v1.40.2
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9901 && printf \"GET /ready HTTP/1.1\\r\\nHost: envoy\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q LIVE <&3'"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+    start_period: 2s
+
 services:
   mysql:
     image: mysql:9.7.4
@@ -29,6 +44,11 @@ services:
       - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
+      # 默认的 151 不够用。这个实例上的连接池加起来已经是 164：inventory 50、payment 50、
+      # 商家索引 2 个库各 25、订单冷库 10、归档任务 4；集成测试的临时库也都建在它上面，
+      # 服务开着的时候跑测试会报 1040（Too many connections）。每个连接的固定开销很小，
+      # 给到 400 留出测试并行跑的余量。真正的约束仍然是各服务自己的连接池上限。
+      - --max-connections=400
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-oppenheimer}
       MYSQL_DATABASE: oppenheimer
@@ -417,6 +437,55 @@ services:
   # 连 kafka 的 INTERNAL 监听器（kafka:19092）：EXTERNAL 只对 localhost 广播，容器里连不上。
   # 只读模式：界面上不能删 topic、改位点、发消息。消息体是 protobuf，未配置 serde，只能看原始字节。
   # 不设登录，端口只绑定 127.0.0.1。
+  # ---- Envoy 边车（1d 步骤三）----
+  # 管理端口 19901 到 19905（只绑本机）：/stats 看每个集群的在途数、溢出次数、摘除次数，/clusters 看实例是否被摘除。
+  # 入站端口 15001 不发布：只有别的边车在容器网络里按容器名访问它。
+  envoy-gateway:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "gateway", "--service-node", "envoy-gateway"]
+    volumes:
+      - ../envoy/gateway.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19901:9901
+      - 127.0.0.1:15081:15081
+      - 127.0.0.1:15082:15082
+      - 127.0.0.1:15083:15083
+      - 127.0.0.1:15084:15084
+
+  envoy-order:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "order", "--service-node", "envoy-order"]
+    volumes:
+      - ../envoy/order.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19902:9901
+      - 127.0.0.1:15182:15182
+
+  envoy-payment:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "payment", "--service-node", "envoy-payment"]
+    volumes:
+      - ../envoy/payment.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19903:9901
+      - 127.0.0.1:15281:15281
+
+  envoy-inventory:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "inventory", "--service-node", "envoy-inventory"]
+    volumes:
+      - ../envoy/inventory.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19904:9901
+
+  envoy-orderindex:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "orderindex", "--service-node", "envoy-orderindex"]
+    volumes:
+      - ../envoy/orderindex.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19905:9901
+
   kafka-ui:
     image: ghcr.io/kafbat/kafka-ui:v1.5.0
     profiles: ["ui"]
@@ -440,6 +509,32 @@ services:
       timeout: 3s
       retries: 30
       start_period: 30s
+
+  # ---- 本机可观测后端（grafana/otel-lgtm，ADR-0023）----
+  # 一个容器里有 OpenTelemetry Collector、Tempo（链路）、Prometheus（指标）、Loki（日志）和 Grafana。
+  # 属于 profile `obs`，平时 make up 和 CI 不启动；make obs-up 启动，make obs-down 删除。
+  # 服务进程设了 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 就把链路和指标推过来（scripts/lib/obs.sh）。
+  # 数据不持久化：没有挂卷，容器删除或重建后全部丢失，只用来看。
+  # 端口只绑 127.0.0.1：OTLP gRPC 4317、OTLP HTTP 4318、Grafana 3000（默认账号 admin，密码 admin，镜像自带）。
+  # 就绪判断：Grafana 的 /api/health 返回 200 说明 Grafana 已起来；Collector 在它之后启动，
+  # 镜像自己的就绪标志是日志里的 "The OpenTelemetry collector and the Grafana LGTM stack are up and running."，
+  # 所以健康检查同时要求 Grafana 健康和 Collector 的 4317 端口在监听。
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.41.0
+    profiles: ["obs"]
+    # 内存：不设上限实测，空闲时约 450 MiB，几个请求、半分钟的数据之后约 740 MiB（Tempo、Prometheus、Loki、Grafana 和 Collector 各占一份）。
+    # 上限定 1536 MB，给长时间运行和压测时的采样数据留余量；超了容器会被 OOM 杀掉，数据丢失，重新 make obs-up 即可。
+    mem_limit: 1536m
+    ports:
+      - 127.0.0.1:${OTEL_GRPC_PORT:-4317}:4317
+      - 127.0.0.1:${OTEL_HTTP_PORT:-4318}:4318
+      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/api/health > /dev/null && (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
 
 volumes:
   mysql-data:

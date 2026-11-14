@@ -32,8 +32,17 @@ func TestProducerSend(t *testing.T) {
 	got := make(map[string]string)
 	for _, r := range readAll(t, brokers, topic, 2) {
 		got[string(r.Key)] = string(r.Value)
-		if string(r.Key) == "k1" && (len(r.Headers) != 1 || r.Headers[0].Key != "h" || string(r.Headers[0].Value) != "1") {
-			t.Errorf("k1 headers = %v", r.Headers)
+		if string(r.Key) == "k1" {
+			// 装配了链路时每条消息还会多一个 traceparent，见 telemetry_test.go；其余的 header 原样保留。
+			h := make(map[string]string)
+			for _, rh := range r.Headers {
+				if rh.Key != kafkax.TraceparentHeader {
+					h[rh.Key] = string(rh.Value)
+				}
+			}
+			if len(h) != 1 || h["h"] != "1" {
+				t.Errorf("k1 headers = %v", r.Headers)
+			}
 		}
 	}
 	if got["k1"] != "v1" || got["k2"] != "v2" {

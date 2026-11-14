@@ -48,6 +48,11 @@ type Reaper struct {
 	cfg    ReaperConfig
 	logger *slog.Logger
 	loop   *worker.Loop
+
+	// 下面两个字段只在 RunOnce 里读写。RunOnce 由 loop 串行调用。
+	// failing 表示上一轮列占用时闸门不可用；holdUntil 之前不回收未认领的占用，见 RunOnce。
+	failing   bool
+	holdUntil time.Time
 }
 
 // NewReaper 返回使用 svc 的闸门和时钟的回收任务。
@@ -89,13 +94,37 @@ type ReapStats struct {
 }
 
 // RunOnce 执行一轮回收。单笔占用失败只记日志，不中断整轮。
+//
+// 闸门恢复之后的半个宽限期内不回收未认领的占用（设计文档 1d 的 6.4）。回收任务按“受理了多久还没被认领”
+// 判断孤儿，前提是落库的消费者一直在认领。闸门不可用期间这个前提不成立：消费者认领不了，排队订单的
+// 等待时长却一直在涨。Redis 一恢复就照常回收的话，回收任务会和刚恢复的消费者抢着处理这些订单，
+// 抢赢了，用户拿到过 202 的订单就没了。等半个宽限期让消费者先把队列排空（队列长度有上限，见背压），
+// 真正的孤儿只是晚一点被归还。
+//
+// “闸门不可用过”有两个来源：本进程里闸门的熔断器打开过（受理、查询、落库都会喂它），
+// 或者回收任务自己上一轮列占用失败（这个实例可能只跑周期任务，没有别的调用去喂熔断器）。
+// 两个都是本进程的见闻：消费者在别的实例上、而只有那个实例连不上 Redis 时，这里看不到，不会等。
 func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 	var stats ReapStats
 	now := r.svc.now()
 	ids, err := r.holdsBefore(ctx, now.Add(-r.cfg.Grace))
 	if err != nil {
-		r.logger.ErrorContext(ctx, "list holds failed", "error", err)
+		if !r.failing || !isBreakerOpen(err) {
+			r.logger.ErrorContext(ctx, "list holds failed", "error", err)
+		}
+		r.failing = true
 		return stats
+	}
+	holdOff := r.cfg.Grace / 2
+	if r.failing {
+		r.failing = false
+		r.holdUntil = now.Add(holdOff)
+	}
+	if now.Before(r.holdUntil) || r.svc.gateRecoveredWithin(holdOff) {
+		if len(ids) > 0 {
+			r.logger.InfoContext(ctx, "stock gate just recovered, not reaping unclaimed holds yet", "candidates", len(ids))
+		}
+		ids = nil
 	}
 	for _, id := range ids {
 		res, err := r.returnIfUnclaimed(ctx, id)
@@ -106,6 +135,7 @@ func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 		switch res {
 		case stockgate.ReapReturned:
 			stats.Returned++
+			reclaimed(ctx, reclaimOrphanHold)
 			r.logger.WarnContext(ctx, "orphan hold returned", "order_id", id)
 		case stockgate.ReapClaimed:
 			// 列出之后刚被消费者认领：它赢了，占用由订单的终态归还。
@@ -129,20 +159,29 @@ func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 	return stats
 }
 
-func (r *Reaper) claimedBefore(ctx context.Context, before time.Time) ([]int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, reapCallTimeout)
-	defer cancel()
-	return r.svc.gate.ClaimedBefore(ctx, before, r.cfg.BatchSize)
+func (r *Reaper) claimedBefore(ctx context.Context, before time.Time) (ids []int64, err error) {
+	err = r.svc.gateCallWithin(ctx, reapCallTimeout, func(ctx context.Context) error {
+		var err error
+		ids, err = r.svc.gate.ClaimedBefore(ctx, before, r.cfg.BatchSize)
+		return err
+	})
+	return ids, err
 }
 
-func (r *Reaper) holdsBefore(ctx context.Context, before time.Time) ([]int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, reapCallTimeout)
-	defer cancel()
-	return r.svc.gate.HoldsBefore(ctx, before, r.cfg.BatchSize)
+func (r *Reaper) holdsBefore(ctx context.Context, before time.Time) (ids []int64, err error) {
+	err = r.svc.gateCallWithin(ctx, reapCallTimeout, func(ctx context.Context) error {
+		var err error
+		ids, err = r.svc.gate.HoldsBefore(ctx, before, r.cfg.BatchSize)
+		return err
+	})
+	return ids, err
 }
 
-func (r *Reaper) returnIfUnclaimed(ctx context.Context, orderID int64) (stockgate.ReapResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, reapCallTimeout)
-	defer cancel()
-	return r.svc.gate.ReturnIfUnclaimed(ctx, orderID)
+func (r *Reaper) returnIfUnclaimed(ctx context.Context, orderID int64) (res stockgate.ReapResult, err error) {
+	err = r.svc.gateCallWithin(ctx, reapCallTimeout, func(ctx context.Context) error {
+		var err error
+		res, err = r.svc.gate.ReturnIfUnclaimed(ctx, orderID)
+		return err
+	})
+	return res, err
 }

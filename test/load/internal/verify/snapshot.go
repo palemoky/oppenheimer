@@ -87,7 +87,7 @@ func ReservationStatusName(s int) string {
 	}
 }
 
-// SKUStock 是 sku_stock 的一行。
+// SKUStock 是一个 SKU 的三个库存数（Snapshot.Stock 里是真实数，RawStock 里是 sku_stock 的原始值）。
 type SKUStock struct {
 	SKUID     int64
 	Available int64
@@ -150,7 +150,13 @@ type Snapshot struct {
 	// Initial 是各 SKU 灌入时的库存（命令行参数）。
 	Initial map[int64]int64
 
-	Stock        map[int64]SKUStock
+	// Stock 是库存的真实数：sku_stock 的值加上 stock_pending 里没有应用的增量。检查用它。
+	Stock map[int64]SKUStock
+	// RawStock 是 sku_stock 表里的原始值（落后于真实数），只用来检查恒等式和报告第 22 条。
+	// 为 nil 时（测试直接构造的 Snapshot）只检查 Stock。
+	RawStock map[int64]SKUStock
+	// Pending 是 stock_pending 里还没有应用的增量，按 SKU 汇总；空表为空 map。
+	Pending      map[int64]PendingSKU
 	Reservations map[int64]Reservation
 	Orders       map[int64]Order
 	// OrdersByIdem 以 (user_id, 幂等键) 索引 Orders。

@@ -31,9 +31,67 @@
 #   BENCH_LOAD_ARGS       追加给 load run 的参数
 #   BENCH_OUT             输出目录，默认 tmp/bench/<时间戳>-<arch>-<mode>
 #   LOG_LEVEL             服务和压测工具的日志级别，默认 warn
+#
+# 两组可选的对比，默认都不跑；不设下面这些变量时，脚本的行为和输出与加它们之前完全相同。
+#   BENCH_SWEEP           默认 1。设为 0 跳过上面按并发档的压测，只跑下面开启的对比
+#   BENCH_OPEN            设为 1 加一组开环档位：load run -mode open 按固定的到达速率发下单请求，
+#                         不管上一个有没有返回。每档输出计划速率、受理速率、被背压拒绝（429 BACKLOGGED）的比例、
+#                         受理延迟（从计划发出的时刻算）的 p50/p99、未发出数（在途请求到上限而没发出的），
+#                         看受理端在多大的到达速率下开始拒绝、延迟是否稳住。汇总在 $BENCH_OUT/summary-open.tsv
+#   BENCH_OPEN_RATES      开环的速率档（请求/秒），空格分隔，默认 "200 500 1000 2000 4000"
+#   BENCH_OPEN_REPEAT     每档运行次数，默认 1
+#   BENCH_OPEN_MAX_IN_FLIGHT  开环在途请求上限，默认 2000
+#   BENCH_OPEN_DRAIN      开环压测结束后轮询受理订单最终状态的时间上限，默认 10s（落库吞吐另从库里统计）
+#   BENCH_POLL            设为 1 加一个“轮询压力下的落库吞吐”对比：同样的开环下单压力跑两次，
+#                         一次没有额外查询压力，一次同时用 load poll 对最近受理的订单高频查询。
+#                         落库吞吐沿用上面的办法（库里 pending_payment 的数量除以第一个请求到最后一次落库的时间），
+#                         输出两次的落库吞吐和它们的比值。汇总在 $BENCH_OUT/summary-poll.tsv
+#   BENCH_POLL_RATE       对比里的开环下单速率，默认 2000
+#   BENCH_POLL_DURATION   对比里每次的下单时长，默认同 BENCH_DURATION
+#   BENCH_POLL_CONCURRENCY  load poll 的 worker 数，默认 64
+#   BENCH_POLL_INTERVAL_REQ  load poll 每个 worker 两次查询的间隔，默认 10ms（约 c/interval 次查询每秒）
+#   BENCH_POLL_RECENT     load poll 从最近受理的多少个订单里随机选，默认 2000
+#   BENCH_POLL_REPEAT     对比重复次数（每次含无查询和有查询各一轮），默认 1
+#   BENCH_OPEN_QUIET_TIMEOUT  开环和对比各轮结束后等落库停止的上限（秒），默认 1200
+#
+# gateway 的限流（ADR-0019）：上面所有的轮次都以 RATE_LIMIT=off 启动 gateway，量的是下单和落库的吞吐，
+# 限流会把结果盖住。下面的对比单独量限流本身：
+#   BENCH_RATELIMIT       设为 1 加一组限流对比，默认不跑。同样的开环下单压力跑两轮：
+#                         RATE_LIMIT=on（默认的按用户限额，按 IP 关掉，限流的 Redis 是缓存实例）和 RATE_LIMIT=off 作对照。
+#                         压力只用很少的用户号，速率远超这些用户的配额总和（默认 20 个用户 x 每秒 5 单 = 100 单/秒，速率 1000），
+#                         预期开着限流时受理速率稳定在配额附近、其余被限流（429 RATE_LIMITED）、受理延迟不升高。
+#                         每轮输出计划速率、受理速率、被限流和被背压拒绝（429 BACKLOGGED）的比例、受理延迟 p50/p99、落库吞吐。
+#                         汇总在 $BENCH_OUT/summary-ratelimit.tsv
+#   BENCH_RATELIMIT_RATE      对比里的开环下单速率，默认 1000
+#   BENCH_RATELIMIT_USERS     对比里的用户数（用户号取 [1, N]），默认 20
+#   BENCH_RATELIMIT_DURATION  对比里每轮的下单时长，默认同 BENCH_DURATION
+#   BENCH_RATELIMIT_REPEAT    对比重复次数（每次含限流开和关各一轮），默认 1
+#
+# 可观测（ADR-0023，scripts/lib/obs.sh）：make obs-up 起着 otel-lgtm 时，服务默认把链路和指标导出过去（OBS=auto）。
+# 压测时全量采样每秒几万个 span 会影响测量，所以默认按 1% 采样：
+#   OBS                   auto（默认，后端在运行就导出）、on（后端没起就报错）、off（不导出，做对照组）
+#   OTEL_TRACES_SAMPLER   默认 parentbased_traceidratio
+#   OTEL_TRACES_SAMPLER_ARG  默认 0.01
+#   OTEL_METRIC_EXPORT_INTERVAL  指标导出间隔（毫秒），默认 10000
+# 这几个变量调用方已设就原样用。要量可观测本身的代价：同样的参数分别用 OBS=off 和 OBS=on 各跑一次。
+#
+# 服务之间的 gRPC 调用默认经过 Envoy 边车（ADR-0020，deploy/envoy/，端口见 scripts/lib/sidecar.sh），
+# 所以上面所有轮次的数字都包含边车这两跳；SIDECAR=off 时直连。1a 没有服务间调用的边车，BENCH_ARCH=1a 时不经过边车。
+# 下面的对比量边车本身的代价：
+#   BENCH_SIDECAR         设为 1 加一组边车对比，默认不跑。同样的开环下单压力（默认每秒 500，低于落库能力，
+#                         这样受理延迟反映的是路径上多出来的跳数而不是排队）跑两轮：SIDECAR=on 和 SIDECAR=off。
+#                         输出两轮的受理延迟 p50/p99、落库吞吐，以及 on 减 off 的差值（边车这两跳给下单加了多少延迟）。
+#                         汇总在 $BENCH_OUT/summary-sidecar.tsv
+#   BENCH_SIDECAR_RATE      对比里的开环下单速率，默认 500
+#   BENCH_SIDECAR_DURATION  对比里每轮的下单时长，默认同 BENCH_DURATION
+#   BENCH_SIDECAR_REPEAT    对比重复次数（每次含 on 和 off 各一轮），默认 1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=lib/sidecar.sh
+. "$ROOT/scripts/lib/sidecar.sh"
+# shellcheck source=lib/obs.sh
+. "$ROOT/scripts/lib/obs.sh"
 ARCH="${BENCH_ARCH:-1b}"
 BIN="${BENCH_BIN_DIR:-$ROOT/bin}"
 case "$BIN" in /*) ;; *) BIN="$ROOT/$BIN" ;; esac
@@ -62,16 +120,56 @@ MODE="${BENCH_MODE:-closed}"
 POLL_INTERVAL="${BENCH_POLL_INTERVAL:-50ms}"
 POLL_TIMEOUT=30s
 QUIET_TIMEOUT="${BENCH_QUIET_TIMEOUT:-}"
+# 1a 没有服务间的边车配置，直连。
+if [ "$ARCH" = 1a ]; then SIDECAR=off; fi
+# 开环和轮询对比的参数（只在 BENCH_OPEN=1 或 BENCH_POLL=1 时用到）。
+SWEEP="${BENCH_SWEEP:-1}"
+OPEN="${BENCH_OPEN:-0}"
+POLL="${BENCH_POLL:-0}"
+OPEN_RATES="${BENCH_OPEN_RATES:-200 500 1000 2000 4000}"
+OPEN_REPEAT="${BENCH_OPEN_REPEAT:-1}"
+OPEN_MAX_IN_FLIGHT="${BENCH_OPEN_MAX_IN_FLIGHT:-2000}"
+OPEN_DRAIN="${BENCH_OPEN_DRAIN:-10s}"
+OPEN_POLL_INTERVAL="${BENCH_POLL_INTERVAL:-50ms}"
+OPEN_QUIET_TIMEOUT="${BENCH_OPEN_QUIET_TIMEOUT:-1200}"
+POLL_RATE="${BENCH_POLL_RATE:-2000}"
+POLL_DURATION="${BENCH_POLL_DURATION:-}"
+POLL_CONC="${BENCH_POLL_CONCURRENCY:-64}"
+POLL_REQ_INTERVAL="${BENCH_POLL_INTERVAL_REQ:-10ms}"
+POLL_RECENT="${BENCH_POLL_RECENT:-2000}"
+POLL_REPEAT="${BENCH_POLL_REPEAT:-1}"
+RATELIMIT="${BENCH_RATELIMIT:-0}"
+RL_RATE="${BENCH_RATELIMIT_RATE:-1000}"
+RL_USERS="${BENCH_RATELIMIT_USERS:-20}"
+RL_DURATION="${BENCH_RATELIMIT_DURATION:-}"
+RL_REPEAT="${BENCH_RATELIMIT_REPEAT:-1}"
+SC_BENCH="${BENCH_SIDECAR:-0}"
+SC_RATE="${BENCH_SIDECAR_RATE:-500}"
+SC_DURATION="${BENCH_SIDECAR_DURATION:-}"
+SC_REPEAT="${BENCH_SIDECAR_REPEAT:-1}"
 case "$MODE" in
   closed) QUIET_TIMEOUT="${QUIET_TIMEOUT:-180}" ;;
   fire) POLL_INTERVAL=1ms POLL_TIMEOUT=1ms QUIET_TIMEOUT="${QUIET_TIMEOUT:-1200}" ;;
   *) echo "BENCH_MODE must be closed or fire" >&2; exit 2 ;;
 esac
 
+for v in "$SWEEP" "$OPEN" "$POLL"; do
+  case "$v" in 0|1) ;; *) echo "BENCH_SWEEP, BENCH_OPEN and BENCH_POLL must be 0 or 1" >&2; exit 2 ;; esac
+done
+case "$SC_BENCH" in 0|1) ;; *) echo "BENCH_SIDECAR must be 0 or 1" >&2; exit 2 ;; esac
+case "$RATELIMIT" in 0|1) ;; *) echo "BENCH_RATELIMIT must be 0 or 1" >&2; exit 2 ;; esac
+POLL_DURATION="${POLL_DURATION:-$DURATION}"
+RL_DURATION="${RL_DURATION:-$DURATION}"
+SC_DURATION="${SC_DURATION:-$DURATION}"
+
 TS="$(date +%Y%m%d-%H%M%S)"
 OUT="${BENCH_OUT:-$ROOT/tmp/bench/$TS-$ARCH-$MODE}"
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.tsv"
+SUMMARY_OPEN="$OUT/summary-open.tsv"
+SUMMARY_POLL="$OUT/summary-poll.tsv"
+SUMMARY_RL="$OUT/summary-ratelimit.tsv"
+SUMMARY_SC="$OUT/summary-sidecar.tsv"
 
 export LOG_LEVEL="${LOG_LEVEL:-warn}"
 export KAFKA_BROKERS="${KAFKA_BROKERS:-127.0.0.1:9092}"
@@ -138,13 +236,25 @@ on_exit() {
 trap on_exit EXIT
 trap 'log interrupted; exit 130' INT TERM
 
+# gateway 的限流开关，默认关；BENCH_RATELIMIT 的对比轮次在启动前把它设为 on，轮次结束后设回 off。
+GW_RATE_LIMIT=off
+
 start_svc() {
   local s="$1" dir="$2" i pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >"$dir/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
-    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >"$dir/payment.log" 2>&1 & ;;
-    gateway) "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 INVENTORY_ADDR="$SC_ORDER_INVENTORY" "$BIN/order" >"$dir/order.log" 2>&1 & ;;
+    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 ORDER_ADDR="$SC_PAYMENT_ORDER" "$BIN/payment" >"$dir/payment.log" 2>&1 & ;;
+    # gateway 默认以 RATE_LIMIT=off 启动：这个脚本量的是下单和落库的吞吐，默认的限流（按 IP 每秒 200）
+    # 会把结果盖住，看起来像“吞吐上不去”。只有 BENCH_RATELIMIT 的对比轮次（GW_RATE_LIMIT=on）才开限流，
+    # 那时按 IP 的限额仍然关掉（压力全部来自 127.0.0.1，开着就只剩按 IP 的效果），按用户的用默认值，
+    # 状态放在缓存实例上（和服务里缓存用的是同一个 Redis，前缀跟本轮的 REDIS_PREFIX，轮次结束时一并清理）。
+    # 调用者 shell 里残留的 RATE_LIMIT_USER、RATE_LIMIT_ROUTE 会改变限额，这里清掉。
+    # shellcheck disable=SC2086 # SC_GATEWAY_ADDRS 故意按空格拆成几个 KEY=VALUE
+    gateway) env -u RATE_LIMIT_USER -u RATE_LIMIT_ROUTE $SC_GATEWAY_ADDRS \
+      RATE_LIMIT="$GW_RATE_LIMIT" RATE_LIMIT_IP=off \
+      RATE_LIMIT_REDIS_ADDR="$CACHE_REDIS_ADDR" RATE_LIMIT_REDIS_PREFIX="$REDIS_PREFIX" \
+      "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
   esac
   pid=$!
   eval "pid_$s=$pid"
@@ -179,7 +289,10 @@ landed_count() { sql -e "SELECT COUNT(*) FROM ($(all_orders_sql status "WHERE st
 
 # ---------- 准备 ----------
 
-for p in 8080 8081 8082 8083; do
+sidecar_setup
+# 压测默认 1% 采样；服务是后面 start_svc 启动的，继承这里 export 的变量。
+obs_setup parentbased_traceidratio 0.01
+for p in 8080 8081 8082 8083 8089; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2
     exit 2
@@ -214,9 +327,77 @@ log "output $OUT"
 
 # ---------- 每一轮 ----------
 
+# summarize_open 把开环或轮询对比的一轮汇总成一行：开环写 summary-open.tsv，对比写 summary-poll.tsv。
+# 落库吞吐的算法和上面按并发档的一样：库里 pending_payment 的数量，除以从压测开始到最后一次落库（updated_at）的时间。
+summarize_open() {
+  local dir="$1" n="$2" t0="$3" out="$SUMMARY_OPEN" label="$ROUND_RATE"
+  if [ "$ROUND_KIND" = poll ]; then
+    out="$SUMMARY_POLL"
+    if [ "$ROUND_POLLER" = 1 ]; then label=polled; else label=baseline; fi
+  elif [ "$ROUND_KIND" = rl ]; then
+    out="$SUMMARY_RL"
+    label="$GW_RATE_LIMIT"
+  elif [ "$ROUND_KIND" = sc ]; then
+    out="$SUMMARY_SC"
+    label="${SIDECAR:-on}"
+  fi
+  python3 -I - "$ROUND_KIND" "$dir" "$label" "$n" "$t0" >>"$out" <<'PY'
+import json, sys, datetime
+kind, d, label, n, t0 = sys.argv[1:]
+try:
+    r = json.load(open(d + "/report.json"))
+except Exception:
+    r = {}
+o = r.get("open") or {}
+oc = o.get("outcomes", {})
+sent = o.get("sent", 0)
+win = o.get("send_window_seconds", 0)
+acc = oc.get("accepted", 0)
+acc_rate = round(acc / win, 1) if win else 0
+back_pct = round(100.0 * oc.get("backlogged", 0) / sent, 2) if sent else 0
+lat = o.get("accepted_from_schedule", {})
+cnt, lo, hi = (open(d + "/db-landed.txt").read().split() + ["NULL"] * 3)[:3]
+cnt = int(cnt)
+start = r.get("started_at")
+st = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() if start else float(t0)
+land = round(cnt / (float(hi) - st), 1) if cnt and hi != "NULL" and float(hi) > st else 0
+if kind == "sc":
+    row = [label, n, o.get("rate", 0), o.get("planned", 0), acc, acc_rate,
+           lat.get("p50_ms", 0), lat.get("p99_ms", 0), cnt, land]
+elif kind == "rl":
+    lim_pct = round(100.0 * oc.get("rate_limited", 0) / sent, 2) if sent else 0
+    row = [label, n, o.get("rate", 0), o.get("planned", 0), sent, acc, acc_rate, lim_pct, back_pct,
+           lat.get("p50_ms", 0), lat.get("p99_ms", 0), cnt, land]
+elif kind == "open":
+    row = [label, n, o.get("planned", 0), sent, o.get("dropped", 0), acc, acc_rate, back_pct,
+           oc.get("rate_limited", 0), oc.get("timeout", 0), lat.get("p50_ms", 0), lat.get("p99_ms", 0), cnt, land]
+else:
+    try:
+        p = json.load(open(d + "/poll.json"))
+    except Exception:
+        p = {}
+    pl = p.get("latency", {})
+    row = [label, n, o.get("planned", 0), acc, acc_rate, cnt, land,
+           p.get("requests", 0), p.get("per_second", 0), pl.get("p50_ms", 0), pl.get("p99_ms", 0)]
+print("\t".join(str(x) for x in row))
+PY
+  log "$(basename "$dir"): $(tail -n 1 "$out")"
+}
+
+
+# run_one 跑一轮。c 是并发数（BENCH_OPEN、BENCH_POLL 的轮次里只是个标签，用来区分 topic 前缀和目录名）。
+# 调用方可以在调用前设置 ROUND_KIND（sweep、open、poll，默认 sweep）、ROUND_NAME、ROUND_RATE、ROUND_POLLER，
+# 不设时就是原来按并发档的一轮。
+ROUND_KIND=sweep
+ROUND_NAME=""
+ROUND_RATE=""
+ROUND_POLLER=0
+ROUND_USERS=""
 run_one() {
-  local c="$1" n="$2" name dir run_ts s pid t0 t1 last stable deadline count prev
-  name="c${c}-r${n}"
+  local c="$1" n="$2" name dir run_ts s pid t0 t1 last stable deadline count prev quiet="$QUIET_TIMEOUT" poll_pid=""
+  name="${ROUND_NAME:-c${c}-r${n}}"
+  if [ "$ROUND_KIND" != sweep ]; then quiet="$OPEN_QUIET_TIMEOUT"; fi
+  local users="${ROUND_USERS:-$USERS}"
   dir="$OUT/$name"
   mkdir -p "$dir"
   run_ts="$(date +%s)"
@@ -229,6 +410,8 @@ run_one() {
   done
   sql -e "$q"
 
+  # SIDECAR 在 BENCH_SIDECAR 的对比里按轮变化，每一轮重新算下游地址。
+  sidecar_setup
   # inventory 先起（它建表），灌入 SKU 后再起其他服务。
   start_svc inventory "$dir"
   sql "${DB_PREFIX}inventory_db" -e \
@@ -239,18 +422,58 @@ run_one() {
   fi
 
   for s in $SERVICES; do eval "cpu0_$s=$(cpu_seconds "$(getv "pid_$s")")"; done
-  log "$name: load run c=$c duration $DURATION"
+  case "$ROUND_KIND" in
+    sweep) log "$name: load run c=$c duration $DURATION" ;;
+    open) log "$name: load run -mode open rate $ROUND_RATE duration $DURATION" ;;
+    poll) log "$name: load run -mode open rate $ROUND_RATE duration $POLL_DURATION, poller $ROUND_POLLER" ;;
+    rl) log "$name: load run -mode open rate $ROUND_RATE duration $RL_DURATION, users $users, rate limit $GW_RATE_LIMIT" ;;
+    sc) log "$name: load run -mode open rate $ROUND_RATE duration $SC_DURATION, SIDECAR=${SIDECAR:-on}" ;;
+  esac
   ( sleep 15; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' >"$dir/docker-stats.txt" 2>&1 ) &
   local stats_pid=$!
   t0="$(now)"
   set +e
-  # shellcheck disable=SC2086 # BENCH_LOAD_ARGS 故意按空格拆分
-  /usr/bin/time -p "$LOAD" run -c "$c" -duration "$DURATION" -skus "$SKU_LIST" -users "$USERS" -qty "$QTY" \
-    -pay 0 -cancel 0 -poll-interval "$POLL_INTERVAL" -poll-timeout "$POLL_TIMEOUT" \
-    -log-level "$LOG_LEVEL" -progress 0 -run-id "b$run_ts$c$n" \
-    -ledger "$dir/ledger.jsonl" -json "$dir/report.json" ${BENCH_LOAD_ARGS:-} \
-    >"$dir/report.txt" 2>"$dir/load.log"
+  case "$ROUND_KIND" in
+    sweep)
+      # shellcheck disable=SC2086 # BENCH_LOAD_ARGS 故意按空格拆分
+      /usr/bin/time -p "$LOAD" run -c "$c" -duration "$DURATION" -skus "$SKU_LIST" -users "$USERS" -qty "$QTY" \
+        -pay 0 -cancel 0 -poll-interval "$POLL_INTERVAL" -poll-timeout "$POLL_TIMEOUT" \
+        -log-level "$LOG_LEVEL" -progress 0 -run-id "b$run_ts$c$n" \
+        -ledger "$dir/ledger.jsonl" -json "$dir/report.json" ${BENCH_LOAD_ARGS:-} \
+        >"$dir/report.txt" 2>"$dir/load.log"
+      ;;
+    open|poll|rl|sc)
+      local dur="$DURATION" drain="$OPEN_DRAIN"
+      if [ "$ROUND_KIND" = poll ]; then
+        # 对比的两轮都只在下单结束后查一下（drain 1s），避免收尾阶段的轮询变成额外的查询压力。
+        dur="$POLL_DURATION" drain=1s
+      fi
+      if [ "$ROUND_KIND" = rl ]; then
+        # 开限流时用户号很少，收尾轮询自己的 getOrder 也会被限流，drain 没有意义，查一下就结束。
+        dur="$RL_DURATION" drain=1s
+      fi
+      if [ "$ROUND_KIND" = sc ]; then
+        # 边车对比：查一下终态就结束，落库吞吐另从库里统计。
+        dur="$SC_DURATION" drain=1s
+      fi
+      if [ "$ROUND_POLLER" = 1 ]; then
+        # 先于下单起动：load poll 会等账本出现，并随账本的增长追最近受理的订单。
+        "$LOAD" poll -orders-from "$dir/ledger.jsonl" -c "$POLL_CONC" -interval "$POLL_REQ_INTERVAL" \
+          -recent "$POLL_RECENT" -duration "$dur" -log-level "$LOG_LEVEL" -json "$dir/poll.json" \
+          >"$dir/poll.txt" 2>"$dir/poll.log" &
+        poll_pid=$!
+      fi
+      # shellcheck disable=SC2086 # BENCH_LOAD_ARGS 故意按空格拆分
+      /usr/bin/time -p "$LOAD" run -mode open -rate "$ROUND_RATE" -max-in-flight "$OPEN_MAX_IN_FLIGHT" \
+        -duration "$dur" -drain "$drain" -skus "$SKU_LIST" -users "$users" -qty "$QTY" \
+        -poll-interval "$OPEN_POLL_INTERVAL" \
+        -log-level "$LOG_LEVEL" -progress 0 -run-id "b$run_ts$c$n" \
+        -ledger "$dir/ledger.jsonl" -json "$dir/report.json" ${BENCH_LOAD_ARGS:-} \
+        >"$dir/report.txt" 2>"$dir/load.log"
+      ;;
+  esac
   local code=$?
+  if [ -n "$poll_pid" ]; then wait "$poll_pid" || log "$name: load poll failed (see $dir/poll.log)"; fi
   set -e
   t1="$(now)"
   for s in $SERVICES; do eval "cpu1_$s=$(cpu_seconds "$(getv "pid_$s")")"; done
@@ -258,7 +481,7 @@ run_one() {
   if [ "$code" != 0 ]; then log "$name: load run exited with $code (see $dir/load.log)"; fi
 
   # 等落库停止：pending_payment 的数量连续 3 秒不变（1a 立即满足）。
-  deadline=$((SECONDS + QUIET_TIMEOUT))
+  deadline=$((SECONDS + quiet))
   prev=-1
   stable=0
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -284,7 +507,9 @@ run_one() {
     echo "load 0 $(awk -v u="$load_user" -v s="$load_sys" 'BEGIN { printf "%.2f", u + s }')"
   } >"$dir/cpu.txt"
 
-  # 汇总：CPU 是压测期间平均占用的核数；落库吞吐和 drain 以库里的 updated_at 为准。
+  case "$ROUND_KIND" in
+  sweep)
+    # 汇总：CPU 是压测期间平均占用的核数；落库吞吐和 drain 以库里的 updated_at 为准。
   python3 -I - "$dir" "$ARCH" "$MODE" "$c" "$n" "$t0" "$t1" "$wall" >>"$SUMMARY" <<'PY'
 import json, sys, datetime
 d, arch, mode, c, n, t0, t1, wall = sys.argv[1:]
@@ -321,15 +546,119 @@ row = [arch, mode, c, n, acc.get("count", 0), acc.get("per_second", 0),
       [round(cpu.get(s, 0), 2) for s in ("gateway", "order", "inventory", "payment")]
 print("\t".join(str(x) for x in row))
 PY
-  log "$name: $(tail -n 1 "$SUMMARY")"
+    log "$name: $(tail -n 1 "$SUMMARY")"
+    ;;
+  open|poll|rl|sc)
+    summarize_open "$dir" "$n" "$t0"
+    ;;
+  esac
   cleanup_prefixes
 }
 
 cleanup_prefixes
-for c in $CONCURRENCY_LIST; do
-  for n in $(seq 1 "$REPEAT"); do
-    run_one "$c" "$n"
+if [ "$SWEEP" = 1 ]; then
+  for c in $CONCURRENCY_LIST; do
+    for n in $(seq 1 "$REPEAT"); do
+      run_one "$c" "$n"
+    done
   done
-done
-log "done, summary $SUMMARY"
-grep -v '^#' "$SUMMARY" | column -t -s "$(printf '\t')" >&2 || true
+  log "done, summary $SUMMARY"
+  grep -v '^#' "$SUMMARY" | column -t -s "$(printf '\t')" >&2 || true
+fi
+
+# 开环档位：每档固定时长、固定到达速率。
+if [ "$OPEN" = 1 ]; then
+  {
+    echo "# open loop: duration $DURATION, max in flight $OPEN_MAX_IN_FLIGHT, drain $OPEN_DRAIN; latency is from the planned send time"
+    printf 'rate\trun\tplanned\tsent\tdropped\taccepted\taccept_per_s\tbacklogged_pct\trate_limited\ttimeout\taccept_p50_ms\taccept_p99_ms\tlanded_db\tland_db_per_s\n'
+  } >"$SUMMARY_OPEN"
+  ROUND_KIND=open
+  for r in $OPEN_RATES; do
+    for n in $(seq 1 "$OPEN_REPEAT"); do
+      ROUND_NAME="open-r${r}-n${n}" ROUND_RATE="$r"
+      run_one "o$r" "$n"
+    done
+  done
+  ROUND_KIND=sweep ROUND_NAME="" ROUND_RATE=""
+  log "open loop done, summary $SUMMARY_OPEN"
+  grep -v '^#' "$SUMMARY_OPEN" | column -t -s "$(printf '\t')" >&2 || true
+fi
+
+# 轮询压力对落库吞吐的影响：同样的开环下单压力，一次没有查询压力，一次叠加 load poll。
+if [ "$POLL" = 1 ]; then
+  {
+    echo "# poll pressure: open rate $POLL_RATE for $POLL_DURATION; poller c=$POLL_CONC interval=$POLL_REQ_INTERVAL recent=$POLL_RECENT"
+    printf 'variant\trun\tplanned\taccepted\taccept_per_s\tlanded_db\tland_db_per_s\tpoll_requests\tpoll_per_s\tpoll_p50_ms\tpoll_p99_ms\n'
+  } >"$SUMMARY_POLL"
+  ROUND_KIND=poll ROUND_RATE="$POLL_RATE"
+  for n in $(seq 1 "$POLL_REPEAT"); do
+    ROUND_NAME="poll-base-n${n}" ROUND_POLLER=0
+    run_one pb "$n"
+    ROUND_NAME="poll-with-n${n}" ROUND_POLLER=1
+    run_one pw "$n"
+  done
+  ROUND_KIND=sweep ROUND_NAME="" ROUND_RATE="" ROUND_POLLER=0
+  log "poll comparison done, summary $SUMMARY_POLL"
+  grep -v '^#' "$SUMMARY_POLL" | column -t -s "$(printf '\t')" >&2 || true
+  python3 -I - "$SUMMARY_POLL" >&2 <<'PY'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if not l.startswith("#")][1:]
+def avg(variant):
+    v = [float(r[6]) for r in rows if r[0] == variant]
+    return sum(v) / len(v) if v else 0.0
+base, polled = avg("baseline"), avg("polled")
+print("landing throughput without poll pressure: %.1f orders/s" % base)
+print("landing throughput with poll pressure:    %.1f orders/s" % polled)
+print("ratio (with / without): %s" % ("%.3f" % (polled / base) if base else "n/a"))
+PY
+fi
+
+# 限流对比：同样的开环下单压力（很少的用户号、速率远超他们的配额），gateway 的限流开和关各一轮。
+if [ "$RATELIMIT" = 1 ]; then
+  {
+    echo "# rate limit: open rate $RL_RATE for $RL_DURATION, users $RL_USERS (per-user create quota 5/s, burst 10), per-IP limit off; variant on = RATE_LIMIT=on, off = RATE_LIMIT=off"
+    printf 'rate_limit\trun\trate\tplanned\tsent\taccepted\taccept_per_s\trate_limited_pct\tbacklogged_pct\taccept_p50_ms\taccept_p99_ms\tlanded_db\tland_db_per_s\n'
+  } >"$SUMMARY_RL"
+  ROUND_KIND=rl ROUND_RATE="$RL_RATE" ROUND_USERS="$RL_USERS"
+  for n in $(seq 1 "$RL_REPEAT"); do
+    for v in on off; do
+      GW_RATE_LIMIT="$v" ROUND_NAME="ratelimit-$v-n${n}"
+      run_one "rl$v" "$n"
+    done
+  done
+  GW_RATE_LIMIT=off ROUND_KIND=sweep ROUND_NAME="" ROUND_RATE="" ROUND_USERS=""
+  log "rate limit comparison done, summary $SUMMARY_RL"
+  grep -v '^#' "$SUMMARY_RL" | column -t -s "$(printf '\t')" >&2 || true
+fi
+
+# 边车对比：同样的开环下单压力，SIDECAR=on 和 SIDECAR=off 各一轮，量边车给下单加了多少延迟。
+# 受理路径上的 gRPC 调用是 gateway -> order 一跳（经两个边车）；落库路径上还有 order -> inventory 一跳，
+# 它不计入受理延迟，但会体现在落库吞吐里。
+SIDECAR_BEFORE="${SIDECAR:-on}"
+if [ "$SC_BENCH" = 1 ]; then
+  if [ "$ARCH" != 1b ]; then echo "BENCH_SIDECAR needs BENCH_ARCH=1b" >&2; exit 2; fi
+  {
+    echo "# sidecar: open rate $SC_RATE for $SC_DURATION; variant on = SIDECAR=on, off = SIDECAR=off; latency is from the planned send time"
+    printf 'sidecar\trun\trate\tplanned\taccepted\taccept_per_s\taccept_p50_ms\taccept_p99_ms\tlanded_db\tland_db_per_s\n'
+  } >"$SUMMARY_SC"
+  ROUND_KIND=sc ROUND_RATE="$SC_RATE"
+  for n in $(seq 1 "$SC_REPEAT"); do
+    for v in on off; do
+      SIDECAR="$v" ROUND_NAME="sidecar-$v-n${n}"
+      run_one "sc$v" "$n"
+    done
+  done
+  SIDECAR="$SIDECAR_BEFORE" ROUND_KIND=sweep ROUND_NAME="" ROUND_RATE=""
+  log "sidecar comparison done, summary $SUMMARY_SC"
+  grep -v '^#' "$SUMMARY_SC" | column -t -s "$(printf '\t')" >&2 || true
+  python3 -I - "$SUMMARY_SC" >&2 <<'PY'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if not l.startswith("#")][1:]
+def avg(variant, col):
+    v = [float(r[col]) for r in rows if r[0] == variant]
+    return sum(v) / len(v) if v else 0.0
+for name, col, unit in (("accept p50", 6, "ms"), ("accept p99", 7, "ms"), ("landing throughput", 9, "orders/s")):
+    on, off = avg("on", col), avg("off", col)
+    print("%-20s on %9.2f %s, off %9.2f %s, on - off %+.2f %s" % (name, on, unit, off, unit, on - off, unit))
+PY
+fi

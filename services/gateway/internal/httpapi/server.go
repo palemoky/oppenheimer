@@ -5,20 +5,34 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
+	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (
 	// DefaultCallTimeout 是单个请求内所有下游调用的总时限。
 	DefaultCallTimeout = 5 * time.Second
+	// DownstreamHopBudget 是 gateway 给任一下游的单跳预算（设计文档 1d 5.6）。总时限 5 秒，给下游 3 秒：
+	// 下游超时之后 gateway 还来得及返回明确的错误，而不是和下游在同一刻一起超时。
+	// 这个数写在 deploy/envoy/gateway.yaml 四条出站路由的 timeout 上（TestHopTimeoutMatchesEnvoy 核对），由边车执行：
+	// 只有边车自己的路由超时到期才计入异常检测，慢下游才会被摘除。
+	DownstreamHopBudget = 3 * time.Second
+	// DownstreamHopTimeout 是进程里的单跳时限，由 grpcx.WithHopTimeout 加在每条下游连接上。
+	// 比预算多 grpcx.SidecarMargin：让边车先超时（理由见那个常量），进程里的只在边车不在或卡住时兜底。
+	// 所以正常情况下，下游超时时客户端看到的是边车返回的 503（Unavailable），不是 504。
+	DownstreamHopTimeout = DownstreamHopBudget + grpcx.SidecarMargin
 	// maxBodyBytes 限制请求体大小，防止客户端用超大 body 占用内存。
 	maxBodyBytes = 1 << 20
 )
@@ -35,6 +49,11 @@ type Deps struct {
 type Config struct {
 	Logger      *slog.Logger
 	CallTimeout time.Duration
+	// RateLimit 为 nil 时不限流。
+	RateLimit *RateLimit
+	// Degrade 不为 nil 时，New 把非核心接口的开关（merchant_orders、user_orders、stock_query）登记到它上面；
+	// 调用方在 New 之后再 Apply 初始值、把它挂到内部端口上。为 nil 时没有开关，接口一直可用。
+	Degrade *degrade.Set
 }
 
 // server 必须实现规范生成的接口。规范新增或修改了接口而这里没跟上时，编译失败。
@@ -45,6 +64,14 @@ type server struct {
 	logger *slog.Logger
 	// callTimeout 在中间件里转成 context 截止时间，handler 不必各自处理。
 	callTimeout time.Duration
+	// rl 为 nil 时不限流。
+	rl *rateLimiter
+	// features 是可以被关掉的接口的开关，按路由查；没有开关的接口查到 nil（nil 开关永远是打开的）。
+	features map[routeKey]*degrade.Switch
+	// trusted 是受信任的代理（来自 RateLimit.TrustedProxies），traceEntry 用它算 span 上的客户端地址。
+	trusted []netip.Prefix
+	// tracer 建 HTTP 入口的 span，在 New 时从全局的 TracerProvider 取。
+	tracer trace.Tracer
 }
 
 // New 构造路由。返回 http.Handler 而不是 *gin.Engine，不让 gin 泄漏到装配层。
@@ -56,12 +83,16 @@ func New(deps Deps, cfg Config) http.Handler {
 		deps:        deps,
 		logger:      cfg.Logger,
 		callTimeout: cfg.CallTimeout,
+		tracer:      newTracer(),
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
 	}
 	if s.callTimeout <= 0 {
 		s.callTimeout = DefaultCallTimeout
+	}
+	if cfg.RateLimit != nil {
+		s.trusted = slices.Clone(cfg.RateLimit.TrustedProxies)
 	}
 
 	r := gin.New()
@@ -72,12 +103,37 @@ func New(deps Deps, cfg Config) http.Handler {
 	r.NoMethod(func(c *gin.Context) {
 		writeError(c, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	})
-	// 日志在最外层，才能记录到 recover 之后写出的 500。
-	r.Use(s.requestLog, s.recoverPanic)
+	// 链路在最外层（见 telemetry.go）：被限流、被开关拒绝、没匹配到路由的请求也有 span 和 X-Trace-Id。
+	// 日志在链路之内，带着 span 的 ctx（日志里有 trace_id）；在 recover 之外，才能记录到 recover 之后写出的 500。
+	// panic 由 recoverPanic 变成 500 之后才回到 traceEntry，按服务端故障标 Error。
+	r.Use(s.traceEntry, s.requestLog, s.recoverPanic)
 
 	// 路由由规范生成的代码注册，路径和方法以 api/openapi/gateway.yaml 为准。
 	// 规范里的路径已经带 /api/v1 前缀，所以分组的前缀为空，分组只用来挂中间件。
-	api := r.Group("", s.requireUser, s.withDeadline)
+	// 限流挂在这个分组上，只作用于规范里的接口：没匹配到路由的 404 不经过它，
+	// 健康检查挂在外层的 mux 上（cmd/gateway），也不经过它。
+	// 顺序：功能开关最先（只读一个原子变量，被关掉的请求不消耗任何配额，理由见 checkFeature）；
+	// 按 IP 在识别用户之前（最便宜，挡没有身份的洪水）；按用户和接口在识别用户之后、设置下游时限之前
+	// （限流器有自己的时限，不占用下游调用的预算）；热点参数在按用户之后（先按用户限，再看这个值是不是被打爆了）。
+	rl, limitIP, limitShared, limitHot := newRateLimiter(cfg.RateLimit)
+	s.rl = rl
+	var mw []gin.HandlerFunc
+	if cfg.Degrade != nil {
+		s.features = registerFeatures(cfg.Degrade)
+		mw = append(mw, s.checkFeature)
+	}
+	if limitIP {
+		mw = append(mw, s.limitIP)
+	}
+	mw = append(mw, s.requireUser)
+	if limitShared {
+		mw = append(mw, s.limitUserAndRoute)
+	}
+	if limitHot {
+		mw = append(mw, s.limitHot)
+	}
+	mw = append(mw, s.withDeadline)
+	api := r.Group("", mw...)
 	oas.RegisterHandlersWithOptions(api, s, oas.GinServerOptions{ErrorHandler: bindError})
 	return r
 }

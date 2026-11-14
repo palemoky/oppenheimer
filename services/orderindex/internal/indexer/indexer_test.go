@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +13,7 @@ import (
 
 	cdcv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/cdc/v1"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
-	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
 	"github.com/palemoky/oppenheimer/services/orderindex/internal/store"
 	"github.com/palemoky/oppenheimer/services/orderindex/internal/storetest"
 )
@@ -150,84 +150,132 @@ func TestDecodeSchemaErrors(t *testing.T) {
 	}
 }
 
-// 多个商家、多个订单，每个订单版本 1..N 的映像（INSERT、UPDATE、READ 混着）打乱顺序、带重复，
-// 多个 goroutine 并发应用，最后每一行都等于版本 N 的映像。
-func TestConvergesUnderReorderDuplicatesAndConcurrency(t *testing.T) {
+// apply 把 msgs 作为一批应用，返回这一批的统计。
+func apply(t *testing.T, ix *Indexer, msgs ...*cdcv1.RowChange) Counts {
+	t.Helper()
+	c, err := ix.Apply(t.Context(), msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// message 把一条变更序列化成 kafka 消息，offset 只用来在日志里区分。
+func message(t testing.TB, m *cdcv1.RowChange, offset int64) kafkax.Message {
+	t.Helper()
+	v, err := proto.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kafkax.Message{Topic: "cdc.order.orders", Offset: offset, Value: v}
+}
+
+// oneByOne 模拟 kafkax 一批失败后的逐条回退：每条消息单独作为一条的批交给 h，返回每条的结果（不重试）。
+func oneByOne(t *testing.T, h kafkax.BatchHandler, msgs []kafkax.Message) []error {
+	t.Helper()
+	errs := make([]error, len(msgs))
+	for i, m := range msgs {
+		errs[i] = h(t.Context(), []kafkax.Message{m})
+	}
+	return errs
+}
+
+// 1 + 6：一批里混着 INSERT、UPDATE、READ、DELETE、没有商家的、别的表、不认识的 op、同一个订单的多个版本
+// （顺序打乱）。结束后每个订单逐列等于它的最高版本；没有商家的不在索引里；归档的（DELETE）行在索引里。
+// 索引原本是空的，每一行都是插入，Changed 的估计在这种情况下是精确的，所以统计逐项精确。
+func TestBatchMixedOps(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
-	const (
-		merchants = 4 // 落在 4 个不同的 slot、2 个库上
-		orders    = 6
-		versions  = 12
-		workers   = 8
-	)
-	var msgs []*cdcv1.RowChange
-	ops := []cdcv1.Op{cdcv1.Op_OP_INSERT, cdcv1.Op_OP_UPDATE, cdcv1.Op_OP_READ}
-	for m := range int64(merchants) {
-		for o := range int64(orders) {
-			order := (m+1)*1000 + o
-			for v := range int64(versions) {
-				for range 1 + rand.IntN(3) { // 每个版本 1 到 3 份
-					msgs = append(msgs, change(ops[rand.IntN(len(ops))], image(m+1, order, v+1)))
-				}
-			}
-		}
+	other := change(cdcv1.Op_OP_INSERT, image(3, 60, 1))
+	other.Table = "order_items"
+	msgs := []*cdcv1.RowChange{
+		change(cdcv1.Op_OP_INSERT, image(1, 10, 1)),
+		change(cdcv1.Op_OP_UPDATE, image(1, 10, 3)),
+		change(cdcv1.Op_OP_READ, image(1, 10, 2)),
+		change(cdcv1.Op_OP_UPDATE, image(1, 10, 3)), // 重复的最高版本
+		change(cdcv1.Op_OP_INSERT, image(2, 20, 1)),
+		change(cdcv1.Op_OP_READ, image(3, 30, 4)),
+		change(cdcv1.Op_OP_UPDATE, image(4, 40, 4)),
+		deletion(image(4, 40, 5)), // 归档，最高版本
+		change(cdcv1.Op_OP_UPDATE, image(4, 40, 3)),
+		deletion(image(5, 50, 2)),                   // 只剩 DELETE 的归档订单（重建）
+		change(cdcv1.Op_OP_INSERT, image(0, 70, 1)), // 没有商家
+		deletion(image(0, 71, 2)),                   // 没有商家的归档
+		other,
+		change(cdcv1.Op(99), image(3, 61, 1)),
 	}
 	rand.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
+	got := apply(t, ix, msgs...)
 
-	ch := make(chan *cdcv1.RowChange)
-	var wg sync.WaitGroup
-	errs := make(chan error, workers)
-	for range workers {
-		wg.Go(func() {
-			for m := range ch {
-				// 并发写同一个订单的同一行在生产里不会发生（同一订单在同一分区串行处理），这里故意制造。
-				// InnoDB 对并发的 INSERT ... ON DUPLICATE KEY UPDATE 可能判死锁回滚其中一条，
-				// 生产里由 kafkax 原地重试，这里照做。
-				for {
-					_, err := ix.Apply(t.Context(), m)
-					if err == nil {
-						break
-					}
-					if !mysqlx.IsDeadlock(err) {
-						errs <- err
-						return
-					}
-				}
-			}
-		})
+	want := map[[2]int64]int64{{1, 10}: 3, {2, 20}: 1, {3, 30}: 4, {4, 40}: 5, {5, 50}: 2}
+	for k, v := range want {
+		r, err := st.Get(t.Context(), k[0], k[1])
+		if err != nil {
+			t.Fatalf("order %d: %v", k[1], err)
+		}
+		if w := wantRow(t, k[0], k[1], v); !sameImage(r, w) {
+			t.Errorf("order %d: row = %+v, want v%d %+v", k[1], r, v, w)
+		}
 	}
-	for _, m := range msgs {
-		ch <- m
+	for _, k := range [][2]int64{{3, 60}, {3, 61}, {1, 70}, {1, 71}} {
+		if _, err := st.Get(t.Context(), k[0], k[1]); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("order %d was written: %v", k[1], err)
+		}
 	}
-	close(ch)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+	// 有商家的消息 10 条，合并成 5 行写入；5 行都是插入。延迟只算写进索引的（有商家的）消息。
+	wantCounts := Counts{Changed: 5, Stale: 5, Written: 5, Merged: 5, SkippedNoMerchant: 2, Ignored: 2, Archived: 3, LagCount: 10}
+	got.LagSum, got.LagMax = 0, 0
+	if got != wantCounts {
+		t.Errorf("counts = %+v\nwant     %+v", got, wantCounts)
+	}
+	if s := ix.Stats().take(); s.Changed != 5 || s.LagCount != 10 || s.LagMax <= 0 || s.LagSum <= 0 {
+		t.Errorf("stats = %+v", s)
+	}
+}
+
+// 2：版本比较在多行语句里仍然成立。索引里已有 v5（和别的订单一起写在同一条多行语句里）：
+// 一批带着同一订单的 v3、v4 → 行逐列不变（含 synced_at）；带着 v6 → 逐列变成 v6。
+// 如果把 src_version 挪到最前面赋值，v6 那一步只有版本号会变，这里会失败（TestUpsertAssignmentOrder 专门钉住）。
+func TestBatchVersionCompare(t *testing.T) {
+	t.Parallel()
+	ix, st := newIndexer(t)
+	first := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
+	ix.now = func() time.Time { return first }
+	// 商家 1 和 5 在同一个 slot：每一批都是同一张表上的多行语句。
+	apply(t, ix, change(cdcv1.Op_OP_UPDATE, image(1, 100, 5)), change(cdcv1.Op_OP_UPDATE, image(5, 101, 1)))
+	before, err := st.Get(t.Context(), 1, 100)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	w := ix.Stats().take()
-	if w.Changed+w.Stale != int64(len(msgs)) {
-		t.Errorf("changed %d + stale %d != %d messages", w.Changed, w.Stale, len(msgs))
+	ix.now = func() time.Time { return first.Add(time.Hour) }
+	c := apply(t, ix,
+		change(cdcv1.Op_OP_UPDATE, image(1, 100, 3)),
+		change(cdcv1.Op_OP_UPDATE, image(5, 101, 2)),
+		change(cdcv1.Op_OP_UPDATE, image(1, 100, 4)),
+	)
+	if after, err := st.Get(t.Context(), 1, 100); err != nil || after != before {
+		t.Errorf("v3, v4 over v5 changed the row:\n got %+v (%v)\nwant %+v", after, err, before)
 	}
-	if w.Changed < merchants*orders || w.Changed > merchants*orders*versions {
-		t.Errorf("changed = %d, want within [%d, %d]", w.Changed, merchants*orders, merchants*orders*versions)
+	if got, err := st.Get(t.Context(), 5, 101); err != nil || !sameImage(got, wantRow(t, 5, 101, 2)) {
+		t.Errorf("order 101 = %+v, %v; want v2", got, err)
 	}
-	if w.LagCount != int64(len(msgs)) || w.LagMax <= 0 || w.LagSum <= 0 {
-		t.Errorf("lag stats = %+v", w)
+	// 写了 2 行（v4 合并掉 v3）：101 覆盖、100 没变，Affected 2，估计 min(2, 2) = 2，比真实的 1 多 1。
+	if c.Written != 2 || c.Merged != 1 || c.Changed+c.Stale != 3 || c.Changed < 1 || c.Changed > 2 {
+		t.Errorf("counts = %+v", c)
 	}
-	for m := range int64(merchants) {
-		for o := range int64(orders) {
-			order := (m+1)*1000 + o
-			got, err := st.Get(t.Context(), m+1, order)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if want := wantRow(t, m+1, order, versions); !sameImage(got, want) {
-				t.Errorf("order %d: row = %+v, want %+v", order, got, want)
-			}
-		}
+
+	c = apply(t, ix, change(cdcv1.Op_OP_UPDATE, image(1, 100, 6)), change(cdcv1.Op_OP_UPDATE, image(1, 100, 3)),
+		change(cdcv1.Op_OP_UPDATE, image(5, 101, 2)))
+	got, err := st.Get(t.Context(), 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := wantRow(t, 1, 100, 6); !sameImage(got, want) || !got.SyncedAt.Equal(first.Add(time.Hour)) {
+		t.Errorf("row = %+v, want v6 %+v synced at %v", got, want, first.Add(time.Hour))
+	}
+	if c.Written != 2 || c.Merged != 1 {
+		t.Errorf("counts = %+v", c)
 	}
 }
 
@@ -238,12 +286,12 @@ func TestDuplicateMessageKeepsSyncedAt(t *testing.T) {
 	first := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
 	ix.now = func() time.Time { return first }
 	msg := change(cdcv1.Op_OP_UPDATE, image(2, 50, 3))
-	if r, err := ix.Apply(t.Context(), msg); err != nil || r != Changed {
-		t.Fatalf("first apply = %v, %v", r, err)
+	if c := apply(t, ix, msg); c.Changed != 1 || c.Stale != 0 {
+		t.Fatalf("first apply = %+v", c)
 	}
 	ix.now = func() time.Time { return first.Add(time.Hour) }
-	if r, err := ix.Apply(t.Context(), msg); err != nil || r != Stale {
-		t.Fatalf("replay = %v, %v", r, err)
+	if c := apply(t, ix, msg); c.Changed != 0 || c.Stale != 1 {
+		t.Fatalf("replay = %+v", c)
 	}
 	got, err := st.Get(t.Context(), 2, 50)
 	if err != nil {
@@ -254,26 +302,21 @@ func TestDuplicateMessageKeepsSyncedAt(t *testing.T) {
 	}
 }
 
-// merchant_id 为 NULL 跳过；别的表、不认识的 op 忽略；都不写库。
+// merchant_id 为 NULL 跳过；别的表、不认识的 op 忽略；都不写库。一批里只有这些时不碰数据库。
 func TestSkipsAndIgnores(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
 	other := change(cdcv1.Op_OP_INSERT, image(3, 60, 1))
 	other.Table = "order_items"
 	unknownOp := change(cdcv1.Op(99), image(3, 61, 1))
-	cases := []struct {
-		msg  *cdcv1.RowChange
-		want Result
-	}{
-		{change(cdcv1.Op_OP_INSERT, image(0, 63, 0)), SkippedNoMerchant},
-		{change(cdcv1.Op_OP_READ, image(0, 64, 0)), SkippedNoMerchant},
-		{other, Ignored},
-		{unknownOp, Ignored},
-	}
-	for i, c := range cases {
-		if r, err := ix.Apply(t.Context(), c.msg); err != nil || r != c.want {
-			t.Errorf("case %d: %v, %v; want %v", i, r, err, c.want)
-		}
+	c := apply(t, ix,
+		change(cdcv1.Op_OP_INSERT, image(0, 63, 0)),
+		change(cdcv1.Op_OP_READ, image(0, 64, 0)),
+		other,
+		unknownOp,
+	)
+	if c != (Counts{SkippedNoMerchant: 2, Ignored: 2}) {
+		t.Errorf("counts = %+v", c)
 	}
 	for _, order := range []int64{60, 61} {
 		if _, err := st.Get(t.Context(), 3, order); !errors.Is(err, store.ErrNotFound) {
@@ -287,7 +330,7 @@ func TestSkipsAndIgnores(t *testing.T) {
 }
 
 // 缺少需要的列：返回 ErrSchema（不是 Permanent，kafkax 会原地重试而不是进死信），不写库。
-// 反序列化失败才是 Permanent。
+// 反序列化失败才是 Permanent。都是只有一条消息的批，含义与按批之前逐条的 handler 相同。
 func TestHandlerErrors(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
@@ -295,11 +338,7 @@ func TestHandlerErrors(t *testing.T) {
 
 	img := image(5, 70, 2)
 	delete(img, "total_amount")
-	value, err := proto.Marshal(change(cdcv1.Op_OP_UPDATE, img))
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = h(t.Context(), kafkax.Message{Value: value})
+	err := h(t.Context(), []kafkax.Message{message(t, change(cdcv1.Op_OP_UPDATE, img), 0)})
 	if !errors.Is(err, ErrSchema) || kafkax.IsPermanent(err) {
 		t.Fatalf("missing column: err = %v, want non-permanent ErrSchema", err)
 	}
@@ -307,20 +346,147 @@ func TestHandlerErrors(t *testing.T) {
 		t.Fatalf("row written despite schema error: %v", err)
 	}
 
-	err = h(t.Context(), kafkax.Message{Value: []byte{0xff, 0xff, 0xff}})
+	err = h(t.Context(), []kafkax.Message{{Value: []byte{0xff, 0xff, 0xff}}})
 	if !kafkax.IsPermanent(err) {
 		t.Fatalf("garbage: err = %v, want permanent", err)
 	}
 
-	value, err = proto.Marshal(change(cdcv1.Op_OP_INSERT, image(5, 71, 1)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h(t.Context(), kafkax.Message{Value: value}); err != nil {
+	if err := h(t.Context(), []kafkax.Message{message(t, change(cdcv1.Op_OP_INSERT, image(5, 71, 1)), 0)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.Get(t.Context(), 5, 71); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// goodBatch 返回一批好消息（4 个商家、跨两个库）和它们对应的最终行，用来夹带一条坏消息。
+func goodBatch(base int64) (msgs []*cdcv1.RowChange, keys [][2]int64) {
+	for i := range int64(6) {
+		m, o := 1+i%4, base+i
+		msgs = append(msgs, change(cdcv1.Op_OP_UPDATE, image(m, o, 2)))
+		keys = append(keys, [2]int64{m, o})
+	}
+	return msgs, keys
+}
+
+// 3 + 4：一批里夹着一条坏消息时整批返回错误、一行都不写；kafkax 逐条回退之后好的都写进去，
+// 坏的那条单独返回同类的错误。
+//   - 缺列、缺映像（ErrSchema）：非 Permanent，逐条时原地重试、分区停住。
+//   - 反序列化不了：Permanent，逐条时进死信、分区继续。
+func TestBatchWithBadMessageFallsBack(t *testing.T) {
+	t.Parallel()
+	missingColumn := image(2, 9001, 3)
+	delete(missingColumn, "currency")
+	cases := []struct {
+		name      string
+		bad       func(t *testing.T) kafkax.Message
+		permanent bool
+	}{
+		{"missing column", func(t *testing.T) kafkax.Message {
+			return message(t, change(cdcv1.Op_OP_UPDATE, missingColumn), 0)
+		}, false},
+		{"insert without after", func(t *testing.T) kafkax.Message {
+			return message(t, change(cdcv1.Op_OP_INSERT, nil), 0)
+		}, false},
+		{"delete without before", func(t *testing.T) kafkax.Message {
+			return message(t, deletion(nil), 0)
+		}, false},
+		{"not a row change", func(*testing.T) kafkax.Message {
+			return kafkax.Message{Value: []byte{0xff, 0xff, 0xff}}
+		}, true},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			ix, st := newIndexer(t)
+			h := ix.Handler(DefaultWriteTimeout)
+			good, keys := goodBatch(int64(1000 * (i + 1)))
+			var batch []kafkax.Message
+			for j, m := range good {
+				batch = append(batch, message(t, m, int64(j)))
+			}
+			badAt := 3
+			batch = slices.Insert(batch, badAt, c.bad(t))
+
+			checkErr := func(what string, err error) {
+				t.Helper()
+				if kafkax.IsPermanent(err) != c.permanent || (!c.permanent && !errors.Is(err, ErrSchema)) {
+					t.Errorf("%s: err = %v, want permanent=%v", what, err, c.permanent)
+				}
+			}
+			checkErr("whole batch", h(t.Context(), batch))
+			for _, k := range keys {
+				if _, err := st.Get(t.Context(), k[0], k[1]); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("order %d written by a failed batch: %v", k[1], err)
+				}
+			}
+			if s := ix.Stats().take(); s != (Counts{}) {
+				t.Errorf("failed batch was counted: %+v", s)
+			}
+
+			for j, err := range oneByOne(t, h, batch) {
+				if j == badAt {
+					checkErr("bad message alone", err)
+				} else if err != nil {
+					t.Errorf("good message %d alone: %v", j, err)
+				}
+			}
+			for _, k := range keys {
+				if r, err := st.Get(t.Context(), k[0], k[1]); err != nil || !sameImage(r, wantRow(t, k[0], k[1], 2)) {
+					t.Errorf("order %d after fallback = %+v, %v", k[1], r, err)
+				}
+			}
+			if s := ix.Stats().take(); s.Changed != int64(len(keys)) || s.Written != int64(len(keys)) {
+				t.Errorf("stats after fallback = %+v", s)
+			}
+		})
+	}
+}
+
+// 两个库之一写失败（这里用一张被删掉的表模拟）时整批返回错误、不计数；另一个库已提交的那一半在重做时是空操作。
+func TestBatchPartialFailureIsRedoable(t *testing.T) {
+	t.Parallel()
+	st, dbs := storetest.New(t)
+	ix, err := New(st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := st.Router()
+	// 找两个在不同库上的商家。
+	var m0, m1 int64
+	for m := int64(1); m0 == 0 || m1 == 0; m++ {
+		if r.DB(r.ForMerchant(m)) == 0 && m0 == 0 {
+			m0 = m
+		} else if r.DB(r.ForMerchant(m)) == 1 && m1 == 0 {
+			m1 = m
+		}
+	}
+	table := sharding.Table(store.TableBase, r.ForMerchant(m1))
+	renamed := table + "_gone"
+	if _, err := dbs[1].ExecContext(t.Context(), "RENAME TABLE "+table+" TO "+renamed); err != nil { //nolint:gosec // 表名只来自 sharding.Table
+		t.Fatal(err)
+	}
+	batch := []*cdcv1.RowChange{change(cdcv1.Op_OP_UPDATE, image(m0, 1, 3)), change(cdcv1.Op_OP_UPDATE, image(m1, 2, 3))}
+	if _, err := ix.Apply(t.Context(), batch); err == nil || kafkax.IsPermanent(err) {
+		t.Fatalf("apply with a missing table: err = %v, want a retryable error", err)
+	}
+	if s := ix.Stats().take(); s != (Counts{}) {
+		t.Errorf("failed batch was counted: %+v", s)
+	}
+	if _, err := st.Get(t.Context(), m0, 1); err != nil {
+		t.Fatalf("the other database should have committed its half: %v", err)
+	}
+	if _, err := dbs[1].ExecContext(t.Context(), "RENAME TABLE "+renamed+" TO "+table); err != nil { //nolint:gosec // 同上
+		t.Fatal(err)
+	}
+	c := apply(t, ix, batch...)
+	if c.Written != 2 || c.Changed != 1 || c.Stale != 1 {
+		t.Errorf("redo counts = %+v, want one change and one no-op", c)
+	}
+	for _, k := range [][2]int64{{m0, 1}, {m1, 2}} {
+		if got, err := st.Get(t.Context(), k[0], k[1]); err != nil || !sameImage(got, wantRow(t, k[0], k[1], 3)) {
+			t.Errorf("order %d = %+v, %v", k[1], got, err)
+		}
 	}
 }
 
@@ -341,8 +507,8 @@ func TestDeleteOfCurrentVersionIsNoop(t *testing.T) {
 	ix, st := newIndexer(t)
 	first := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
 	ix.now = func() time.Time { return first }
-	if r, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(7, 80, finalVersion))); err != nil || r != Changed {
-		t.Fatalf("update = %v, %v", r, err)
+	if c := apply(t, ix, change(cdcv1.Op_OP_UPDATE, image(7, 80, finalVersion))); c.Changed != 1 {
+		t.Fatalf("update = %+v", c)
 	}
 	before, err := st.Get(t.Context(), 7, 80)
 	if err != nil {
@@ -351,8 +517,8 @@ func TestDeleteOfCurrentVersionIsNoop(t *testing.T) {
 	ix.Stats().take()
 
 	ix.now = func() time.Time { return first.Add(time.Hour) }
-	if r, err := ix.Apply(t.Context(), deletion(image(7, 80, finalVersion))); err != nil || r != Stale {
-		t.Fatalf("delete = %v, %v; want Stale", r, err)
+	if c := apply(t, ix, deletion(image(7, 80, finalVersion))); c.Stale != 1 || c.Changed != 0 {
+		t.Fatalf("delete = %+v; want Stale", c)
 	}
 	after, err := st.Get(t.Context(), 7, 80)
 	if err != nil {
@@ -371,8 +537,8 @@ func TestDeleteOfCurrentVersionIsNoop(t *testing.T) {
 func TestDeleteRebuildsMissingRow(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
-	if r, err := ix.Apply(t.Context(), deletion(image(8, 90, finalVersion))); err != nil || r != Changed {
-		t.Fatalf("delete = %v, %v; want Changed", r, err)
+	if c := apply(t, ix, deletion(image(8, 90, finalVersion))); c.Changed != 1 {
+		t.Fatalf("delete = %+v; want Changed", c)
 	}
 	got, err := st.Get(t.Context(), 8, 90)
 	if err != nil {
@@ -403,11 +569,11 @@ func TestDeleteRebuildsMissingRow(t *testing.T) {
 func TestDeleteOrdersByVersion(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
-	if r, err := ix.Apply(t.Context(), deletion(image(9, 100, 5))); err != nil || r != Changed {
-		t.Fatalf("delete = %v, %v", r, err)
+	if c := apply(t, ix, deletion(image(9, 100, 5))); c.Changed != 1 {
+		t.Fatalf("delete = %+v", c)
 	}
-	if r, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(9, 100, 3))); err != nil || r != Stale {
-		t.Fatalf("late update = %v, %v; want Stale", r, err)
+	if c := apply(t, ix, change(cdcv1.Op_OP_UPDATE, image(9, 100, 3))); c.Stale != 1 {
+		t.Fatalf("late update = %+v; want Stale", c)
 	}
 	got, err := st.Get(t.Context(), 9, 100)
 	if err != nil {
@@ -418,11 +584,9 @@ func TestDeleteOrdersByVersion(t *testing.T) {
 	}
 
 	// 反过来：索引已是 v=6，旧的 DELETE（v=4，重放的一段）不改行。
-	if _, err := ix.Apply(t.Context(), change(cdcv1.Op_OP_UPDATE, image(9, 101, 6))); err != nil {
-		t.Fatal(err)
-	}
-	if r, err := ix.Apply(t.Context(), deletion(image(9, 101, 4))); err != nil || r != Stale {
-		t.Fatalf("old delete = %v, %v; want Stale", r, err)
+	apply(t, ix, change(cdcv1.Op_OP_UPDATE, image(9, 101, 6)))
+	if c := apply(t, ix, deletion(image(9, 101, 4))); c.Stale != 1 {
+		t.Fatalf("old delete = %+v; want Stale", c)
 	}
 	if got, err := st.Get(t.Context(), 9, 101); err != nil || !sameImage(got, wantRow(t, 9, 101, 6)) {
 		t.Errorf("row = %+v, %v; want v6", got, err)
@@ -433,8 +597,8 @@ func TestDeleteOrdersByVersion(t *testing.T) {
 func TestDeleteWithoutMerchantSkipped(t *testing.T) {
 	t.Parallel()
 	ix, st := newIndexer(t)
-	if r, err := ix.Apply(t.Context(), deletion(image(0, 110, 3))); err != nil || r != SkippedNoMerchant {
-		t.Fatalf("delete = %v, %v; want SkippedNoMerchant", r, err)
+	if c := apply(t, ix, deletion(image(0, 110, 3))); c.SkippedNoMerchant != 1 {
+		t.Fatalf("delete = %+v; want SkippedNoMerchant", c)
 	}
 	rows, err := st.List(t.Context(), store.ListQuery{MerchantID: 1, Limit: 10})
 	if err != nil {
@@ -462,11 +626,7 @@ func TestImageMissingIsSchemaError(t *testing.T) {
 			return ch
 		}(),
 	} {
-		value, err := proto.Marshal(msg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = h(t.Context(), kafkax.Message{Value: value})
+		err := h(t.Context(), []kafkax.Message{message(t, msg, 0)})
 		if !errors.Is(err, ErrSchema) || kafkax.IsPermanent(err) {
 			t.Errorf("%s: err = %v, want non-permanent ErrSchema", name, err)
 		}

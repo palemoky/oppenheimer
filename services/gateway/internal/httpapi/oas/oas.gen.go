@@ -257,6 +257,9 @@ type OrderSummary struct {
 
 // OrderSummaryList defines model for OrderSummaryList.
 type OrderSummaryList struct {
+	// ArchiveUnavailable 为 true 表示较早的（已归档的）订单暂时无法查询，这一页只包含近期的订单。 列出的每一行都是准确的，只是不完整；稍后用 `next_cursor` 可以接着取。正常时不出现。
+	ArchiveUnavailable *bool `json:"archive_unavailable,omitempty"`
+
 	// NextCursor 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
 	NextCursor *string        `json:"next_cursor,omitempty"`
 	Orders     []OrderSummary `json:"orders"`
@@ -353,6 +356,12 @@ type NotFound = Error
 
 // PayloadTooLarge defines model for PayloadTooLarge.
 type PayloadTooLarge = Error
+
+// ServiceUnavailable defines model for ServiceUnavailable.
+type ServiceUnavailable = Error
+
+// TooManyRequests defines model for TooManyRequests.
+type TooManyRequests = Error
 
 // Unauthorized defines model for Unauthorized.
 type Unauthorized = Error

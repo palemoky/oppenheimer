@@ -17,10 +17,10 @@ import (
 	"github.com/palemoky/oppenheimer/services/orderindex/internal/store"
 )
 
-// startConsumer 按 main 里的配置（MaxAttempts 取最大值）启动消费者，测试结束时停止。
+// startConsumer 按 main 里的配置（按批、MaxAttempts 取最大值）启动消费者，测试结束时停止。
 func startConsumer(t *testing.T, brokers []string, topic string, ix *Indexer) {
 	t.Helper()
-	c, err := kafkax.NewConsumer(t.Context(), kafkax.ConsumerConfig{
+	c, err := kafkax.NewBatchConsumer(t.Context(), kafkax.BatchConsumerConfig{
 		Brokers:      brokers,
 		ClientID:     "orderindex-test",
 		Group:        topic + ".group",

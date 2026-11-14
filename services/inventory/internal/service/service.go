@@ -5,19 +5,24 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
@@ -26,7 +31,7 @@ import (
 // 事务遇到死锁时的重试参数。
 //
 // 按 sku_id 排序消除了库存行之间的死锁，Release 在冲突时直接加排他锁消除了锁升级死锁，
-// 但还剩一种无法在应用层排除的情况：同一订单的 Reserve 插入者回滚（例如库存不足）时，
+// 但还剩一种无法在应用层排除的情况：同一订单的 Reserve 插入者回滚（例如 SKU 不存在）时，
 // 排队等它的重复请求在记录消失后都继承了同一个间隙锁，又都要插入，彼此的插入意向锁
 // 与对方的间隙锁冲突，InnoDB 会判定死锁并回滚其中一些。三个操作都幂等，整个事务重来
 // 是安全的；退避加随机抖动，让重来的请求错开，不再同时撞到同一个间隙上。
@@ -70,6 +75,47 @@ func WithStockCache(c *cache.Cache[*inventoryv1.GetStockResponse], ttl time.Dura
 	}
 }
 
+// errCorruptReservation 标记“预占的数据本身不对”（状态值不认识、已预占却没有明细）。
+// 重试多少次结果都一样，处理订单事件时遇到它直接进死信（见 HandleOrderEvent）：
+// 消费者对普通错误不设重试上限（ADR-0021），不标出来的话这一条消息会永远挡住它的分区。
+var errCorruptReservation = errors.New("corrupt reservation")
+
+// SwitchCache 是库存查询缓存的降级开关（设计文档 1d 的 6.9）：关掉之后 GetStock 不经过缓存，每次都读库。
+// 由 NewStockCache 登记；没开缓存（STOCK_CACHE_TTL=0）时不登记。
+const SwitchCache = "cache"
+
+// NewStockCache 创建 GetStock 的查询缓存，接上降级开关和一个状态变化时记日志的熔断器（设计文档 1d 的 6.6）：
+// Redis 连续出错或开关被关掉时，查询不碰 Redis、直接读库。set 为 nil 时不登记开关（测试用）。
+func NewStockCache(client redis.Cmdable, prefix string, logger *slog.Logger, set *degrade.Set) (*cache.Cache[*inventoryv1.GetStockResponse], error) {
+	var sw *degrade.Switch
+	if set != nil {
+		sw = set.Switch(SwitchCache, "stock queries skip the cache and read the database")
+	}
+	c, err := cache.New(cache.Config{
+		Client:    client,
+		Name:      "stock",
+		KeyPrefix: prefix,
+		Logger:    logger,
+		Switch:    sw,
+		Breaker: breaker.New(breaker.Config{Name: "stock-cache", OnChange: func(name string, from, to breaker.State) {
+			logger.Warn("cache redis breaker changed", "breaker", name, "from", from.String(), "to", to.String())
+		}}),
+	}, cache.ProtoCodec[*inventoryv1.GetStockResponse]{})
+	if err != nil {
+		return nil, fmt.Errorf("new stock cache: %w", err)
+	}
+	if sw != nil {
+		sw.Watch(func() degrade.Status {
+			st := c.Breaker().Stats()
+			return degrade.Status{
+				Degraded: st.State != breaker.Closed,
+				Detail:   fmt.Sprintf("redis=%s(opens=%d,rejected=%d)", st.State, st.Opens, st.Rejected),
+			}
+		})
+	}
+	return c, nil
+}
+
 // New 返回使用 st 和库存闸门 gate 的 Service。
 func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger, opts ...Option) *Service {
 	s := &Service{store: st, gate: gate, logger: logger, txRetry: defaultTxRetry}
@@ -82,6 +128,7 @@ func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger, opts ...Opt
 // Reserve 实现 InventoryServiceServer。
 func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) (*inventoryv1.ReserveResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	want, err := validateReserve(req)
 	if err != nil {
 		return nil, err
@@ -90,9 +137,11 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 	var (
 		result     []store.Item
 		merchantID int64
+		// fresh 只给指标用：这次是新的预占（不是幂等重放）。
+		fresh bool
 	)
 	err = s.inTx(ctx, func(tx *store.Tx) error {
-		result, merchantID = nil, 0
+		result, merchantID, fresh = nil, 0, false
 		// 先插入再判断，让唯一键充当互斥；并发的重复请求会等这里提交或回滚。
 		inserted, err := tx.InsertReservation(ctx, orderID, store.StatusReserved)
 		if err != nil {
@@ -103,26 +152,7 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 			return err
 		}
 
-		// 所有事务按同一顺序锁 sku_stock 的行，避免交叉购买时死锁。
-		for _, it := range want {
-			ok, err := tx.ReserveStock(ctx, it.SKUID, it.Quantity)
-			if err != nil {
-				return err
-			}
-			if ok {
-				continue
-			}
-			exists, err := tx.SKUExists(ctx, it.SKUID)
-			if err != nil {
-				return err
-			}
-			// 返回错误让整个事务回滚，连同上面插入的头记录和已扣的其他 SKU。
-			if !exists {
-				return errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", it.SKUID)
-			}
-			return errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "insufficient stock for sku %d", it.SKUID)
-		}
-
+		// 读单价和商家，同时确认 SKU 都存在。普通的快照读，不锁 sku_stock 的行。
 		skuIDs := make([]int64, len(want))
 		for i, it := range want {
 			skuIDs[i] = it.SKUID
@@ -135,12 +165,12 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		for i := range items {
 			sku, ok := skus[items[i].SKUID]
 			if !ok {
-				// 刚刚成功扣减过的行不可能消失，出现就是数据被破坏。
-				return errors.New("sku missing after reserve")
+				// 返回错误让整个事务回滚，连同上面插入的头记录。
+				return errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", items[i].SKUID)
 			}
 			items[i].UnitPrice = sku.UnitPrice
 		}
-		// 一个订单只属于一个商家（ADR-0014）。返回错误让整个事务回滚，连同已扣的库存。
+		// 一个订单只属于一个商家（ADR-0014）。返回错误让整个事务回滚。
 		merchant, err := singleMerchant(skus)
 		if err != nil {
 			return err
@@ -151,11 +181,29 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 		if err := tx.InsertReservationItems(ctx, orderID, items); err != nil {
 			return err
 		}
-		result, merchantID = items, merchant
+		// 库存的变化只记增量，不改 sku_stock（ADR-0018）：买同一个 SKU 的订单不再抢同一行的锁，
+		// 后台的应用者按 SKU 合并后一次更新。这里不检查可售数够不够：能不能卖由库存闸门在受理时
+		// 原子地判断过了。闸门和 MySQL 对不上时，以前是这里返回库存不足，现在是应用者发现并报错。
+		for _, it := range items {
+			if err := tx.PendReserve(ctx, orderID, it.SKUID, it.Quantity); err != nil {
+				return err
+			}
+		}
+		result, merchantID, fresh = items, merchant, true
 		return nil
 	})
 	if err != nil {
+		if reason := errx.Reason(err); reason != "" {
+			stockRejections.Add(ctx, 1, rejectionOpt(reason))
+		}
 		return nil, s.toStatus(ctx, "reserve", err, "order_id", orderID)
+	}
+	if fresh {
+		var n int64
+		for _, it := range result {
+			n += int64(it.Quantity)
+		}
+		stockReserved.Add(ctx, n)
 	}
 	return &inventoryv1.ReserveResponse{Items: toProtoItems(result), MerchantId: merchantID}, nil
 }
@@ -258,6 +306,7 @@ func validateReserve(req *inventoryv1.ReserveRequest) ([]store.Item, error) {
 // avail 偏大扣掉，占用本身却永远不会消失）。结清以订单号幂等，之后订单的 paid 事件再来也无害。
 func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) (*inventoryv1.ConfirmResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
@@ -270,7 +319,10 @@ func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) 
 // confirm 把订单的预占转为已售，以 order_id 幂等。gRPC 和事件消费共用。
 // 返回业务错误（errx）或未经转换的内部错误，由调用方决定如何对外呈现。
 func (s *Service) confirm(ctx context.Context, orderID int64) error {
-	return s.inTx(ctx, func(tx *store.Tx) error {
+	// n 只给指标用：这次确认记下的件数，事务提交成功后才计入。
+	var n int64
+	err := s.inTx(ctx, func(tx *store.Tx) error {
+		n = 0
 		// 记录应当已经存在，加排他锁不会落到间隙上；不存在就报错，不会接着插入。
 		st, found, err := tx.ReservationStatusForUpdate(ctx, orderID)
 		if err != nil {
@@ -285,11 +337,15 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 		case store.StatusReleased:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "reservation of order %d has been released", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusConfirmed, tx.ConfirmStock)
+			return settle(ctx, tx, orderID, store.StatusConfirmed, countPend(&n, tx.PendConfirm))
 		default:
-			return errors.New("unknown reservation status")
+			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
+	if err == nil && n > 0 {
+		stockDeducted.Add(ctx, n)
+	}
+	return err
 }
 
 // Release 实现 InventoryServiceServer。
@@ -298,6 +354,7 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 // 恒等式两边都不变，对账发现不了，闸门会永久少放这部分数量。
 func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) (*inventoryv1.ReleaseResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
@@ -310,7 +367,10 @@ func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) 
 // release 释放订单的预占，以 order_id 幂等；预占不存在时留下空回滚标记。
 // gRPC 和事件消费共用，错误约定同 confirm。
 func (s *Service) release(ctx context.Context, orderID int64) error {
-	return s.inTx(ctx, func(tx *store.Tx) error {
+	// n 只给指标用：这次释放记下的件数，事务提交成功后才计入。
+	var n int64
+	err := s.inTx(ctx, func(tx *store.Tx) error {
+		n = 0
 		// 没有预占记录时插入成功，这一行就是“已释放”标记（空回滚），
 		// 它让仍在路上的 Reserve 撞上唯一键而被拒绝，防止库存悬挂。
 		// 已有记录时这一步已对它加了排他锁，见 InsertReservationOrLock。
@@ -332,16 +392,23 @@ func (s *Service) release(ctx context.Context, orderID int64) error {
 		case store.StatusConfirmed:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationConfirmed, "reservation of order %d has been confirmed", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusReleased, tx.ReleaseStock)
+			return settle(ctx, tx, orderID, store.StatusReleased, countPend(&n, tx.PendRelease))
 		default:
-			return errors.New("unknown reservation status")
+			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
+	if err == nil && n > 0 {
+		stockReleased.Add(ctx, n)
+	}
+	return err
 }
 
-// settle 把 RESERVED 的预占转为 to，并对每一项按 sku_id 升序执行 move。
+// settle 把 RESERVED 的预占转为 to，并对每一项记一笔库存增量（pend）。
 // 调用方必须已对 reservation 记录持有排他锁。
-func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, move func(context.Context, int64, int32) (bool, error)) error {
+//
+// 状态的条件更新保证一个订单只会被确认或释放一次，所以每笔增量只记一次。
+// 增量应用到 sku_stock 时如果预占量不够扣，说明恒等式已被破坏，由应用者发现并报错（见 store.ApplyPending）。
+func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, pend func(ctx context.Context, orderID, skuID int64, qty int32) error) error {
 	ok, err := tx.UpdateReservationStatus(ctx, orderID, store.StatusReserved, to)
 	if err != nil {
 		return err
@@ -355,17 +422,11 @@ func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, m
 		return err
 	}
 	if len(items) == 0 {
-		return errors.New("reserved reservation has no items")
+		return fmt.Errorf("%w: reserved reservation of order %d has no items", errCorruptReservation, orderID)
 	}
 	for _, it := range items {
-		ok, err := move(ctx, it.SKUID, it.Quantity)
-		if err != nil {
+		if err := pend(ctx, orderID, it.SKUID, it.Quantity); err != nil {
 			return err
-		}
-		if !ok {
-			// 预占量不够扣，说明 available + reserved + sold 的恒等式已被破坏，
-			// 宁可整单失败报警，也不能继续写出错误的库存。
-			return errors.New("stock invariant violated")
 		}
 	}
 	return nil
@@ -400,7 +461,9 @@ func (s *Service) loadStock(ctx context.Context, skuID int64) (*inventoryv1.GetS
 		return nil, false, err
 	}
 	return &inventoryv1.GetStockResponse{
-		SkuId:     stock.SKUID,
+		SkuId: stock.SKUID,
+		// 照实返回，超卖时 available 是负数（ADR-0018）：这个接口也给对账和排查用，
+		// 在这里截断会让 available + reserved + sold 对不上入库总量。面向买家的展示由 gateway 截到 0。
 		Available: stock.Available,
 		Reserved:  stock.Reserved,
 		Sold:      stock.Sold,
@@ -429,16 +492,20 @@ func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
 }
 
 // toStatus 把 handler 的错误转换为返回给调用方的 gRPC 错误。
-// 业务错误原样返回；其他错误在这里记录细节，对外只给出不含内部信息的 Internal。
+// 业务错误原样返回；闸门（Redis）的错误是降级错误；其他错误在这里记录细节，对外只给出不含内部信息的 Internal。
 func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...any) error {
-	if errx.Reason(err) != "" {
+	if reason := errx.Reason(err); reason != "" {
+		otelx.SetReason(ctx, reason)
 		return err
 	}
 	switch {
 	case errors.Is(err, errGate):
 		// MySQL 的那一步已经提交（或根本没开始，如 WarmUp），调用方重试即可补上。
+		// 用降级错误而不是 UNAVAILABLE（理由见 errx.Degraded）：坏的是闸门的 Redis，不是 inventory。
+		// 返回 UNAVAILABLE 的话，order 的边车连续 5 次就把 inventory 整个摘掉，不碰 Redis 的 Reserve 也跟着不可用。
+		// 排在取消、超时之前：闸门的调用因为这个请求的时限到了而失败，多半是 Redis 慢或连不上，照样算降级。
 		s.logger.WarnContext(ctx, "stock gate operation failed", append([]any{"op", op, "error", err.Error()}, attrs...)...)
-		return status.Error(codes.Unavailable, "stock gate unavailable, retry later")
+		return errx.Degraded(errx.ReasonStockGateUnavailable, "stock gate unavailable, retry later")
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, "request canceled")
 	case errors.Is(err, context.DeadlineExceeded):

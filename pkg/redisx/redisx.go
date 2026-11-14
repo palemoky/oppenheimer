@@ -8,8 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -44,9 +46,50 @@ const DefaultPoolSize = 32
 const warmUpTimeout = 2 * time.Second
 
 // Open 创建客户端并用 PING 确认可达。调用方负责 Close。
+//
+// Redis 不可达时返回错误。只有“没有 Redis 就什么都做不了”的程序（测试、工具）该用它；
+// 服务用 OpenLazy，见那里的说明。
 func Open(ctx context.Context, cfg Config) (*redis.Client, error) {
+	client, minIdle, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("redisx: ping %s: %w", cfg.Addr, err)
+	}
+	waitWarm(ctx, client, minIdle)
+	return client, nil
+}
+
+// OpenLazy 创建客户端，Redis 此刻不可达也照样返回它。调用方负责 Close。
+//
+// 服务启动时用它（设计文档 1d 的 6.10）。Redis 在运行中坏了，各个使用方都有降级的办法（受理拒绝、
+// 缓存回源、锁放行）；启动时坏着却让进程起不来的话，Redis 故障期间重启或发布的实例就回不来了，
+// 连那些不依赖 Redis 的功能也跟着没了。运行中能降级的东西，启动时坏着也应该能起来。
+//
+// 可达时和 Open 一样等连接池建满。不可达时记一条 WARN 就返回：go-redis 在每次命令时自己建连接，
+// Redis 恢复之后客户端不用重建。只有配置本身不对（地址为空）才返回错误。
+func OpenLazy(ctx context.Context, cfg Config, logger *slog.Logger) (*redis.Client, error) {
+	client, minIdle, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Ping(ctx).Err(); err != nil {
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.WarnContext(ctx, "redis is not reachable at startup, starting degraded", "addr", cfg.Addr, "error", err)
+		return client, nil
+	}
+	waitWarm(ctx, client, minIdle)
+	return client, nil
+}
+
+// newClient 按 cfg 创建客户端，不访问网络。返回的 minIdle 是要预先建好的连接数。
+func newClient(cfg Config) (client *redis.Client, minIdle int, err error) {
 	if cfg.Addr == "" {
-		return nil, errors.New("redisx: empty address")
+		return nil, 0, errors.New("redisx: empty address")
 	}
 	opts := &redis.Options{
 		Addr:         cfg.Addr,
@@ -57,6 +100,10 @@ func Open(ctx context.Context, cfg Config) (*redis.Client, error) {
 		WriteTimeout: cmp(cfg.WriteTimeout, time.Second),
 		PoolSize:     cfg.PoolSize,
 		MinIdleConns: cfg.MinIdleConns,
+		// 让命令遵守调用方 ctx 的截止时间和取消。go-redis 默认不看 ctx：不开的话，调用方给一次 Redis 调用
+		// 设的时限（比如“这次查询最多等 50 毫秒”）不起作用，真正生效的只有上面的 ReadTimeout（1 秒），
+		// 调用方取消了命令也照样等到底。1d 做网关限流时发现（设计文档 1d 的 4.16）。
+		ContextTimeoutEnabled: true,
 	}
 	if opts.PoolSize <= 0 {
 		opts.PoolSize = DefaultPoolSize
@@ -65,13 +112,19 @@ func Open(ctx context.Context, cfg Config) (*redis.Client, error) {
 		opts.MinIdleConns = opts.PoolSize
 	}
 	opts.MinIdleConns = min(opts.MinIdleConns, opts.PoolSize)
-	client := redis.NewClient(opts)
-	if err := client.Ping(ctx).Err(); err != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("redisx: ping %s: %w", cfg.Addr, err)
+	client = redis.NewClient(opts)
+	// 链路和指标（设计文档 1d 的 8.4）：每条命令一个 CLIENT span，名字是命令名；连接池的统计进指标。
+	// 不记命令的内容：key 里有用户号和幂等键，Lua 脚本很长。
+	// 没有父 span 的命令（后台循环发的）由采样器丢掉，见 otelx 的 dropRootClient。
+	if err := redisotel.InstrumentTracing(client, redisotel.WithDBStatement(false), redisotel.WithDialFilter(true),
+		// 不记调用位置：它要每条命令做一次 runtime.Caller，而位置总是落在我们自己的封装里，没有信息量。
+		redisotel.WithCallerEnabled(false)); err != nil {
+		return nil, 0, fmt.Errorf("redisx: instrument tracing: %w", err)
 	}
-	waitWarm(ctx, client, opts.MinIdleConns)
-	return client, nil
+	if err := redisotel.InstrumentMetrics(client); err != nil {
+		return nil, 0, fmt.Errorf("redisx: instrument metrics: %w", err)
+	}
+	return client, opts.MinIdleConns, nil
 }
 
 func cmp(v, def time.Duration) time.Duration {

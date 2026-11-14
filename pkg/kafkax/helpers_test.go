@@ -139,9 +139,24 @@ func committed(t *testing.T, brokers []string, group, topic string) map[int32]in
 		t.Fatalf("new client: %v", err)
 	}
 	defer cl.Close()
-	resp, err := kadm.NewClient(cl).FetchOffsets(ctx, group)
-	if err != nil {
-		t.Fatalf("fetch offsets: %v", err)
+	// 查位点失败时重试到时限为止。刚建的消费组、broker 忙的时候，组协调者会暂时不可用
+	// （COORDINATOR_NOT_AVAILABLE、COORDINATOR_LOAD_IN_PROGRESS、NOT_COORDINATOR），过一会儿就好。
+	// 这是 Kafka 的正常行为，不是被测代码的问题；以前这里一次失败就让测试失败，CI 上出现过。
+	adm := kadm.NewClient(cl)
+	var resp kadm.OffsetResponses
+	for {
+		resp, err = adm.FetchOffsets(ctx, group)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("fetch offsets: %v", err)
+		}
+		t.Logf("fetch offsets (will retry): %v", err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	out := make(map[int32]int64)
 	for _, ps := range resp {

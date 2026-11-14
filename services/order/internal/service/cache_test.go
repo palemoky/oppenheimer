@@ -21,7 +21,7 @@ import (
 // st 为空时用 e.store；传入一个读不了的 store 可以证明某次查询没有读库。
 func (e *env) cachedService(t *testing.T, st *store.Store) *Service {
 	t.Helper()
-	c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger)
+	c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

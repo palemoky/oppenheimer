@@ -45,3 +45,25 @@ func TestReasonOfForeignErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestDegraded(t *testing.T) {
+	err := errx.Degraded(errx.ReasonStockGateUnavailable, "stock gate unavailable")
+	// 不能是 UNAVAILABLE：调用方的边车会把它算成这个服务的失败（见 Degraded 的注释）。
+	if got := errx.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("code = %s, want FailedPrecondition", got)
+	}
+	if !errx.IsDegraded(err) || !errx.IsDegraded(fmt.Errorf("wrapped: %w", err)) {
+		t.Fatal("IsDegraded = false for a degraded error")
+	}
+	for _, other := range []error{
+		nil,
+		errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "no stock"),
+		errx.New(codes.ResourceExhausted, errx.ReasonBacklogged, "busy"),
+		status.Error(codes.Unavailable, "down"),
+		errors.New("plain"),
+	} {
+		if errx.IsDegraded(other) {
+			t.Errorf("errx.IsDegraded(%v) = true, want false", other)
+		}
+	}
+}

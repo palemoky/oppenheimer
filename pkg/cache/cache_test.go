@@ -12,6 +12,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"github.com/palemoky/oppenheimer/pkg/breaker"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
@@ -324,6 +326,120 @@ func TestRedisDownFallsBackToLoad(t *testing.T) {
 	}
 	if n := l.calls.Load(); n != 3 {
 		t.Fatalf("loaded %d times, want 3", n)
+	}
+}
+
+// countingHook 数实际发往 Redis 的命令（包括连不上的）。
+type countingHook struct{ cmds atomic.Int64 }
+
+func (h *countingHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *countingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.cmds.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *countingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// Redis 不可用：连续失败几次之后不再碰 Redis，直接回源；冷却之后只放一次去探测。
+func TestBreakerStopsCallingDeadRedis(t *testing.T) {
+	dead := redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:1", DialTimeout: 100 * time.Millisecond, MaxRetries: -1, DialerRetries: 1,
+	})
+	t.Cleanup(func() { _ = dead.Close() })
+	hook := &countingHook{}
+	dead.AddHook(hook)
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	br := breaker.New(breaker.Config{Failures: 3, Cooldown: 5 * time.Second, Now: clock})
+	ctx := testCtx(t)
+	c := newCache(t, dead, "t:dead:", func(cfg *Config) { cfg.Breaker = br })
+	l := &loader{res: Loaded[string]{Value: "v", Found: true, TTL: time.Minute}}
+
+	for range 20 {
+		if v, found := mustGet(ctx, t, c, "k", l); !found || v != "v" {
+			t.Fatalf("got (%q, %v), want (v, true)", v, found)
+		}
+	}
+	if n := l.calls.Load(); n != 20 {
+		t.Fatalf("loaded %d times, want 20", n)
+	}
+	// 前 3 次各读一次 Redis（读失败后这次调用不再写、不再加锁），之后熔断器打开。
+	if n := hook.cmds.Load(); n != 3 {
+		t.Fatalf("%d redis commands for 20 gets against a dead redis, want 3", n)
+	}
+	if got := c.Breaker().State(); got != breaker.Open {
+		t.Fatalf("breaker state = %s, want open", got)
+	}
+
+	// 冷却之后：一次探测，失败，继续打开。
+	now = now.Add(5 * time.Second)
+	for range 10 {
+		mustGet(ctx, t, c, "k", l)
+	}
+	if n := hook.cmds.Load(); n != 4 {
+		t.Fatalf("%d redis commands after the cooldown, want 4 (one probe)", n)
+	}
+}
+
+// Redis 恢复之后熔断器关闭，缓存重新生效。
+func TestBreakerRecovers(t *testing.T) {
+	client, prefix := testredis.New(t)
+	now := time.Now()
+	br := breaker.New(breaker.Config{Failures: 1, Cooldown: time.Second, Now: func() time.Time { return now }})
+	c := newCache(t, client, prefix, func(cfg *Config) { cfg.Breaker = br })
+	ctx := testCtx(t)
+	l := &loader{res: Loaded[string]{Value: "v", Found: true, TTL: time.Minute}}
+
+	// 模拟 Redis 出过一次错：熔断器打开，Get 不读缓存也不写缓存。
+	br.Report(false)
+	mustGet(ctx, t, c, "k", l)
+	mustGet(ctx, t, c, "k", l)
+	if n := l.calls.Load(); n != 2 {
+		t.Fatalf("loaded %d times while the breaker is open, want 2", n)
+	}
+	// 冷却之后的第一次 Get 是探测：读成功（未命中），回源并写入；之后命中。
+	now = now.Add(time.Second)
+	mustGet(ctx, t, c, "k", l)
+	mustGet(ctx, t, c, "k", l)
+	if n := l.calls.Load(); n != 3 {
+		t.Fatalf("loaded %d times in total, want 3 (the probe filled the cache)", n)
+	}
+	if got := br.State(); got != breaker.Closed {
+		t.Fatalf("breaker state = %s, want closed", got)
+	}
+}
+
+// 开关关掉：不读也不写缓存；打开之后恢复。
+func TestSwitchOffBypassesCache(t *testing.T) {
+	client, prefix := testredis.New(t)
+	set := degrade.New("test", slog.New(slog.DiscardHandler))
+	sw := set.Switch("cache", "")
+	c := newCache(t, client, prefix, func(cfg *Config) { cfg.Switch = sw })
+	ctx := testCtx(t)
+	l := &loader{res: Loaded[string]{Value: "v", Found: true, TTL: time.Minute}}
+
+	if err := set.SetMode("cache", degrade.ModeOff); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		mustGet(ctx, t, c, "k", l)
+	}
+	if n := l.calls.Load(); n != 3 {
+		t.Fatalf("loaded %d times with the cache switched off, want 3", n)
+	}
+	if err := set.SetMode("cache", degrade.ModeAuto); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		mustGet(ctx, t, c, "k", l)
+	}
+	if n := l.calls.Load(); n != 4 {
+		t.Fatalf("loaded %d times in total, want 4 (one fill after switching back on)", n)
 	}
 }
 

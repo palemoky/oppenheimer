@@ -14,6 +14,7 @@ import (
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
@@ -34,6 +35,7 @@ func (s *server) requireUser(c *gin.Context) {
 		return
 	}
 	c.Set(userIDKey, uid)
+	otelx.SetUser(c.Request.Context(), uid)
 }
 
 func userID(c *gin.Context) int64 { return c.GetInt64(userIDKey) }
@@ -119,6 +121,8 @@ func (s *server) CreateOrder(c *gin.Context, params oas.CreateOrderParams) {
 		s.writeEmptyResponse(c, "SubmitOrder")
 		return
 	}
+	// 订单号在受理之后才有。
+	otelx.SetOrder(c.Request.Context(), resp.GetOrder().GetOrderId(), userID(c))
 	// 下单是异步的：这里只表示请求已受理，订单还没落库。Location 告诉客户端去哪里轮询结果。
 	c.Header("Location", "/api/v1/orders/"+strconv.FormatInt(resp.GetOrder().GetOrderId(), 10))
 	writeJSON(c, http.StatusAccepted, toOrder(resp.GetOrder()))
@@ -130,6 +134,7 @@ func (s *server) GetOrder(c *gin.Context, rawOrderID oas.OrderId) {
 	if !ok {
 		return
 	}
+	otelx.SetOrder(c.Request.Context(), orderID, userID(c))
 	resp, err := s.deps.Order.GetOrder(c.Request.Context(), &orderv1.GetOrderRequest{OrderId: orderID, UserId: userID(c)})
 	if err != nil {
 		s.writeGRPCError(c, err)
@@ -148,6 +153,7 @@ func (s *server) CancelOrder(c *gin.Context, rawOrderID oas.OrderId) {
 	if !ok {
 		return
 	}
+	otelx.SetOrder(c.Request.Context(), orderID, userID(c))
 	resp, err := s.deps.Order.CancelOrder(c.Request.Context(), &orderv1.CancelOrderRequest{OrderId: orderID, UserId: userID(c)})
 	if err != nil {
 		s.writeGRPCError(c, err)
@@ -166,6 +172,7 @@ func (s *server) PayOrder(c *gin.Context, rawOrderID oas.OrderId) {
 	if !ok {
 		return
 	}
+	otelx.SetOrder(c.Request.Context(), orderID, userID(c))
 	var req oas.PayOrderRequest
 	if !decodeBody(c, &req, true) {
 		return
@@ -211,6 +218,7 @@ func (s *server) GetPayment(c *gin.Context, rawOrderID oas.OrderId) {
 	if !ok {
 		return
 	}
+	otelx.SetOrder(c.Request.Context(), orderID, userID(c))
 	resp, err := s.deps.Payment.GetPayment(c.Request.Context(), &paymentv1.GetPaymentRequest{OrderId: orderID, UserId: userID(c)})
 	if err != nil {
 		s.writeGRPCError(c, err)
@@ -319,6 +327,10 @@ func (s *server) ListOrders(c *gin.Context, params oas.ListOrdersParams) {
 		out.Orders = append(out.Orders, toOrderSummary(o))
 	}
 	out.NextCursor = nextCursor(resp.GetNextBeforeOrderId())
+	if resp.GetArchiveUnavailable() {
+		// 冷库不可用时 order 只返回近期的一段（设计文档 1d 的 6.8）。正常时这个字段不出现。
+		out.ArchiveUnavailable = new(true)
+	}
 	writeJSON(c, http.StatusOK, out)
 }
 

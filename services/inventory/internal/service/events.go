@@ -10,6 +10,7 @@ import (
 	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 )
 
 // DefaultEventTimeout 是处理一条订单事件的时限。
@@ -48,6 +49,7 @@ func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 	}
 
 	orderID := ev.GetOrderId()
+	otelx.SetOrder(ctx, orderID, ev.GetUserId())
 	if orderID <= 0 {
 		// 发布方保证有 order_id（eventx.MarshalOrderEvent 会拒绝），出现就是消息损坏。
 		return kafkax.Permanent(fmt.Errorf("order event %s without order_id", op))
@@ -62,6 +64,12 @@ func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 		// 不自作主张修复（例如把已释放的库存再扣一次），送进死信由人判断。
 		s.logger.ErrorContext(ctx, "order event conflicts with reservation state",
 			"op", op, "order_id", orderID, "reason", errx.Reason(err), "error", err.Error())
+		return kafkax.Permanent(fmt.Errorf("%s order %d: %w", op, orderID, err))
+	}
+	if errors.Is(err, errCorruptReservation) {
+		// 数据本身不对，重试不会变。和上面一样送进死信由人判断，不让它一直挡住分区。
+		s.logger.ErrorContext(ctx, "reservation data is corrupt",
+			"op", op, "order_id", orderID, "error", err.Error())
 		return kafkax.Permanent(fmt.Errorf("%s order %d: %w", op, orderID, err))
 	}
 	return fmt.Errorf("%s order %d: %w", op, orderID, err)

@@ -22,7 +22,8 @@
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
-| Redis | 8.10.3 | 稳定版 | 2026-11-11 | compose 里有两个实例，同一个镜像：`redis`（闸门和锁，`noeviction`，AOF）和 `redis-cache`（查询缓存，`allkeys-lru`，不持久化），升级时一起改 |
+| Envoy | v1.40.2 | 稳定版 | 2026-11-14 | 服务之间的熔断和并发隔离（ADR-0020）。镜像 `envoyproxy/envoy:v1.40.2`。没有 LTS，同时维护最近四个小版本 |
+| Redis | 8.10.3 | 稳定版 | 2026-11-11 | compose 里有两个实例，同一个镜像：`redis`（闸门和锁，`noeviction`，AOF）和 `redis-cache`（查询缓存和 gateway 的限流状态，`allkeys-lru`，不持久化；限流的桶丢了只是重新装满），升级时一起改 |
 | Kafka | 4.4.0 | 稳定版 | 2026-11-11 | `apache/kafka` 镜像，KRaft 模式 |
 | buf | v1.75.0 | 稳定版 | 2026-11-11 | 版本写在 `Makefile` 和 CI 里，升级时一起改 |
 | protoc-gen-go | v1.36.12 | 稳定版 | 2026-11-11 | 同上 |
@@ -37,6 +38,12 @@
 | redis/go-redis | v9.23.0 | 稳定版 | 2026-11-11 | Redis 客户端，见 ADR-0007 |
 | go-mysql-org/go-mysql | v1.16.0 | 稳定版 | 2026-11-13 | CDC 服务读 binlog 用它的 `replication` 包（ADR-0014）。GitHub 的 API 当时访问不了，版本是从仓库的标签列表和 Go 模块代理核对的；已实测能从 MySQL 9.7.4 读到列名、行映像和提交时间 |
 | kafbat-ui | v1.5.0 | 稳定版 | 2026-11-14 | Kafka 的 Web 界面，镜像 `ghcr.io/kafbat/kafka-ui:v1.5.0`（tag 带 `v`），GitHub releases 上的最新正式版，发布于 2026-04-20。仅本机开发用，profile `ui`，只读，宿主机端口 8090（`KAFKA_UI_PORT`），见下 |
+| grafana/otel-lgtm | 0.41.0 | 稳定版 | 2026-11-14 | 本机可观测后端，一个容器里有 OpenTelemetry Collector、Tempo、Prometheus、Loki、Grafana。Docker Hub 的最新正式 tag（2026-11-13 发布，有 amd64 和 arm64）。版本号是 0.x，没有 LTS。仅本机开发用，profile `obs`，宿主机端口 4317（OTLP gRPC）、4318（OTLP HTTP）、3000（Grafana，`GRAFANA_PORT`），数据不持久化，见 ADR-0023 |
+| go.opentelemetry.io/otel | v1.47.0 | 稳定版 | 2026-11-14 | 链路和指标。同版本还有 `sdk`、`sdk/metric`、`trace`、`exporters/otlp/otlptrace/otlptracegrpc`、`exporters/otlp/otlpmetric/otlpmetricgrpc`（OTLP gRPC 导出器），版本一起升。装配在 `pkg/otelx`，见 ADR-0004、ADR-0023 |
+| otel contrib：otelgrpc | v0.72.0 | 稳定版 | 2026-11-14 | `go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc`，gRPC 的链路传播和指标 |
+| otel contrib：runtime | v0.72.0 | 稳定版 | 2026-11-14 | `go.opentelemetry.io/contrib/instrumentation/runtime`，Go 运行时指标（GC、goroutine 等） |
+| redis/go-redis/extra/redisotel | v9.23.0 | 稳定版 | 2026-11-14 | `github.com/redis/go-redis/extra/redisotel/v9`，Redis 调用的链路和指标，版本与 go-redis 一致 |
+| XSAM/otelsql | v0.44.0 | 稳定版 | 2026-11-14 | `github.com/XSAM/otelsql`，`database/sql` 的链路和指标（MySQL） |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
 ## 本机 compose 的 MySQL 实例（2026-11-13）
@@ -81,6 +88,20 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 | compose 服务 | 用途 | 宿主机端口 | 备注 |
 |---|---|---|---|
 | `kafka-ui` | 看 topic、消息、消费组 lag | 8090（只绑 127.0.0.1） | 连 `kafka:19092`；`KAFKA_CLUSTERS_0_READONLY=true` 只读；不设登录；堆上限 256 MB，容器上限 512 MB；未配置 protobuf serde |
+
+## 本机 compose 的 Envoy 边车（2026-11-14）
+
+每个服务一个边车（ADR-0020，配置在 `deploy/envoy/<服务>.yaml`），`make up` 启动，镜像 `envoyproxy/envoy:v1.40.2`。服务是宿主机上的进程，调用下游时连自己边车的出站端口；入站端口 15001 只在边车之间用（容器网络内），不发布到宿主机。`scripts/lib/sidecar.sh` 里是脚本用的同一份端口。
+
+| compose 服务 | 管理端口（宿主机，`/stats`、`/ready`） | 出站端口（宿主机） | 备注 |
+|---|---|---|---|
+| `envoy-gateway` | 19901 | 15081 order、15082 inventory、15083 payment、15084 orderindex | gateway 没有入站边车，客户端直接访问 8080 |
+| `envoy-order` | 19902 | 15182 inventory | 入站 15001 转给 order 的 gRPC 9081 |
+| `envoy-payment` | 19903 | 15281 order | 入站 15001 转给 payment 的 gRPC 9083 |
+| `envoy-inventory` | 19904 | 无 | 入站 15001 转给 inventory 的 gRPC 9082 |
+| `envoy-orderindex` | 19905 | 无 | 入站 15001 转给 orderindex 的 gRPC 9084 |
+
+统计项例子：`curl -s 127.0.0.1:19901/stats | grep to_inventory`。并发上限溢出看 `cluster.to_<下游>.upstream_rq_active_overflow`（HTTP/2 的在途请求上限），熔断看 `cluster.to_<下游>.outlier_detection.ejections_enforced_total` 和 `ejections_active`。
 
 ## 待引入（引入时查证并移到上表）
 

@@ -188,6 +188,9 @@ type Report struct {
 	// PollRequests 是查询订单的请求数，PollErrors 是其中没有拿到 200 或 404 的。
 	PollRequests int64 `json:"poll_requests"`
 	PollErrors   int64 `json:"poll_errors"`
+
+	// Open 只在开环模式下有，闭环的报告里不出现。
+	Open *OpenReport `json:"open,omitempty"`
 }
 
 func toMs(d time.Duration) float64 {
@@ -245,6 +248,19 @@ func (a *aggregator) report(end time.Time, cfg *Config) *Report {
 // WriteText 把报告以人读的格式写出。
 func (r *Report) WriteText(w io.Writer) error {
 	p := &printer{w: w}
+	if r.Open != nil {
+		p.printf("run %s  seed %d  mode open  elapsed %.1fs", r.RunID, r.Seed, r.ElapsedSeconds)
+		if r.Interrupted {
+			p.printf("  (interrupted)")
+		}
+		p.printf("\n\n")
+		r.Open.writeText(p)
+		p.printf("polls     %d (errors %d)\n", r.PollRequests, r.PollErrors)
+		for _, op := range slices.Sorted(maps.Keys(r.Requests)) {
+			p.section("requests "+op, r.Requests[op])
+		}
+		return p.err
+	}
 	p.printf("run %s  seed %d  concurrency %d  elapsed %.1fs", r.RunID, r.Seed, r.Concurrency, r.ElapsedSeconds)
 	if r.Interrupted {
 		p.printf("  (interrupted)")
@@ -289,5 +305,140 @@ func (p *printer) section(title string, m map[string]int64) {
 	p.printf("\n%s:\n", title)
 	for _, k := range slices.Sorted(maps.Keys(m)) {
 		p.printf("  %-20s %d\n", k, m[k])
+	}
+}
+
+// DrainReport 是开环收尾阶段的结果：对所有受理的订单轮询，直到都离开 creating 或 -drain 到时。
+//
+// 落库延迟没有量：订单的响应只有 create_time 和 expire_time，没有落库（状态离开 creating）的时刻，
+// 压测期间又不轮询，收尾阶段第一次看到的时间会比真实落库晚得多。这里只报告收尾用了多久、
+// 有多少订单在 -drain 内没有离开 creating。
+type DrainReport struct {
+	Accepted      int64            `json:"accepted"`
+	LeftCreating  int64            `json:"left_creating"`  // 收尾阶段看到已离开 creating 的订单数（含同步落库的）
+	StillCreating int64            `json:"still_creating"` // -drain 到时仍在 creating（或一直没拿到响应）
+	NotFound      int64            `json:"not_found"`      // 最后一次查询是 404
+	TimedOut      bool             `json:"timed_out"`
+	Seconds       float64          `json:"seconds"`
+	FinalStatus   map[string]int64 `json:"final_status"`
+	// LandingLatencyMeasured 恒为 false：见类型说明。
+	LandingLatencyMeasured bool `json:"landing_latency_measured"`
+}
+
+// PerSecond 是每秒受理数的时间序列和它的最小值、中位数、最大值。
+type PerSecond struct {
+	Min    int64   `json:"min"`
+	Median float64 `json:"median"`
+	Max    int64   `json:"max"`
+	Series []int64 `json:"series"`
+}
+
+// OpenReport 是开环模式特有的汇总。
+type OpenReport struct {
+	Rate            float64 `json:"rate"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	MaxInFlight     int     `json:"max_in_flight"`
+	Planned         int64   `json:"planned"`
+	Sent            int64   `json:"sent"`
+	Dropped         int64   `json:"dropped"`
+	// SendWindowSeconds 是调度循环从开始到发完（或放弃）最后一个请求的时间，SentPerSecond 是 Sent 除以它。
+	SendWindowSeconds float64 `json:"send_window_seconds"`
+	SentPerSecond     float64 `json:"sent_per_second"`
+	// Outcomes 是实际发出的请求按结果的分类计数。
+	Outcomes map[string]int64 `json:"outcomes"`
+	// 从计划时刻算的延迟（含请求在压测机这边被耽搁的时间）和从实际发出算的延迟（service time）。
+	// 只统计实际发出且拿到响应的请求；受理的和被拒绝（背压、限流、业务拒绝）的分开。
+	AcceptedFromSchedule Latency     `json:"accepted_from_schedule"`
+	AcceptedServiceTime  Latency     `json:"accepted_service_time"`
+	RejectedFromSchedule Latency     `json:"rejected_from_schedule"`
+	RejectedServiceTime  Latency     `json:"rejected_service_time"`
+	AcceptedPerSecond    PerSecond   `json:"accepted_per_second"`
+	Drain                DrainReport `json:"drain"`
+}
+
+func (o *openRunner) openReport(sr scheduleResult, drain DrainReport) *OpenReport {
+	o.mu.Lock()
+	outcomes := maps.Clone(o.outcomes)
+	series := slices.Clone(o.perSec)
+	o.mu.Unlock()
+	rep := &OpenReport{
+		Rate:                 o.cfg.Rate,
+		DurationSeconds:      o.cfg.Duration.Seconds(),
+		MaxInFlight:          o.cfg.MaxInFlight,
+		Planned:              sr.Planned,
+		Sent:                 sr.Sent,
+		Dropped:              sr.Dropped,
+		SendWindowSeconds:    sr.End.Sub(sr.Start).Seconds(),
+		Outcomes:             outcomes,
+		AcceptedFromSchedule: latencyOf(o.acceptSched.Summary()),
+		AcceptedServiceTime:  latencyOf(o.acceptSvc.Summary()),
+		RejectedFromSchedule: latencyOf(o.rejectSched.Summary()),
+		RejectedServiceTime:  latencyOf(o.rejectSvc.Summary()),
+		AcceptedPerSecond:    perSecondOf(series),
+		Drain:                drain,
+	}
+	if rep.SendWindowSeconds > 0 {
+		rep.SentPerSecond = math.Round(float64(sr.Sent)/rep.SendWindowSeconds*100) / 100
+	}
+	return rep
+}
+
+func perSecondOf(series []int64) PerSecond {
+	p := PerSecond{Series: series}
+	if len(series) == 0 {
+		return p
+	}
+	sorted := slices.Sorted(slices.Values(series))
+	p.Min, p.Max = sorted[0], sorted[len(sorted)-1]
+	if n := len(sorted); n%2 == 1 {
+		p.Median = float64(sorted[n/2])
+	} else {
+		p.Median = float64(sorted[n/2-1]+sorted[n/2]) / 2
+	}
+	return p
+}
+
+func (o *OpenReport) writeText(p *printer) {
+	p.printf("open loop: planned rate %.0f/s for %.0fs, max in flight %d\n", o.Rate, o.DurationSeconds, o.MaxInFlight)
+	p.printf("  planned %d  sent %d  dropped %d  actual send rate %.2f/s\n", o.Planned, o.Sent, o.Dropped, o.SentPerSecond)
+	p.printf("\noutcomes (of %d sent):\n", o.Sent)
+	for _, k := range openOutcomes {
+		n := o.Outcomes[k]
+		if n == 0 && k != outAccepted {
+			continue
+		}
+		pct := 0.0
+		if o.Sent > 0 {
+			pct = float64(n) / float64(o.Sent) * 100
+		}
+		p.printf("  %-20s %8d  %6.2f%%\n", k, n, pct)
+	}
+	p.printf("\n")
+	for _, l := range []struct {
+		name string
+		l    Latency
+	}{
+		{"accepted latency (from schedule)", o.AcceptedFromSchedule},
+		{"accepted service time (from send)", o.AcceptedServiceTime},
+		{"rejected latency (from schedule)", o.RejectedFromSchedule},
+		{"rejected service time (from send)", o.RejectedServiceTime},
+	} {
+		p.printf("%-35s n %7d  p50 %8.2fms  p90 %8.2fms  p99 %8.2fms  max %8.2fms\n",
+			l.name, l.l.Count, l.l.P50Ms, l.l.P90Ms, l.l.P99Ms, l.l.MaxMs)
+	}
+	ps := o.AcceptedPerSecond
+	p.printf("\naccepted per second: min %d  median %.1f  max %d (over %d s)\n", ps.Min, ps.Median, ps.Max, len(ps.Series))
+	d := o.Drain
+	p.printf("\ndrain: %.2fs, %d accepted, %d left creating, %d still creating, %d not found", d.Seconds, d.Accepted, d.LeftCreating, d.StillCreating, d.NotFound)
+	if d.TimedOut {
+		p.printf(" (hit -drain)")
+	}
+	p.printf("\n  landing latency: not measured (the order response carries no landing time; polling at drain time would overstate it)\n")
+	if len(d.FinalStatus) > 0 {
+		p.section("final status", d.FinalStatus)
+	}
+	if o.Dropped > 0 {
+		p.printf("\n!!! %d of %d planned requests were NOT SENT (in-flight limit %d reached): the load generator is the bottleneck or the system is stuck.\n",
+			o.Dropped, o.Planned, o.MaxInFlight)
 	}
 }

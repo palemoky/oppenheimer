@@ -130,11 +130,12 @@ func (s *Sweeper) sweepSlot(ctx context.Context, slot int, now time.Time) {
 // 会把时限耗光，退回主库时已经没有时间，这个 slot 这一轮就被跳过；从库一直挂着，兜底任务就一直不工作。
 // 留下的另一半给主库那次查询和处理这一批订单。按剩余时间而不是固定的 SlotTimeout/2 算：一个 slot 依次做
 // 两类扫描，第二次列表开始时 slot 的时限已经用掉一部分，固定的一半可能把剩下的全部占掉。
-// 没有从库时直接查一次主库，不加这层时限。
+// 没有从库时直接查一次主库，不加这层时限。从库被标记为不健康时（设计文档 1d 的 6.7，见 ReplicaProber）
+// 也直接查主库，不再每个 slot 都先在一个落后或挂住的从库上耗掉一半时限。
 func (s *Sweeper) list(ctx context.Context, slot int, kind string,
 	query func(ctx context.Context, src store.Source) ([]store.OrderRef, error),
 ) ([]store.OrderRef, error) {
-	if !s.svc.store.HasReplicas() {
+	if !s.svc.store.HasReplicas() || !s.svc.replicaHealthy(s.svc.store.Router().DB(slot)) {
 		return query(ctx, store.Primary)
 	}
 	budget := s.cfg.SlotTimeout / 2
@@ -172,6 +173,7 @@ func (s *Sweeper) closeOrder(ctx context.Context, r store.OrderRef, now time.Tim
 		return
 	}
 	if ok {
+		reclaimed(ctx, reclaimCloseExpired)
 		s.logger.InfoContext(ctx, "order closed for payment timeout", "order_id", r.OrderID)
 	}
 	// !ok：扫描之后被支付或取消抢先了，事件由抢先的一方写。
@@ -200,6 +202,7 @@ func (s *Sweeper) failCreating(ctx context.Context, r store.OrderRef, now time.T
 		return
 	}
 	if ok {
+		reclaimed(ctx, reclaimCreateTimeout)
 		s.logger.InfoContext(ctx, "order failed for create timeout", "order_id", r.OrderID)
 	}
 }

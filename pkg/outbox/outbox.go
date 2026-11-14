@@ -21,13 +21,18 @@ import (
 	"time"
 
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/worker"
 )
 
-// Schema 是 outbox 表的建表语句。各服务把它放进自己的迁移文件（表名固定为 outbox）。
+// Schema 是 outbox 表的建表语句（表名固定为 outbox）。各服务的迁移跑完之后，表结构要和它一致
+// （已有的表是分几个迁移文件改成这样的，各服务有测试拿实际的表结构和它比）。
 //
 // 索引 (published_at, id)：中继按 “published_at IS NULL ORDER BY id” 取待发送的行，
 // 清理任务按 “published_at < ? ORDER BY id” 删旧行，两者都走这个索引。
+//
+// trace_context 是写这一行时的链路上下文（W3C traceparent，55 个字符），NULL 表示当时没有链路。
+// 中继是后台循环，它发消息时的 ctx 和写这一行的请求没有关系，上下文只能跟着数据走（ADR-0023）。
 const Schema = `CREATE TABLE outbox (
     id            BIGINT          NOT NULL AUTO_INCREMENT,
     topic         VARCHAR(128)    NOT NULL,
@@ -35,6 +40,7 @@ const Schema = `CREATE TABLE outbox (
     payload       MEDIUMBLOB      NOT NULL,
     created_at    DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     published_at  DATETIME(6)     NULL,
+    trace_context VARCHAR(64)     NULL,
     PRIMARY KEY (id),
     KEY idx_outbox_pending (published_at, id)
 ) ENGINE = InnoDB`
@@ -56,7 +62,16 @@ type Message struct {
 //
 // 参数类型是 *sql.Tx 而不是 *sql.DB：从类型上保证它只能在事务里调用。
 // 在事务外写 outbox 就失去了和业务变更的原子性，这个包也就没有意义了。
+//
+// ctx 里有 span 时，它的链路上下文和消息一起写进表里，中继发布时带在消息的 header 上，
+// 消费者的 span 就接在调用 Add 的这个 span 下面。没被采样的也写：采样的决定就在这个值里，
+// 不写的话下游会各自重新决定，采样率低时多出一批只有后半段的链路。
 func Add(ctx context.Context, tx *sql.Tx, msgs ...Message) error {
+	// 没有链路时存 NULL，不存空串。
+	var traceContext sql.NullString
+	if tp := otelx.Traceparent(ctx); tp != "" {
+		traceContext = sql.NullString{String: tp, Valid: true}
+	}
 	for _, m := range msgs {
 		if m.Topic == "" {
 			return errors.New("outbox: empty topic")
@@ -71,8 +86,8 @@ func Add(ctx context.Context, tx *sql.Tx, msgs ...Message) error {
 			payload = []byte{}
 		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO outbox (topic, msg_key, payload) VALUES (?, ?, ?)",
-			m.Topic, key, payload,
+			"INSERT INTO outbox (topic, msg_key, payload, trace_context) VALUES (?, ?, ?, ?)",
+			m.Topic, key, payload, traceContext,
 		); err != nil {
 			return fmt.Errorf("outbox: insert: %w", err)
 		}
@@ -202,6 +217,8 @@ type row struct {
 	topic   string
 	key     []byte
 	payload []byte
+	// traceContext 是写入时的 traceparent，没有时为空串。
+	traceContext string
 }
 
 // Flush 把当前所有未发布的消息发送一遍，返回成功发布的条数。
@@ -232,12 +249,13 @@ func (r *Relay) Flush(ctx context.Context) (published int, err error) {
 
 		recs := make([]kafkax.Record, len(rows))
 		for i, rw := range rows {
-			recs[i] = kafkax.Record{
-				Topic:   rw.topic,
-				Key:     rw.key,
-				Value:   rw.payload,
-				Headers: map[string]string{EventIDHeader: r.cfg.Name + ":" + strconv.FormatInt(rw.id, 10)},
+			headers := map[string]string{EventIDHeader: r.cfg.Name + ":" + strconv.FormatInt(rw.id, 10)}
+			if rw.traceContext != "" {
+				// 生产者看到 ctx 里没有 span 而 header 里有 traceparent 时，把发送的 span 接在它下面
+				// （见 kafkax.Producer.Send）。中继延迟了多久，就是写入的 span 和发送的 span 之间的空隙。
+				headers[kafkax.TraceparentHeader] = rw.traceContext
 			}
+			recs[i] = kafkax.Record{Topic: rw.topic, Key: rw.key, Value: rw.payload, Headers: headers}
 		}
 		errs, err := r.cfg.Sender.Send(ctx, recs...)
 		if err != nil {
@@ -285,7 +303,7 @@ func (r *Relay) fetch(ctx context.Context, afterID int64) ([]row, error) {
 	// 同一订单的两次状态变更被订单行的行锁串行，后一个事务在前一个提交之后才会插入 outbox，
 	// 所以同一个 key 的消息 id 递增，并且前一条一定先于后一条可见。
 	rs, err := r.cfg.DB.QueryContext(ctx,
-		"SELECT id, topic, msg_key, payload FROM outbox WHERE published_at IS NULL AND id > ? ORDER BY id LIMIT ?",
+		"SELECT id, topic, msg_key, payload, trace_context FROM outbox WHERE published_at IS NULL AND id > ? ORDER BY id LIMIT ?",
 		afterID, r.cfg.BatchSize,
 	)
 	if err != nil {
@@ -296,9 +314,11 @@ func (r *Relay) fetch(ctx context.Context, afterID int64) ([]row, error) {
 	var rows []row
 	for rs.Next() {
 		var rw row
-		if err := rs.Scan(&rw.id, &rw.topic, &rw.key, &rw.payload); err != nil {
+		var traceContext sql.NullString
+		if err := rs.Scan(&rw.id, &rw.topic, &rw.key, &rw.payload, &traceContext); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
 		}
+		rw.traceContext = traceContext.String
 		if len(rw.key) == 0 {
 			// 空 key 表示“没有 key”（见 Add）。还原成 nil，让生产者自己挑分区，
 			// 而不是把所有无 key 的消息按空串哈希到同一个分区。

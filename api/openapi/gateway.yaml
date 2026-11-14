@@ -14,7 +14,14 @@ info:
     - 时间是 RFC 3339 格式的 UTC 时间。
     - 请求体里出现未定义的字段会被拒绝（400）。
     - 所有错误响应的结构相同，见 `Error`。500 的响应不透出内部错误消息。
-    - 存活探测 `GET /healthz` 由各服务统一提供，不属于本接口。
+    - 网关按客户端地址、按用户加接口、按接口限流，查库存和商家订单列表还按路径里的 ID 限流（热点参数），
+      超出时返回 429（`RATE_LIMITED`），见 `TooManyRequests`。
+    - 依赖不可用或功能被关掉时，受影响的接口返回 503 和具体的原因码，其余接口照常，见 `ServiceUnavailable`。
+    - 访问日志里的 499 表示客户端在响应返回前断开了连接（Nginx 的约定，不是标准状态码）。
+      客户端收不到这个响应，所以各接口不声明它。
+    - 存活探测 `GET /healthz` 和就绪探测 `GET /readyz` 由各服务统一提供，不属于本接口。
+    - 本接口的每个响应（包括 429、503 和路径不存在时的 404）都带 `X-Trace-Id`，是这个请求的链路 ID。
+      排查问题时把它报给我们。请求里带的 `traceparent` 不会成为这条链路的上级，只作为关联记下。
 servers:
   - url: http://localhost:8080
     description: 本机（make run）
@@ -73,6 +80,9 @@ paths:
       responses:
         '200':
           description: 一页订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -81,6 +91,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -110,6 +124,8 @@ paths:
         '202':
           description: 下单请求已受理（或幂等重放返回已有订单）
           headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
             Location:
               description: 查询这个订单的地址
               schema:
@@ -124,6 +140,9 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           description: 商品不存在
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -132,12 +151,19 @@ paths:
           description: |
             库存不足（`INSUFFICIENT_STOCK`）、超出每人限购数量（`PURCHASE_LIMIT_EXCEEDED`），
             或幂等键已被内容不同的请求使用（`IDEMPOTENCY_KEY_REUSED`）
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -151,6 +177,9 @@ paths:
       responses:
         '200':
           description: 订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -161,6 +190,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -175,6 +208,9 @@ paths:
       responses:
         '200':
           description: 取消后的订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -187,6 +223,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -209,6 +249,9 @@ paths:
       responses:
         '202':
           description: 支付单已受理
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -223,6 +266,10 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -236,6 +283,9 @@ paths:
       responses:
         '200':
           description: 支付单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -246,6 +296,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -259,6 +313,9 @@ paths:
       responses:
         '200':
           description: 库存
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -269,6 +326,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -314,6 +375,9 @@ paths:
       responses:
         '200':
           description: 一页订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -322,6 +386,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -370,42 +438,122 @@ components:
         type: string
         pattern: '^[1-9][0-9]*$'
 
+  headers:
+    TraceId:
+      description: |
+        这个请求在网关的链路 ID（W3C Trace Context 的 trace-id，32 个小写十六进制字符）。
+        每个请求一个新的，不沿用请求里 `traceparent` 的 trace-id（那个只作为关联记在链路上）。
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+    RetryAfter:
+      description: |
+        多少秒之后再重试（正整数，向上取整，至少 1）。它是下界：这段时间里别的请求也在消耗配额，
+        到时重试仍可能被拒绝。原因码是 `RATE_LIMITED` 时一定有；`BACKLOGGED` 时不一定有。
+        503 的降级原因码（见 `ServiceUnavailable`）一定有，是建议的等待时间，不保证到时已经恢复。
+      schema:
+        type: integer
+        minimum: 1
+
   responses:
     BadRequest:
       description: 请求参数非法（`INVALID_ARGUMENT`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     Unauthorized:
       description: 缺少或非法的 `X-User-Id`（`UNAUTHENTICATED`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     NotFound:
       description: 资源不存在，或不属于当前用户
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: 当前状态不允许这个操作（`FAILED_PRECONDITION` 或更具体的原因码）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: 请求体超过 1 MiB（`PAYLOAD_TOO_LARGE`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: |
+        请求被拒绝，没有产生任何效果（没有创建或修改任何东西）。原因码有三种，客户端的处理不同：
+
+        - `RATE_LIMITED`：调用方自己太快了，超出了配额。按 `Retry-After` 等待之后再重试，不要立刻重试。
+          `message` 里说明是哪一维的限制：`ip`（同一个客户端地址的所有请求）、`user`（同一个用户对这个接口）、
+          `route`（这个接口所有用户的总量）、`hot`（这个接口下同一个参数值的所有请求，不分用户：
+          查库存按 `sku_id`，商家订单列表按 `merchant_id`）。其他用户、其他接口通常不受影响。
+        - `BACKLOGGED`：只在下单时出现。系统忙（等待落库的订单积压过多），与调用方的速率无关，所有人都应当退避；
+          稍后用同一个 `Idempotency-Key` 重试即可。
+        - `READ_BUSY`：只在查询订单时出现（查单个订单、订单列表，以及创建支付单时对订单的检查）。
+          订单服务同时处理的查询已经到了上限，这个上限是为了给下单的落库留出数据库连接。
+          与调用方自己的速率无关，稍后重试即可；没有 `Retry-After`。
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: |
+        暂时无法处理，没有产生任何效果（没有创建或修改任何东西），稍后重试。原因码分两类：
+
+        - `UNAVAILABLE`：下游服务不可用。下游响应太慢时通常也是它（服务之间的代理先于网关超时，返回的是“不可用”），
+          和 504 对客户端的含义相同。没有 `Retry-After`。
+        - 降级：系统的某个依赖不可用，或者某个功能被人工关掉了，这个请求现在做不了；其余接口照常。
+          一定带 `Retry-After`。下单时用同一个 `Idempotency-Key` 重试。
+          - `STOCK_GATE_UNAVAILABLE`：库存闸门不可用，暂不受理下单；查询还没落库的订单时也可能出现（说不清它的状态）。
+          - `ORDER_LANDING_UNAVAILABLE`：订单落库在持续失败，暂不受理下单。
+          - `INVENTORY_UNAVAILABLE`：下单时库存服务不可用。
+          - `ORDER_QUEUE_UNAVAILABLE`：下单的消息发不出去。
+          - `ORDER_UNAVAILABLE`：创建或查询支付单时，订单服务不可用。
+          - `ARCHIVE_UNAVAILABLE`：已归档的订单暂时查不到。
+          - `FEATURE_DISABLED`：这个功能被暂时关掉了（维护或保护核心功能）。目前可能被关掉的是下单、
+            订单列表、商家订单列表、查库存；查单个订单、取消、支付不会被关掉。
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     Error:
       description: |
-        其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
-        下单时等待落库的订单积压过多返回 429，原因码 `BACKLOGGED`：请求没有产生任何效果，
-        稍后用同一个 `Idempotency-Key` 重试即可。
+        其他错误。下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
@@ -513,6 +661,11 @@ components:
         next_cursor:
           description: 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
           type: string
+        archive_unavailable:
+          description: >-
+            为 true 表示较早的（已归档的）订单暂时无法查询，这一页只包含近期的订单。
+            列出的每一行都是准确的，只是不完整；稍后用 `next_cursor` 可以接着取。正常时不出现。
+          type: boolean
 
     OrderSummary:
       description: 用户订单列表里的一行，只有列表页要显示的字段。完整内容用订单详情接口。

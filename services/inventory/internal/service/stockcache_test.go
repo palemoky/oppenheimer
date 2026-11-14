@@ -9,6 +9,7 @@ import (
 
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/testdb"
 	"github.com/palemoky/oppenheimer/pkg/testredis"
@@ -105,6 +106,11 @@ func TestGetStockCacheDisabled(t *testing.T) {
 	}
 }
 
+// TestReserveDoesNotInvalidateOrReadCache：Reserve 不失效 GetStock 的缓存，自己也不读它。
+//
+// 以前“不读缓存”是这样验证的：缓存里还是 10，库里只剩 7，再要 8 必须 INSUFFICIENT_STOCK。
+// ADR-0018 之后 Reserve 不再检查可售数，那个断言不再成立。Reserve 仍然从库里读、并且必须读对的
+// 是单价和商家（价格快照），所以改用单价验证：库里改了价，缓存里还是旧价，Reserve 返回的是库里的新价。
 func TestReserveDoesNotInvalidateOrReadCache(t *testing.T) {
 	e := newCacheEnv(t, time.Minute)
 	e.seed(t, 1, 100, 10)
@@ -121,10 +127,81 @@ func TestReserveDoesNotInvalidateOrReadCache(t *testing.T) {
 	if got, err := e.get(t, 1); err != nil || got.GetAvailable() != 10 || got.GetReserved() != 0 {
 		t.Fatalf("after reserve = %v, %v; want stale (10, 0)", got, err)
 	}
-	// Reserve 自己读库：库存只剩 7，再要 8 必须失败，不会被缓存里的 10 骗过。
-	_, err := e.cached.Reserve(t.Context(), &inventoryv1.ReserveRequest{
-		OrderId: 2, Items: []*inventoryv1.ReserveItem{{SkuId: 1, Quantity: 8}},
+	// Reserve 自己读库：改价之后的预占拿到新价，不会被缓存里的旧价骗过。
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET unit_price = 150 WHERE sku_id = 1`)
+	resp, err := e.cached.Reserve(t.Context(), &inventoryv1.ReserveRequest{
+		OrderId: 2, Items: []*inventoryv1.ReserveItem{{SkuId: 1, Quantity: 2}},
 	})
-	assertErr(t, err, codes.FailedPrecondition, errx.ReasonInsufficientStock)
-	e.assertStock(t, 1, 7, 3, 0)
+	mustOK(t, err)
+	if got := resp.GetItems()[0].GetUnitPrice().GetAmount(); got != 150 {
+		t.Errorf("reserve after price change: unit price %d, want 150 from mysql", got)
+	}
+	if got, err := e.get(t, 1); err != nil || got.GetUnitPrice().GetAmount() != 100 || got.GetAvailable() != 10 {
+		t.Fatalf("cache after second reserve = %v, %v; want stale (price 100, available 10)", got, err)
+	}
+	e.assertStock(t, 1, 5, 5, 0)
+}
+
+// TestGetStockCacheSwitchOff：降级开关 cache 关掉之后 GetStock 不读也不写缓存，每次都读库；
+// 回到 auto 之后恢复经过缓存。用 NewStockCache 构造，和 main 里一样。
+func TestGetStockCacheSwitchOff(t *testing.T) {
+	e := newEnv(t)
+	rdb, prefix := testredis.New(t)
+	logger := slog.New(slog.NewTextHandler(t.Output(), nil))
+	set := degrade.New("inventory", logger)
+	c, err := NewStockCache(rdb, prefix, logger, set)
+	if err != nil {
+		t.Fatalf("new stock cache: %v", err)
+	}
+	svc := New(store.New(e.db), e.gate, logger, WithStockCache(c, time.Minute))
+	get := func() int64 {
+		t.Helper()
+		resp, err := svc.GetStock(t.Context(), &inventoryv1.GetStockRequest{SkuId: 1})
+		mustOK(t, err)
+		return resp.GetAvailable()
+	}
+	cached := func() bool {
+		t.Helper()
+		n, err := rdb.Exists(t.Context(), prefix+StockCacheKey(1)).Result()
+		mustOK(t, err)
+		return n == 1
+	}
+	// 不经 seed：下面直接改库里的数量，会破坏 seed 的恒等式检查。
+	testdb.MustExec(t, e.db, `INSERT INTO sku_stock (sku_id, name, unit_price, available) VALUES (1, 'sku', 100, 10)`)
+
+	// 关着：读库，不写缓存。
+	if err := set.Apply(SwitchCache + "=" + degrade.ModeOff); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := get(); got != 10 {
+		t.Fatalf("available = %d, want 10", got)
+	}
+	if cached() {
+		t.Fatal("cache written while switched off")
+	}
+
+	// 开着：经过缓存，缓存里是 10。
+	mustOK(t, set.SetMode(SwitchCache, degrade.ModeAuto))
+	if got := get(); got != 10 || !cached() {
+		t.Fatalf("available = %d, cached = %v; want 10 and cached", got, cached())
+	}
+
+	// 改库之后关掉：不读缓存（拿到库里的 11，不是缓存里的 10），也不覆盖缓存。
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 11 WHERE sku_id = 1`)
+	mustOK(t, set.SetMode(SwitchCache, degrade.ModeOff))
+	if got := get(); got != 11 {
+		t.Fatalf("available = %d, want 11 from mysql while switched off", got)
+	}
+
+	// 回到 auto：又经过缓存，读到的是关掉之前缓存的 10，说明关着的那次没有写缓存。
+	mustOK(t, set.SetMode(SwitchCache, degrade.ModeAuto))
+	if got := get(); got != 10 {
+		t.Fatalf("available = %d, want stale 10 from cache after switching back", got)
+	}
+
+	// GET /degrade 能看到这个开关；熔断器是关闭的，没有自动降级。
+	views := set.Snapshot()
+	if len(views) != 1 || views[0].Name != SwitchCache || views[0].Degraded {
+		t.Fatalf("snapshot = %+v, want the cache switch, not degraded", views)
+	}
 }

@@ -6,6 +6,12 @@
 # 压测结束后停止杀进程、确保四个服务都在，等系统静止（load wait-quiet），再对账（load verify）。
 # 退出码：0 表示静止且对账通过，1 表示没有静止或对账不通过，其他表示脚本本身出错。
 #
+# 服务之间的 gRPC 调用默认经过 Envoy 边车（ADR-0020，deploy/envoy/，端口见 scripts/lib/sidecar.sh）；
+# SIDECAR=off 时直连。被 kill -9 的服务会被调用方的边车摘除至少 5 秒（重启后也要等摘除期满），
+# 压测工具会看到更多的 503，但对账查的是数据一致性（账本、库存、订单状态），不是成功率：
+# 摘除只是让失败更快，不会让已受理的订单丢失，所以对账和静止的判断都不因此放宽。
+# 静止等待（load wait-quiet）的时限是 2 分钟，远大于 5 秒的摘除期，不需要为它调整。
+#
 # 需要先 make up 和 make build。只能用 macOS 自带的 bash 3.2 能跑的写法：
 # 不用关联数组、wait -n、${var,,} 等。
 #
@@ -24,6 +30,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin"
+# shellcheck source=lib/sidecar.sh
+. "$ROOT/scripts/lib/sidecar.sh"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-oppenheimer}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
 COMPOSE="docker compose -f $ROOT/deploy/compose/docker-compose.yml"
@@ -99,9 +107,13 @@ start_svc() {
   local s="$1" pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >>"$RUN_DIR/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
-    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
-    gateway) "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 INVENTORY_ADDR="$SC_ORDER_INVENTORY" "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
+    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 ORDER_ADDR="$SC_PAYMENT_ORDER" "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
+    # 限流关掉：这个脚本验证杀进程后的数据一致性。被限流的请求（429 RATE_LIMITED）会让压测工具的重试
+    # 和账本的判断变复杂，又与要验证的东西无关；默认的按 IP 限额（每秒 200）还会把压力直接压下去。
+    # 重启 gateway 也走这个函数，用的是同一组环境变量。
+    # shellcheck disable=SC2086 # SC_GATEWAY_ADDRS 故意按空格拆成几个 KEY=VALUE
+    gateway) env RATE_LIMIT=off $SC_GATEWAY_ADDRS "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
   esac
   pid=$!
   setv "pid_$s" "$pid"
@@ -153,7 +165,10 @@ trap on_signal INT TERM
 
 # ---------- 准备 ----------
 
-for p in 8080 8081 8082 8083; do
+sidecar_setup
+# 不导出：开发者 shell 里残留的 OTEL_EXPORTER_OTLP_ENDPOINT 不能让故障实验去连后端（ADR-0023）。
+unset OTEL_EXPORTER_OTLP_ENDPOINT
+for p in 8080 8081 8082 8083 8089; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2
     exit 2
@@ -162,6 +177,7 @@ done
 
 log "building load tool"
 (cd "$ROOT" && go build -o "$BIN/load" ./test/load)
+(cd "$ROOT" && go build -o "$BIN/recon" ./services/recon/cmd/recon)
 
 log "run dir $RUN_DIR, kafka prefix $KAFKA_PREFIX, redis prefix $REDIS_PREFIX"
 sql=""
@@ -305,6 +321,14 @@ tick
 "$BIN/load" verify $SRC_FLAGS -ledger "$LEDGER" -initial "$INITIAL" -inventory-log "$RUN_DIR/inventory.log" \
   2>"$RUN_DIR/verify.log" | tee "$RUN_DIR/verify.txt"
 verify_code=${PIPESTATUS[0]}
+# 第二套检查（ADR-0022）：对账工具比订单对支付单、订单对预占。它和 load verify 的第 4 到 8 项查的是同一批
+# 不变式，实现完全独立（在数据库里算摘要再下钻，不读账本），两套互相印证。系统已经静止，所以不设水位线。
+# chaos 的环境没有从库和商家索引，replica、index 两对不跑。
+MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" \
+  PAYMENT_DSN="$(dsn payment_db)" INVENTORY_DSN="$(dsn inventory_db)" \
+  "$BIN/recon" -pairs payment,stock -settle 0 -recheck 1s -json "$RUN_DIR/recon.json" \
+  2>"$RUN_DIR/recon.log" | tee "$RUN_DIR/recon.txt"
+recon_code=${PIPESTATUS[0]}
 set -e
 
 {
@@ -318,10 +342,10 @@ set -e
     echo "unexpected exits: 0"
   fi
   grep -E '^(accepted|landed|drain) ' "$RUN_DIR/load-report.txt" 2>/dev/null || true
-  echo "load exit $load_code, wait-quiet exit $quiet_code, verify exit $verify_code"
+  echo "load exit $load_code, wait-quiet exit $quiet_code, verify exit $verify_code, recon exit $recon_code"
 } | tee -a "$EVENTS"
 
-if [ "$quiet_code" = 0 ] && [ "$verify_code" = 0 ] && [ ! -f "$RUN_DIR/unexpected-exits" ]; then
+if [ "$quiet_code" = 0 ] && [ "$verify_code" = 0 ] && [ "$recon_code" = 0 ] && [ ! -f "$RUN_DIR/unexpected-exits" ]; then
   log "CHAOS PASS"
   exit 0
 fi

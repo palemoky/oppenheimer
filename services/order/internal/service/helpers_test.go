@@ -248,6 +248,12 @@ type envOptions struct {
 	gtidWait time.Duration
 	// cold 为 true 时建一个冷库并接到 Service 上。
 	cold bool
+	// ids 非空时代替默认的发号器。
+	ids IDGenerator
+	// readMax、archiveMax 对应 Config 的 ReadMaxConcurrency、ArchiveMaxConcurrency，零值不限制。
+	readMax, archiveMax int
+	// logHandler 非空时代替默认的日志输出，用来断言日志级别。
+	logHandler slog.Handler
 }
 
 func newEnv(t *testing.T) *env {
@@ -307,7 +313,7 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		t.Fatal(err)
 	}
 	clock := &fakeClock{t: time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)}
-	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger := slog.New(cmp.Or[slog.Handler](opts.logHandler, slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug})))
 	var storeOpts []store.Option
 	if replicas != nil {
 		storeOpts = append(storeOpts, store.WithReplicas(replicas))
@@ -328,7 +334,7 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		e.coldDB = testdb.NewTemplate(t, order.ArchiveMigrations, order.ArchiveMigrationsDir, order.NewArchiveMigrationData())
 		cold = store.NewCold(e.coldDB)
 	}
-	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger, Marks: marks, Cold: cold}, Config{
+	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: cmp.Or[IDGenerator](opts.ids, ids), Logger: logger, Marks: marks, Cold: cold}, Config{
 		Clock:            clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,
@@ -337,6 +343,9 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		ReadMode:         opts.readMode,
 		ReadPinTTL:       opts.pinTTL,
 		ReadGTIDWait:     opts.gtidWait,
+
+		ReadMaxConcurrency:    opts.readMax,
+		ArchiveMaxConcurrency: opts.archiveMax,
 	})
 	sweeper, err := NewSweeper(svc, SweeperConfig{})
 	if err != nil {
@@ -745,7 +754,20 @@ func refOf(o *orderv1.Order) store.OrderRef {
 }
 
 // mustNew 是 New 的测试版本：配置有误时终止测试。
+// mustNew 返回 New 的结果。有从库时把它们都标记为健康，相当于探测已经连续通过：
+// 生产里从库初始是不健康的，要等 ReplicaProber；大多数测试关心的是“健康的从库”上的读路径，
+// 不想每个都先跑探测。测试从库健康本身的用 newUnprobed。
 func mustNew(t testing.TB, d Deps, cfg Config) *Service {
+	t.Helper()
+	svc := newUnprobed(t, d, cfg)
+	for _, h := range svc.replicas {
+		h.healthy.Store(true)
+	}
+	return svc
+}
+
+// newUnprobed 返回 New 的结果，从库保持初始的不健康状态。
+func newUnprobed(t testing.TB, d Deps, cfg Config) *Service {
 	t.Helper()
 	svc, err := New(d, cfg)
 	if err != nil {

@@ -66,8 +66,10 @@ func toPayment(p *paymentv1.Payment) oas.Payment {
 
 func toStock(s *inventoryv1.GetStockResponse) oas.Stock {
 	return oas.Stock{
-		SkuId:     oas.ID(s.GetSkuId()),
-		Available: s.GetAvailable(),
+		SkuId: oas.ID(s.GetSkuId()),
+		// 展示给买家的可售数不为负。inventory 返回的是真实值，超卖时是负数（ADR-0018：
+		// 闸门放行的数量超过了 MySQL 里有的，由后台任务发现）；买家应当看到的是“没货”。
+		Available: max(s.GetAvailable(), 0),
 		Reserved:  s.GetReserved(),
 		Sold:      s.GetSold(),
 		UnitPrice: toMoney(s.GetUnitPrice()),

@@ -101,12 +101,16 @@ e2e: build ## 端到端测试：在独立的 e2e_* 库上启动全部服务并�
 chaos: build ## 杀进程对账测试：压测期间随机 kill -9 服务，静止后对账（需要先 make up，CHAOS_* 变量见脚本）
 	scripts/chaos.sh
 
+.PHONY: fault
+fault: build ## 故障注入：挂住、杀掉 inventory，并发打满，验证边车的熔断和并发隔离（需要先 make up，变量见 scripts/fault.sh）
+	scripts/fault.sh
+
 .PHONY: bench
-bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本）
+bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本；BENCH_OPEN=1 加开环档位，BENCH_POLL=1 加轮询压力对比）
 	scripts/bench.sh
 
 .PHONY: load
-load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"
+load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"（开环：-mode open -rate 1000 -duration 30s）
 	go run ./test/load run $(LOAD_ARGS)
 
 .PHONY: seed
@@ -138,6 +142,11 @@ archive-dry-run: ## 归档的试运行：只统计会归档多少订单，不写
 archive-reclaim: ## 归档删行之后，回收热表的表空间（只做回收，不搬订单）
 	scripts/archive.sh -reclaim $(ARCHIVE_ARGS)
 
+# 对账（ADR-0022）：比对主从、订单对商家索引、订单对支付单、订单对预占。DSN 的生成见 scripts/recon.sh（ORDER_DBS 同 run-local.sh）。
+.PHONY: recon
+recon: ## 对账：在系统运行中比对几份应当一致的数据并定位到行，参数用 RECON_ARGS 传，例如 RECON_ARGS="-pairs index -since 26h"（只比最近 26 小时，不带 -since 是全量）；ORDER_DBS=4 表示订单库已扩成 4 个
+	scripts/recon.sh $(RECON_ARGS)
+
 .PHONY: seed-report
 seed-report: ## 灌数之后量分片均匀度、查询延迟、偏移量对游标（只读），参数用 SEED_ARGS 传，例如 SEED_ARGS="-analyze -json tmp/seed-report.json"
 	go run ./test/load seed-report \
@@ -161,18 +170,30 @@ up-core: ## 只启动 MySQL、Redis（含缓存实例）、Kafka 并等待就绪
 	@echo "databases ready: inventory_db payment_db merchant_index_db_0 merchant_index_db_1 order_archive_db"
 
 .PHONY: up
-up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka 并等待就绪
+up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含缓存实例）、Kafka、五个 Envoy 边车并等待就绪
 	$(COMPOSE) up -d --wait
 	@# order_db_0、order_db_1 在各自的分片主库上由复制脚本创建，并确认已复制到从库。
 	@MYSQL_ROOT_PASSWORD=$(MYSQL_ROOT_PASSWORD) scripts/mysql-replication.sh
 
 .PHONY: down
-down: ## 停止本地依赖（含 kafbat-ui），保留数据
-	$(COMPOSE) --profile ui down
+down: ## 停止本地依赖（含 kafbat-ui、otel-lgtm），保留数据
+	$(COMPOSE) --profile ui --profile obs down
 
 .PHONY: down-volumes
-down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例和 kafbat-ui）
-	$(COMPOSE) --profile expand --profile ui down --volumes
+down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例、kafbat-ui 和 otel-lgtm）
+	$(COMPOSE) --profile expand --profile ui --profile obs down --volumes
+
+.PHONY: envoy-validate
+envoy-validate: ## 用 Envoy 自己的校验模式检查 deploy/envoy/ 下每个边车的配置（需要 docker，不需要 make up）
+	@for f in deploy/envoy/*.yaml; do \
+		out=$$(docker run --rm -v "$(ROOT)/$$f:/etc/envoy/envoy.yaml:ro" envoyproxy/envoy:v1.40.2 \
+			--mode validate -c /etc/envoy/envoy.yaml 2>&1); code=$$?; \
+		if [ $$code = 0 ] && printf '%s\n' "$$out" | grep -q "' OK$$"; then \
+			printf '%s: %s\n' "$$f" "$$(printf '%s\n' "$$out" | grep "' OK$$")"; \
+		else \
+			printf '%s: validation failed (docker exit %s), full output:\n%s\n' "$$f" "$$code" "$$out"; exit 1; \
+		fi; \
+	done
 
 .PHONY: expand-up
 expand-up: ## 启动扩容演练用的 4 个 MySQL 容器（profile expand）并等待就绪；之后用 scripts/expand.sh 分阶段演练
@@ -194,6 +215,19 @@ kafka-ui: ## 启动 Kafka 的 Web 界面 kafbat-ui（profile ui，只读）并�
 .PHONY: kafka-ui-down
 kafka-ui-down: ## 停止并删除 kafbat-ui 容器（不影响其他实例）
 	$(COMPOSE) --profile ui rm -f -s -v kafka-ui
+
+GRAFANA_PORT ?= 3000
+export GRAFANA_PORT
+
+.PHONY: obs-up
+obs-up: ## 启动本机可观测后端 otel-lgtm（profile obs，Grafana+Tempo+Prometheus+Loki）并等待就绪，打印地址；之后 make run 会自动导出（OBS=off 关闭）
+	$(COMPOSE) --profile obs up -d --wait otel-lgtm
+	@echo "Grafana: http://127.0.0.1:$(GRAFANA_PORT)  (login: admin / admin, image default)"
+	@echo "OTLP gRPC: 127.0.0.1:4317, OTLP HTTP: 127.0.0.1:4318"
+
+.PHONY: obs-down
+obs-down: ## 停止并删除 otel-lgtm 容器（数据不持久化，一并丢失；不影响其他实例）
+	$(COMPOSE) --profile obs rm -f -s -v otel-lgtm
 
 .PHONY: ps
 ps: ## 查看本地依赖的状态
