@@ -212,7 +212,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	reporter := indexer.NewReporter(ix.Stats(), logger, indexer.DefaultReportInterval)
 
-	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.HealthHandler(serviceName))
+	// 内部端口：存活和就绪探测。就绪状态由 app.RunWith 维护（设计文档 1d 的 6.11）。
+	readiness := &app.Readiness{}
+	drainDelay, err := app.DrainDelayFromEnv()
+	if err != nil {
+		return err
+	}
+	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.AdminMux(serviceName, readiness))
 	if err != nil {
 		return err
 	}
@@ -224,9 +230,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
-	// 停止顺序与列出的顺序相反：先停 gRPC（等在途查询做完），再停消费者（处理完在途消息、提交位点），
-	// 然后汇总日志输出最后一段，健康检查最后停。数据库连接由 defer 在 app.Run 返回后关闭。
-	return app.Run(ctx, logger, httpServer, reporter, consumer, grpcServer)
+	// 收到退出信号后先摘流：就绪探测和 gRPC 健康检查变成不可用，继续正常服务 DRAIN_DELAY 这么久（本机默认 0），
+	// 然后按与列出的顺序相反的顺序停止：先停 gRPC（等在途查询做完），再停消费者（处理完在途消息、提交位点），
+	// 然后汇总日志输出最后一段，健康检查最后停。数据库连接由 defer 在 app.RunWith 返回后关闭。
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: drainDelay},
+		httpServer, reporter, consumer, grpcServer)
 }
 
 // ensureTopics 创建本服务消费的 topic 及其死信 topic。broker 关闭了自动建 topic，消费者要求死信 topic 已存在。

@@ -31,7 +31,7 @@ import (
 //   - 热点参数（hot）：只对 hotParams 表里的接口，按路径里某个参数的值（SKU、商家）一个值一个桶，不分用户。
 //     进程内，见 limitHot 和 RateLimit.Hot。
 //
-// 中间件的顺序（从外到内）：requestLog → recoverPanic → limitIP → requireUser → limitUserAndRoute
+// 中间件的顺序（从外到内）：requestLog → recoverPanic → checkFeature（功能开关，见 degrade.go）→ limitIP → requireUser → limitUserAndRoute
 // → limitHot → withDeadline → handler。被任何一维拒绝的请求都不调用下游。
 
 // codeRateLimited 是被限流时的原因码。下单的背压是 429 BACKLOGGED，两者要分开：

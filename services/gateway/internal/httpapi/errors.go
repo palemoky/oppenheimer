@@ -51,7 +51,7 @@ func clientClosed(c *gin.Context) bool {
 }
 
 // writeGRPCError 把下游错误转成 HTTP 响应。
-// code 优先用 errx 原因码，没有时用 gRPC 状态码名。
+// code 优先用 errx 原因码，没有时用 gRPC 状态码名。降级错误（errx.IsDegraded）一律是 503 加 Retry-After。
 //
 // 客户端已经断开时一律是 499，不看下游返回了什么：这时下游通常返回 Canceled，也可能恰好返回了别的错误，
 // 但不管是什么，都没有人在等这个响应了。
@@ -66,6 +66,15 @@ func (s *server) writeGRPCError(c *gin.Context, err error) {
 		return
 	}
 	st, _ := status.FromError(err) // 非 gRPC 错误得到 Unknown 状态
+	if errx.IsDegraded(err) {
+		// 降级（设计文档 1d 的 6.2）：下游自己是好的，是它的依赖坏了或者功能被关掉了，这个请求现在做不了，什么都没有发生。
+		// 按原因码判断，不按 gRPC 码：降级错误的 gRPC 码是 FAILED_PRECONDITION（理由见 errx.Degraded），
+		// 按码映射会变成 409，客户端会以为是“当前状态不允许”而不再重试。
+		// 消息是下游特意写给调用方的（errx.Degraded 构造），可以透出。
+		// 不记日志：这是预期内的降级，不是 gateway 的故障；降级期间每个请求都会走到这里，状态在下游的 /degrade 里看。
+		writeDegraded(c, errx.Reason(err), st.Message())
+		return
+	}
 	code := errx.Reason(err)
 	if code == "" {
 		code = codeName(st.Code())
@@ -90,7 +99,7 @@ func httpStatusOf(c codes.Code) int {
 	case codes.AlreadyExists:
 		return http.StatusConflict
 	case codes.FailedPrecondition:
-		// INSUFFICIENT_STOCK 也属于此类，同为 409。
+		// INSUFFICIENT_STOCK 也属于此类，同为 409。降级错误的码也是 FAILED_PRECONDITION，但在 writeGRPCError 里先被拦下。
 		return http.StatusConflict
 	case codes.Unavailable:
 		// 也包括 Envoy 边车的路由超时（DownstreamHopTimeout）到期：边车回给 gateway 的是 Unavailable，

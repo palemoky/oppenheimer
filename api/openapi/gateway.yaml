@@ -16,9 +16,10 @@ info:
     - 所有错误响应的结构相同，见 `Error`。500 的响应不透出内部错误消息。
     - 网关按客户端地址、按用户加接口、按接口限流，查库存和商家订单列表还按路径里的 ID 限流（热点参数），
       超出时返回 429（`RATE_LIMITED`），见 `TooManyRequests`。
+    - 依赖不可用或功能被关掉时，受影响的接口返回 503 和具体的原因码，其余接口照常，见 `ServiceUnavailable`。
     - 访问日志里的 499 表示客户端在响应返回前断开了连接（Nginx 的约定，不是标准状态码）。
       客户端收不到这个响应，所以各接口不声明它。
-    - 存活探测 `GET /healthz` 由各服务统一提供，不属于本接口。
+    - 存活探测 `GET /healthz` 和就绪探测 `GET /readyz` 由各服务统一提供，不属于本接口。
 servers:
   - url: http://localhost:8080
     description: 本机（make run）
@@ -87,6 +88,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -146,6 +149,8 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -171,6 +176,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -199,6 +206,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -237,6 +246,8 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -262,6 +273,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -287,6 +300,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -342,6 +357,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
         default:
           $ref: '#/components/responses/Error'
 
@@ -395,6 +412,7 @@ components:
       description: |
         多少秒之后再重试（正整数，向上取整，至少 1）。它是下界：这段时间里别的请求也在消耗配额，
         到时重试仍可能被拒绝。原因码是 `RATE_LIMITED` 时一定有；`BACKLOGGED` 时不一定有。
+        503 的降级原因码（见 `ServiceUnavailable`）一定有，是建议的等待时间，不保证到时已经恢复。
       schema:
         type: integer
         minimum: 1
@@ -450,10 +468,32 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: |
+        暂时无法处理，没有产生任何效果（没有创建或修改任何东西），稍后重试。原因码分两类：
+
+        - `UNAVAILABLE`：下游服务不可用。下游响应太慢时通常也是它（服务之间的代理先于网关超时，返回的是“不可用”），
+          和 504 对客户端的含义相同。没有 `Retry-After`。
+        - 降级：系统的某个依赖不可用，或者某个功能被人工关掉了，这个请求现在做不了；其余接口照常。
+          一定带 `Retry-After`。下单时用同一个 `Idempotency-Key` 重试。
+          - `STOCK_GATE_UNAVAILABLE`：库存闸门不可用，暂不受理下单；查询还没落库的订单时也可能出现（说不清它的状态）。
+          - `ORDER_LANDING_UNAVAILABLE`：订单落库在持续失败，暂不受理下单。
+          - `INVENTORY_UNAVAILABLE`：下单时库存服务不可用。
+          - `ORDER_QUEUE_UNAVAILABLE`：下单的消息发不出去。
+          - `ORDER_UNAVAILABLE`：创建或查询支付单时，订单服务不可用。
+          - `ARCHIVE_UNAVAILABLE`：已归档的订单暂时查不到。
+          - `FEATURE_DISABLED`：这个功能被暂时关掉了（维护或保护核心功能）。目前可能被关掉的是下单、
+            订单列表、商家订单列表、查库存；查单个订单、取消、支付不会被关掉。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     Error:
       description: |
-        其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
-        下游响应太慢时通常也是 503：服务之间的代理先于网关超时，返回的是“不可用”。两者对客户端的含义相同，稍后重试。
+        其他错误。下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
       content:
         application/json:
           schema:
@@ -561,6 +601,11 @@ components:
         next_cursor:
           description: 下一页的游标；没有更多时不出现。对客户端是不透明的字符串。
           type: string
+        archive_unavailable:
+          description: >-
+            为 true 表示较早的（已归档的）订单暂时无法查询，这一页只包含近期的订单。
+            列出的每一行都是准确的，只是不完整；稍后用 `next_cursor` 可以接着取。正常时不出现。
+          type: boolean
 
     OrderSummary:
       description: 用户订单列表里的一行，只有列表页要显示的字段。完整内容用订单详情接口。
