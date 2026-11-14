@@ -149,6 +149,9 @@ type Consumer struct {
 	log     *slog.Logger
 	client  *kgo.Client
 	dlq     *Producer
+	// batch 非空时按批处理（NewBatchConsumer），handler 只在一批失败后逐条回退时使用。
+	batch    BatchHandler
+	maxBatch int
 	// laneSeed 是把 key 分到 lane 的哈希种子，见 laneOf。
 	laneSeed maphash.Seed
 	// clock 只在延迟消费者里非空。
@@ -679,6 +682,10 @@ func (w *worker) run(ctx context.Context) {
 	defer close(w.exited)
 	if len(w.lanes) > 0 {
 		w.runLanes(ctx)
+		return
+	}
+	if w.c.batch != nil {
+		w.runBatches(ctx)
 		return
 	}
 	for {
