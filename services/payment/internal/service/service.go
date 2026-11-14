@@ -69,8 +69,13 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 		if errx.Reason(err) != "" {
 			return nil, err
 		}
+		// 调用方自己取消或超时了：按调用方的原因作答，而不是说订单服务不可用（设计文档 1d 的 5.9）。
+		if cerr := s.callerGone(ctx, "get order", err); cerr != nil {
+			return nil, cerr
+		}
 		// 订单服务暂时不可用不是本服务的内部错误：如实告诉调用方可以稍后重试，
-		// 网关才能返回 503 而不是 500。
+		// 网关才能返回 503 而不是 500。DEADLINE_EXCEEDED 走到这里说明调用方的 ctx 还有效，
+		// 是这一跳自己的时限（orderHopTimeout）到了：order 慢，同样答 UNAVAILABLE。
 		switch status.Code(err) {
 		case codes.Unavailable, codes.DeadlineExceeded:
 			s.logger.WarnContext(ctx, "order service unavailable", "error", err)
@@ -151,9 +156,38 @@ func (s *Service) clock() time.Time {
 }
 
 // internal 记录内部错误的细节，只把不含细节的 Internal 返回给调用方。
+//
+// 调用方取消、调用方超时、这一跳超时都不是内部错误（设计文档 1d 的 5.9），先按 callerGone 和 hopTimeout 分出去。
+// ctx 必须是请求自己的 ctx。
 func (s *Service) internal(ctx context.Context, op string, err error) error {
+	if cerr := s.callerGone(ctx, op, err); cerr != nil {
+		return cerr
+	}
+	// 请求的 ctx 还有效而错误是超时：某一跳自己的时限到了（数据库驱动的读超时、下游的按跳时限），
+	// 下游慢，稍后重试。
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		s.logger.WarnContext(ctx, "dependency timed out", "op", op, "error", err)
+		return status.Error(codes.Unavailable, "a dependency timed out, retry later")
+	}
 	s.logger.ErrorContext(ctx, "internal error", "op", op, "error", err)
 	return status.Error(codes.Internal, "internal error")
+}
+
+// callerGone 在请求自己的 ctx 已经结束时返回对外的错误，否则返回 nil。
+//   - 被取消（调用方断开、上游放弃）：CANCELED，只记 DEBUG。调用方已经不在了，不是故障。
+//   - 到了截止时间：DEADLINE_EXCEEDED，记 WARN。
+//
+// 先看 ctx 再看 err：ctx 已经结束时，不管下游返回的是什么错误，根因都是 ctx 结束。
+func (s *Service) callerGone(ctx context.Context, op string, err error) error {
+	switch ctxErr := ctx.Err(); {
+	case errors.Is(ctxErr, context.Canceled):
+		s.logger.DebugContext(ctx, "request canceled", "op", op, "error", err)
+		return status.Error(codes.Canceled, "request canceled")
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		s.logger.WarnContext(ctx, "request deadline exceeded", "op", op, "error", err)
+		return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+	}
+	return nil
 }
 
 func toProto(p store.Payment) *paymentv1.Payment {

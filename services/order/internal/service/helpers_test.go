@@ -250,6 +250,10 @@ type envOptions struct {
 	cold bool
 	// ids 非空时代替默认的发号器。
 	ids IDGenerator
+	// readMax、archiveMax 对应 Config 的 ReadMaxConcurrency、ArchiveMaxConcurrency，零值不限制。
+	readMax, archiveMax int
+	// logHandler 非空时代替默认的日志输出，用来断言日志级别。
+	logHandler slog.Handler
 }
 
 func newEnv(t *testing.T) *env {
@@ -309,7 +313,7 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		t.Fatal(err)
 	}
 	clock := &fakeClock{t: time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)}
-	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger := slog.New(cmp.Or[slog.Handler](opts.logHandler, slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelDebug})))
 	var storeOpts []store.Option
 	if replicas != nil {
 		storeOpts = append(storeOpts, store.WithReplicas(replicas))
@@ -339,6 +343,9 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		ReadMode:         opts.readMode,
 		ReadPinTTL:       opts.pinTTL,
 		ReadGTIDWait:     opts.gtidWait,
+
+		ReadMaxConcurrency:    opts.readMax,
+		ArchiveMaxConcurrency: opts.archiveMax,
 	})
 	sweeper, err := NewSweeper(svc, SweeperConfig{})
 	if err != nil {

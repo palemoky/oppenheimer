@@ -109,6 +109,11 @@ type Config struct {
 	ReadGTIDTTL time.Duration
 	// ReadGTIDWait 是 ReadGTID 下展示读等从库追上的最长时间，默认 DefaultReadGTIDWait。等不到就读主库。
 	ReadGTIDWait time.Duration
+	// ReadMaxConcurrency 是每个订单库上展示读（GetOrder 读订单行、ListUserOrders）的并发上限，
+	// 见 DefaultReadMaxConcurrency。零值表示不限制（测试用；cmd/order 总会给一个值）。
+	ReadMaxConcurrency int
+	// ArchiveMaxConcurrency 是读冷库的并发上限，见 DefaultArchiveMaxConcurrency。零值表示不限制。
+	ArchiveMaxConcurrency int
 }
 
 // ReadMode 决定对外的展示读（GetOrder）读主库还是从库。
@@ -202,6 +207,8 @@ type Service struct {
 	gtidTTL        time.Duration
 	gtidWait       time.Duration
 	cold           *store.Cold
+	// limits 是展示读和冷库读的并发上限，见 protect.go。
+	limits readLimits
 }
 
 // New 返回 Service。读模式与依赖不匹配（要读从库却没有从库或标记）时返回错误：
@@ -226,6 +233,14 @@ func New(d Deps, cfg Config) (*Service, error) {
 	logger := d.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	var dbs int
+	if d.Store != nil {
+		dbs = d.Store.Router().DBs()
+	}
+	limits, err := newReadLimits(dbs, cfg.ReadMaxConcurrency, cfg.ArchiveMaxConcurrency)
+	if err != nil {
+		return nil, err
 	}
 	return &Service{
 		store:          d.Store,
@@ -252,6 +267,7 @@ func New(d Deps, cfg Config) (*Service, error) {
 		gtidTTL:        cmp.Or(cfg.ReadGTIDTTL, DefaultReadGTIDTTL),
 		gtidWait:       cmp.Or(cfg.ReadGTIDWait, DefaultReadGTIDWait),
 		cold:           d.Cold,
+		limits:         limits,
 	}, nil
 }
 
@@ -276,12 +292,20 @@ func orderNotFound(orderID int64) error {
 
 // internal 记录真实原因后返回不带细节的 Internal。
 // op 说明是哪一步失败，作为日志字段而不是消息，保持消息为常量便于检索。
+//
+// ctx 必须是请求自己的 ctx（不是为某一跳另设时限的子 ctx）：超时和取消按它来区分是调用方的还是这一跳的，
+// 见 contextError。
 func (s *Service) internal(ctx context.Context, op string, err error, attrs ...any) error {
 	// 分片表不存在：扩容切换期间这个 slot 的表在旧库上被改名作围栏（ADR-0015），几秒后路由切到新库。
 	// 这是“暂时不可用、稍后重试”，不是内部错误；告诉调用方可以重试，日志也不按 ERROR 记。
+	// 排在超时和取消之前：这个错误是 MySQL 明确答复的，不会是超时或取消造成的。
 	if mysqlx.IsNoSuchTable(err) {
 		s.logger.WarnContext(ctx, "shard unavailable", append(attrs, "op", op, "error", err)...)
 		return errShardUnavailable
+	}
+	// 调用方取消、调用方超时、这一跳超时：都不是本服务的内部错误（设计文档 1d 的 5.9）。
+	if cerr := s.contextError(ctx, op, err, attrs...); cerr != nil {
+		return cerr
 	}
 	s.logger.ErrorContext(ctx, "internal error", append(attrs, "op", op, "error", err)...)
 	return errInternal
@@ -673,8 +697,12 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 //
 // 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
-	hold, held, err := s.gate.Get(ctx, orderID)
+	hold, held, err := s.gateGet(ctx, orderID)
 	if err != nil {
+		if ctx.Err() != nil {
+			// 调用方已经取消或超时：不必再去读订单行，按调用方的原因作答（不记 ERROR）。
+			return nil, false, s.internal(ctx, "read hold", err, "order_id", orderID)
+		}
 		s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
 		if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
 			return o, ok, err
@@ -698,13 +726,32 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 
 // loadConfirmed 读已落库的订单行。ok 为 false 时“没有这一行”是主库确认过的：
 // display 为 true 时先按读模式读（可能是从库），从库没有再读一次主库。
+//
+// display 也是展示读和写路径的分界（设计文档 1d 的 5.7）：display 为 true 的主库读要先占这个库的展示读名额
+// （loadDisplayPrimary），名额满了答 RESOURCE_EXHAUSTED；为 false 的（lookup，给取消、受理时的幂等查询这些
+// 要据此作答或做决定的路径用）不占名额，查询再多也挤不掉它们。
 func (s *Service) loadConfirmed(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
-	if display {
-		o, ok, fromReplica, err := s.loadDisplayRow(ctx, orderID)
-		if err != nil || ok || !fromReplica {
-			return o, ok, err
-		}
+	if !display {
+		return s.loadRow(ctx, orderID)
 	}
+	o, ok, fromReplica, err := s.loadDisplayRow(ctx, orderID)
+	if err != nil || ok || !fromReplica {
+		return o, ok, err
+	}
+	return s.loadDisplayPrimary(ctx, orderID)
+}
+
+// loadDisplayPrimary 是展示读对主库的一次读：先占订单所在库的展示读名额，读完立刻归还。
+//
+// 名额只包住读库这一段（包括在连接池上等连接），不包住读闸门、读缓存、读标记：限制的是“查询同时占用多少个
+// 主库连接”，其余步骤不碰主库，算进去只会让名额在没有占用连接的时候也被占着。
+// 从库读不占这个名额：从库有自己的连接池，保护的对象是主库上留给写路径的连接（见 loadDisplayRow）。
+func (s *Service) loadDisplayPrimary(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	release, err := acquire(s.limits.db(s.store.DBOfOrder(orderID)))
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
 	return s.loadRow(ctx, orderID)
 }
 
@@ -719,11 +766,25 @@ func (s *Service) loadConfirmed(ctx context.Context, orderID int64, display bool
 //
 // 订单号新于 now - MinHotAge 的一定不在冷库，直接答不存在，不碰冷库：热订单的读路径没有额外开销，
 // 冷库不可用也不影响它们。冷库查询出错时返回错误而不是“不存在”，上层不会把它写进负缓存。
+//
+// 冷库读有并发上限和 coldTimeout（设计文档 1d 的 5.7）：冷库卡住时旧订单的查询最多占住几个协程、各等 1 秒，
+// 答 UNAVAILABLE（这一跳超时）或 RESOURCE_EXHAUSTED（名额满），不会把热订单的查询一起拖住。
+// 展示读和 lookup 都经过这里，冷库的名额对两者一样：它保护的是冷库的连接池，而冷库上没有写路径要让。
 func (s *Service) loadCold(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
 	if s.cold == nil || !archive.MaybeCold(orderID, s.now()) {
 		return nil, false, nil
 	}
-	o, err := s.cold.GetOrder(ctx, orderID)
+	release, err := acquire(s.limits.cold)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	var o *store.Order
+	err = hop(ctx, coldTimeout, func(ctx context.Context) error {
+		var err error
+		o, err = s.cold.GetOrder(ctx, orderID)
+		return err
+	})
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, false, nil
 	}
@@ -735,20 +796,33 @@ func (s *Service) loadCold(ctx context.Context, orderID int64) (*orderv1.Order, 
 
 // loadDisplayRow 是展示读的 loadRow：按读模式和标记决定读主库还是从库（见 useReplica）。
 // fromReplica 表示结果来自从库（包括“从库上没有这一行”），fetch 据此决定要不要再去主库确认。
-// 从库出错（不是“没有这一行”）时改读主库，不让一个出问题的从库拖垮查询。
+// 从库出错（不是“没有这一行”）或超过 replicaTimeout 时改读主库，不让一个出问题的从库拖垮查询。
+//
+// 从库读不占展示读的名额（名额是给主库的，见 loadDisplayPrimary）。从库不单独设上限：它的连接池只有展示读
+// 和 sweeper 的扫描在用，没有写路径需要让；从库卡住时每次读最多等 replicaTimeout 就退回主库，
+// 退回的那次读照常占主库的名额，所以从库出问题也不会让主库上的查询超过上限。
 func (s *Service) loadDisplayRow(ctx context.Context, orderID int64) (o *orderv1.Order, ok, fromReplica bool, err error) {
 	if !s.useReplica(ctx, orderID) {
-		o, ok, err = s.loadRow(ctx, orderID)
+		o, ok, err = s.loadDisplayPrimary(ctx, orderID)
 		return o, ok, false, err
 	}
-	row, err := s.store.GetOrderFromReplica(ctx, orderID)
+	var row *store.Order
+	err = hop(ctx, replicaTimeout, func(ctx context.Context) error {
+		var err error
+		row, err = s.store.GetOrderFromReplica(ctx, orderID)
+		return err
+	})
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		// 从库没有不能说明订单不存在，fetch 会接着查占用、必要时由主库确认。
 		return nil, false, true, nil
+	case err != nil && ctx.Err() != nil:
+		// 调用方已经取消或超时，退回主库也来不及了。
+		return nil, false, false, s.internal(ctx, "load order from replica", err, "order_id", orderID)
 	case err != nil:
+		// 包括这一跳的超时（errHopTimeout）：从库慢，主库还来得及。
 		s.logger.WarnContext(ctx, "read order from replica failed, reading primary", "order_id", orderID, "error", err)
-		o, ok, err = s.loadRow(ctx, orderID)
+		o, ok, err = s.loadDisplayPrimary(ctx, orderID)
 		return o, ok, false, err
 	}
 	return toProto(row), true, true, nil

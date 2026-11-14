@@ -23,8 +23,8 @@ import (
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
-// releaseTimeout 是受理失败后归还占用的时限。这一步在请求的 ctx 可能已经到期之后执行，
-// 所以用独立的 ctx；它是尽力而为的，失败了占用留给回收任务。
+// releaseTimeout 是受理失败后查询订单当前状态的时限（publishFailed）。这一步在请求的 ctx 可能已经到期之后执行，
+// 所以用独立的 ctx；它是尽力而为的。归还占用（abandon）同样用独立的 ctx，时限是闸门调用统一的 gateTimeout。
 const releaseTimeout = time.Second
 
 func errUnavailable(msg string) error {
@@ -120,7 +120,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 
 // hold 执行 Hold；遇到未装载的 SKU 时请库存服务预热，再试一次。返回的错误已是 gRPC 错误。
 func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgate.HoldResult, error) {
-	res, err := s.gate.Hold(ctx, req)
+	res, err := s.gateHold(ctx, req)
 	if err != nil {
 		return res, s.holdUnknown(ctx, req.OrderID, err)
 	}
@@ -142,14 +142,15 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 	if missing := warm.GetMissing(); len(missing) > 0 {
 		return stockgate.HoldResult{Outcome: stockgate.NotLoaded, SKUID: slices.Min(missing)}, nil
 	}
-	res, err = s.gate.Hold(ctx, req)
+	res, err = s.gateHold(ctx, req)
 	if err != nil {
 		return res, s.holdUnknown(ctx, req.OrderID, err)
 	}
 	return res, nil
 }
 
-// warmUpTimeout 是一次合并后的预热调用的时限。
+// warmUpTimeout 是一次合并后的预热调用的时限。到 inventory 的连接上另有 1 秒的按跳时限
+// （Envoy 边车的路由超时 1 秒，进程里的 inventoryHopTimeout 比它长一截做兜底），实际生效的是其中最短的那个。
 const warmUpTimeout = 3 * time.Second
 
 // warmUp 请库存服务把这些 SKU 装进闸门，同一组 SKU 的并发调用合并成一次。
@@ -188,6 +189,12 @@ func (s *Service) warmUp(ctx context.Context, skus []int64) (*inventoryv1.WarmUp
 // 撤销是值得的：不撤的话，重试会命中幂等键得到这个永远不会落库的订单（CREATING），
 // 等回收任务在宽限期后把它还掉，用户看到的是订单凭空消失。
 // 撤销失败（Redis 仍不可用）也无妨，占用留给回收任务。
+//
+// Hold 的时限是 gateTimeout（300 毫秒），“脚本其实执行成功了、只是回复超时”比原来常见。这条路径对它仍然正确：
+// 撤销在 Hold 之后发出，同一个 Redis 上它排在 Hold 后面执行，撤销掉的正是那次已经生效的占用。
+// 例外是 Hold 的请求在网络上比撤销晚到 Redis（Hold 的包丢了、重传时撤销已经走另一条连接先到）：撤销看到
+// “占用不存在”，随后 Hold 才执行，留下一个孤儿占用，由回收任务在宽限期后归还。这个窗口在加时限之前就有，
+// 时限变短只是让它更容易出现。
 func (s *Service) holdUnknown(ctx context.Context, orderID int64, holdErr error) error {
 	s.logger.WarnContext(ctx, "hold outcome unknown", "order_id", orderID, "error", holdErr)
 	if _, err := s.abandon(ctx, orderID); err != nil {
@@ -202,10 +209,15 @@ func (s *Service) holdUnknown(ctx context.Context, orderID int64, holdErr error)
 // 用 ReturnIfUnclaimed 而不是 Abort：发消息失败不代表消息没写进去，消费者可能已经 Claim 了它
 // 并在落库。Abort 不看认领状态，会把一个即将在 MySQL 里预占成功的订单的占用还掉（Redis 偏大），
 // 还删掉幂等键，用户重试就会再下一单。ReturnIfUnclaimed 与 Claim 互斥，两者只有一方得手。
-func (s *Service) abandon(ctx context.Context, orderID int64) (stockgate.ReapResult, error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-	defer cancel()
-	return s.gate.ReturnIfUnclaimed(ctx, orderID)
+//
+// 不跟着请求的 ctx 取消（请求可能正是因为超时才走到这里），时限是闸门调用统一的 gateTimeout。
+func (s *Service) abandon(ctx context.Context, orderID int64) (r stockgate.ReapResult, err error) {
+	err = s.gateCall(context.WithoutCancel(ctx), func(ctx context.Context) error {
+		var err error
+		r, err = s.gate.ReturnIfUnclaimed(ctx, orderID)
+		return err
+	})
+	return r, err
 }
 
 // publish 在一次 Send 里发出 order.submit 和 order.close.delay。
@@ -308,7 +320,15 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 
 	// 1. 认领。占用不存在说明它已被回收（受理方发消息失败后撤销，或回收任务），
 	// 或者订单早已走到终态、占用已被归还（重复投递）。两种情况都应当丢弃这条消息。
-	hold, ok, err := s.gate.Claim(ctx, o.OrderID, s.now())
+	var (
+		hold stockgate.HoldInfo
+		ok   bool
+	)
+	err = s.gateCall(ctx, func(ctx context.Context) error {
+		var err error
+		hold, ok, err = s.gate.Claim(ctx, o.OrderID, s.now())
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("claim hold of order %d: %w", o.OrderID, err)
 	}
@@ -387,10 +407,15 @@ func (s *Service) dropReplay(ctx context.Context, b *store.Order) error {
 		// 唯一键冲突却两个键都查不到：冲突的那一行刚好被删了，不应发生。重试一次看看。
 		return fmt.Errorf("load order by idempotency key for replayed order %d: %w", b.OrderID, err)
 	}
-	if err := s.gate.PointIdempotency(ctx, a.UserID, a.IdempotencyKey, a.OrderID, a.RequestHash, s.idemTTL); err != nil {
+	if err := s.gateCall(ctx, func(ctx context.Context) error {
+		return s.gate.PointIdempotency(ctx, a.UserID, a.IdempotencyKey, a.OrderID, a.RequestHash, s.idemTTL)
+	}); err != nil {
 		return fmt.Errorf("point idempotency key to order %d: %w", a.OrderID, err)
 	}
-	if _, err := s.gate.Abort(ctx, b.OrderID); err != nil {
+	if err := s.gateCall(ctx, func(ctx context.Context) error {
+		_, err := s.gate.Abort(ctx, b.OrderID)
+		return err
+	}); err != nil {
 		return fmt.Errorf("abort hold of replayed order %d: %w", b.OrderID, err)
 	}
 	s.logger.WarnContext(ctx, "replayed submission dropped, idempotency key already has an order",

@@ -87,6 +87,23 @@ const (
 const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
 
+// order 调 inventory（Reserve、WarmUp）这一跳的时限（设计文档 1d 的 5.6）。
+//
+// inventoryHopBudget 是这一跳的预算，写在 deploy/envoy/order.yaml 出站路由 to_inventory 的 timeout 上，由边车执行
+// （有测试核对两处一致）。取 1 秒：Reserve 是一次短事务，正常几毫秒；网关给下游的总预算是 3 秒，
+// order 在 Reserve 超时之后还有时间返回明确的错误。
+//
+// inventoryHopTimeout 是进程里的时限，比预算多 grpcx.SidecarMargin，只做兜底（边车不在或卡住时 order 仍然放手）。
+// 边车必须先超时，慢的 inventory 才会被摘除，理由见 grpcx.SidecarMargin。所以 inventory 超时时这里正常看到的是
+// 边车返回的 UNAVAILABLE。
+//
+// 落库的消费者没有上游截止时间（它有自己的 DefaultEventTimeout），这个时限对它同样生效：
+// Reserve 超时按“结果未知”原地重试。
+const (
+	inventoryHopBudget  = time.Second
+	inventoryHopTimeout = inventoryHopBudget + grpcx.SidecarMargin
+)
+
 // archiveMaxOpenConns 是冷库的连接池上限。冷库只承接旧订单的查询，量很小；
 // 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
 const archiveMaxOpenConns = 10
@@ -129,6 +146,10 @@ type config struct {
 	archiveDSN string
 	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
 	mysqlMaxOpenConns int
+	// readMaxConcurrency 是每个订单库上展示读的并发上限，见 service.DefaultReadMaxConcurrency。
+	readMaxConcurrency int
+	// archiveMaxConcurrency 是冷库读的并发上限，见 service.DefaultArchiveMaxConcurrency。
+	archiveMaxConcurrency int
 	// submitConcurrency 是落库消费者每个分区的并发度，见 defaultSubmitConcurrency。
 	submitConcurrency int
 	workerID          int64
@@ -217,6 +238,27 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("MYSQL_MAX_OPEN_CONNS must be positive")
 	}
 	cfg.mysqlMaxOpenConns = int(maxOpen)
+	// 展示读的并发上限必须小于连接池：它的作用是给落库、支付结果这些写路径留出连接，
+	// 等于或超过连接池时查询仍然能把池子占满，这个上限就形同虚设。
+	readMax, err := envInt("READ_MAX_CONCURRENCY", service.DefaultReadMaxConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if readMax < 1 || readMax >= maxOpen {
+		return cfg, fmt.Errorf("READ_MAX_CONCURRENCY (%d) must be at least 1 and less than MYSQL_MAX_OPEN_CONNS (%d), "+
+			"otherwise queries can take every connection and leave none for order landing", readMax, maxOpen)
+	}
+	cfg.readMaxConcurrency = int(readMax)
+	// 冷库上没有在线写入，上限不超过连接池即可；超过了就不起作用（多出来的查询在连接池上排队）。
+	archiveMax, err := envInt("ARCHIVE_MAX_CONCURRENCY", service.DefaultArchiveMaxConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if archiveMax < 1 || archiveMax > archiveMaxOpenConns {
+		return cfg, fmt.Errorf("ARCHIVE_MAX_CONCURRENCY (%d) must be between 1 and the archive db pool size (%d)",
+			archiveMax, archiveMaxOpenConns)
+	}
+	cfg.archiveMaxConcurrency = int(archiveMax)
 	// 只校验下限。上限不在这里拒绝：它和连接池的关系取决于库数和分区数，启动时只做检查和警告
 	// （checkSubmitConcurrency）。1 就是 1d 之前的分区内串行，可以用来对比或回退。
 	concurrency, err := envInt("SUBMIT_CONCURRENCY", defaultSubmitConcurrency)
@@ -452,7 +494,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	conn, err := grpcx.Dial(cfg.inventoryAddr)
+	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeout(inventoryHopTimeout))
 	if err != nil {
 		return err
 	}
@@ -561,6 +603,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		ReadPinTTL:        cfg.readPinTTL,
 		ReadGTIDTTL:       cfg.readGTIDTTL,
 		ReadGTIDWait:      cfg.readGTIDWait,
+		// 设计文档 1d 的 5.7：展示读对每个订单库、读冷库各有并发上限，满了答 RESOURCE_EXHAUSTED。
+		ReadMaxConcurrency:    cfg.readMaxConcurrency,
+		ArchiveMaxConcurrency: cfg.archiveMaxConcurrency,
 	})
 	if err != nil {
 		return err
@@ -638,6 +683,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	readLimitReporter := svc.ReadLimitReporter(service.DefaultReadLimitReportInterval)
 	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// 停止顺序与列出的顺序相反：
@@ -652,7 +698,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 生产者、Redis、数据库和库存的连接由 defer 在 app.Run 返回后关闭，此时已没有组件在用。
 	// 全部 leader 锁（每个中继一把、sweeper、回收任务）也在 app.Run 返回后释放（先于 Redis 连接关闭）：
 	// 此时所有中继、sweeper、回收任务都已停下。
-	components := []app.Component{httpServer}
+	// 汇总日志在 gRPC 停下之后才停（停止顺序与列表相反），停止时把最后一段的拒绝次数也记下来。
+	components := []app.Component{httpServer, readLimitReporter}
 	for _, r := range relays {
 		components = append(components, r)
 	}

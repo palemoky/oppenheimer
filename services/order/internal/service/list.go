@@ -3,6 +3,7 @@ package service
 import (
 	"cmp"
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -45,17 +46,18 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, listTimeout)
+	// lctx 是本服务给这次列表的总时限；internal 用请求自己的 ctx，以便区分“调用方超时”和“这里的时限到了”。
+	lctx, cancel := hopContext(ctx, listTimeout)
 	defer cancel()
-	rows, more, err := s.store.ListUserOrders(ctx, q, store.Primary)
+	rows, more, err := s.listHot(lctx, q)
 	if err != nil {
-		return nil, s.internal(ctx, "list user orders", err, "user_id", req.GetUserId())
+		return nil, s.listError(ctx, "list user orders", hopErr(lctx, err), req.GetUserId())
 	}
 	if s.cold != nil && s.mayNeedCold(rows, more) {
-		cold, moreCold, err := s.cold.ListUserOrders(ctx, q)
+		cold, moreCold, err := s.listCold(lctx, q)
 		if err != nil {
 			// 不悄悄只返回热库的部分：那样这一页会漏掉已归档的订单，而且 more 可能是错的，翻页就此结束。
-			return nil, s.internal(ctx, "list archived user orders", err, "user_id", req.GetUserId())
+			return nil, s.listError(ctx, "list archived user orders", hopErr(lctx, err), req.GetUserId())
 		}
 		rows, more = mergeNewestFirst(rows, more, cold, moreCold, q.Limit)
 	}
@@ -67,6 +69,40 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 		resp.NextBeforeOrderId = rows[len(rows)-1].OrderID
 	}
 	return resp, nil
+}
+
+// listHot 读用户所在库的主库，先占那个库的展示读名额（与 GetOrder 共用，设计文档 1d 的 5.7）。
+func (s *Service) listHot(ctx context.Context, q store.UserOrdersQuery) ([]store.OrderSummary, bool, error) {
+	router := s.store.Router()
+	release, err := acquire(s.limits.db(router.DB(router.ForUser(q.UserID))))
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	return s.store.ListUserOrders(ctx, q, store.Primary)
+}
+
+// listCold 读冷库，占冷库的名额，最多 coldTimeout（与 loadCold 相同）。
+func (s *Service) listCold(ctx context.Context, q store.UserOrdersQuery) (rows []store.OrderSummary, more bool, err error) {
+	release, err := acquire(s.limits.cold)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	err = hop(ctx, coldTimeout, func(ctx context.Context) error {
+		var err error
+		rows, more, err = s.cold.ListUserOrders(ctx, q)
+		return err
+	})
+	return rows, more, err
+}
+
+// listError 把列表的错误转成对外的错误：名额满原样返回（RESOURCE_EXHAUSTED），其余交给 internal。
+func (s *Service) listError(ctx context.Context, op string, err error, userID int64) error {
+	if errors.Is(err, errReadBusy) {
+		return errReadBusy
+	}
+	return s.internal(ctx, op, err, "user_id", userID)
 }
 
 // mayNeedCold 判断热库这一页（hot、moreHot）之外，是否还需要查冷库才能得出精确的一页。

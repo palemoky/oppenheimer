@@ -41,6 +41,16 @@ const kafkaStartTimeout = 30 * time.Second
 // redisSetupTimeout 是启动时连接 Redis 的时限。
 const redisSetupTimeout = 10 * time.Second
 
+// payment 调 order（创建支付单前查订单）这一跳的时限（设计文档 1d 的 5.6）。
+//
+// orderHopBudget 是这一跳的预算，写在 deploy/envoy/payment.yaml 出站路由 to_order 的 timeout 上，由边车执行
+// （有测试核对两处一致）。orderHopTimeout 是进程里的时限，比预算多 grpcx.SidecarMargin，只做兜底。
+// 边车必须先超时，慢的 order 才会被摘除，理由见 grpcx.SidecarMargin。
+const (
+	orderHopBudget  = time.Second
+	orderHopTimeout = orderHopBudget + grpcx.SidecarMargin
+)
+
 // 两个周期任务的 leader 锁。锁名固定，TTL 比各自的轮询间隔长：持有者崩溃后最多这么久由别的副本接手。
 const (
 	relayLockName      = "payment:outbox-relay"
@@ -172,7 +182,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 	}()
 
-	orderConn, err := grpcx.Dial(cfg.orderAddr)
+	orderConn, err := grpcx.Dial(cfg.orderAddr, grpcx.WithHopTimeout(orderHopTimeout))
 	if err != nil {
 		return fmt.Errorf("dial order service: %w", err)
 	}
