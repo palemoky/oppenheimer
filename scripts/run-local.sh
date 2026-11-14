@@ -17,6 +17,9 @@
 # 没设就由 gateway 用自己的默认值。
 # RATE_LIMIT_REDIS_ADDR 默认指向缓存实例（和其他服务的 CACHE_REDIS_ADDR 同一个），RATE_LIMIT_REDIS_PREFIX 默认跟随 REDIS_PREFIX；
 # 设为空字符串表示限流不用 Redis。
+# 服务之间的 gRPC 调用经过各自的 Envoy 边车（ADR-0020，make up 会启动它们）：gateway、order、payment 的下游地址
+# 指向自己边车的出站端口，熔断、并发上限、路由超时都在边车的配置里（deploy/envoy/）。SIDECAR=off 时直连
+# （不经过边车，也就没有这些保护），用来对比或者在边车没起来的环境里跑。
 # 冷库要先建好（make up 会建；e2e、chaos、bench 各自建带前缀的）。配置和数据对不上时 order 会因为 shard_meta 不符而拒绝启动。
 set -euo pipefail
 
@@ -90,6 +93,14 @@ start() {
   exit 1
 }
 
+# 每个服务调用下游时连自己边车的出站端口（scripts/lib/sidecar.sh：端口、边车健康检查、SIDECAR=off 直连）。
+# shellcheck source=lib/sidecar.sh
+. "$ROOT/scripts/lib/sidecar.sh"
+sidecar_setup
+order_to_inventory="$SC_ORDER_INVENTORY"
+payment_to_order="$SC_PAYMENT_ORDER"
+gateway_addrs="$SC_GATEWAY_ADDRS"
+
 # 启动顺序按依赖方向：被依赖的先起。
 start inventory 8082 MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1
 # MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应。
@@ -112,14 +123,15 @@ case "$ORDER_DBS" in
   exit 2
   ;;
 esac
-start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2
-start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3
+start order     8081 MYSQL_DSNS="$order_dsns" MYSQL_REPLICA_DSNS="$order_replica_dsns" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 INVENTORY_ADDR="$order_to_inventory"
+start payment   8083 MYSQL_DSN="$(dsn payment_db)"   WORKER_ID=3 ORDER_ADDR="$payment_to_order"
 # 商家维度的订单索引（ADR-0014）。两个索引库在单实例 mysql 上。
 start orderindex 8084 MYSQL_DSNS="$(dsn merchant_index_db_0),$(dsn merchant_index_db_1)"
 # CDC 从 order 的两个从库读 binlog。排在 order 之后启动只是为了第一次全量时表已经建好；
 # 表在它启动之后才建也没关系，建表之后的写入都在 binlog 里。server-id 登记在 docs/infra/versions.md。
 start cdc 8085 CDC_SOURCE_NAMES="$cdc_names" CDC_SERVER_IDS="$cdc_ids" CDC_SOURCE_DSNS="$cdc_dsns"
-start gateway   8080
+# shellcheck disable=SC2086 # 有意按空格拆成几个 KEY=VALUE
+start gateway   8080 $gateway_addrs
 
 if [ "${1:-}" = "--" ]; then
   shift

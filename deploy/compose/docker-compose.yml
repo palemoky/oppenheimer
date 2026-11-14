@@ -15,6 +15,21 @@ x-mysql-shard: &mysql-shard
     retries: 30
     start_period: 20s
 
+# 每个服务一个 Envoy 边车（设计文档 1d 第 5 节、ADR-0020）。服务进程跑在宿主机上（make run 起的是二进制），
+# 边车在容器里：入站把请求转给 host.docker.internal 上的服务端口，出站的端口发布到宿主机的回环地址给服务用。
+# extra_hosts 让 host.docker.internal 在 Linux（CI）上也能解析；macOS 的容器运行时自带这个名字。
+# 镜像里没有 curl，健康检查用 bash 的 /dev/tcp 问管理端口的 /ready。
+x-envoy: &envoy
+  image: envoyproxy/envoy:v1.40.2
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9901 && printf \"GET /ready HTTP/1.1\\r\\nHost: envoy\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q LIVE <&3'"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+    start_period: 2s
+
 services:
   mysql:
     image: mysql:9.7.4
@@ -422,6 +437,55 @@ services:
   # 连 kafka 的 INTERNAL 监听器（kafka:19092）：EXTERNAL 只对 localhost 广播，容器里连不上。
   # 只读模式：界面上不能删 topic、改位点、发消息。消息体是 protobuf，未配置 serde，只能看原始字节。
   # 不设登录，端口只绑定 127.0.0.1。
+  # ---- Envoy 边车（1d 步骤三）----
+  # 管理端口 19901 到 19905（只绑本机）：/stats 看每个集群的在途数、溢出次数、摘除次数，/clusters 看实例是否被摘除。
+  # 入站端口 15001 不发布：只有别的边车在容器网络里按容器名访问它。
+  envoy-gateway:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "gateway", "--service-node", "envoy-gateway"]
+    volumes:
+      - ../envoy/gateway.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19901:9901
+      - 127.0.0.1:15081:15081
+      - 127.0.0.1:15082:15082
+      - 127.0.0.1:15083:15083
+      - 127.0.0.1:15084:15084
+
+  envoy-order:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "order", "--service-node", "envoy-order"]
+    volumes:
+      - ../envoy/order.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19902:9901
+      - 127.0.0.1:15182:15182
+
+  envoy-payment:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "payment", "--service-node", "envoy-payment"]
+    volumes:
+      - ../envoy/payment.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19903:9901
+      - 127.0.0.1:15281:15281
+
+  envoy-inventory:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "inventory", "--service-node", "envoy-inventory"]
+    volumes:
+      - ../envoy/inventory.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19904:9901
+
+  envoy-orderindex:
+    <<: *envoy
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn", "--service-cluster", "orderindex", "--service-node", "envoy-orderindex"]
+    volumes:
+      - ../envoy/orderindex.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - 127.0.0.1:19905:9901
+
   kafka-ui:
     image: ghcr.io/kafbat/kafka-ui:v1.5.0
     profiles: ["ui"]

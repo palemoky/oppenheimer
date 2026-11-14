@@ -6,6 +6,12 @@
 # 压测结束后停止杀进程、确保四个服务都在，等系统静止（load wait-quiet），再对账（load verify）。
 # 退出码：0 表示静止且对账通过，1 表示没有静止或对账不通过，其他表示脚本本身出错。
 #
+# 服务之间的 gRPC 调用默认经过 Envoy 边车（ADR-0020，deploy/envoy/，端口见 scripts/lib/sidecar.sh）；
+# SIDECAR=off 时直连。被 kill -9 的服务会被调用方的边车摘除至少 5 秒（重启后也要等摘除期满），
+# 压测工具会看到更多的 503，但对账查的是数据一致性（账本、库存、订单状态），不是成功率：
+# 摘除只是让失败更快，不会让已受理的订单丢失，所以对账和静止的判断都不因此放宽。
+# 静止等待（load wait-quiet）的时限是 2 分钟，远大于 5 秒的摘除期，不需要为它调整。
+#
 # 需要先 make up 和 make build。只能用 macOS 自带的 bash 3.2 能跑的写法：
 # 不用关联数组、wait -n、${var,,} 等。
 #
@@ -24,6 +30,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin"
+# shellcheck source=lib/sidecar.sh
+. "$ROOT/scripts/lib/sidecar.sh"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-oppenheimer}"
 MYSQL_PORT="${MYSQL_PORT:-3306}"
 COMPOSE="docker compose -f $ROOT/deploy/compose/docker-compose.yml"
@@ -99,12 +107,13 @@ start_svc() {
   local s="$1" pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >>"$RUN_DIR/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
-    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 INVENTORY_ADDR="$SC_ORDER_INVENTORY" "$BIN/order" >>"$RUN_DIR/order.log" 2>&1 & ;;
+    payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 ORDER_ADDR="$SC_PAYMENT_ORDER" "$BIN/payment" >>"$RUN_DIR/payment.log" 2>&1 & ;;
     # 限流关掉：这个脚本验证杀进程后的数据一致性。被限流的请求（429 RATE_LIMITED）会让压测工具的重试
     # 和账本的判断变复杂，又与要验证的东西无关；默认的按 IP 限额（每秒 200）还会把压力直接压下去。
     # 重启 gateway 也走这个函数，用的是同一组环境变量。
-    gateway) env RATE_LIMIT=off "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
+    # shellcheck disable=SC2086 # SC_GATEWAY_ADDRS 故意按空格拆成几个 KEY=VALUE
+    gateway) env RATE_LIMIT=off $SC_GATEWAY_ADDRS "$BIN/gateway" >>"$RUN_DIR/gateway.log" 2>&1 & ;;
   esac
   pid=$!
   setv "pid_$s" "$pid"
@@ -156,6 +165,7 @@ trap on_signal INT TERM
 
 # ---------- 准备 ----------
 
+sidecar_setup
 for p in 8080 8081 8082 8083; do
   if curl -fsS -m 1 "http://127.0.0.1:$p/healthz" >/dev/null 2>&1; then
     echo "port $p is already serving; stop the other services first" >&2

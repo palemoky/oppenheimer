@@ -22,6 +22,7 @@
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
+| Envoy | v1.40.2 | 稳定版 | 2026-11-14 | 服务之间的熔断和并发隔离（ADR-0020）。镜像 `envoyproxy/envoy:v1.40.2`。没有 LTS，同时维护最近四个小版本 |
 | Redis | 8.10.3 | 稳定版 | 2026-11-11 | compose 里有两个实例，同一个镜像：`redis`（闸门和锁，`noeviction`，AOF）和 `redis-cache`（查询缓存和 gateway 的限流状态，`allkeys-lru`，不持久化；限流的桶丢了只是重新装满），升级时一起改 |
 | Kafka | 4.4.0 | 稳定版 | 2026-11-11 | `apache/kafka` 镜像，KRaft 模式 |
 | buf | v1.75.0 | 稳定版 | 2026-11-11 | 版本写在 `Makefile` 和 CI 里，升级时一起改 |
@@ -81,6 +82,20 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 | compose 服务 | 用途 | 宿主机端口 | 备注 |
 |---|---|---|---|
 | `kafka-ui` | 看 topic、消息、消费组 lag | 8090（只绑 127.0.0.1） | 连 `kafka:19092`；`KAFKA_CLUSTERS_0_READONLY=true` 只读；不设登录；堆上限 256 MB，容器上限 512 MB；未配置 protobuf serde |
+
+## 本机 compose 的 Envoy 边车（2026-11-14）
+
+每个服务一个边车（ADR-0020，配置在 `deploy/envoy/<服务>.yaml`），`make up` 启动，镜像 `envoyproxy/envoy:v1.40.2`。服务是宿主机上的进程，调用下游时连自己边车的出站端口；入站端口 15001 只在边车之间用（容器网络内），不发布到宿主机。`scripts/lib/sidecar.sh` 里是脚本用的同一份端口。
+
+| compose 服务 | 管理端口（宿主机，`/stats`、`/ready`） | 出站端口（宿主机） | 备注 |
+|---|---|---|---|
+| `envoy-gateway` | 19901 | 15081 order、15082 inventory、15083 payment、15084 orderindex | gateway 没有入站边车，客户端直接访问 8080 |
+| `envoy-order` | 19902 | 15182 inventory | 入站 15001 转给 order 的 gRPC 9081 |
+| `envoy-payment` | 19903 | 15281 order | 入站 15001 转给 payment 的 gRPC 9083 |
+| `envoy-inventory` | 19904 | 无 | 入站 15001 转给 inventory 的 gRPC 9082 |
+| `envoy-orderindex` | 19905 | 无 | 入站 15001 转给 orderindex 的 gRPC 9084 |
+
+统计项例子：`curl -s 127.0.0.1:19901/stats | grep to_inventory`。并发上限溢出看 `cluster.to_<下游>.upstream_rq_active_overflow`（HTTP/2 的在途请求上限），熔断看 `cluster.to_<下游>.outlier_detection.ejections_enforced_total` 和 `ejections_active`。
 
 ## 待引入（引入时查证并移到上表）
 
