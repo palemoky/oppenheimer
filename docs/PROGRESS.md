@@ -118,7 +118,8 @@
                - 新的环境变量（order）：`REDIS_POOL_SIZE`、`READ_GATE_MAX_CONCURRENCY`。
                - 8.17 里仍然没做的：`make fault` 里抽查指标、后端长时间不在时的表现、压测工具用 `X-Trace-Id`、cdc 发 Kafka 没有 span、orderindex 的 `ListMerchantOrders` 错误映射。
                - 收尾的全部改动之后：`make lint` 各模块 0 issues，`make test` 全部通过，`make e2e` 通过，`make fault` 14 个场景全过（`make fault` 是在加指标和改日志之前跑的）。`make chaos` 这一轮没有跑。`pkg/lock` 的 `TestExperimentNaiveDelDeletesOthersLock` 在整仓库的 `make test` 里失败过一次，单独重跑通过，原因没有看。
-               - 下一步：PR #8 等主人说合并。之后阶段 1 的完成标准都满足了，可以进阶段 2（要先请主人开 Ubuntu 3900X 和 DS218+，装 helm）。
+               - 2026-11-15 进阶段 2 之前主人定的三件事（都只改了文档，见“计划变更记录”）：链路后端从 SkyWalking 换成 Tempo（ADR-0024）；Agent 的 Kubernetes 只读工具提前到 3d、pprof 工具提前到阶段 4；阶段 5 加 Gemini Decision 的对比实验。
+               - 下一步：PR #8 已合并进 `main`（见“当前状态”）。阶段 1 的完成标准都满足了，可以进阶段 2（要先请主人开 Ubuntu 3900X 和 DS218+，装 helm）。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
@@ -228,6 +229,9 @@
 | 2026-11-14 | 步骤四的三个并行任务（order 读路径、inventory 和 payment、gateway）仍在主工作目录里各改各的目录，没有用 worktree；故障注入脚本在它们验收之后才派 | 主线的共享改动没有提交；故障注入要暂停共享的 Redis，不能和别的测试同时跑 |
 | 2026-11-14 | 1d 步骤五：闸门（Redis）和 MySQL 的库存不纳入 Merkle 对账，维持 inventory 现有的 `reconcile`；树的节点摘要用行哈希的和，不是教科书式的 H(子节点) | SKU 很少、数一直在变，逐个比就是对的做法；两边分片方式不同，摘要要能跨分片相加。见设计文档 1d 第 7 节、ADR-0022；主人确认 |
 | 2026-11-14 | 1d 步骤六：`outbox` 表加 `trace_context` 列；本机多一个可选的 `otel-lgtm` 容器（`obs` profile）；步骤六的五个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 链路要穿过 outbox 只能跟着数据走；埋点要被真实的后端收过才算数。见设计文档 1d 第 8 节、ADR-0023，主人确认。主线的共享改动没有提交，worktree 里看不到 |
+| 2026-11-15 | 链路后端从 SkyWalking 换成 Grafana Tempo，不部署 SkyWalking | 本机已经在用 Tempo；三种信号统一成 PromQL、LogQL、TraceQL，Agent 只对接一套；省约 3 GB 内存；去掉 ADR-0004 的待验证项。见 ADR-0024，主人提出并确认 |
+| 2026-11-15 | 阶段 5 增加“封闭式判断交给决策模型（Gemini Decision 1）”的对比实验，挂在模型分层下面；3d 和阶段 4 不接，主循环保持 Claude | 它只做是否、多选、打分，不能做主循环；适合判分、裁剪工具输出、告警分诊，接不接由评测数据决定。主人提出并确认 |
+| 2026-11-15 | 诊断 Agent 的 Kubernetes 只读工具从阶段 5 提前到 3d，pprof 工具提前到阶段 4（Go 代码缺陷实验之前） | 阶段 4 的 Pod 和节点类故障、Go 缺陷类故障没有这两个工具基本诊断不了，运行记录也就没有评测价值。主人提出并确认 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |

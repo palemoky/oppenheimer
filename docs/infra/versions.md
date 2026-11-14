@@ -113,7 +113,7 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 | OpenTelemetry Collector 与 Go SDK | 1d / 3 | 无 |
 | Prometheus | 3 | 有 |
 | Grafana、Loki、Alertmanager | 3 | 无 |
-| SkyWalking OAP、BanyanDB | 3 | 无 |
+| Tempo | 3 | 无 |
 | k6 | 3 | 无 |
 | Chaos Mesh | 4 | 无 |
 | Rust | 8 | 无，选最新 stable |

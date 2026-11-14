@@ -12,8 +12,10 @@
 - [ ] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟
 - [ ] 中间件 exporter：MySQL、Redis、Kafka（含消费延迟）
 - [ ] 日志：结构化日志（JSON，带 trace id），Loki 收集
-- [ ] 链路：SkyWalking OAP + BanyanDB + UI，通过 OTLP 接收器接入
-- [ ] 验证 ADR-0004 的待验证项：OTLP 链路在 SkyWalking 里是否够用，必要时选一个服务接 skywalking-go 对比，结论写回 ADR
+- [ ] 链路：Grafana Tempo（单体模式），由 Collector 经 OTLP 写入（ADR-0024，原计划是 SkyWalking）
+  - 存储放本地盘还是 NAS 上的对象存储；保留期和采样率按实测的数据量定
+  - 打开 metrics-generator，生成 service graph（服务拓扑）和 span 指标，写进 Prometheus
+  - 尾部采样在 Collector 里做（只留出错的和慢的），和 1d 的头部采样对比（设计文档 1d 的 8.7）
 - [ ] 链路打通 HTTP → gRPC → Kafka → MySQL、Redis
 - [ ] Go 运行时指标与持续剖析入口：goroutine 数、堆、GC、pprof 端点（阶段 4 的泄漏类故障要用）
 - [ ] 指标、日志、链路通过 trace id 互相跳转
@@ -48,7 +50,9 @@
 动工前先查最新的 Claude API 和 Agent SDK 文档。
 
 - [ ] Agent 主循环（Go + Claude API 工具调用）：多轮推理、终止条件、步数与费用上限
-- [ ] 两个只读工具：Prometheus 查询（PromQL 即时与范围）、Loki 日志查询
+- [ ] 三个只读工具：Prometheus 查询（PromQL 即时与范围）、Loki 日志查询、Kubernetes（get、describe、events、logs）
+  - Kubernetes 工具从阶段 5 提前到这里（2026-11-15）：阶段 4 的故障里有一大类是 Pod 被杀、OOM、节点失联、调度不上，只有指标和日志时 Agent 只能从数据的缺口去猜
+  - 用 client-go，单独的 ServiceAccount，只给 get、list、watch；不给 exec、不给任何写权限，权限写在清单里入库
 - [ ] 工具输出的裁剪，控制上下文长度
 - [ ] 触发方式：Alertmanager webhook 和命令行手动提问
 - [ ] 输出 Markdown 报告：根因判断、证据（每条结论附查询和结果）、置信度

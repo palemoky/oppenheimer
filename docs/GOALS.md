@@ -16,7 +16,7 @@
 
 ## 要模拟的工业级要素
 
-Kubernetes、Kafka、Prometheus、SkyWalking、分库分表、主从与集群架构、限流、熔断、降级、故障注入。
+Kubernetes、Kafka、Prometheus、OpenTelemetry（链路后端用 Tempo，见 ADR-0024）、分库分表、主从与集群架构、限流、熔断、降级、故障注入。
 
 ## 每个阶段的产出标准
 
