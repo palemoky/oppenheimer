@@ -35,7 +35,7 @@ func put(t *testing.T, st *store.Store, merchant, order int64, status orderv1.Or
 	if status == orderv1.OrderStatus_ORDER_STATUS_PAID {
 		r.PaidAt = r.CreatedAt.Add(time.Minute)
 	}
-	if _, err := st.Upsert(t.Context(), r, time.Now()); err != nil {
+	if _, err := st.UpsertRows(t.Context(), []store.Row{r}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 }
