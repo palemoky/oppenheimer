@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1c（分库分表与主从），步骤一到三已完成并推送；**步骤四（跨分片查询、造数、扩容演练）已完成，改动都在工作区里，没有提交**。剩步骤五（冷热归档）
+- **当前阶段**：1c（分库分表与主从），步骤一到四已完成并推送，剩步骤五（冷热归档）
 - **当前分支**：`phase-1c`（已推送，draft PR 已开）
 - **最后更新**：2026-11-14
 
@@ -38,7 +38,7 @@
 **1c 步骤三（CDC 加商家索引表）已完成并推送（5 个提交，`400a97e` 到 `4b34bb7`，另有一个修 e2e 的提交）。** 设计在设计文档 1c 第 4 节，决定在 ADR-0014，实现中的发现在 4.13，结果在 4.14。`make lint test e2e` 通过，`make chaos` 两次 PASS。步骤一、二已推送，在 draft PR #6（`phase-1c`）里。
 
 1. 下一步：
-   - **提交并推送步骤四**（等主人发话）。工作区里约 50 个文件，建议分成几个提交：文档（设计文档 1c 第 5 节、ADR-0015、计划、本文件）；共享改动（`pkg/sharding`、`pkg/idgen` 的 Epoch、`pkg/mysqlx`、order 的 `shard_meta` 和 00003 迁移、proto）；按用户列出订单（openapi、gateway、order）；围栏期间的行为（支付结果无限重试、`Unavailable`、`fence_test.go`）；造数工具（`test/load` 的 `seed`、`seed-report`，对账跳过造数订单）；扩容脚本（compose 的 `expand` profile、`scripts/expand.sh`、`scripts/expand-cdc-wait.sh`、`run-local.sh` 的 `ORDER_DBS`、cdc 的 `-print-checkpoint`）。推送后按规则派 Haiku 看 CI。
+   - 步骤四已分 6 个提交推送（`baa80e3` 到 `e2a01c8`，在 draft PR #6 里），CI 的 24 项检查全部通过（2026-11-14）。
    - 步骤四的结果在设计文档 5.11。最后一次 `make lint test e2e` 通过（2026-11-14，扩容之后）。`make chaos` 这次没有跑。
    - **补商家索引这一半的造数报告**：索引消费者只有约 2000 行/秒，演练结束时积压约 547 万条。追上后（`kafka-consumer-groups.sh --describe --group orderindex.cdc-orders` 的 lag 归零）跑 `make seed-report SEED_ARGS="-order-dsns <4 个库的 DSN，见 scripts/expand.sh env>"`，把索引的均匀度和商家列表的延迟补进 5.11，勾掉计划里对应的一项。
    - 然后做 **1c 步骤五**（冷热归档），动工前先细化设计文档第 6 节并写 ADR，主人确认后再实现。归档就用本机现在这批 500 万单的数据。
@@ -186,6 +186,8 @@
 
 主线（Fable）做了共享部分：库数由 DSN 个数决定加 `shard_meta` 校验、00003 迁移、`ListUserOrders` 的 proto、Epoch，清空了本机开发库。然后三个子 Agent 并行：按用户列出订单（Opus）、造数工具（Opus）、扩容脚本和 compose（Sonnet）。主线同时读代码确认围栏期间的行为，发现支付结果的消费者 1.5 秒后进死信并修掉，给 cdc 加了 `-print-checkpoint`。
 
-评审后合入。扩容脚本改了三处（等待超时自动撤围栏、建从库移出窗口、校验不怕新写入）。灌了 500 万单并出报告，带流量演练了 2 库扩 4 库：窗口 9.3 秒，8181 个订单全部落库，对账和数据校验通过，结果在设计文档 5.11。全程没有提交。
+评审后合入。扩容脚本改了三处（等待超时自动撤围栏、建从库移出窗口、校验不怕新写入）。灌了 500 万单并出报告，带流量演练了 2 库扩 4 库：窗口 9.3 秒，8181 个订单全部落库，对账和数据校验通过，结果在设计文档 5.11。做完后分 6 个提交推送（git 操作和看 CI 派给 Haiku），CI 全绿。
+
+同日按主人要求在路线图里加了可选的阶段 9（eBPF），并回答了两个设计问题，要点记进了阶段计划的考点：为什么用 CHECK 而不是 UNSIGNED，`SKIP LOCKED` 适合什么场景。
 
 教训：直接在模块目录里跑 `go test` 时集成测试会因为没有环境变量而全部跳过，看起来是通过。要用 `make test MODULES=$PWD/<模块>`。
