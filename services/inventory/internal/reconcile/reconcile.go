@@ -191,6 +191,7 @@ func (r *Reconciler) check(ctx context.Context, sku int64, next map[int64]streak
 
 	// 连续 rounds 轮得到同一个 d，认定为真实偏差。修正后不再记入 next：
 	// 修正如果没有完全消除偏差（被上限截住），下一轮重新从 1 开始数，而不是每轮都修。
+	drifts.Add(ctx, 1)
 	after, ok, err := r.gate.Adjust(ctx, sku, -d, maxAvail)
 	if err != nil {
 		next[sku] = s // 没修成，保留计数，下一轮再试
@@ -211,6 +212,7 @@ func (r *Reconciler) check(ctx context.Context, sku int64, next map[int64]streak
 		r.logger.WarnContext(ctx, "stock gate deviation persists, correction capped", attrs...)
 		return nil
 	}
+	repairs.Add(ctx, 1)
 	r.logger.ErrorContext(ctx, "stock gate deviation corrected", attrs...)
 	return nil
 }

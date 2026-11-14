@@ -38,6 +38,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/outbox"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
@@ -474,6 +475,7 @@ func (s *Service) advance(ctx context.Context, o *store.Order) (*store.Order, er
 		return nil, fmt.Errorf("mark order %d reserved: %w", o.OrderID, err)
 	}
 	if ok {
+		transitionDone(ctx, transCreatingToPending)
 		s.stamp(ctx, o.OrderID)
 		o.Status = orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT
 		o.MerchantID = merchantID
@@ -652,6 +654,7 @@ func NewOrderCache(client redis.Cmdable, prefix string, logger *slog.Logger, set
 		sw = set.Switch(SwitchCache, "order queries skip the cache and read the database")
 	}
 	c, err := cache.New(cache.Config{
+		Name:        "order",
 		Client:      client,
 		KeyPrefix:   prefix,
 		DisableLock: true,
@@ -688,6 +691,7 @@ func (s *Service) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, invalidArgument("order_id and user_id must be positive")
 	}
+	otelx.SetOrder(ctx, req.GetOrderId(), req.GetUserId())
 	var (
 		o   *orderv1.Order
 		ok  bool
@@ -716,7 +720,11 @@ func (s *Service) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*
 //
 // 已受理未落库的订单在 fetch 里从占用合成，Found 为 true，所以不会被写成空值。
 func (s *Service) fetchCached(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	// loaded 只给指标用：回源的那一次由 fetch 里的各个来源记，没有回源（命中）的记成缓存。
+	// 回源可能在另一个 goroutine 里跑（singleflight），所以用原子变量。
+	var loaded atomic.Bool
 	o, ok, err := s.orderCache.Get(ctx, orderCacheKey(orderID), func(ctx context.Context) (cache.Loaded[*orderv1.Order], error) {
+		loaded.Store(true)
 		o, ok, err := s.fetch(ctx, orderID, true)
 		if err != nil {
 			return cache.Loaded[*orderv1.Order]{}, err
@@ -737,6 +745,9 @@ func (s *Service) fetchCached(ctx context.Context, orderID int64) (*orderv1.Orde
 			return nil, false, status.FromContextError(err).Err()
 		}
 		return nil, false, err
+	}
+	if !loaded.Load() {
+		s.readDone(ctx, readFromCache, false)
 	}
 	return o, ok, nil
 }
@@ -799,6 +810,9 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 		return nil, false, errHoldPending
 	}
 	if held && !hold.Claimed {
+		if display {
+			s.readDone(ctx, readFromHold, false)
+		}
 		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
 	}
 	if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
@@ -806,11 +820,18 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 	}
 	if held {
 		// 已认领、主库上还没有行：落库正在进行，按占用合成。
+		if display {
+			s.readDone(ctx, readFromHold, false)
+		}
 		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
 	}
 	// 走到这里，占用没有，热库主库也确认没有这一行。这是 fetch 里唯一一个返回“不存在”的出口，
 	// 冷库只在这里查一次。
-	return s.loadCold(ctx, orderID)
+	o, ok, err := s.loadCold(ctx, orderID)
+	if display && ok && err == nil {
+		s.readDone(ctx, readFromCold, false)
+	}
+	return o, ok, err
 }
 
 // loadConfirmed 读已落库的订单行。ok 为 false 时“没有这一行”是主库确认过的：
@@ -841,7 +862,11 @@ func (s *Service) loadDisplayPrimary(ctx context.Context, orderID int64) (*order
 		return nil, false, err
 	}
 	defer release()
-	return s.loadRow(ctx, orderID)
+	o, ok, err := s.loadRow(ctx, orderID)
+	if ok && err == nil {
+		s.readDone(ctx, readFromPrimary, false)
+	}
+	return o, ok, err
 }
 
 // loadCold 在热库主库确认没有订单之后查冷库（设计文档 1c 第 6.6 节）。ok 为 false 表示订单不存在。
@@ -919,6 +944,7 @@ func (s *Service) loadDisplayRow(ctx context.Context, orderID int64) (o *orderv1
 		o, ok, err = s.loadDisplayPrimary(ctx, orderID)
 		return o, ok, false, err
 	}
+	s.readDone(ctx, readFromReplica, false)
 	return toProto(row), true, true, nil
 }
 
@@ -1017,6 +1043,7 @@ func (s *Service) CancelOrder(ctx context.Context, req *orderv1.CancelOrderReque
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, invalidArgument("order_id and user_id must be positive")
 	}
+	otelx.SetOrder(ctx, req.GetOrderId(), req.GetUserId())
 	// 不先查后改：直接做带前置条件的更新，并发的取消、支付、关单里只有一个能完成转换。
 	// 订单不属于该用户时更新不到任何行，下面按不存在作答。
 	ref := store.OrderRef{OrderID: req.GetOrderId(), UserID: req.GetUserId()}
@@ -1159,6 +1186,9 @@ func (s *Service) transition(ctx context.Context, ev *eventv1.OrderEvent,
 	}
 	if done {
 		s.afterCommit(ctx, ev.GetOrderId())
+		if opt, ok := transitionOfEvent(ev); ok {
+			transitionDone(ctx, opt)
+		}
 	}
 	return done, nil
 }

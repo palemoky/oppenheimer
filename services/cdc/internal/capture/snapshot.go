@@ -162,6 +162,7 @@ func (p *Pipeline) snapshotBatch(ctx context.Context, rule *Rule, slot int32, ta
 		if err := p.produce(ctx, rule.Topic, k, msg); err != nil {
 			return 0, 0, err
 		}
+		p.countEvent(ctx, cdcv1.Op_OP_READ)
 		n++
 		maxKey = max(maxKey, kn)
 	}

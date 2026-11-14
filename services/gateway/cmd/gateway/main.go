@@ -16,6 +16,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/pkg/logx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi"
 )
 
@@ -32,6 +33,14 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	// 链路和指标（设计文档 1d 第 8 节）。最先装配、最后关闭：其他组件停止时产生的 span 也要发出去。
+	// 没设 OTEL_EXPORTER_OTLP_ENDPOINT 时不导出，只让日志带上 trace id。
+	shutdownTelemetry, err := otelx.Setup(ctx, serviceName, logger)
+	if err != nil {
+		return err
+	}
+	defer otelx.Shutdown(ctx, shutdownTelemetry, logger)
+
 	addr := cmp.Or(os.Getenv("HTTP_ADDR"), ":8080")
 	adminAddr := cmp.Or(os.Getenv("ADMIN_ADDR"), defaultAdminAddr)
 	orderAddr := cmp.Or(os.Getenv("ORDER_ADDR"), "127.0.0.1:9081")

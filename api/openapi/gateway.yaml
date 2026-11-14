@@ -20,6 +20,8 @@ info:
     - 访问日志里的 499 表示客户端在响应返回前断开了连接（Nginx 的约定，不是标准状态码）。
       客户端收不到这个响应，所以各接口不声明它。
     - 存活探测 `GET /healthz` 和就绪探测 `GET /readyz` 由各服务统一提供，不属于本接口。
+    - 本接口的每个响应（包括 429、503 和路径不存在时的 404）都带 `X-Trace-Id`，是这个请求的链路 ID。
+      排查问题时把它报给我们。请求里带的 `traceparent` 不会成为这条链路的上级，只作为关联记下。
 servers:
   - url: http://localhost:8080
     description: 本机（make run）
@@ -78,6 +80,9 @@ paths:
       responses:
         '200':
           description: 一页订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -119,6 +124,8 @@ paths:
         '202':
           description: 下单请求已受理（或幂等重放返回已有订单）
           headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
             Location:
               description: 查询这个订单的地址
               schema:
@@ -133,6 +140,9 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           description: 商品不存在
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -141,6 +151,9 @@ paths:
           description: |
             库存不足（`INSUFFICIENT_STOCK`）、超出每人限购数量（`PURCHASE_LIMIT_EXCEEDED`），
             或幂等键已被内容不同的请求使用（`IDEMPOTENCY_KEY_REUSED`）
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -164,6 +177,9 @@ paths:
       responses:
         '200':
           description: 订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -192,6 +208,9 @@ paths:
       responses:
         '200':
           description: 取消后的订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -230,6 +249,9 @@ paths:
       responses:
         '202':
           description: 支付单已受理
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -261,6 +283,9 @@ paths:
       responses:
         '200':
           description: 支付单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -288,6 +313,9 @@ paths:
       responses:
         '200':
           description: 库存
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -347,6 +375,9 @@ paths:
       responses:
         '200':
           description: 一页订单
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
           content:
             application/json:
               schema:
@@ -408,6 +439,13 @@ components:
         pattern: '^[1-9][0-9]*$'
 
   headers:
+    TraceId:
+      description: |
+        这个请求在网关的链路 ID（W3C Trace Context 的 trace-id，32 个小写十六进制字符）。
+        每个请求一个新的，不沿用请求里 `traceparent` 的 trace-id（那个只作为关联记在链路上）。
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
     RetryAfter:
       description: |
         多少秒之后再重试（正整数，向上取整，至少 1）。它是下界：这段时间里别的请求也在消耗配额，
@@ -420,30 +458,45 @@ components:
   responses:
     BadRequest:
       description: 请求参数非法（`INVALID_ARGUMENT`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     Unauthorized:
       description: 缺少或非法的 `X-User-Id`（`UNAUTHENTICATED`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     NotFound:
       description: 资源不存在，或不属于当前用户
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: 当前状态不允许这个操作（`FAILED_PRECONDITION` 或更具体的原因码）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: 请求体超过 1 MiB（`PAYLOAD_TOO_LARGE`）
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:
@@ -462,6 +515,8 @@ components:
           订单服务同时处理的查询已经到了上限，这个上限是为了给下单的落库留出数据库连接。
           与调用方自己的速率无关，稍后重试即可；没有 `Retry-After`。
       headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -485,6 +540,8 @@ components:
           - `FEATURE_DISABLED`：这个功能被暂时关掉了（维护或保护核心功能）。目前可能被关掉的是下单、
             订单列表、商家订单列表、查库存；查单个订单、取消、支付不会被关掉。
       headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -494,6 +551,9 @@ components:
     Error:
       description: |
         其他错误。下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/TraceId'
       content:
         application/json:
           schema:

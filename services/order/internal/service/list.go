@@ -53,15 +53,17 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 	if err != nil {
 		return nil, s.listError(ctx, "list user orders", hopErr(lctx, err), req.GetUserId())
 	}
+	src := readFromPrimary // 只给指标用：结果是否用到了冷库
 	if s.cold != nil && s.mayNeedCold(rows, more) {
 		const op = "list archived user orders"
 		cold, moreCold, err := s.listCold(lctx, q)
 		switch {
 		case err == nil:
 			rows, more = mergeNewestFirst(rows, more, cold, moreCold, q.Limit)
+			src = readFromCold
 		case s.archiveUnavailable(lctx, op, err, "user_id", req.GetUserId()):
 			// 冷库不可用：返回精确的前一段，并明说不完整（设计文档 1d 的 6.8）。
-			return s.listHotOnly(rows)
+			return s.listHotOnly(ctx, rows)
 		default:
 			// 调用方取消、超时，本服务给列表的总时限到了，名额满：按原来的方式返回错误。
 			// 不悄悄只返回热库的部分：那样这一页会漏掉已归档的订单，而且 more 可能是错的，翻页就此结束。
@@ -72,6 +74,7 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 	if more {
 		resp.NextBeforeOrderId = rows[len(rows)-1].OrderID
 	}
+	s.readDone(ctx, src, false)
 	return resp, nil
 }
 
@@ -105,7 +108,7 @@ func newListResponse(rows []store.OrderSummary) *orderv1.ListUserOrdersResponse 
 // 游标总是给出，即使 U 里其实已经没有更早的订单：没有冷库就不知道“后面还有没有”，不能答 more=false。
 //
 // 这一段为空（游标已经翻过冷热分界，或者 hot 的第一条就可能在冷库）时没有任何能确定的东西，返回降级错误。
-func (s *Service) listHotOnly(hot []store.OrderSummary) (*orderv1.ListUserOrdersResponse, error) {
+func (s *Service) listHotOnly(ctx context.Context, hot []store.OrderSummary) (*orderv1.ListUserOrdersResponse, error) {
 	now := s.now()
 	n := len(hot)
 	if i := slices.IndexFunc(hot, func(r store.OrderSummary) bool { return archive.MaybeCold(r.OrderID, now) }); i >= 0 {
@@ -117,6 +120,7 @@ func (s *Service) listHotOnly(hot []store.OrderSummary) (*orderv1.ListUserOrders
 	resp := newListResponse(hot[:n])
 	resp.ArchiveUnavailable = true
 	resp.NextBeforeOrderId = hot[n-1].OrderID
+	s.readDone(ctx, readFromPrimary, true)
 	return resp, nil
 }
 

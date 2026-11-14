@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/palemoky/oppenheimer/pkg/ratelimit"
@@ -146,8 +147,11 @@ func positiveDuration(get func(string) string, name string, def time.Duration) (
 //
 // 连接池的大小和预先建满沿用 redisx 的理由（突发流量下不现建连接，见 redisx.DefaultPoolSize）；go-redis 在后台补齐空闲连接，
 // Redis 不可用时它按自己的节奏重试，不阻塞请求。
-func newRateLimitRedis(addr string) *redis.Client {
-	return redis.NewClient(&redis.Options{
+//
+// 链路和指标和 redisx 里的一样（设计文档 1d 的 8.4）：每条命令一个 CLIENT span，不记命令内容（键里有用户号），
+// 不给建连单独出 span；连接池的统计进指标。埋点失败只返回错误，客户端照样可用，由调用方决定怎么处理。
+func newRateLimitRedis(addr string) (*redis.Client, error) {
+	rdb := redis.NewClient(&redis.Options{
 		Addr:                  addr,
 		ContextTimeoutEnabled: true,
 		MaxRetries:            -1,
@@ -158,6 +162,13 @@ func newRateLimitRedis(addr string) *redis.Client {
 		PoolSize:              redisx.DefaultPoolSize,
 		MinIdleConns:          redisx.DefaultPoolSize,
 	})
+	if err := redisotel.InstrumentTracing(rdb, redisotel.WithDBStatement(false), redisotel.WithDialFilter(true)); err != nil {
+		return rdb, fmt.Errorf("instrument rate limit redis tracing: %w", err)
+	}
+	if err := redisotel.InstrumentMetrics(rdb); err != nil {
+		return rdb, fmt.Errorf("instrument rate limit redis metrics: %w", err)
+	}
+	return rdb, nil
 }
 
 // newRateLimit 按配置创建限流器。返回的 rl 为 nil 表示不限流；reporter 为 nil 表示没有汇总日志要输出。
@@ -196,11 +207,10 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 		local := ratelimit.NewLocal(ratelimit.LocalConfig{})
 		rl.Shared = local
 		if cfg.redisAddr != "" {
-			rdb := newRateLimitRedis(cfg.redisAddr)
-			closeFn = func() {
-				if err := rdb.Close(); err != nil {
-					logger.Warn("close rate limit redis", "error", err)
-				}
+			rdb, err := newRateLimitRedis(cfg.redisAddr)
+			if err != nil {
+				// 可观测性是可选的（otelx.Setup 的约定）：埋点没装上不影响限流本身，记下来照常启动。
+				logger.Warn("rate limit redis is not instrumented", "error", err)
 			}
 			pctx, cancel := context.WithTimeout(ctx, rateLimitRedisPingTimeout)
 			if err := rdb.Ping(pctx).Err(); err != nil {
@@ -218,6 +228,17 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 			rl.Shared = fb
 			fallbacks = fb.Fallbacks
 			useRedis = true
+			unregister, err := httpapi.RegisterFallbackMetric(fb.Fallbacks)
+			if err != nil {
+				logger.Warn("register rate limit fallback metric", "error", err)
+				unregister = func() {}
+			}
+			closeFn = func() {
+				unregister()
+				if err := rdb.Close(); err != nil {
+					logger.Warn("close rate limit redis", "error", err)
+				}
+			}
 		}
 	}
 

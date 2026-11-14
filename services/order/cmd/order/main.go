@@ -30,6 +30,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/lock"
 	"github.com/palemoky/oppenheimer/pkg/logx"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/outbox"
 	"github.com/palemoky/oppenheimer/pkg/redisx"
 	"github.com/palemoky/oppenheimer/pkg/sharding"
@@ -442,6 +443,14 @@ func envDurationOrZero(key string, def time.Duration) (time.Duration, error) {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	// 链路和指标（设计文档 1d 第 8 节）。最先装配、最后关闭：其他组件停止时产生的 span 也要发出去。
+	// 没设 OTEL_EXPORTER_OTLP_ENDPOINT 时不导出，只让日志带上 trace id。
+	shutdownTelemetry, err := otelx.Setup(ctx, serviceName, logger)
+	if err != nil {
+		return err
+	}
+	defer otelx.Shutdown(ctx, shutdownTelemetry, logger)
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -639,6 +648,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 展示读名额的在用数和拒绝数。defer 在 app.Run 返回、gRPC 停下之后执行，那时已没有展示读在用名额。
+	unregisterLimitMetrics, err := svc.RegisterLimitMetrics()
+	if err != nil {
+		return fmt.Errorf("register read limit metrics: %w", err)
+	}
+	defer unregisterLimitMetrics()
 	// 开关都登记完了（缓存的在 openOrderCache，其余在 service.New）。名字写错在这里就拒绝启动：
 	// 被悄悄忽略的话，人以为关了其实没关。
 	if err := switches.Apply(os.Getenv(degrade.Env)); err != nil {

@@ -155,14 +155,19 @@ func (ix *Indexer) Apply(ctx context.Context, changes []*cdcv1.RowChange) (Count
 
 	if len(latest) > 0 {
 		// synced_at 是写入时刻；同一批共用一个，表示“这一批写进去的时刻”。
+		start := time.Now()
 		res, err := ix.store.UpsertRows(ctx, slices.Collect(maps.Values(latest)), ix.now().UTC())
 		if err != nil {
 			return Counts{}, fmt.Errorf("indexer: %w", err)
 		}
+		applyDuration.Record(ctx, time.Since(start).Seconds())
+		batchSize.Record(ctx, res.Rows)
 		c.Written = res.Rows
 		c.Merged = indexed - res.Rows
 		c.Changed = res.Changed
 		c.Stale = indexed - res.Changed
+		rows.Add(ctx, c.Changed, outcomeApplied)
+		rows.Add(ctx, c.Stale, outcomeStale)
 	}
 	// 端到端延迟：写完的时刻减去事务在主库上的提交时刻。取写完而不是写之前，批写的耗时也是延迟的一部分。
 	done := ix.now()
@@ -208,7 +213,7 @@ func (ix *Indexer) Handler(timeout time.Duration) kafkax.BatchHandler {
 		// 避免同一个问题在日志里报两遍，也只有这时才知道是哪一条。
 		if errors.Is(err, ErrSchema) && len(msgs) == 1 {
 			msg := msgs[0]
-			ix.log.Error("cdc row change does not match the index schema, consumption stalled until fixed",
+			ix.log.ErrorContext(ctx, "cdc row change does not match the index schema, consumption stalled until fixed",
 				"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset, "key", string(msg.Key), "error", err)
 		}
 		return err

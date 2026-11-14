@@ -12,6 +12,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
@@ -64,6 +65,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	if ev.GetOrderId() <= 0 || ev.GetPaymentId() <= 0 {
 		return fmt.Errorf("%w: payment event without order_id or payment_id", ErrInvalidEvent)
 	}
+	otelx.SetOrder(ctx, ev.GetOrderId(), ev.GetUserId())
 	amount := completed.GetAmount()
 	if completed.GetSucceeded() && (amount == nil || amount.GetAmount() < 0 || amount.GetCurrency() == "") {
 		return fmt.Errorf("%w: succeeded payment %d without amount", ErrInvalidEvent, ev.GetPaymentId())
@@ -72,11 +74,12 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	var (
 		handled bool // false 表示该 payment_id 已经处理过，本次什么都没写
 		reply   *eventv1.PaymentResultHandled
+		paid    bool // 只给指标用：本次事务把订单置为了 PAID
 	)
 	now := s.now()
 	// 事务落在订单所在的分片上：订单行、payment_results 和 outbox 都在那个库里。
 	err := s.inTx(ctx, paymentTxRetry, ev.GetOrderId(), func(tx *store.Tx) error {
-		handled, reply = false, nil
+		handled, reply, paid = false, nil, false
 
 		// 先锁订单行：同一订单的重复投递在此排队，与取消、关单的条件更新也互斥。
 		o, err := tx.LockOrder(ctx, ev.GetOrderId())
@@ -149,9 +152,10 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 				// 行已被本事务锁住且状态刚读过，不应发生。
 				return fmt.Errorf("mark paid affected no rows for order %d", o.OrderID)
 			}
-			paid := newEvent(ref, now)
-			paid.Body = &eventv1.OrderEvent_Paid{Paid: &eventv1.OrderPaid{PaymentId: ev.GetPaymentId()}}
-			events = append(events, paid)
+			paidEv := newEvent(ref, now)
+			paidEv.Body = &eventv1.OrderEvent_Paid{Paid: &eventv1.OrderPaid{PaymentId: ev.GetPaymentId()}}
+			events = append(events, paidEv)
+			paid = true
 		}
 
 		if err := tx.InsertPaymentResult(ctx, &store.PaymentResult{
@@ -181,7 +185,11 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 		return nil
 	}
 	s.afterCommit(ctx, ev.GetOrderId())
+	if paid {
+		transitionDone(ctx, transPendingToPaid)
+	}
 	if reply.GetDisposition() == refundRequired {
+		otelx.SetReason(ctx, reply.GetReason())
 		s.logger.WarnContext(ctx, "payment requires refund",
 			"order_id", ev.GetOrderId(), "payment_id", ev.GetPaymentId(), "reason", reply.GetReason())
 	}

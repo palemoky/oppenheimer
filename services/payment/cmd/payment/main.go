@@ -26,6 +26,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/lock"
 	"github.com/palemoky/oppenheimer/pkg/logx"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/outbox"
 	"github.com/palemoky/oppenheimer/pkg/redisx"
 	"github.com/palemoky/oppenheimer/services/payment"
@@ -143,6 +144,14 @@ func durationEnv(name string) (time.Duration, error) {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	// 链路和指标（设计文档 1d 第 8 节）。最先装配、最后关闭：其他组件停止时产生的 span 也要发出去。
+	// 没设 OTEL_EXPORTER_OTLP_ENDPOINT 时不导出，只让日志带上 trace id。
+	shutdownTelemetry, err := otelx.Setup(ctx, serviceName, logger)
+	if err != nil {
+		return err
+	}
+	defer otelx.Shutdown(ctx, shutdownTelemetry, logger)
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err

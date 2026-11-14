@@ -19,7 +19,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
 	cdcv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/cdc/v1"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 )
 
 // 各类跨进程调用的时限。
@@ -79,6 +83,11 @@ type Pipeline struct {
 	versionAnomalies atomic.Int64
 
 	lag lagStats
+
+	// eventOpts 是 cdc.events 按 op 的标签，见 newEventOptions。
+	eventOpts map[cdcv1.Op]metric.AddOption
+	// lastCommitMicros 是最后一个读完的事务在源库的提交时间（微秒），给 cdc.lag_ms 用；还没有时为 0。
+	lastCommitMicros atomic.Int64
 
 	// 以下只供测试替换。
 	purgedQuery        string
@@ -165,6 +174,7 @@ func New(cfg Config) (*Pipeline, error) {
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
 		purgedQuery: "SELECT @@global.gtid_purged",
+		eventOpts:   newEventOptions(cfg.Name),
 	}, nil
 }
 
@@ -201,6 +211,13 @@ func (p *Pipeline) stopping() bool {
 func (p *Pipeline) Start(ctx context.Context) error {
 	defer close(p.done)
 	defer p.db.Close()
+	// 指标登记失败不影响同步，只记一条日志。
+	if unregister, err := otelx.ObserveGauge(meter, "cdc.lag_ms", lagDesc, p.lagMillis,
+		attribute.String("pipeline", p.cfg.Name)); err != nil {
+		p.log.Warn("register cdc lag gauge", "error", err)
+	} else {
+		defer unregister()
+	}
 
 	if p.stopping() {
 		return nil

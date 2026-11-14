@@ -169,6 +169,7 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 
 	bctx, cancel := context.WithTimeout(ctx, batchTimeout)
 	defer cancel()
+	start := time.Now()
 	res, err := a.store.ApplyPending(bctx, a.batch, exclude, now)
 	if mysqlx.IsDeadlock(err) {
 		// 两个应用者（多副本）互相死锁，数据库回滚了这一个。什么都没有改，接着再来一批。
@@ -188,6 +189,8 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 	if res.Fetched > 0 {
 		a.sinceSummary.batches++
 		a.sinceSummary.maxAge = max(a.sinceSummary.maxAge, res.OldestAge)
+		batchSize.Record(ctx, int64(res.Applied))
+		batchDuration.Record(ctx, time.Since(start).Seconds())
 	}
 
 	nowStuck := make(map[int64]string, len(res.Stuck))
@@ -197,6 +200,7 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 			// 这是 MySQL 这一侧发现超卖或恒等式被破坏的地方（设计文档 1d 的 3.4）：把这个 SKU 的全部
 			// 未应用增量加上去之后仍然有一个数为负，闸门放行的数量超过了 MySQL 里有的。
 			// 订单已经成功，这里只能报出来等人处理。
+			oversellDetected.Add(ctx, 1)
 			a.logger.ErrorContext(ctx, "stock deltas cannot be applied, sku is stuck until the stock is fixed",
 				"sku_id", s.SKUID, "pending_rows", s.Rows, "reason", s.Reason)
 		}

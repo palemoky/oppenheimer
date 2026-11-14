@@ -17,6 +17,7 @@ import (
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/services/payment/internal/store"
 )
 
@@ -76,6 +77,7 @@ func (h *Handler) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 	if reply == nil {
 		return nil
 	}
+	otelx.SetOrder(ctx, ev.GetOrderId(), ev.GetUserId())
 	if reply.GetPaymentId() <= 0 {
 		return kafkax.Permanent(fmt.Errorf("payment_result_handled without payment_id (order %d)", ev.GetOrderId()))
 	}
@@ -101,10 +103,19 @@ func (h *Handler) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 	now := h.now().UTC().Truncate(time.Microsecond)
 	switch reply.GetDisposition() {
 	case eventv1.PaymentDisposition_PAYMENT_DISPOSITION_ACCEPTED:
-		return h.accept(ctx, log, pay, now)
+		err := h.accept(ctx, log, pay, now)
+		if err == nil {
+			orderReplies.Add(ctx, 1, replyAccepted)
+		}
+		return err
 	case eventv1.PaymentDisposition_PAYMENT_DISPOSITION_REFUND_REQUIRED:
-		return h.refund(ctx, log, pay, reply.GetReason(), now)
+		err := h.refund(ctx, log, pay, reply.GetReason(), now)
+		if err == nil {
+			orderReplies.Add(ctx, 1, replyRefundRequired)
+		}
+		return err
 	default:
+		orderReplies.Add(ctx, 1, replyUnknown)
 		// 不认识的答复说明双方版本不一致，重试也不会变，进死信等人处理。不能当作已答复。
 		return kafkax.Permanent(fmt.Errorf("payment %d: unknown disposition %v", pay.PaymentID, reply.GetDisposition()))
 	}
@@ -151,6 +162,7 @@ func (h *Handler) refund(ctx context.Context, log *slog.Logger, pay store.Paymen
 			return h.checkAfterLost(ctx, log, pay.PaymentID, eventv1.PaymentDisposition_PAYMENT_DISPOSITION_REFUND_REQUIRED)
 		}
 		// 只有完成转换的那一次记录退款，重复处理不会产生第二条退款记录。
+		refunds.Add(ctx, 1, refundReasonOpt(reason))
 		logRejection(ctx, log, reason)
 		log.InfoContext(ctx, "payment refunded", "amount", pay.Amount, "currency", pay.Currency)
 		return nil

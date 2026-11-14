@@ -15,6 +15,7 @@ import (
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/services/payment/internal/store"
 )
 
@@ -43,6 +44,7 @@ func New(st *store.Store, orders orderv1.OrderServiceClient, ids IDGenerator, no
 
 // CreatePayment 实现 PaymentServiceServer。
 func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymentRequest) (*paymentv1.CreatePaymentResponse, error) {
+	otelx.SetOrder(ctx, req.GetOrderId(), req.GetUserId())
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, "order_id and user_id must be positive")
 	}
@@ -66,7 +68,8 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 
 	resp, err := s.orders.GetOrder(ctx, &orderv1.GetOrderRequest{OrderId: req.GetOrderId(), UserId: req.GetUserId()})
 	if err != nil {
-		if errx.Reason(err) != "" {
+		if reason := errx.Reason(err); reason != "" {
+			otelx.SetReason(ctx, reason)
 			return nil, err
 		}
 		// 调用方自己取消或超时了：按调用方的原因作答，而不是说订单服务不可用（设计文档 1d 的 5.9）。
@@ -81,6 +84,7 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 		switch status.Code(err) {
 		case codes.Unavailable, codes.DeadlineExceeded:
 			s.logger.WarnContext(ctx, "order service unavailable", "error", err)
+			otelx.SetReason(ctx, errx.ReasonOrderUnavailable)
 			return nil, errx.Degraded(errx.ReasonOrderUnavailable, "order service unavailable, retry later")
 		default:
 			return nil, s.internal(ctx, "get order", err)
@@ -89,9 +93,11 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 	order := resp.GetOrder()
 	// 订单服务已按 user_id 过滤；这里再核对一次，防止下游实现有误时把别人的订单当成自己的支付。
 	if order.GetOrderId() != req.GetOrderId() || order.GetUserId() != req.GetUserId() {
+		otelx.SetReason(ctx, errx.ReasonOrderNotFound)
 		return nil, errx.New(codes.NotFound, errx.ReasonOrderNotFound, "order %d not found", req.GetOrderId())
 	}
 	if order.GetStatus() != orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT {
+		otelx.SetReason(ctx, errx.ReasonOrderNotPayable)
 		return nil, errx.New(codes.FailedPrecondition, errx.ReasonOrderNotPayable, "order %d is not pending payment", req.GetOrderId())
 	}
 	total := order.GetTotal()
@@ -139,6 +145,7 @@ func (s *Service) existingPayment(p store.Payment, userID int64) (*paymentv1.Cre
 
 // GetPayment 实现 PaymentServiceServer。
 func (s *Service) GetPayment(ctx context.Context, req *paymentv1.GetPaymentRequest) (*paymentv1.GetPaymentResponse, error) {
+	otelx.SetOrder(ctx, req.GetOrderId(), req.GetUserId())
 	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
 		return nil, errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, "order_id and user_id must be positive")
 	}

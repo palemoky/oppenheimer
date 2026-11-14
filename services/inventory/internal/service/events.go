@@ -10,6 +10,7 @@ import (
 	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 )
 
 // DefaultEventTimeout 是处理一条订单事件的时限。
@@ -48,6 +49,7 @@ func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 	}
 
 	orderID := ev.GetOrderId()
+	otelx.SetOrder(ctx, orderID, ev.GetUserId())
 	if orderID <= 0 {
 		// 发布方保证有 order_id（eventx.MarshalOrderEvent 会拒绝），出现就是消息损坏。
 		return kafkax.Permanent(fmt.Errorf("order event %s without order_id", op))

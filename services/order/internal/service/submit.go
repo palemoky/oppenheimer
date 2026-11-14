@@ -17,6 +17,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
 	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
@@ -44,7 +45,7 @@ func errRetry(reason, msg string) error {
 func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderRequest) (*orderv1.SubmitOrderResponse, error) {
 	items, err := validateSubmit(req)
 	if err != nil {
-		return nil, err
+		return nil, admissionFailed(ctx, err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.submitTimeout)
 	defer cancel()
@@ -52,19 +53,20 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	userID := req.GetUserId()
 	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。两项检查都在 Hold 之前：被拒绝时什么都没有发生。
 	if s.swAdmission.Off() {
-		return nil, errAdmissionOff
+		return nil, admissionFailed(ctx, errAdmissionOff)
 	}
 	settle, err := s.admitLanding(userID)
 	if err != nil {
-		return nil, err
+		return nil, admissionFailed(ctx, err)
 	}
 	published := false
 	defer func() { settle(published) }()
 
 	orderID, err := s.ids.Next(userID)
 	if err != nil {
-		return nil, s.internal(ctx, "generate order id", err, "user_id", userID)
+		return nil, admissionFailed(ctx, s.internal(ctx, "generate order id", err, "user_id", userID))
 	}
+	otelx.SetOrder(ctx, orderID, userID)
 	// 受理时间截断到毫秒：占用里的 ts 是毫秒精度，GetOrder 从占用合成的 create_time、expire_time
 	// 才能和这里返回的、写进消息的值完全一样。
 	accepted := s.clock().UTC().Truncate(time.Millisecond)
@@ -80,7 +82,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	}
 	res, err := s.hold(ctx, hreq)
 	if err != nil {
-		return nil, err
+		return nil, admissionFailed(ctx, err)
 	}
 	// 闸门说“这个幂等键已经受理过”，而受理的正是这次调用刚生成的订单号：占用是这次调用自己写的。
 	// Redis 客户端在读超时之后会自动重试命令；Hold 的脚本第一次已经在 Redis 里执行成功、只是回复没收到时，
@@ -94,33 +96,36 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	case stockgate.Held:
 	case stockgate.Duplicate:
 		// 已经受理过：返回那个订单的当前状态，不再发消息（第一次受理时已经发过）。
+		otelx.SetOrder(ctx, res.OrderID, userID)
 		o, err := s.lookup(ctx, res.OrderID, userID)
 		if errx.Reason(err) == errx.ReasonOrderNotFound {
 			// 幂等键还在，订单和占用都没了：刚好被回收（回收会同时删掉幂等键），重试就会重新受理。
-			return nil, errRetry(errx.ReasonStockGateUnavailable, "previous attempt was abandoned")
+			return nil, admissionFailedAs(ctx, admissionDuplicateAbandoned,
+				errRetry(errx.ReasonStockGateUnavailable, "previous attempt was abandoned"))
 		}
 		if err != nil {
-			return nil, err
+			return nil, admissionFailed(ctx, err)
 		}
+		admissionDone(ctx, admissionDuplicate)
 		return &orderv1.SubmitOrderResponse{Order: o}, nil
 	case stockgate.KeyReused:
-		return nil, errx.New(codes.AlreadyExists, errx.ReasonIdempotencyKeyReused,
-			"idempotency key was used for a different request")
+		return nil, admissionFailed(ctx, errx.New(codes.AlreadyExists, errx.ReasonIdempotencyKeyReused,
+			"idempotency key was used for a different request"))
 	case stockgate.NotLoaded:
-		return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", res.SKUID)
+		return nil, admissionFailed(ctx, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", res.SKUID))
 	case stockgate.Insufficient:
-		return nil, errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "insufficient stock for sku %d", res.SKUID)
+		return nil, admissionFailed(ctx, errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "insufficient stock for sku %d", res.SKUID))
 	case stockgate.LimitExceeded:
-		return nil, errx.New(codes.FailedPrecondition, errx.ReasonPurchaseLimit, "purchase limit exceeded for sku %d", res.SKUID)
+		return nil, admissionFailed(ctx, errx.New(codes.FailedPrecondition, errx.ReasonPurchaseLimit, "purchase limit exceeded for sku %d", res.SKUID))
 	case stockgate.Backlogged:
 		// 闸门里什么都没改，幂等键也没写：稍后用同一个幂等键重试是安全的。
 		// 用 RESOURCE_EXHAUSTED 而不是 UNAVAILABLE：这是有意的削峰，不是故障。grpcx 把 UNAVAILABLE
 		// 记成 ERROR，积压时每秒上百条，会淹没真正的下游故障。网关把它映射为 429。
 		// 也不逐条记日志，积压本身由落库延迟和消费积压的监控发现（1d、阶段 3）。
-		return nil, errx.New(codes.ResourceExhausted, errx.ReasonBacklogged,
-			"too many orders are waiting to be processed, retry later")
+		return nil, admissionFailed(ctx, errx.New(codes.ResourceExhausted, errx.ReasonBacklogged,
+			"too many orders are waiting to be processed, retry later"))
 	default:
-		return nil, s.internal(ctx, "hold", fmt.Errorf("unexpected outcome %s", res.Outcome), "order_id", orderID)
+		return nil, admissionFailed(ctx, s.internal(ctx, "hold", fmt.Errorf("unexpected outcome %s", res.Outcome), "order_id", orderID))
 	}
 
 	expire := accepted.Add(s.paymentTimeout)
@@ -128,6 +133,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		return s.publishFailed(ctx, orderID, userID, items, accepted, err)
 	}
 	published = true
+	admissionDone(ctx, admissionAdmitted)
 	return &orderv1.SubmitOrderResponse{Order: s.creatingProto(orderID, userID, items, accepted)}, nil
 }
 
@@ -293,15 +299,17 @@ func (s *Service) publishFailed(ctx context.Context, orderID, userID int64, item
 		s.logger.ErrorContext(ctx, "abandon hold failed, left for reaper", "order_id", orderID, "error", err)
 	case r == stockgate.ReapClaimed:
 		s.logger.InfoContext(ctx, "submission reached consumer despite send error", "order_id", orderID)
+		admissionDone(ctx, admissionAdmitted)
 		return &orderv1.SubmitOrderResponse{Order: s.creatingProto(orderID, userID, items, accepted)}, nil
 	case r == stockgate.ReapMissing:
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 		defer cancel()
 		if o, err := s.lookup(lctx, orderID, userID); err == nil {
+			admissionDone(ctx, admissionAdmitted)
 			return &orderv1.SubmitOrderResponse{Order: o}, nil
 		}
 	}
-	return nil, errRetry(errx.ReasonOrderQueueUnavailable, "order queue unavailable")
+	return nil, admissionFailed(ctx, errRetry(errx.ReasonOrderQueueUnavailable, "order queue unavailable"))
 }
 
 func gateItems(items []store.Item) []stockgate.Item {
@@ -326,6 +334,8 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 	if err != nil {
 		return err
 	}
+	otelx.SetOrder(ctx, o.OrderID, o.UserID)
+	acceptedAt := o.CreatedAt
 
 	// 订单号老到可能已经归档的，不再落库（设计文档 1c 第 6.6 节，不变量“数据只从热到冷”）。
 	// 这只会是一条被重放的陈年消息。放它过去的话，热库里会重新插入一个已经归档的订单号：
@@ -334,6 +344,7 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 	if archive.MaybeCold(o.OrderID, s.now()) {
 		s.logger.ErrorContext(ctx, "order submission dropped, order id is older than the minimum hot age",
 			"order_id", o.OrderID, "accepted_at", idgen.Time(o.OrderID).Format(time.RFC3339), "min_hot_age", archive.MinHotAge.String())
+		persistDone(ctx, persistTooOld)
 		return nil
 	}
 
@@ -355,6 +366,7 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 	}
 	if !ok {
 		s.logger.InfoContext(ctx, "order submission dropped, hold no longer exists", "order_id", o.OrderID)
+		persistDone(ctx, persistHoldMissing)
 		return nil
 	}
 	if hold.UserID != o.UserID {
@@ -401,6 +413,8 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 			}
 			s.logger.WarnContext(ctx, "order landed after its payment deadline, failed without reserving",
 				"order_id", o.OrderID, "expire_at", o.ExpireAt.Format(time.RFC3339Nano))
+			otelx.SetReason(ctx, ReasonCreateTimeout)
+			s.persistLanded(ctx, persistExpired, acceptedAt)
 			return nil
 		}
 	}
@@ -425,6 +439,17 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 	}
 	if o.Status == orderv1.OrderStatus_ORDER_STATUS_FAILED {
 		s.logger.InfoContext(ctx, "order failed", "order_id", o.OrderID, "reason", o.FailReason)
+	}
+	switch {
+	case !exercised:
+		persistDone(ctx, persistAlreadyProcessed)
+	case o.Status == orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT:
+		s.persistLanded(ctx, persistPendingPayment, acceptedAt)
+	case o.Status == orderv1.OrderStatus_ORDER_STATUS_FAILED:
+		otelx.SetReason(ctx, o.FailReason)
+		s.persistLanded(ctx, persistReserveRejected, acceptedAt)
+	default:
+		persistDone(ctx, persistAlreadyProcessed)
 	}
 	return nil
 }
@@ -464,6 +489,7 @@ func (s *Service) dropReplay(ctx context.Context, b *store.Order) error {
 	}
 	s.logger.WarnContext(ctx, "replayed submission dropped, idempotency key already has an order",
 		"order_id", b.OrderID, "existing_order_id", a.OrderID, "user_id", b.UserID)
+	persistDone(ctx, persistReplayDropped)
 	return nil
 }
 
@@ -529,6 +555,7 @@ func (s *Service) HandleOrderCloseDue(ctx context.Context, m *eventv1.OrderClose
 	if m.GetOrderId() <= 0 {
 		return fmt.Errorf("%w: order close due without order_id", ErrInvalidEvent)
 	}
+	otelx.SetOrder(ctx, m.GetOrderId(), m.GetUserId())
 	o, err := s.store.GetOrder(ctx, m.GetOrderId())
 	if errors.Is(err, store.ErrNotFound) {
 		return nil

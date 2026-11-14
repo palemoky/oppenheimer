@@ -31,7 +31,7 @@ import (
 //   - 热点参数（hot）：只对 hotParams 表里的接口，按路径里某个参数的值（SKU、商家）一个值一个桶，不分用户。
 //     进程内，见 limitHot 和 RateLimit.Hot。
 //
-// 中间件的顺序（从外到内）：requestLog → recoverPanic → checkFeature（功能开关，见 degrade.go）→ limitIP → requireUser → limitUserAndRoute
+// 中间件的顺序（从外到内）：traceEntry（链路，见 telemetry.go）→ requestLog → recoverPanic → checkFeature（功能开关，见 degrade.go）→ limitIP → requireUser → limitUserAndRoute
 // → limitHot → withDeadline → handler。被任何一维拒绝的请求都不调用下游。
 
 // codeRateLimited 是被限流时的原因码。下单的背压是 429 BACKLOGGED，两者要分开：
@@ -408,7 +408,9 @@ func (s *server) limitIP(c *gin.Context) {
 	if !d.Allowed {
 		// 只在拒绝时才查是哪个接口（给统计用），放行的路径上少做一次查表。
 		s.rejectRateLimited(c, rl.op(c), dimIP, d.RetryAfter)
+		return
 	}
+	recordDecision(c.Request.Context(), dimIP, true)
 }
 
 // limitUserAndRoute 按用户加接口、按接口限流：一次 Allow 判断两个桶，用户的在前、接口的在后。
@@ -433,7 +435,17 @@ func (s *server) limitUserAndRoute(c *gin.Context) {
 		if d.Denied == 1 {
 			dim = dimRoute
 		}
+		// 被拒绝时只记拒绝的那一维：两个桶全有或全无，另一维什么也没有扣，不算它放行了。
 		s.rejectRateLimited(c, op, dim, d.RetryAfter)
+		return
+	}
+	// 放行时两维各记一次（不限的那一维不是判定，不记）。
+	ctx := c.Request.Context()
+	if op.user.Enabled() {
+		recordDecision(ctx, dimUser, true)
+	}
+	if op.route.Enabled() {
+		recordDecision(ctx, dimRoute, true)
 	}
 }
 
@@ -472,15 +484,21 @@ func (s *server) limitHot(c *gin.Context) {
 	}
 	if !d.Allowed {
 		s.rejectRateLimited(c, op, dimHot, d.RetryAfter)
+		return
 	}
+	recordDecision(c.Request.Context(), dimHot, true)
 }
 
 // rejectRateLimited 写出 429 RATE_LIMITED 并中止请求。不记日志：洪水来时每个请求一条日志会成为第二个问题，
 // 只计数，由 RateLimitReporter 周期性地汇总成一条。requestLog 照常记这个请求的访问日志。
+// 同时记指标（gateway.ratelimit.decisions）和 span 上的原因：汇总日志按接口分，指标不按接口分（规则和结果就够了）。
 func (s *server) rejectRateLimited(c *gin.Context, op *opLimits, dim dimension, retryAfter time.Duration) {
 	if op != nil {
 		s.rl.stats.denied[op.index][dim].Add(1)
 	}
+	ctx := c.Request.Context()
+	recordDecision(ctx, dim, false)
+	setRateLimited(ctx, dim)
 	c.Header("Retry-After", strconv.FormatInt(retryAfterSeconds(retryAfter), 10))
 	writeError(c, http.StatusTooManyRequests, codeRateLimited, rateLimitedMessages[dim])
 	c.Abort()

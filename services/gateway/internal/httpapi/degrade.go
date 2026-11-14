@@ -5,10 +5,13 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 )
 
 // 降级（设计文档 1d 第 6 节）在 gateway 这一层有两件事：
@@ -71,7 +74,15 @@ func (s *server) checkFeature(c *gin.Context) {
 }
 
 // writeDegraded 写出降级的 503：原因码、给人看的消息和 Retry-After。
+//
+// 降级响应只从这里写出，所以在这里计数（gateway.degraded.responses）并把原因码记在 span 上。
+// reason 只会是降级原因码（errx.IsDegraded 判断过的，或 FEATURE_DISABLED），是有限的几个，可以做标签。
+// 在 gin context 里设 degradedKey：traceEntry 据此不把这个 503 标成 Error（降级不是 gateway 的故障，设计文档 1d 8.4）。
 func writeDegraded(c *gin.Context, reason, message string) {
+	ctx := c.Request.Context()
+	c.Set(degradedKey, true)
+	degradedResponses.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+	otelx.SetReason(ctx, reason)
 	c.Header("Retry-After", strconv.FormatInt(retryAfterSeconds(degradedRetryAfter), 10))
 	writeError(c, http.StatusServiceUnavailable, reason, message)
 }

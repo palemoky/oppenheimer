@@ -135,6 +135,7 @@ func (r *Reaper) RunOnce(ctx context.Context) ReapStats {
 		switch res {
 		case stockgate.ReapReturned:
 			stats.Returned++
+			reclaimed(ctx, reclaimOrphanHold)
 			r.logger.WarnContext(ctx, "orphan hold returned", "order_id", id)
 		case stockgate.ReapClaimed:
 			// 列出之后刚被消费者认领：它赢了，占用由订单的终态归还。

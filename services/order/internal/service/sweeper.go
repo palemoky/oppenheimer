@@ -173,6 +173,7 @@ func (s *Sweeper) closeOrder(ctx context.Context, r store.OrderRef, now time.Tim
 		return
 	}
 	if ok {
+		reclaimed(ctx, reclaimCloseExpired)
 		s.logger.InfoContext(ctx, "order closed for payment timeout", "order_id", r.OrderID)
 	}
 	// !ok：扫描之后被支付或取消抢先了，事件由抢先的一方写。
@@ -201,6 +202,7 @@ func (s *Sweeper) failCreating(ctx context.Context, r store.OrderRef, now time.T
 		return
 	}
 	if ok {
+		reclaimed(ctx, reclaimCreateTimeout)
 		s.logger.InfoContext(ctx, "order failed for create timeout", "order_id", r.OrderID)
 	}
 }

@@ -5,9 +5,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
@@ -65,6 +68,10 @@ type server struct {
 	rl *rateLimiter
 	// features 是可以被关掉的接口的开关，按路由查；没有开关的接口查到 nil（nil 开关永远是打开的）。
 	features map[routeKey]*degrade.Switch
+	// trusted 是受信任的代理（来自 RateLimit.TrustedProxies），traceEntry 用它算 span 上的客户端地址。
+	trusted []netip.Prefix
+	// tracer 建 HTTP 入口的 span，在 New 时从全局的 TracerProvider 取。
+	tracer trace.Tracer
 }
 
 // New 构造路由。返回 http.Handler 而不是 *gin.Engine，不让 gin 泄漏到装配层。
@@ -76,12 +83,16 @@ func New(deps Deps, cfg Config) http.Handler {
 		deps:        deps,
 		logger:      cfg.Logger,
 		callTimeout: cfg.CallTimeout,
+		tracer:      newTracer(),
 	}
 	if s.logger == nil {
 		s.logger = slog.Default()
 	}
 	if s.callTimeout <= 0 {
 		s.callTimeout = DefaultCallTimeout
+	}
+	if cfg.RateLimit != nil {
+		s.trusted = slices.Clone(cfg.RateLimit.TrustedProxies)
 	}
 
 	r := gin.New()
@@ -92,8 +103,10 @@ func New(deps Deps, cfg Config) http.Handler {
 	r.NoMethod(func(c *gin.Context) {
 		writeError(c, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	})
-	// 日志在最外层，才能记录到 recover 之后写出的 500。
-	r.Use(s.requestLog, s.recoverPanic)
+	// 链路在最外层（见 telemetry.go）：被限流、被开关拒绝、没匹配到路由的请求也有 span 和 X-Trace-Id。
+	// 日志在链路之内，带着 span 的 ctx（日志里有 trace_id）；在 recover 之外，才能记录到 recover 之后写出的 500。
+	// panic 由 recoverPanic 变成 500 之后才回到 traceEntry，按服务端故障标 Error。
+	r.Use(s.traceEntry, s.requestLog, s.recoverPanic)
 
 	// 路由由规范生成的代码注册，路径和方法以 api/openapi/gateway.yaml 为准。
 	// 规范里的路径已经带 /api/v1 前缀，所以分组的前缀为空，分组只用来挂中间件。

@@ -22,6 +22,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
@@ -92,6 +93,7 @@ func NewStockCache(client redis.Cmdable, prefix string, logger *slog.Logger, set
 	}
 	c, err := cache.New(cache.Config{
 		Client:    client,
+		Name:      "stock",
 		KeyPrefix: prefix,
 		Logger:    logger,
 		Switch:    sw,
@@ -126,6 +128,7 @@ func New(st *store.Store, gate *stockgate.Gate, logger *slog.Logger, opts ...Opt
 // Reserve 实现 InventoryServiceServer。
 func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) (*inventoryv1.ReserveResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	want, err := validateReserve(req)
 	if err != nil {
 		return nil, err
@@ -134,9 +137,11 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 	var (
 		result     []store.Item
 		merchantID int64
+		// fresh 只给指标用：这次是新的预占（不是幂等重放）。
+		fresh bool
 	)
 	err = s.inTx(ctx, func(tx *store.Tx) error {
-		result, merchantID = nil, 0
+		result, merchantID, fresh = nil, 0, false
 		// 先插入再判断，让唯一键充当互斥；并发的重复请求会等这里提交或回滚。
 		inserted, err := tx.InsertReservation(ctx, orderID, store.StatusReserved)
 		if err != nil {
@@ -184,11 +189,21 @@ func (s *Service) Reserve(ctx context.Context, req *inventoryv1.ReserveRequest) 
 				return err
 			}
 		}
-		result, merchantID = items, merchant
+		result, merchantID, fresh = items, merchant, true
 		return nil
 	})
 	if err != nil {
+		if reason := errx.Reason(err); reason != "" {
+			stockRejections.Add(ctx, 1, rejectionOpt(reason))
+		}
 		return nil, s.toStatus(ctx, "reserve", err, "order_id", orderID)
+	}
+	if fresh {
+		var n int64
+		for _, it := range result {
+			n += int64(it.Quantity)
+		}
+		stockReserved.Add(ctx, n)
 	}
 	return &inventoryv1.ReserveResponse{Items: toProtoItems(result), MerchantId: merchantID}, nil
 }
@@ -291,6 +306,7 @@ func validateReserve(req *inventoryv1.ReserveRequest) ([]store.Item, error) {
 // avail 偏大扣掉，占用本身却永远不会消失）。结清以订单号幂等，之后订单的 paid 事件再来也无害。
 func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) (*inventoryv1.ConfirmResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
@@ -303,7 +319,10 @@ func (s *Service) Confirm(ctx context.Context, req *inventoryv1.ConfirmRequest) 
 // confirm 把订单的预占转为已售，以 order_id 幂等。gRPC 和事件消费共用。
 // 返回业务错误（errx）或未经转换的内部错误，由调用方决定如何对外呈现。
 func (s *Service) confirm(ctx context.Context, orderID int64) error {
-	return s.inTx(ctx, func(tx *store.Tx) error {
+	// n 只给指标用：这次确认记下的件数，事务提交成功后才计入。
+	var n int64
+	err := s.inTx(ctx, func(tx *store.Tx) error {
+		n = 0
 		// 记录应当已经存在，加排他锁不会落到间隙上；不存在就报错，不会接着插入。
 		st, found, err := tx.ReservationStatusForUpdate(ctx, orderID)
 		if err != nil {
@@ -318,11 +337,15 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 		case store.StatusReleased:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "reservation of order %d has been released", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusConfirmed, tx.PendConfirm)
+			return settle(ctx, tx, orderID, store.StatusConfirmed, countPend(&n, tx.PendConfirm))
 		default:
 			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
+	if err == nil && n > 0 {
+		stockDeducted.Add(ctx, n)
+	}
+	return err
 }
 
 // Release 实现 InventoryServiceServer。
@@ -331,6 +354,7 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 // 恒等式两边都不变，对账发现不了，闸门会永久少放这部分数量。
 func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) (*inventoryv1.ReleaseResponse, error) {
 	orderID := req.GetOrderId()
+	otelx.SetOrder(ctx, orderID, 0)
 	if orderID <= 0 {
 		return nil, invalidArgument("order_id must be positive")
 	}
@@ -343,7 +367,10 @@ func (s *Service) Release(ctx context.Context, req *inventoryv1.ReleaseRequest) 
 // release 释放订单的预占，以 order_id 幂等；预占不存在时留下空回滚标记。
 // gRPC 和事件消费共用，错误约定同 confirm。
 func (s *Service) release(ctx context.Context, orderID int64) error {
-	return s.inTx(ctx, func(tx *store.Tx) error {
+	// n 只给指标用：这次释放记下的件数，事务提交成功后才计入。
+	var n int64
+	err := s.inTx(ctx, func(tx *store.Tx) error {
+		n = 0
 		// 没有预占记录时插入成功，这一行就是“已释放”标记（空回滚），
 		// 它让仍在路上的 Reserve 撞上唯一键而被拒绝，防止库存悬挂。
 		// 已有记录时这一步已对它加了排他锁，见 InsertReservationOrLock。
@@ -365,11 +392,15 @@ func (s *Service) release(ctx context.Context, orderID int64) error {
 		case store.StatusConfirmed:
 			return errx.New(codes.FailedPrecondition, errx.ReasonReservationConfirmed, "reservation of order %d has been confirmed", orderID)
 		case store.StatusReserved:
-			return settle(ctx, tx, orderID, store.StatusReleased, tx.PendRelease)
+			return settle(ctx, tx, orderID, store.StatusReleased, countPend(&n, tx.PendRelease))
 		default:
 			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
+	if err == nil && n > 0 {
+		stockReleased.Add(ctx, n)
+	}
+	return err
 }
 
 // settle 把 RESERVED 的预占转为 to，并对每一项记一笔库存增量（pend）。
@@ -463,7 +494,8 @@ func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
 // toStatus 把 handler 的错误转换为返回给调用方的 gRPC 错误。
 // 业务错误原样返回；闸门（Redis）的错误是降级错误；其他错误在这里记录细节，对外只给出不含内部信息的 Internal。
 func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...any) error {
-	if errx.Reason(err) != "" {
+	if reason := errx.Reason(err); reason != "" {
+		otelx.SetReason(ctx, reason)
 		return err
 	}
 	switch {

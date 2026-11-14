@@ -124,6 +124,7 @@ func (p *Pipeline) handleEvent(ctx context.Context, ev replication.Event, st *st
 		if e.GSet != nil {
 			st.done = e.GSet.String()
 		}
+		p.recordCommit(st.commitMicros)
 	case *replication.QueryEvent:
 		query := string(e.Query)
 		if query == "BEGIN" {
@@ -133,6 +134,7 @@ func (p *Pipeline) handleEvent(ctx context.Context, ev replication.Event, st *st
 		if e.GSet != nil {
 			st.done = e.GSet.String()
 		}
+		p.recordCommit(st.commitMicros)
 		if query != "COMMIT" {
 			p.log.Info("ddl", "schema", string(e.Schema), "query", query, "gtid", st.gtid)
 		}
@@ -189,6 +191,7 @@ func (p *Pipeline) handleRows(ctx context.Context, e *replication.RowsEvent, st 
 		if err := p.produce(ctx, rule.Topic, key, msg); err != nil {
 			return err
 		}
+		p.countEvent(ctx, op)
 		p.lag.observe(time.Now().UnixMicro() - st.commitMicros)
 		return nil
 	}
