@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/oppenheimer/pkg/testdb"
 	"github.com/palemoky/oppenheimer/services/inventory"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/apply"
@@ -155,12 +156,17 @@ func TestConcurrentWritersAndAppliers(t *testing.T) {
 			for !stop.Load() {
 				// 小批量，让“一个订单的预占和释放落在不同批里”经常发生。
 				res, err := f.store.ApplyPending(ctx, 7, nil, time.Now())
+				if mysqlx.IsDeadlock(err) {
+					// 两个应用者偶尔互相死锁，数据库回滚其中一个，重试即可（Applier 就是这么做的）。
+					continue
+				}
 				if err != nil {
 					t.Errorf("apply: %v", err)
 					return
 				}
-				// 库存充足，没有任何 SKU 应该卡住。出现了就是增量的先后被打乱（例如释放先于它的预占被应用），
-				// 某个数出现了一瞬间的负值。它之后会自己恢复，但每次都是一条误报的“超卖”。
+				// 库存充足，没有任何 SKU 应该被报成卡住（Stuck 是“真的对不上”）。取到的增量先后不全时
+				// （一个订单的释放在这一批里、它的预占却在扫描游标的后面）应用者会改用这个 SKU 的全部增量重算，
+				// 最多记成 Deferred 留到下一轮，不能报成超卖。CI 上抓到过这种交错：见设计文档 1d 的 3.10。
 				if len(res.Stuck) > 0 {
 					t.Errorf("applier reported stuck skus with plenty of stock: %+v", res.Stuck)
 					return
@@ -218,6 +224,53 @@ func TestConcurrentWritersAndAppliers(t *testing.T) {
 		if a, r, s := f.raw(t, sku); a != initial-sold || r != 0 || s != sold {
 			t.Errorf("sku %d raw = %d/%d/%d, want %d/0/%d", sku, a, r, s, initial-sold, sold)
 		}
+	}
+}
+
+// 取到的增量先后不全：一批里有释放（-n 预占），它的预占却不在这一批里，合计会让 reserved 变负。
+// 这不是超卖。应用者改用这个 SKU 的全部未应用增量重算，全部应用，不报卡住。
+//
+// 真实系统里这种交错来自并发（加锁扫描不是瞬间的快照，更早的 id 可以更晚才看得见），很难稳定复现。
+// 这里直接按“释放的 id 比预占小”的顺序写入，再用只取一行的批来构造同样的局面。
+func TestOutOfOrderDeltasAreNotReportedAsOversold(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.addSKU(t, 1, 10)
+	f.addSKU(t, 2, 10)
+	ctx := t.Context()
+	// sku 1：释放在前、预占在后，净额为零。sku 2：一笔正常的预占，排在最后。
+	f.pend(ctx, t, func(tx *store.Tx) error { return tx.PendRelease(ctx, 1, 1, 3) })
+	f.pend(ctx, t, func(tx *store.Tx) error { return tx.PendReserve(ctx, 1, 1, 3) })
+	f.pend(ctx, t, func(tx *store.Tx) error { return tx.PendReserve(ctx, 2, 1, 4) })
+	f.pend(ctx, t, func(tx *store.Tx) error { return tx.PendReserve(ctx, 3, 2, 1) })
+
+	// 一批只取一行：只有那条释放。
+	res, err := f.store.ApplyPending(ctx, 1, nil, f.clock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Stuck) != 0 || len(res.Deferred) != 0 {
+		t.Fatalf("out-of-order deltas reported as stuck %+v / deferred %+v, want them applied", res.Stuck, res.Deferred)
+	}
+	// 取了 1 行，应用了这个 SKU 的全部 3 行。
+	if res.Fetched != 1 || res.Applied != 3 || res.SKUs != 1 {
+		t.Fatalf("apply result = %+v, want 1 fetched, all 3 rows of the sku applied", res)
+	}
+	if a, r, s := f.raw(t, 1); a != 6 || r != 4 || s != 0 {
+		t.Fatalf("sku 1 raw = %d/%d/%d, want 6/4/0", a, r, s)
+	}
+	if n := f.pendingRows(t); n != 1 {
+		t.Fatalf("%d pending rows left, want only the one of sku 2", n)
+	}
+	// 没有重复应用：再来一批只剩 sku 2。
+	if err := f.applier(t, 100).Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if a, r, _ := f.raw(t, 1); a != 6 || r != 4 {
+		t.Fatalf("sku 1 raw changed to %d/%d on the next round", a, r)
+	}
+	if a, r, _ := f.raw(t, 2); a != 9 || r != 1 {
+		t.Fatalf("sku 2 raw = %d/%d, want 9/1", a, r)
 	}
 }
 

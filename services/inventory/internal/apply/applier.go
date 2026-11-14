@@ -12,6 +12,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/oppenheimer/pkg/worker"
 	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
@@ -70,7 +71,9 @@ type Applier struct {
 
 type summary struct {
 	rows, skuUpdates, batches int
-	maxAge                    time.Duration
+	// deferred 是 SKU 被推迟的次数，deadlocks 是和别的应用者死锁后重试的次数。
+	deferred, deadlocks int
+	maxAge              time.Duration
 }
 
 // New 返回 Applier。
@@ -167,10 +170,18 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 	bctx, cancel := context.WithTimeout(ctx, batchTimeout)
 	defer cancel()
 	res, err := a.store.ApplyPending(bctx, a.batch, exclude, now)
+	if mysqlx.IsDeadlock(err) {
+		// 两个应用者（多副本）互相死锁，数据库回滚了这一个。什么都没有改，接着再来一批。
+		a.sinceSummary.deadlocks++
+		return true, nil
+	}
 	if err != nil {
 		return false, err
 	}
 	full := res.Fetched == a.batch
+	// 推迟的 SKU 账是平的，只是这一批取到的增量先后不全（见 store.ApplyPending）。不记日志、不绕开，
+	// 它们留在表头，下一批连同漏掉的那几行一起应用。只计数，汇总日志里能看到它发生得多不多。
+	a.sinceSummary.deferred += len(res.Deferred)
 
 	a.sinceSummary.rows += res.Applied
 	a.sinceSummary.skuUpdates += res.SKUs
@@ -183,8 +194,9 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 	for _, s := range res.Stuck {
 		nowStuck[s.SKUID] = s.Reason
 		if _, known := a.stuck[s.SKUID]; !known {
-			// 这是 MySQL 这一侧发现超卖或恒等式被破坏的地方（设计文档 1d 的 3.4）：闸门放行的数量
-			// 超过了 MySQL 里有的。订单已经成功，这里只能报出来等人处理。
+			// 这是 MySQL 这一侧发现超卖或恒等式被破坏的地方（设计文档 1d 的 3.4）：把这个 SKU 的全部
+			// 未应用增量加上去之后仍然有一个数为负，闸门放行的数量超过了 MySQL 里有的。
+			// 订单已经成功，这里只能报出来等人处理。
 			a.logger.ErrorContext(ctx, "stock deltas cannot be applied, sku is stuck until the stock is fixed",
 				"sku_id", s.SKUID, "pending_rows", s.Rows, "reason", s.Reason)
 		}
@@ -206,8 +218,10 @@ func (a *Applier) once(ctx context.Context) (more bool, err error) {
 		a.stuck = nowStuck
 	}
 
+	// 有被推迟的 SKU 时马上再来一批：它们的增量还在表头，漏掉的那几行这时已经看得见了。
+	// 推迟只在有写入方并发时才会发生，所以不会在静止的表上空转。
 	// 满批里如果一行都没应用（全是卡住的 SKU），再来一批也是同样的行，不算“还有”。
-	return full && res.Applied > 0, nil
+	return (full && res.Applied > 0) || len(res.Deferred) > 0, nil
 }
 
 func (a *Applier) maybeLogSummary(ctx context.Context) {
@@ -220,5 +234,6 @@ func (a *Applier) maybeLogSummary(ctx context.Context) {
 	// rows / sku_updates 是合并的倍数：每次更新 sku_stock 的一行顶了多少笔逐单的更新。
 	a.logger.InfoContext(ctx, "stock deltas applied",
 		"rows", s.rows, "sku_updates", s.skuUpdates, "batches", s.batches,
-		"max_age_ms", s.maxAge.Milliseconds(), "stuck_skus", len(a.stuck))
+		"max_age_ms", s.maxAge.Milliseconds(), "stuck_skus", len(a.stuck),
+		"deferred", s.deferred, "deadlocks", s.deadlocks)
 }
