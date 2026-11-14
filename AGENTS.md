@@ -98,7 +98,11 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 **可观测**
 
 - 埋点只依赖 OpenTelemetry SDK（链路、指标），不直接绑定具体后端，见 ADR-0004。
-- 日志用 `slog` 输出 JSON，带 trace id。
+- 日志用 `slog` 输出 JSON，带 trace id。手边有请求或消息处理的 ctx 时一律用带 ctx 的方法（`InfoContext` 这一类），trace id 是从 ctx 里取的。
+- 装配在 `pkg/otelx`（每个服务的 `run` 开头调用 `Setup`），gRPC、Kafka、MySQL、Redis、outbox 的链路和基础指标由 `pkg/` 里对应的包自动产生，业务代码不手工建 span、不重复记这些。业务指标用 `otelx.Counter` 等建在包级变量里。见设计文档 1d 第 8 节、ADR-0023。
+- **指标的标签只能是有限的枚举**（结果、原因码、规则名、topic）。订单号、用户号、SKU、IP、请求路径原文一律不进标签：每种标签组合是一条独立的时间序列。它们放在 span 上（`otelx.SetOrder`、`otelx.SetUser`）。
+- 只有服务端故障才把 span 标成 Error。库存不足、限流、降级是正常结果，用 `otelx.SetReason` 记原因码。
+- 加指标不能改业务行为，也不为了指标新增数据库或 Redis 查询；热路径上的标签组合预先建好，不要每次分配。
 
 **版本选择**
 

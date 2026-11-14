@@ -49,3 +49,4 @@
 | [0020](0020-service-protection.md) | 服务之间的熔断和并发隔离用 Envoy 边车，时限逐跳收紧，同步链路不重试 | 已采纳 |
 | [0021](0021-degradation-and-lifecycle.md) | 闸门不可用时拒绝下单而不退回数据库扣减；依赖不可用时消息不进死信；就绪和存活分开 | 已采纳 |
 | [0022](0022-reconciliation-hash-tree.md) | 对账用订单号上的基数哈希树，摘要是行哈希的和，在数据库里算 | 已采纳 |
+| [0023](0023-instrumentation.md) | 埋点：链路过 outbox 靠表里的一列，异步一跳以父子为主，指标走 OTLP | 已采纳 |

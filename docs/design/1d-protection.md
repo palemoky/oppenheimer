@@ -1684,3 +1684,271 @@ MySQL 对无符号 64 位整数求和返回精确的 DECIMAL，取模在工具�
 - 用生成列（`STORED`）存行哈希：哈希永远跟着行走，没有上面的问题；但一列只对应一个投影，五对的投影各不相同。数据到几十亿行、SHA-256 的代价显眼时可以给 `replica` 这类同构的对用。
 - 存节点摘要（比过的旧时间段不再重扫）：和下界是同一个取舍，下界不需要存任何东西。
 
+
+## 8. 步骤六：埋点
+
+状态：主人已确认（2026-11-14），8.14 的四项都按建议。决定和理由见 ADR-0023。
+
+对应阶段计划里的“埋点（OpenTelemetry SDK，见 ADR-0004）：链路贯穿 HTTP、gRPC、Kafka、MySQL、Redis；指标含 QPS、延迟、错误率和业务指标；日志带 trace id”。
+
+### 8.1 现在是什么样
+
+- 仓库里没有任何 OpenTelemetry 代码。日志是 `slog` 的 JSON，只带 `service`，不带 trace id；非测试代码里 95 处日志带了 ctx（`InfoContext` 这一类），84 处没带。
+- 到现在为止所有的“量”都是临时的：压测工具自己的统计、`performance_schema`、脚本里数日志。前五步里明确挂到这一步的有：
+  - 3.9 的悬案：放宽刷盘后落库停在约 1050 单/秒，每个订单在途约 60 毫秒，其中约 54 毫秒不在 MySQL 里，分不出是本机网络还是 order 进程内的等待。
+  - 读走了主库、从库、冷库还是缓存的比例（1c 步骤二挪出来的定量对比）。
+  - 降级开关和熔断器的状态（现在只有日志和 `GET /degrade`）。
+  - 消费者什么时候分到分区、排查恢复耗时只能靠推断（1c 步骤一评审的遗留）。
+- 好的一面：所有客户端的构造都集中在 `pkg/`（`grpcx.Listen`、`grpcx.Dial`、`kafkax` 的生产者和消费者、`mysqlx.Open`、`redisx.Open`），例外只有 gateway 的限流自己建了一个 Redis 客户端、cdc 自己开了一个 `sql.DB`。接入点很少。
+
+### 8.2 边界：这一步只做“产生”，不做“用”
+
+这一步让每个进程产生链路、指标和带 trace id 的日志，并且在本机能看到。Collector 的部署、SkyWalking、大盘、告警、SLO、尾部采样都在阶段 3。
+
+划在这里的理由：埋点是代码的一部分，后端是部署的一部分。但完全不接后端有两个问题：一是 3.9 的悬案要真的看到一条链路才能回答；二是按这个项目的教训，没有跑过的东西不算数，埋点写完却从来没有被任何后端收过，到阶段 3 才发现属性名不对、链路断在哪一跳，返工更贵。所以本机接一个最轻的后端（8.9），只用来看。
+
+### 8.3 装配：`pkg/otelx`
+
+一个新包，做三件事：
+
+1. `Setup(ctx, service) (shutdown func(context.Context) error, err error)`：建 `TracerProvider` 和 `MeterProvider`，设成全局的，设全局的传播器（W3C `traceparent` 加 `baggage`）。资源属性是 `service.name`、`service.instance.id`（主机名加进程号）、`service.version`（构建信息里的提交号）。
+2. 导出只用 OTLP（gRPC），地址和采样全部用 OTel 规范里的标准环境变量（`OTEL_EXPORTER_OTLP_ENDPOINT`、`OTEL_TRACES_SAMPLER`、`OTEL_TRACES_SAMPLER_ARG`），不自己发明变量名。到了阶段 2、3，改部署清单里的环境变量就能指向 Collector。
+3. `shutdown` 在所有组件停止之后调用，把缓冲里的 span 和最后一次指标发出去，时限 5 秒。
+
+**没配地址时的行为**：仍然建 `TracerProvider`，只是不挂导出器。span 照常产生、照常有 trace id，日志里就有 trace id 可以串起来；不往任何地方发。`make test`、e2e、chaos 默认都是这个状态。指标没有读取器时各个仪表是空操作。
+
+**后端不在时不能影响服务**（要有测试）：OTLP 导出器建连接是惰性的，不挡启动；批处理的队列满了就丢 span，不阻塞业务 goroutine；`shutdown` 有时限。可观测性是可选依赖，和 6.10 的规则一致。
+
+**为什么用全局的 provider**：`otelgrpc`、`redisotel`、`otelsql` 默认都读全局的，`pkg/` 里各个构造函数不用多一个参数。代价是测试里换 provider 是进程级的状态，所以埋点的测试各自放在单独的测试文件里、用 `TestMain` 设一次，不和 `t.Parallel()` 的业务测试混用。
+
+版本（2026-11-14 从 Go 模块代理查的，引入时登记到 `versions.md`）：`go.opentelemetry.io/otel` 和 SDK v1.47.0；contrib 的 `otelgrpc`、`runtime` v0.72.0（起草时还列了 `otelgin`，后来没有用，见 8.4）；`redis/go-redis/extra/redisotel/v9` v9.23.0（和 go-redis 同版本号）；`XSAM/otelsql` v0.44.0。
+
+### 8.4 链路：每一跳怎么接
+
+| 跳 | 做法 | 要注意的 |
+|---|---|---|
+| HTTP 入口（gateway） | gateway 自己的中间件（`traceEntry`），span 名用路由模板（`POST /api/v1/orders`，不是带订单号的路径），没匹配到路由的叫 `GET unmatched`。`/healthz`、`/readyz` 不经过这个 gin 引擎 | gateway 是对外的入口：外面带进来的 `traceparent` 不当成父 span，只记成 link（否则任何人都能把自己的 span 接到我们的链路上、或者用采样位强制我们全量采样）。响应里加 `X-Trace-Id`，压测工具和排查时用它找链路 |
+| gRPC | `otelgrpc` 的 stats handler，加在 `grpcx.Listen` 和 `grpcx.Dial` 里（v0.72 已经没有拦截器的接法，只有 `NewServerHandler`、`NewClientHandler`）。过滤健康检查 | 中间隔着两个 Envoy 边车。边车没有配链路追踪时把 `traceparent`、`tracestate`、`baggage` 原样转发（2026-11-14 实测：自己起一个 gRPC 服务端打印收到的元数据，经 gateway 和 inventory 两个边车调用，三个头都在，只多出 `x-request-id` 和 `x-forwarded-proto`）。边车自己出 span 是阶段 3 的事 |
+| Kafka 生产 | `kafkax.Producer.Send` 里把 ctx 的链路上下文写进消息的 header，每条消息一个 PRODUCER span | 自己写，不用 franz-go 的 `kotel` 插件，理由见下 |
+| Kafka 消费 | `kafkax` 的消费者在调用 handler 之前从 header 里取出上下文，**每一次尝试**一个 CONSUMER span，属性里带第几次尝试和消息在 Kafka 里排了多久 | 见 8.5 |
+| outbox | 表加一列存 `traceparent`，`outbox.Add` 从 ctx 写入，中继发布时放进消息的 header | 见 8.6 |
+| MySQL | `mysqlx` 里用 `otelsql.OpenDB(connector)` 代替 `sql.OpenDB`，每条语句一个 span | 语句文本记进 span（全部是 `?` 占位符，不含参数值）。关掉 `Ping`、`rows.Next`、`reset_session` 这些噪音；**没有父 span 的语句不产生 span**（中继、sweeper、应用者这些后台循环每秒都在查，全是孤立的根 span），用 `otelsql` 的 `SpanFilter` 实现。span 名是 `mysql` 加语句的第一个词或操作名（`mysql SELECT`、`mysql commit`） |
+| Redis | `redisx` 里对客户端调 `redisotel.InstrumentTracing`。gateway 限流的客户端改成也走这里 | 不记命令文本：key 里有用户号和幂等键，Lua 脚本很长。span 名就是命令名（`evalsha`、`get`）。`redisotel` 的过滤器拿不到 ctx，“没有父 span 就不出 span”做不到在它那一层，改由采样器做：`otelx` 在环境变量选出的采样器外面包一层，没有父 span 的 CLIENT span 一律丢弃（所以采样器的环境变量是 `otelx` 自己解析的，SDK 只在没有显式传采样器时才读） |
+
+**HTTP 入口为什么没有用 `otelgin`**（起草时写的是用它，实现后去掉了）。读它 v0.72.0 的源码，有四处和这里的要求对不上，而且都没有选项可以改：没有“公共入口”的选项，外面带来的 `traceparent` 一律当成父 span；它的指标带 `server.port` 标签，值取自请求的 Host 头，客户端随便写一个端口就多一条时间序列；`client.address` 用 gin 的 `ClientIP()`，默认信任所有代理；所有 5xx 和所有被取消的请求都标成 Error，降级的 503 和客户端断开的 499 也在内。把这四处都绕开之后它只剩“建一个 span”，所以改成自己建，一共几十行。降级响应靠 `writeDegraded` 在 gin 的 context 里设的一个键来认，不靠状态码猜（下游真的不可用时也是 503，那个要标 Error）。
+
+**Kafka 为什么自己写。** `kotel` 是挂在 franz-go 客户端上的钩子，它的 span 对应“消息进了客户端缓冲”和“消息出了缓冲”。而我们关心的处理过程在 `kafkax` 自己的代码里：消息按 key 分到各条 lane、排队、重试、按批、延迟消息等到期。这些 `kotel` 看不到，处理的 span 无论如何都要自己建。传播本身只是把一个 `map[string]string` 交给传播器，`kafkax.Record` 和 `kafkax.Message` 的 header 正好是这个类型，自己写大约几十行，而且能控制 8.5 的那些选择。
+
+**业务代码不手工建 span。** 一次落库里的查占用、预占、写库都已经是客户端 span 了。客户端 span 覆盖不到的只有“等待”，最主要的一处是 `kafkax` 消费者里消息从拉到进程里到 handler 开始之间的排队（按 key 分 lane、等窗口），它记成 CONSUMER span 上的两个属性和两个直方图：`kafkax.queue_ms` 是进程内的排队，`kafkax.delivery_ms` 是从写入 Kafka 算起的总等待，两者的差就是消息在 broker 和网络上的时间。3.9 的 54 毫秒如果在进程里，要么在这里，要么在 span 之间的空隙里。
+
+起草时还列了 `pkg/bulkhead` 的排队和 `pkg/cache` 合并回源的等待，实现时去掉了：舱壁不排队（满了立刻拒绝）；缓存的等待两端都有 Redis 的 span，空隙就是它，另有 `cache.requests` 的 `coalesced` 计数。
+
+**span 上放什么属性。** `order_id`、`user_id` 可以放在 span 上（链路里高基数没有代价，而且按订单号找链路是最常用的入口），由 order、payment、inventory 的入口处各加一行。它们**绝不能**出现在指标的标签里（8.8）。
+
+**什么算错误。** 和 `grpcx.isServerFault` 同一条规则：只有服务端故障才把 span 标成 Error。库存不足、限流的 429、降级的 `errx.Degraded` 是正常结果，不标 Error，原因码记成属性。否则阶段 3 的“错误率”会被业务拒绝淹没。
+
+### 8.5 异步的一跳：父子还是 link
+
+同步调用没有疑问，下游的 span 是上游的子 span。消息队列的一跳有两种接法：
+
+- **父子**：消费者的 span 接在生产者的 span 下面，受理和落库在同一条链路里。看一条链路就能看到一个订单从 HTTP 到落库的全过程，中间在 Kafka 里排了多久是两个 span 之间的空隙。
+- **link**：消费者开一条新的链路，只带一个指向生产者 span 的引用。每条链路都短、都很快结束，但要看全过程得在后端里跳转。
+
+规范对这件事没有强制，常见的建议是“一条消息对应一次处理”用父子，“一批消息一次处理”只能用 link（一个 span 只能有一个父）。
+
+建议按“是不是同一个业务动作的延续”来分：
+
+| 消息 | 接法 | 理由 |
+|---|---|---|
+| 受理到落库（`OrderSubmitted`） | 父子 | 客户端在轮询等结果，这就是一次下单。3.9 的问题正是要在一条链路里看到受理、排队、落库各占多少 |
+| 订单事件、支付结果（经 outbox） | 父子 | 同一个订单状态推进的后续 |
+| 延迟关单（`OrderCloseDue`） | link | 它在支付时限之后才触发（默认 15 分钟）。给一条早就结束的链路在 15 分钟后再添 span，后端按“链路已结束”做的处理（尾部采样、聚合）都会出错 |
+| 按批消费（orderindex） | 批一个 span，link 到各条消息（上限 32 个） | 一个 span 只能有一个父。实际上这些消息来自 CDC，本来就不带上下文 |
+| 进死信 | 原样带着 header | 死信里的消息还能找回它的链路 |
+
+**重试时每次尝试一个 span，不是整条消息一个 span。** 步骤四之后消费者对普通错误不设重试上限，依赖坏着时一条消息可以重试几分钟。span 要结束了才会被导出，整条消息一个 span 的话，分区停住的那段时间里什么也看不到，恰好是最需要看的时候。
+
+CDC 的一跳不传递：binlog 里没有地方放上下文（除非给每张表加一列），orderindex 的链路从它自己的消费开始。
+
+### 8.6 outbox：链路要过一张表
+
+order 的订单事件和 payment 的支付结果都是先写进 `outbox` 表、由后台的中继读出来再发到 Kafka。中继是个定时循环，它发消息时的 ctx 和当初写这一行的请求毫无关系。不处理的话，链路在这里断开：下单的链路到“写库”为止，支付、完结各是孤立的链路。
+
+做法是给 `outbox` 加一列 `trace_context VARCHAR(64) NULL`（`traceparent` 固定 55 个字符），`outbox.Add` 从 ctx 里取、和业务变更在同一个事务里写入，中继发布时原样放进消息的 header。消费者看到的父 span 是写 outbox 的那个 span，中继的延迟表现为空隙。中继自己那一轮的扫描和发送不属于任何订单的链路。
+
+代价：
+
+- 一次表结构变更。order 每个库一张、payment 一张，`outbox.Schema` 和两个服务的迁移各加一个文件（order 的 `00004`、payment 的 `00003`）。表很小（发布后定期清理），加一个可空的列是 INSTANT 的。MySQL 没有 `ADD COLUMN IF NOT EXISTS`，迁移里先查 `information_schema` 再决定要不要 `ALTER`（和 order 的 `00002`、`00003` 同一个写法），中途被杀后可以重跑。原来“迁移文件里的建表语句和 `outbox.Schema` 逐字一致”的测试改成比数据库里实际的表结构（`SHOW CREATE TABLE`），两个服务各一个。
+- 每行多 55 个字节，未采样的也要写（采样位在里面，下游要靠它知道“不采样”）。可以只在采样时写、`NULL` 表示没有上下文，那样下游会各自重新做采样决定，1% 采样时会多出一批只有后半段的链路。建议都写。
+
+不加这一列的替代办法是靠 span 上的 `order_id` 属性在后端里搜，能找到同一个订单的几条链路，但它们之间没有先后和因果关系，也没法自动算“从下单到完结”的耗时。
+
+### 8.7 采样
+
+头部采样，`ParentBased(TraceIDRatioBased(r))`：gateway 在入口按比例决定，决定写在 `traceparent` 的标志位里，后面每一跳（包括经过 Kafka 和 outbox 的）都跟着这个决定，一条链路要么完整要么没有。
+
+- 本机 `make run` 默认 100%；`bench.sh` 默认 1%，可以用环境变量改；e2e、chaos 没有后端，采样多少都不导出。
+- 量级：落库约 1000 单/秒时，一个订单的 span 数先估 30 到 50 个（实测后改），全量就是每秒几万个 span。全量采样只适合看单个请求，不适合压测。
+- “只留出错的和慢的”是尾部采样，要等一条链路的 span 到齐才能决定，只能在 Collector 里做，是阶段 3 的事。头部采样的缺点（出错的那条恰好没采到）到那时再解决。
+
+没被采样的请求仍然有 trace id、仍然传播，只是不记录属性、不导出。这部分的开销要量（8.11）。
+
+### 8.8 指标
+
+用 OTel 的指标 API，经 OTLP 推到和链路同一个地址（ADR-0004：服务统一用 OTLP 上报）。本机每 10 秒导出一次。
+
+**自动得到的**：gRPC 服务端和客户端的请求数、耗时、状态码（`otelgrpc`）；HTTP 的（gateway 的中间件自己记 `http.server.request.duration`，标签只有方法、路由模板、状态码）；数据库连接池（`otelsql.RegisterDBStatsMetrics`：在用、空闲、等待次数、等待时长）；Redis 连接池（`redisotel.InstrumentMetrics`）；Go 运行时（goroutine 数、堆、GC）。这些已经覆盖了 QPS、延迟、错误率。
+
+**自己加的**，按“前五步每一层保护都要能看到它有没有在动”来列：
+
+| 在哪 | 指标 | 标签 |
+|---|---|---|
+| gateway | 限流判定次数；限流退回进程内的次数；降级响应数 | 规则（ip、user、route、hot）、结果；原因码 |
+| order 受理 | 受理结果数；闸门里未认领的占用数（背压看的就是它） | 结果（受理、库存不足、限购、背压、闸门不可用、落库不健康、重复） |
+| order 落库 | 落库结果数；从受理到落库完成的耗时；状态迁移数；回收任务回收的订单数 | 结果和原因；起止状态 |
+| order 读 | 读请求数 | 来源（缓存、从库、主库、冷库）、读模式 |
+| inventory | 预占、释放、扣减的件数；`stock_pending` 的积压行数；应用者每批的行数和耗时；发现超卖的次数；闸门对账修正的次数 | 无（不按 SKU） |
+| payment | 支付结果数、退款数 | 结果 |
+| `kafkax` | handler 耗时；重试次数；进死信数；进程内排队时长；在途数；暂停的分区数；分区的消费延迟（拉取时拿到的高水位减去下一个要处理的位点） | topic、消费组、结果 |
+| `outbox` | 发布条数；从写入到发布的延迟 | 中继名 |
+| `breaker`、`degrade`、`bulkhead` | 熔断器状态和状态变化次数；开关状态；舱壁的在用数、拒绝数（舱壁本身没有名字，由 order 登记） | 名字 |
+| `cache` | 命中、未命中、回源、合并回源 | 缓存名 |
+| cdc、orderindex | 事件数；最后一个事件的提交时间到现在的延迟；每批的行数和写库耗时 | 无 |
+
+**标签的规则**：只能是有限的枚举（结果、原因码、规则名、topic）。订单号、用户号、SKU、IP、trace id 一律不进标签。指标的每一种标签组合都是一条独立的时间序列，在进程里和后端里各占一份内存；按用户号打标签，序列数就等于用户数。这条写进 AGENTS.md。阶段计划里说的“库存扣减数”因此是总数，不分 SKU。
+
+**直方图的桶**：SDK 默认的边界是给秒级的 HTTP 请求定的，Redis 一次调用不到 1 毫秒，全落在第一个桶里。用 View 给耗时类的仪表统一设一组从 0.5 毫秒到 10 秒的边界。不用指数直方图：阶段 3 的后端对它的支持要另外验证，现在不引入这个变数。
+
+消费延迟在阶段 3 还会由 Kafka 的 exporter 提供一份。进程里的这份便宜（拉取的响应里本来就带高水位），而且消费者进程挂了时它会消失，两份互相印证。
+
+### 8.9 日志
+
+`logx.New` 返回的 handler 包一层：记录带的 ctx 里有 span 时，加上 `trace_id` 和 `span_id` 两个字段。只有带 ctx 的调用（`InfoContext` 这一类）才有；所以要把那 84 处不带 ctx 的日志里“当时手边有 ctx”的改成带 ctx 的，并在 golangci-lint 里打开 `sloglint` 的对应检查，以后新写的不会漏。启动阶段和后台循环里确实没有请求 ctx 的不动。
+
+日志不走 OTLP，仍然是标准输出上的 JSON，阶段 3 由 Loki 收。和 ADR-0004 一致。
+
+顺带补上 1c 步骤一评审的遗留：消费者分到分区、失去分区时记一条日志。
+
+### 8.10 本机怎么看
+
+compose 里加一个 `obs` profile（和 `ui`、`expand` 一样，`make up` 不启动），`make obs-up` 启动。`scripts/lib/` 里加一小段：这个容器在运行时，`run-local`、`bench` 给服务设上 `OTEL_EXPORTER_OTLP_ENDPOINT`；不在时不设，服务就是 8.3 的“不导出”状态。
+
+候选（版本是 2026-11-14 查 Docker Hub 的）：
+
+- `grafana/otel-lgtm` 0.41.0：一个容器里有 Collector、Tempo（链路）、Prometheus（指标）、Loki、Grafana。镜像 958 MB，内存占用要实测。链路和指标都能看，能在 Grafana 里写 PromQL。它是给开发和演示用的，版本号还是 0.x，只放在本机。
+- Jaeger 2.23.0：57 MB，只有链路。指标要另想办法。
+
+SkyWalking 不在这一步接：OAP 加 BanyanDB 很重，而且“OTLP 链路在 SkyWalking 里够不够用”是 ADR-0004 留给阶段 3a 的验证项，要和集群上的部署一起做。
+
+### 8.11 测试和验收
+
+按模块的测试（用 SDK 自带的内存导出器和手动读取器，进 CI）：
+
+- `otelx`：没配地址时不导出但 span 有 id；配了一个连不上的地址时 `Setup` 立刻返回、业务调用不变慢、`shutdown` 在时限内返回。
+- `logx`：ctx 里有 span 时日志带 `trace_id`、`span_id`，没有时不带。
+- `grpcx`：客户端和服务端的 span 在同一条链路里；健康检查不产生 span。
+- `kafkax`：生产到消费是父子；重试时每次尝试一个 span；延迟消息是 link；按批消费带 link；死信保留 header；指标里的计数对得上。
+- `outbox`：`Add` 时的链路上下文，经过表和中继，到消费者手里是同一个 trace id；`Add` 时没有 span 则写 `NULL`、消息不带 header。
+- `mysqlx`、`redisx`：有父 span 时出子 span，没有父 span 时不出。
+
+端到端（进 CI）：e2e 的测试进程里起一个很小的 OTLP 接收端（实现 `TraceService` 的 `Export`，几十行），服务把链路发给它。一个用例：下一单并支付，断言同一个 trace id 下出现了 gateway、order、inventory、payment 四个服务的 span，并且有 HTTP、gRPC、Kafka、MySQL、Redis 五种。这就是阶段计划里“链路贯穿”的验收。
+
+实测（不进 CI，结果写进本节末尾）：
+
+1. **开销**：`bench.sh` 在四种配置下的落库吞吐和受理延迟（p50、p99）：埋点之前的提交、采样 0、采样 1%、采样 100%。不预设通过线，量出来再说。
+2. **回答 3.9**：放宽刷盘、并发度 16，采样 1%，从链路里看那 54 毫秒在哪。
+3. **边车**：经过 Envoy 时 `traceparent` 原样到达下游（实现的第一步就做，它决定 gRPC 这一跳的做法成不成立）。
+4. `make fault` 的场景里，熔断器、开关、限流的指标和实际发生的事对得上（抽两三个场景看）。
+5. 后端容器停掉时服务照常，内存不涨。
+
+### 8.12 实现顺序和分工
+
+1. 主线（Fable）：`pkg/otelx`、`logx`；`grpcx`；`kafkax` 的传播、消费 span 和指标；`outbox` 的列和两个服务的迁移；`mysqlx`、`redisx`；`breaker`、`degrade`、`bulkhead`、`cache` 的指标；`versions.md`。这些是共享部分，按约定先在主线串行做完。第一件事是验证边车转发 `traceparent`。
+2. 并行的子任务：
+   - gateway（Opus）：入口的中间件、`X-Trace-Id`、限流和降级的指标、限流的 Redis 客户端改走 `redisx`。
+   - order 的业务指标和 span 属性（Opus 写，Fable 评审：不改状态逻辑，但动的是受理和落库的文件）。
+   - inventory、payment、orderindex、cdc 的指标和 span 属性（Opus）。
+   - compose 的 `obs` profile、脚本、e2e 的 OTLP 接收端和用例、`sloglint`（Sonnet）。
+3. 主线验收、合入、实测、写结果。
+
+### 8.13 不在这一步做的
+
+- Collector 的部署、SkyWalking、Grafana 大盘、告警、SLO、尾部采样、指标和链路之间的 exemplar：阶段 3。
+- Envoy 边车自己的 span 和访问日志：阶段 3。边车的统计现在已经能从管理端口的 `/stats/prometheus` 读到。
+- 日志经 OTLP 上报；持续剖析。
+- CDC 这一跳的链路传递；CDC 源库心跳（1c 步骤三挪到阶段 3 的那一项）。
+- `recon`、`archiver`、`test/load` 这些命令行工具的埋点。
+- 把 `grpcx` 的日志拦截器对超时仍记 ERROR 的遗留一并改掉：和埋点无关，不夹带。
+
+### 8.14 主人定的（2026-11-14，四项都按建议）
+
+1. **本机的后端**：`grafana/otel-lgtm`，放在 `obs` profile 里（8.10，建议）；还是只起 Jaeger 看链路、指标先不看；还是这一步完全不接后端，只靠测试里的内存导出器。
+2. **outbox 加一列传递链路**（8.6，建议）；还是不改表，链路在 outbox 处断开，靠 `order_id` 属性在后端里关联。
+3. **异步一跳的接法**：同一个业务动作的延续用父子、延迟关单和按批消费用 link（8.5，建议）；还是所有消息一律用 link，每段各是一条短链路。
+4. **指标怎么导出**：OTLP 推（8.8，建议，和 ADR-0004 一致）；还是每个服务在内部端口上开 `/metrics` 给 Prometheus 拉（本机不需要 Collector 也能 `curl` 看一眼，但和链路走了两条路，阶段 3 要么改回来、要么 ADR-0004 改写）。
+
+### 8.15 实现中的发现（2026-11-14）
+
+- **HTTP 入口没有用 `otelgin`**，原因在 8.4。
+- **支付结果的链路要自己开头。** e2e 第一次跑出来，支付结果的链路是从“中继发消息”那一刻才开始的：出结果的是 payment 的后台处理器，ctx 里没有 span，`outbox.Add` 存不下上下文。现在处理器在出结果的地方开一条链路（`payment.complete`），写 outbox 的事务在它下面，经两次 outbox 一直连到 inventory。这是业务代码里唯一手工建 span 的地方，规则是：后台循环里的一步如果是一个业务动作的起点，就在那里开头。它和用户发起支付的那次请求是两条链路；真实系统里这一步是支付渠道的回调，本来就是新请求。
+- **一个订单是三条链路，不是一条**：下单（HTTP 到落库，约 70 个 span，gateway、order、inventory）、发起支付（gateway、payment、order，没有 Kafka）、支付结果（payment、order、inventory）。延迟关单是第四条，用 link 指回下单。它们靠 span 上的 `app.order_id` 关联。ADR-0023 里“一条下单的链路会持续到支付完结”的担心因此不成立。
+- **写测试时查出的两个缺陷**（都已修）：降级开关的指标先报后改，两个并发的 `SetMode` 会让指标和实际状态相反，一直错到下一次改动（并发用例约 300 次里失败 1 次；改成在同一把锁里改值和报指标）。MySQL 的 span 名按空格取第一个词，多行语句的名字带着换行，以注释开头的叫 `mysql /*`（改成只认十来个动词，其余叫 `mysql query`）。
+- **`redisotel` 默认给每个 span 记调用位置**，每条命令一次 `runtime.Caller`，位置总是落在我们自己的封装里。已关掉。
+- **lint 的 `contextcheck`** 会沿着调用链报“记指标时没有用调用方的 ctx”。状态变化发生在不带 ctx 的方法里（熔断器的 `Allow`、开关的 `SetMode`），指标的 ctx 只用来带 baggage 和 exemplar，这里用不到；在这几个函数上标了 `nolint` 并写明原因。
+- 刚受理、还没落库的订单在响应里 `unit_price` 是 0：它从闸门的占用合成，只有商品和数量，价格在预占时才有。不是缺陷，记在这里免得再查一次。
+
+### 8.16 实测结果（2026-11-14）
+
+**链路贯穿**（进了 e2e，`TestTraceSpansAllServices`）：测试进程里起一个 OTLP 接收端，下一单并支付，断言下单那条链路里有 gateway、order、inventory，有 HTTP、gRPC、Kafka 的生产和消费、MySQL、Redis 各种 span，除根之外每个 span 的父都在这条链路里，`process order.submit` 的父是 `send order.submit`；支付结果那条链路从 `payment.complete` 经 order 到 inventory。经过 Envoy 边车没有断。
+
+**开销**（`scripts/bench.sh`，开环每秒 2000 个下单请求、20 秒、落库并发度 16，每种配置 3 次；原始输出在 `tmp/bench/otel-overhead/`）：
+
+| 配置 | 落库吞吐（单/秒），3 次 | 受理 p50（毫秒） |
+|---|---|---|
+| 不导出，采样器 `always_off` | 736、751、611\* | 6.2 到 7.6 |
+| 不导出，默认采样（span 照常记录，不发） | 623\*、725\*、726 | 6.2 到 7.5 |
+| 导出，采样 1% | 793、728、737 | 5.8 到 7.4 |
+| 导出，采样 100% | 562\*、687、553\* | 8.5 到 9.4 |
+
+带 \* 的那几次出现了落库重试（见下一条），不能用来比。没有重试的几次里，前三种配置分不出差别（725 到 793，在这台机器的波动之内）；全量采样只有一次没有重试，687，比前三种低约 7%，受理的 p50 多约 2 毫秒。四个服务的 CPU 用量在四种配置下几乎一样（order 都是约 26 秒）。结论：**1% 采样的开销量不出来；全量采样有可见的代价，只适合看单个请求。** 基线用的是 `always_off` 而不是埋点之前的二进制，它仍然包含传播和生成 trace id 的开销，所以这里量到的是“记录和导出”的代价，不是埋点的全部代价。
+
+全量采样压测一轮之后，`otel-lgtm` 容器的内存是 1.26 到 1.33 GiB，上限 1.5 GiB：全量采样加长时间压测会把它撑爆。
+
+**过载时闸门的调用会成批超时**（不是埋点引起的：`always_off` 的一次也出现了）。12 次运行里 5 次：认领占用的 Redis 调用超过 300 毫秒的时限，闸门的熔断器打开，之后的几百条消息在熔断期间被拒绝、重试（每次 378 到 751 次重试，集中在一两秒里）。订单没有丢，但那一轮的落库吞吐低 15% 到 25%。这是步骤三、四的保护在过载下的实际表现，以前没有注意到，因为没有 `kafkax.consumer.retries` 这个数。原因没有查：可能是下面说的网络停顿打在了 Redis 的连接上。
+
+**回答 3.9：那 54 毫秒在哪。** 放宽刷盘（`sync_binlog=0`、`innodb_flush_log_at_trx_commit=2`，量完已改回）、采样 2%，取 120 条落库的链路，同时读 MySQL 自己的语句统计：
+
+| 一次落库（`process order.submit`）里 | p50（毫秒） | 平均 | 最大 |
+|---|---|---|---|
+| 整个 handler | 26.8 | 55.3 | 632 |
+| 调 inventory 的 `Reserve`（客户端看到的） | 14.9 | 26.4 | 423 |
+| 其中 inventory 服务端 | 9.8 | 21.4 | 419 |
+| order 自己的 MySQL 语句（不含提交） | 8.1 | 22.0 | 219 |
+| order 的提交（两次） | 1.6 | 3.9 | 110 |
+| Redis | 0.6 | 0.8 | 5.5 |
+| 没有被任何子 span 覆盖的时间 | 0.15 | 2.2 | 204 |
+
+- **不在 order 进程里。** handler 的时间几乎全部被子 span 覆盖，没覆盖的中位数是 0.15 毫秒。3.9 猜的“order 进程内的某处等待”不存在。
+- **不是一个 54 毫秒，是一个 27 毫秒的中位数加一条长尾。** 平均值被少数几百毫秒的调用拉到 55。64 个在途除以平均 55 毫秒约等于每秒 1160 单，和 3.9 的 1050 对得上。
+- **长尾是 200 毫秒的整数倍**：最大值是 219、419、423 这样的数。这是 TCP 重传的特征（丢一个包，等约 200 毫秒重发），和 1b 起就怀疑的本机容器网络丢包一致。它打在谁身上是随机的，所以“语句”“提交”“Reserve”的最大值都是这种数。
+- **中位数的 27 毫秒花在往返次数上。** MySQL 自己统计的语句执行时间是每条 0.2 到 0.5 毫秒、提交 1.5 毫秒，而客户端看到的是每条 1 毫秒上下。一次落库在 order 里有 18 个子 span，inventory 里还有十来条语句，每次往返经过容器的端口转发多出大半毫秒；`Reserve` 这一跳经过两个边车另外多 5 毫秒（客户端 14.9、服务端 9.8）。
+
+所以 MySQL 不再是瓶颈之后，剩下的是**往返的次数乘以这台机器上每次往返的代价，再加上偶发的 200 毫秒重传**。前一半在集群上会小得多（同机房的往返是几十微秒），后一半是 OrbStack 的问题。这支持 1b 把吞吐结论挂到阶段 2 的决定；也说明方案 B（经 Kafka、order 不再同步调 `Reserve`，3.9 末尾）在本机上能省掉的是那 15 毫秒，在集群上未必值得。
+
+刷盘严格时（默认）同样的拆法：handler 的 p50 是 51 毫秒，其中 order 的两次提交 18、`Reserve` 21（里面一次提交约 9）、order 的语句 8。MySQL 自己统计的提交是每次 10.2 毫秒，和链路里的数一致；而单个连接串行提交只要 1.3 毫秒（300 个小事务 0.39 秒），所以那 10 毫秒是每秒两千多次提交并发时排队等刷盘的时间。
+
+另一个顺带看到的数：过载（每秒 2000 个请求，落库只有 700 多）时，消息从写入 Kafka 到开始处理的中位数是 1.7 到 10 秒，其中大部分是进程内的排队（`kafkax.queue_ms`），不是在 broker 上。这是背压放进来的积压，符合设计。
+
+`make lint`、`make test`（55 个包）、`make e2e` 通过，`make chaos` 一次 PASS（杀进程 18 次，`load verify` 和 `recon` 都通过）。
+
+### 8.17 没有做的
+
+- **`sloglint` 没有打开，剩下不带 ctx 的日志没有逐个改**（8.9 的计划）。各服务请求和消息路径上的日志本来就带 ctx，子任务核对过；没带的集中在启动阶段、后台循环和熔断器的回调里，手边没有请求的 ctx。规则写进了 AGENTS.md，lint 的强制还没有。
+- **两个指标没有做**，都是因为不为指标新增查询：`order.gate.unclaimed_holds`（背压看的数是受理的 Lua 脚本每次现算的）、`inventory.stock_pending.backlog`（应用者只知道这一批取了多少）。要补的话，让回收任务和应用者每轮顺带查一次、存进原子变量。
+- “没找到”的展示读不计入 `order.reads`；返回错误的落库不计入 `order.persists`（由 `kafkax` 的重试和死信计数覆盖）；舱壁没有排队时长（它不排队）。
+- **`make fault` 的场景里指标对不对得上没有抽查**；“后端容器停掉时服务照常、内存不涨”只有 `otelx` 的测试（连不上的地址不挡启动、不阻塞、`shutdown` 按时返回）和 e2e 退出时的表现（接收端先关，每个服务一两条 WARN，没有拖慢退出），没有长时间跑过。
+- 过载时闸门调用成批超时的原因（8.16）。
+- 没配后端地址时 span 仍然被完整记录然后丢掉。量不出代价（上表第二行），所以没有改；改成“不记录”的话，一个没配地址的服务会把“不采样”传给下游，下游即使配了地址也收不到这些链路。
+- 压测工具没有用 `X-Trace-Id`：现在从一次慢请求找到它的链路要手工去后端搜。
+- cdc 发 Kafka 没有走 `kafkax.Producer`，没有 span；orderindex 的 `ListMerchantOrders` 把存储层的错误原样返回（gRPC 码是 Unknown、内部文字暴露给调用方），是子任务读代码时看到的旧问题，没有改。
+- `inventory.oversell.detected` 依赖每个应用者实例内存里的“已知卡住”集合，重启或多副本时同一个 SKU 会重复计数。

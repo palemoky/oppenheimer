@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交（`1ac7c1c`）和增量对账的两个提交（到 `4e0f4ca`），CI 27 项全部通过；下一步是步骤六（埋点）。1c 五步全部完成并已合并进 `main`
+- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交（`1ac7c1c`）和增量对账的两个提交（到 `4e0f4ca`），CI 27 项全部通过；**步骤六（埋点）已实现并实测，改动都没有提交，等主人看过后提交推送**。1c 五步全部完成并已合并进 `main`
 - **当前分支**：`phase-1d`（从 `main` 开出，已推送并开 draft PR）。1c 的 PR #6 已于 2026-11-14 合并进 `main`（合并提交 `aa5df0a`），main 上 CI 全绿
 - **最后更新**：2026-11-14
 
@@ -98,7 +98,15 @@
              - 重新推送后（`1ac7c1c`）CI 27 项全部通过，`envoy` 这次也过了，所以那次失败的原因仍然不知道（最长的是 e2e 3 分 52 秒，其次 `test (./services/order)` 3 分 44 秒）。
              - **增量对账（窗口的下界）已加，已分 2 个提交推送到 PR #7**（2026-11-14，主人提出）：`recon -since 26h` 只比最近 26 小时的订单，和 `-settle` 合成一个窗口；`archive` 不支持。设计文档 7.17，ADR-0022 有补充。`make lint` 和 recon 模块的测试通过；本机 `index` 全量 4.7 秒、`-since 26h` 0.27 秒。改的文件：`services/recon/` 下的 `sql.go`、`source.go`、`rows.go`、`compare.go`、`report.go`、`cmd/recon/main.go` 和测试，`Makefile` 的帮助，三份文档。
              - 这次推送（`4e0f4ca`）的 CI 27 项全部通过（最长的是 `test (./services/order)` 4 分 1 秒和 e2e 4 分；`envoy` 没有再失败）。
-             - 下一步：1d 步骤六（埋点），动工前先细化设计文档。
+             - **1d 步骤六（埋点）已实现、验收并实测，改动都没有提交**（2026-11-14）。设计文档 1d 第 8 节，ADR-0023（已采纳），发现在 8.15，结果在 8.16，没做的在 8.17。`make lint`、`make test`（55 个包）、`make e2e` 通过，`make chaos` 一次 PASS（杀进程 18 次，`load verify` 和 `recon` 都通过）。
+               - 主人定的（8.14，四项都按建议）：本机后端用 `grafana/otel-lgtm`（compose 的 `obs` profile）；`outbox` 加一列 `trace_context` 传递链路；异步一跳以父子为主，延迟关单和按批消费用 link；指标经 OTLP 推。
+               - 做了什么：`pkg/otelx`（`Setup`、采样器、建指标和给 span 加属性的小工具）；`logx` 的日志带 `trace_id`、`span_id`；`grpcx`（`otelgrpc`）、`mysqlx`（`otelsql`）、`redisx`（`redisotel`）；`kafkax/telemetry.go`（生产和消费的 span、排队时长、重试和死信的计数）和分到分区的日志；`outbox` 的列加 order 的 `00004`、payment 的 `00003` 迁移（可重跑）；`breaker`、`degrade`、`cache` 的指标；gateway 入口的中间件（没有用 `otelgin`，原因在 8.4）、`X-Trace-Id`、限流和降级的指标；order、inventory、payment、orderindex、cdc 的业务指标和 span 属性；payment 的处理器在出结果处开一条链路（`payment.complete`）；e2e 的 `TestTraceSpansAllServices`（测试进程里起 OTLP 接收端）；`scripts/lib/obs.sh`、`make obs-up`、`make obs-down`。公共库和 payment 的那一处由 Fable 写；gateway、order、inventory 等四个服务派 Opus，order、inventory、payment 的 diff 由 Fable 逐行评审（只加观测，没有改行为）；公共库的测试、本机后端和脚本、e2e 用例派 Sonnet。
+               - 实测要点：1% 采样的开销量不出来，全量采样落库吞吐低约 7%；一个订单是三条链路（下单到落库约 70 个 span、发起支付、支付结果），靠 span 上的订单号关联。**3.9 的悬案有了答案**：那 54 毫秒不在 order 进程里（子 span 没覆盖的时间中位数 0.15 毫秒），是“一次落库约 30 次往返乘以本机每次往返的代价”加上偶发的 200 毫秒 TCP 重传造成的长尾（中位数 27 毫秒、平均 55 毫秒）。
+               - **新发现、没有查原因**：过载（开环每秒 2000 个请求）时，12 次运行里 5 次出现闸门的 Redis 调用成批超过 300 毫秒、熔断器打开、几百条消息重试，那一轮落库吞吐低 15% 到 25%，订单没有丢。和埋点无关（`always_off` 时也出现）。
+               - **本机的变化**：`make obs-up` 启动 `otel-lgtm`（Grafana 在 http://127.0.0.1:3000 ，admin/admin；OTLP 4317/4318；内存上限 1.5 GiB，全量采样压测后到过 1.33 GiB）。它在运行时 `make run`、`bench.sh` 自动导出（`OBS=off` 关闭；`bench.sh` 默认 1% 采样）；e2e 把链路发给测试进程自己的接收端（14317），chaos、fault 不导出。**当前 `otel-lgtm` 容器在运行**，不用时 `make obs-down`。查链路和指标的命令在 8.10 之外另记在这里：Tempo 用 `curl -s -u admin:admin -G localhost:3000/api/datasources/proxy/uid/tempo/api/search --data-urlencode 'q={ resource.service.name = "order" }'`，Prometheus 用同样的前缀换成 `uid/prometheus/api/v1/query`。拆落库时间的脚本没有入库（在会话的临时目录里），压测的原始输出在 `tmp/bench/otel-overhead/`。
+               - 新的约定（已写进 AGENTS.md 的“可观测”）：带 ctx 的日志；业务代码不手工建 span；指标的标签只能是有限的枚举；只有服务端故障标 Error；加指标不改行为、不新增查询。
+               - 没做的见设计文档 8.17。要点：`sloglint` 没有打开；`order.gate.unclaimed_holds` 和 `inventory.stock_pending.backlog` 两个指标没有做；`make fault` 里指标对不对得上没有抽查；后端长时间不在时的表现没有跑过。
+               - 下一步：主人看过后提交并推送（按惯例分几个提交：公共库、outbox 的列和迁移、各服务、脚本和 compose、e2e、文档），推送后派 Haiku 看 CI。CI 里要留意：e2e 现在会把链路发到测试进程的 14317 端口；`pkg` 多了十个 `telemetry_test.go`。之后 1d 的清单只剩前面三项没勾的旧条目（orderindex 按批写、落库性能、开环模式，其实都在步骤一做完了，勾之前核对一下）和面试笔记。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
@@ -207,6 +215,7 @@
 | 2026-11-14 | 1d 步骤四：闸门的 Redis 不可用时拒绝下单，不退回数据库扣减；增加落库健康（受理时拒绝落不了库的订单）和列表的部分结果；落库和订单事件的消费者不设重试上限 | 退回数据库扣减在多实例下会超卖、切回要重新装载闸门，而 ADR-0018 之后 MySQL 已不阻止超卖。见设计文档 1d 第 6 节、ADR-0021；主人确认 |
 | 2026-11-14 | 步骤四的三个并行任务（order 读路径、inventory 和 payment、gateway）仍在主工作目录里各改各的目录，没有用 worktree；故障注入脚本在它们验收之后才派 | 主线的共享改动没有提交；故障注入要暂停共享的 Redis，不能和别的测试同时跑 |
 | 2026-11-14 | 1d 步骤五：闸门（Redis）和 MySQL 的库存不纳入 Merkle 对账，维持 inventory 现有的 `reconcile`；树的节点摘要用行哈希的和，不是教科书式的 H(子节点) | SKU 很少、数一直在变，逐个比就是对的做法；两边分片方式不同，摘要要能跨分片相加。见设计文档 1d 第 7 节、ADR-0022；主人确认 |
+| 2026-11-14 | 1d 步骤六：`outbox` 表加 `trace_context` 列；本机多一个可选的 `otel-lgtm` 容器（`obs` profile）；步骤六的五个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 链路要穿过 outbox 只能跟着数据走；埋点要被真实的后端收过才算数。见设计文档 1d 第 8 节、ADR-0023，主人确认。主线的共享改动没有提交，worktree 里看不到 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
