@@ -79,7 +79,9 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。
-- 所有跨进程调用带 `context` 和超时。
+- 所有跨进程调用带 `context` 和超时。时限逐跳收紧：总时限只在入口设一次，每一跳给下一跳单独设一个更短的时限（服务之间用 `grpcx.WithHopTimeout`），同一个数也写在 Envoy 边车的出站路由上（`deploy/envoy/`），两处要一致。见 ADR-0020。
+- 重试的规则：只重试幂等的操作；一条调用链上只有一层重试（同步调用链上不重试，由客户端带幂等键重试；异步的由消费者重试）；退避带抖动；重试有上限，耗尽后的去向要明确。客户端库可能自己重试（go-redis 默认会），非幂等的操作要先确认它被执行两次的后果。
+- 服务之间的熔断和并发上限在 Envoy 边车的配置里，不在业务代码里；改之前先读设计文档 1d 的 5.3（实测的行为和三个坑）。
 - 并发代码必须有 `-race` 测试；一致性逻辑（幂等、扣减、状态机）必须有并发场景的测试。
 - 提交前通过 `make lint test`。CI（`.github/workflows/ci.yml`）会对每个 go module 跑 lint、build、vet 和带 `-race` 的测试。
 
