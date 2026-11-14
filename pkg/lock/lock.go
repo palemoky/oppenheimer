@@ -309,7 +309,7 @@ func (k *Lock) watch(ctx context.Context, lastOK time.Time) {
 			lastOK = sent
 		case err == nil:
 			// Redis 明确说锁不是我的了：过期后被别人拿走，或者已经过期不存在。
-			l.logger.Warn("lock lost", "lock_name", k.name, "fencing_token", k.token, "reason", "not_owner")
+			l.logger.WarnContext(ctx, "lock lost", "lock_name", k.name, "fencing_token", k.token, "reason", "not_owner")
 			k.cancel(ErrLost)
 			return
 		case ctx.Err() != nil:
@@ -324,12 +324,12 @@ func (k *Lock) watch(ctx context.Context, lastOK time.Time) {
 			// 持有者整个进程暂停（GC、虚拟机迁移）时，这段代码根本没机会运行，锁会在它不知情的
 			// 情况下过期。所以“Context 没被取消”不能证明锁还在，受保护的资源仍需要检查 fencing token。
 			if elapsed := l.now().Sub(lastOK); elapsed >= l.ttl {
-				l.logger.Warn("lock lost", "lock_name", k.name, "fencing_token", k.token,
+				l.logger.WarnContext(ctx, "lock lost", "lock_name", k.name, "fencing_token", k.token,
 					"reason", "renew_failed_past_ttl", "since_last_renew", elapsed, "error", err)
 				k.cancel(ErrLost)
 				return
 			}
-			l.logger.Warn("lock renew failed", "lock_name", k.name, "fencing_token", k.token, "error", err)
+			l.logger.WarnContext(ctx, "lock renew failed", "lock_name", k.name, "fencing_token", k.token, "error", err)
 		}
 	}
 }

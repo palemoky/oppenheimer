@@ -119,7 +119,7 @@ func Run(ctx context.Context, cfg Config, led *ledger.Writer) (*Report, error) {
 		agg:        newAggregator(time.Now()),
 		cancelRoot: cancelRoot,
 	}
-	r.log.Info("load run starting", "run_id", cfg.RunID, "seed", cfg.Seed, "concurrency", cfg.Concurrency,
+	r.log.InfoContext(ctx, "load run starting", "run_id", cfg.RunID, "seed", cfg.Seed, "concurrency", cfg.Concurrency,
 		"duration", cfg.Duration, "orders", cfg.Orders, "skus", cfg.SKUs)
 
 	var bg sync.WaitGroup
@@ -173,7 +173,7 @@ func (r *runner) progressLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			p := r.agg.progress()
-			r.log.Info("progress", "started", p.started, "accepted", p.accepted, "rejected", p.rejected,
+			r.log.InfoContext(ctx, "progress", "started", p.started, "accepted", p.accepted, "rejected", p.rejected,
 				"landed", p.landed, "unknown", p.unknown, "http_errors", p.httpErrors)
 		}
 	}

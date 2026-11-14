@@ -171,7 +171,7 @@ func run(ctx context.Context, logger *slog.Logger, resetName, printName string) 
 		if err := checkpoints.Reset(startCtx, resetName); err != nil {
 			return err
 		}
-		logger.Info("checkpoint reset; the pipeline will redo the snapshot on next start", "pipeline", resetName)
+		logger.InfoContext(ctx, "checkpoint reset; the pipeline will redo the snapshot on next start", "pipeline", resetName)
 		return nil
 	}
 
@@ -221,7 +221,7 @@ func run(ctx context.Context, logger *slog.Logger, resetName, printName string) 
 	if err != nil {
 		return err
 	}
-	logger.Info("listening", "http_addr", httpServer.Addr().String(), "pipelines", cfg.names)
+	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "pipelines", cfg.names)
 
 	// app.Run 按相反顺序停止：健康检查先停，然后各流水线停止读取、落最后一次位点。
 	return app.Run(ctx, logger, append(components, httpServer)...)

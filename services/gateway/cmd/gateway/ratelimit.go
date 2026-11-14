@@ -176,7 +176,7 @@ func newRateLimitRedis(addr string) (*redis.Client, error) {
 func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig) (rl *httpapi.RateLimit, reporter *httpapi.RateLimitReporter, closeFn func()) {
 	closeFn = func() {}
 	if !cfg.enabled {
-		logger.Info("rate limit disabled")
+		logger.InfoContext(ctx, "rate limit disabled")
 		return nil, nil, closeFn
 	}
 
@@ -210,11 +210,11 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 			rdb, err := newRateLimitRedis(cfg.redisAddr)
 			if err != nil {
 				// 可观测性是可选的（otelx.Setup 的约定）：埋点没装上不影响限流本身，记下来照常启动。
-				logger.Warn("rate limit redis is not instrumented", "error", err)
+				logger.WarnContext(ctx, "rate limit redis is not instrumented", "error", err)
 			}
 			pctx, cancel := context.WithTimeout(ctx, rateLimitRedisPingTimeout)
 			if err := rdb.Ping(pctx).Err(); err != nil {
-				logger.Warn("rate limit redis is unreachable; starting anyway, per-user and per-route limits use the local limiter until it is back",
+				logger.WarnContext(ctx, "rate limit redis is unreachable; starting anyway, per-user and per-route limits use the local limiter until it is back",
 					"addr", cfg.redisAddr, "error", err)
 			}
 			cancel()
@@ -230,13 +230,13 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 			useRedis = true
 			unregister, err := httpapi.RegisterFallbackMetric(fb.Fallbacks)
 			if err != nil {
-				logger.Warn("register rate limit fallback metric", "error", err)
+				logger.WarnContext(ctx, "register rate limit fallback metric", "error", err)
 				unregister = func() {}
 			}
 			closeFn = func() {
 				unregister()
 				if err := rdb.Close(); err != nil {
-					logger.Warn("close rate limit redis", "error", err)
+					logger.WarnContext(ctx, "close rate limit redis", "error", err)
 				}
 			}
 		}
@@ -259,7 +259,7 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 			"redis_cooldown", cfg.redisCooldown.String(),
 		)
 	}
-	logger.Info("rate limit config", attrs...)
+	logger.InfoContext(ctx, "rate limit config", attrs...)
 
 	reporter = httpapi.NewRateLimitReporter(rl.Stats, fallbacks, logger, httpapi.DefaultRateLimitReportInterval)
 	return rl, reporter, closeFn

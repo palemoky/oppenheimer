@@ -248,7 +248,7 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 				return
 			case <-t.C:
 				if err := src.refresh(); err != nil {
-					cfg.Logger.Warn("refresh orders source failed", "error", err)
+					cfg.Logger.WarnContext(ctx, "refresh orders source failed", "error", err)
 				}
 			}
 		}

@@ -116,13 +116,13 @@ func (w *worker) tryBatch(ctx context.Context, recs []*kgo.Record) (done, interr
 			return false, true
 		}
 		if IsPermanent(err) || attempt >= batchAttempts {
-			w.log.Warn("kafka batch failed, processing it one message at a time",
+			w.log.WarnContext(ctx, "kafka batch failed, processing it one message at a time",
 				"first_offset", recs[0].Offset, "last_offset", recs[len(recs)-1].Offset, "size", len(recs),
 				"attempt", attempt, "permanent", IsPermanent(err), "error", err)
 			return false, false
 		}
 		backoff := w.c.backoff(attempt)
-		w.log.Warn("kafka batch failed, retrying the batch", "first_offset", recs[0].Offset, "size", len(recs),
+		w.log.WarnContext(ctx, "kafka batch failed, retrying the batch", "first_offset", recs[0].Offset, "size", len(recs),
 			"attempt", attempt, "backoff", backoff, "error", err)
 		if !w.sleep(ctx, backoff) {
 			return false, true

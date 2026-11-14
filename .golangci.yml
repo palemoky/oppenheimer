@@ -41,6 +41,8 @@ linters:
   settings:
     sloglint:
       static-msg: true
+      # 作用域里有 ctx 时必须用带 ctx 的方法（InfoContext 这一类）：trace id 是从 ctx 里取的（设计文档 1d 的 8.9）。
+      context: scope
       key-naming-case: snake
     exhaustive:
       default-signifies-exhaustive: true

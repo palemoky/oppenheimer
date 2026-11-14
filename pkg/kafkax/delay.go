@@ -70,7 +70,7 @@ func NewDelayConsumer(ctx context.Context, cfg DelayConsumerConfig, handler Hand
 func (c *Consumer) waitDue(ctx context.Context, w *worker, rec *kgo.Record, log *slog.Logger) bool {
 	due, ok := dueAt(rec)
 	if !ok {
-		log.Warn("kafka delay message has no valid due-at header, processing now")
+		log.WarnContext(ctx, "kafka delay message has no valid due-at header, processing now")
 		return true
 	}
 	waited := false

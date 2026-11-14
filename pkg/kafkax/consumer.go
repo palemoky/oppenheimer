@@ -343,7 +343,7 @@ func (c *Consumer) Start(ctx context.Context) error {
 	bg.Wait()
 
 	if err := c.client.LeaveGroupContext(finalCtx); err != nil {
-		c.log.Warn("kafka leave group failed", "error", err)
+		c.log.WarnContext(ctx, "kafka leave group failed", "error", err)
 	}
 	c.client.CloseAllowingRebalance()
 
@@ -390,7 +390,7 @@ func (c *Consumer) pollLoop(pollCtx, hardCtx context.Context) {
 		var fetchErr bool
 		fetches.EachError(func(topic string, partition int32, err error) {
 			fetchErr = true
-			c.log.Warn("kafka fetch error", "topic", topic, "partition", partition, "error", err)
+			c.log.WarnContext(pollCtx, "kafka fetch error", "topic", topic, "partition", partition, "error", err)
 		})
 		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
 			if len(p.Records) == 0 {
@@ -457,7 +457,7 @@ func (c *Consumer) onAssigned(ctx context.Context, _ *kgo.Client, assigned map[s
 // 不等的话，新的持有者会从旧位点开始，与本成员同时处理同一分区，顺序和重复都失控。
 func (c *Consumer) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[string][]int32) {
 	if len(revoked) > 0 {
-		c.log.Info("kafka partitions revoked", "partitions", revoked)
+		c.log.InfoContext(ctx, "kafka partitions revoked", "partitions", revoked)
 	}
 	c.retire(ctx, c.workersOf(revoked), true)
 	// 暂停状态在分区重新分配回来后仍然有效，交出前必须恢复，否则再分配回来会永远不拉。
@@ -467,7 +467,7 @@ func (c *Consumer) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[str
 // onLost 是分区丢失时的回调（会话过期等）。此时提交大概率失败，而且分区可能已经属于别人，
 // 所以不提交，只停掉 worker；没提交的消息会被新的持有者重新处理。
 func (c *Consumer) onLost(ctx context.Context, _ *kgo.Client, lost map[string][]int32) {
-	c.log.Warn("kafka partitions lost", "partitions", lost)
+	c.log.WarnContext(ctx, "kafka partitions lost", "partitions", lost)
 	c.retire(ctx, c.workersOf(lost), false)
 	c.client.ResumeFetchPartitions(lost)
 }
@@ -568,7 +568,7 @@ func (c *Consumer) commitLocked(ctx context.Context, ws []*worker) {
 	defer cancel()
 	// CommitRecords 提交每条记录的 offset+1，内部用 CommitOffsetsSync，不会被再平衡取消。
 	if err := c.client.CommitRecords(cctx, recs...); err != nil {
-		c.log.Warn("kafka commit failed", "partitions", len(recs), "error", err)
+		c.log.WarnContext(ctx, "kafka commit failed", "partitions", len(recs), "error", err)
 		return
 	}
 	for i, w := range owner {
@@ -949,7 +949,7 @@ func (c *Consumer) sendDLQ(ctx context.Context, w *worker, rec *kgo.Record, caus
 			return true
 		}
 		backoff := c.backoff(try)
-		log.Error("kafka dlq send failed, retrying", "dlq_topic", dlqTopic, "try", try, "backoff", backoff, "error", err)
+		log.ErrorContext(ctx, "kafka dlq send failed, retrying", "dlq_topic", dlqTopic, "try", try, "backoff", backoff, "error", err)
 		if !w.sleep(ctx, backoff) {
 			return false
 		}
