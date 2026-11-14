@@ -191,6 +191,8 @@ func (f *fakeInventory) Reserve(_ context.Context, in *inventoryv1.ReserveReques
 			if !ok {
 				return nil, errx.New(codes.NotFound, errx.ReasonSKUNotFound, "sku %d not found", it.GetSkuId())
 			}
+			// 真实的 inventory 自 ADR-0018 起不在预占时检查可售数，不会返回这个错误。
+			// 这里保留它，是为了让测试能驱动 order 处理“库存不足”的那条防御路径。
 			if sku.available < int64(it.GetQuantity()) {
 				return nil, errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "sku %d", it.GetSkuId())
 			}

@@ -297,8 +297,14 @@ func TestLandConcurrentDistinctOrders(t *testing.T) {
 	e.cancelAllAndSettle(t, orders)
 }
 
-// 稀缺库存：闸门放进来 100 单，MySQL 只剩 30 件（闸门比 MySQL 大，与 TestLandReserveRejected 同样的构造）。
-// 并发落库后恰好 30 单待支付、70 单创建失败，不超卖；失败订单的占用在消费 failed 事件后归还。
+// 并发落库时一部分订单的预占被 inventory 以“库存不足”拒绝：被拒绝的恰好走创建失败的路径，
+// 成功和失败的订单数加起来不多不少，失败订单的占用在消费 failed 事件后归还。
+//
+// 这是 order 一侧的防御用例，不代表系统现在的行为。构造方式是让假的 inventory 在可售数不够时拒绝
+// （闸门放进来 100 单，假 inventory 只有 30 件）。真实的 inventory 自 ADR-0018 起不再在预占时检查
+// 可售数：闸门有货而 MySQL 没货时预占照常成功，由后台任务事后发现。所以真实系统里这 100 单都会成功，
+// “MySQL 兜底闸门、不超卖”不是这个测试能证明的性质。order 仍然要正确处理这个错误码，
+// 因为它是契约的一部分，inventory 以后的版本（例如降级到数据库扣减时）可能再次返回它。
 func TestLandConcurrentScarceStock(t *testing.T) {
 	t.Parallel()
 	const (
