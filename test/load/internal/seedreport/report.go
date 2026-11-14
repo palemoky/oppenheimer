@@ -25,6 +25,8 @@ type Config struct {
 	OrderDBs []*sql.DB
 	// IndexDBs 是商家索引库，可选；为空时跳过商家相关的统计和查询。
 	IndexDBs []*sql.DB
+	// ArchiveDB 是冷库（order_archive_db），可选；为空时报告里没有冷库一节。
+	ArchiveDB *sql.DB
 	// Runs 是每类查询的次数，默认 2000。
 	Runs int
 	// CompareRuns 是偏移量对游标每种写法的次数，默认 20。
@@ -63,7 +65,9 @@ type Report struct {
 	BigMerchant []Top        `json:"big_merchants,omitempty"`
 	Queries     []QueryStat  `json:"queries"`
 	Compare     []Comparison `json:"offset_vs_cursor"`
-	Notes       []string     `json:"notes,omitempty"`
+	// Archive 是冷库一节；没有给冷库时为 nil。
+	Archive *ArchiveReport `json:"archive,omitempty"`
+	Notes   []string       `json:"notes,omitempty"`
 }
 
 // TableStat 是一张表的行数和大小。行数是 COUNT(*) 的精确值；大小取自 information_schema.tables，
@@ -112,6 +116,8 @@ type ExplainRow struct {
 	Rows     int64   `json:"rows"`
 	Filtered float64 `json:"filtered"`
 	Extra    string  `json:"extra"`
+	// Partitions 是分区表上命中的分区（EXPLAIN 的 partitions 列）；不是分区表时为空。
+	Partitions string `json:"partitions,omitempty"`
 }
 
 // Comparison 是同一个深页用偏移量和用游标两种写法的耗时对比。
@@ -176,6 +182,12 @@ func Generate(ctx context.Context, cfg Config) (*Report, error) {
 		{"top users and merchants", g.tops},
 		{"queries", g.queries},
 		{"offset vs cursor", g.compare},
+	}
+	if cfg.ArchiveDB != nil {
+		steps = append(steps, struct {
+			name string
+			fn   func(context.Context) error
+		}{"cold archive", g.archive})
 	}
 	for _, s := range steps {
 		fmt.Fprintf(cfg.Log, "seed-report: %s...\n", s.name)
@@ -354,13 +366,20 @@ const (
 	merchantListCols = "merchant_id, order_id, user_id, status, total_amount, currency, created_at, paid_at, src_version, synced_at"
 )
 
-func getOrderSQL(slot int) string {
-	return "SELECT " + getOrderCols + " FROM " + sharding.Table("orders", slot) + " WHERE order_id = ?"
+func getOrderSQL(slot int) string { return getOrderSQLOn(sharding.Table("orders", slot)) }
+
+func getOrderSQLOn(table string) string {
+	return "SELECT " + getOrderCols + " FROM " + table + " WHERE order_id = ?" //nolint:gosec // 表名只来自 sharding.Table 或常量
 }
 
 // userListSQL 生成用户列表的语句：WHERE user_id = ? [AND status = ?] [AND order_id < ?] ORDER BY order_id DESC LIMIT n。
 func userListSQL(slot int, userID int64, status int8, before int64, limit int) (string, []any) {
-	q := "SELECT " + userListCols + " FROM " + sharding.Table("orders", slot) + " FORCE INDEX (idx_orders_user) WHERE user_id = ?"
+	return userListSQLOn(sharding.Table("orders", slot), userID, status, before, limit)
+}
+
+// userListSQLOn 是 userListSQL 在指定的表上的写法（冷库的 orders_archive 有同构的 idx_orders_user）。
+func userListSQLOn(table string, userID int64, status int8, before int64, limit int) (string, []any) {
+	q := "SELECT " + userListCols + " FROM " + table + " FORCE INDEX (idx_orders_user) WHERE user_id = ?" //nolint:gosec // 表名只来自 sharding.Table 或常量
 	args := []any{userID}
 	if status != 0 {
 		q += " AND status = ?"
@@ -390,13 +409,16 @@ type call struct {
 
 // samples 随机取 n 个订单：先按行数加权选 slot，再在这个 slot 的订单号范围里取一个随机值，取不小于它的第一个订单。
 // 订单号里是时间，所以这近似于按时间均匀取；取到的用户按下单次数加权（活跃用户被取到的机会多）。
+//
+// 热库里没有订单（全部归档了）时返回空，由调用方跳过依赖取样的查询。归档任务可能正在跑：
+// 取样时选中的行刚好被删掉就跳过这一次，不当成错误。
 func (g *gen) samples(ctx context.Context, n int) ([]sample, error) {
 	var total int64
 	for _, si := range g.slots {
 		total += si.rows
 	}
 	if total == 0 {
-		return nil, errors.New("no orders")
+		return nil, nil
 	}
 	out := make([]sample, 0, n)
 	for range n {
@@ -410,6 +432,9 @@ func (g *gen) samples(ctx context.Context, n int) ([]sample, error) {
 		var s sample
 		if err := si.db.QueryRowContext(ctx, "SELECT order_id, user_id, COALESCE(merchant_id, 0) FROM "+sharding.Table("orders", slot)+
 			" WHERE order_id >= ? ORDER BY order_id LIMIT 1", from).Scan(&s.orderID, &s.userID, &s.merchantID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
 			return nil, fmt.Errorf("sample slot %d: %w", slot, err)
 		}
 		out = append(out, s)
@@ -428,6 +453,9 @@ func (g *gen) queries(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(ss) == 0 {
+		g.rep.Notes = append(g.rep.Notes, "no orders in the order dbs (archived?): sampled hot queries skipped")
+	}
 	pick := func() sample { return ss[g.r.IntN(len(ss))] }
 	slotOfUser := func(u int64) int { return g.or.ForUser(u) }
 	userCall := func(u int64, status int8, before int64) call {
@@ -436,20 +464,19 @@ func (g *gen) queries(ctx context.Context) error {
 		return call{g.slots[slot].db, q, args}
 	}
 
-	type class struct {
-		name string
-		next func(i int) (call, error)
-	}
-	classes := []class{
-		{"order by id", func(i int) (call, error) {
-			s := ss[i%len(ss)]
-			slot := g.or.ForOrder(s.orderID)
-			return call{g.slots[slot].db, getOrderSQL(slot), []any{s.orderID}}, nil
-		}},
-		{"user list, first page", func(int) (call, error) { return userCall(pick().userID, 0, 0), nil }},
-		{"user list, status filter, first page", func(int) (call, error) {
-			return userCall(pick().userID, finalStatuses[g.r.IntN(len(finalStatuses))], 0), nil
-		}},
+	var classes []class
+	if len(ss) > 0 {
+		classes = []class{
+			{"order by id", func(i int) (call, error) {
+				s := ss[i%len(ss)]
+				slot := g.or.ForOrder(s.orderID)
+				return call{g.slots[slot].db, getOrderSQL(slot), []any{s.orderID}}, nil
+			}},
+			{"user list, first page", func(int) (call, error) { return userCall(pick().userID, 0, 0), nil }},
+			{"user list, status filter, first page", func(int) (call, error) {
+				return userCall(pick().userID, finalStatuses[g.r.IntN(len(finalStatuses))], 0), nil
+			}},
+		}
 	}
 
 	// 重度用户的深页：先用偏移量找到第 DeepPage 页之前的最后一个订单号当游标，测的是带游标的查询。
@@ -505,6 +532,21 @@ func (g *gen) queries(ctx context.Context) error {
 		}
 	}
 
+	stats, err := g.runClasses(ctx, classes)
+	g.rep.Queries = append(g.rep.Queries, stats...)
+	return err
+}
+
+// class 是一类查询：名字，和给出第 i 次执行用的语句的函数。
+type class struct {
+	name string
+	next func(i int) (call, error)
+}
+
+// runClasses 对每一类查询执行 Runs 次，量延迟分布；每类第一次执行前取一次执行计划。
+func (g *gen) runClasses(ctx context.Context, classes []class) ([]QueryStat, error) {
+	n := g.cfg.Runs
+	var out []QueryStat
 	for _, c := range classes {
 		fmt.Fprintf(g.cfg.Log, "seed-report:   %s x%d\n", c.name, n)
 		st := QueryStat{Name: c.name, Runs: n}
@@ -513,26 +555,26 @@ func (g *gen) queries(ctx context.Context) error {
 		for i := range n {
 			cl, err := c.next(i)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if i == 0 {
 				st.SQL = cl.query
 				if st.Explain, err = explain(ctx, cl); err != nil {
-					return fmt.Errorf("%s: %w", c.name, err)
+					return nil, fmt.Errorf("%s: %w", c.name, err)
 				}
 			}
 			d, nr, err := timeQuery(ctx, cl)
 			if err != nil {
-				return fmt.Errorf("%s: %w", c.name, err)
+				return nil, fmt.Errorf("%s: %w", c.name, err)
 			}
 			lat = append(lat, d)
 			rowsTotal += nr
 		}
 		st.P50Ms, st.P99Ms, st.MaxMs = percentiles(lat)
 		st.AvgRows = float64(rowsTotal) / float64(n)
-		g.rep.Queries = append(g.rep.Queries, st)
+		out = append(out, st)
 	}
-	return nil
+	return out, nil
 }
 
 // deepOffset 返回第 page 页的偏移量，数据不够深时退到最后一整页。
@@ -616,6 +658,8 @@ func explain(ctx context.Context, c call) ([]ExplainRow, error) {
 				e.Table = v
 			case "type":
 				e.Type = v
+			case "partitions":
+				e.Partitions = v
 			case "key":
 				e.Key = v
 			case "rows":

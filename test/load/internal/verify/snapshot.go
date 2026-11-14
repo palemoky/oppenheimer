@@ -5,7 +5,12 @@
 // 外部系统就测试，连库的部分只负责“读对”。
 package verify
 
-import "github.com/palemoky/oppenheimer/test/load/internal/ledger"
+import (
+	"fmt"
+	"time"
+
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
+)
 
 // 订单状态，与 proto OrderStatus 的数值一致（order 的 00001_init.sql）。
 const (
@@ -170,6 +175,9 @@ type Snapshot struct {
 	// MerchantIndex 是商家索引对账要的数据；没有给索引库时为 nil，对应的检查跳过。
 	MerchantIndex *MerchantIndexData
 
+	// Archive 是冷热归档对账的结果；没有给冷库时为 nil，对应的检查跳过。
+	Archive *ArchiveData
+
 	// Corrections 是库存服务日志里闸门对账做过修正的行；Capped 是偏差持续但被上限截住的行。
 	Corrections []string
 	Capped      []string
@@ -190,7 +198,10 @@ type MerchantOrderRow struct {
 // MerchantIndexData 是商家索引与订单表的两侧数据。
 type MerchantIndexData struct {
 	Orders []MerchantOrderRow // 订单侧：全部 merchant_id IS NOT NULL 的订单
-	Index  []MerchantOrderRow // 索引侧：全部 merchant_orders_{slot} 的行
+	// ColdOrders 是冷库里 merchant_id 非空的订单（没有给冷库时为空）。归档后订单从热库删掉，索引行保留，
+	// 所以订单侧是 Orders 并上 ColdOrders；同一订单两边都有时取热库的。
+	ColdOrders []MerchantOrderRow
+	Index      []MerchantOrderRow // 索引侧：全部 merchant_orders_{slot} 的行
 }
 
 // IdemRef 是订单库唯一键 (user_id, idempotency_key)。
@@ -203,4 +214,38 @@ type IdemRef struct {
 type Input struct {
 	Snapshot *Snapshot
 	Ledger   []ledger.Entry
+	// ArchiveInFlight 为 true 表示归档任务还在跑：第 21 条里“同一订单热库冷库都有”只记 note，不算失败。
+	// 零值（false）是归档已结束，这是默认。
+	ArchiveInFlight bool
+}
+
+// Issues 是一类问题的总数和前几个例子（按订单号升序）。例子只留几个：出问题时可能有成千上万行。
+type Issues struct {
+	N        int
+	Examples []string
+}
+
+func (is *Issues) add(format string, args ...any) {
+	is.N++
+	if len(is.Examples) < archiveExamples {
+		is.Examples = append(is.Examples, fmt.Sprintf(format, args...))
+	}
+}
+
+// ArchiveData 是第 21 条（冷热归档一致）在读库时就算好的结果。冷库可能有几百万行，
+// 不把订单号带进 Snapshot，只留各类问题的数量和例子。
+type ArchiveData struct {
+	// Cutoff 是“现在减 ArchiveMinAge”：冷库里不应该有订单号时间不早于它的订单，热库子表的孤儿也只查早于它的。
+	Cutoff time.Time
+	// ColdOrders 是冷库的订单数，HotOrders 是参与比较的热库订单数。
+	ColdOrders, HotOrders int64
+
+	NonFinal Issues // 冷库里有非终态订单
+	TooNew   Issues // 冷库里有订单号时间不早于 Cutoff 的订单
+	Both     Issues // 同一个订单号热库冷库都有
+	NoItems  Issues // 冷库订单没有任何明细行
+	// ItemOrphans、PaymentOrphans 是冷库里有明细、支付结果行但没有订单行的订单号。
+	ItemOrphans, PaymentOrphans Issues
+	// HotItemOrphans、HotPaymentOrphans 是热库里订单号早于 Cutoff、有明细或支付结果行但没有订单行的订单号。
+	HotItemOrphans, HotPaymentOrphans Issues
 }

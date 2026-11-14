@@ -170,18 +170,21 @@ func seedReportCmd(args []string, stdout, stderr io.Writer) int {
 	var (
 		cfg                seedreport.Config
 		orderDSNs, idxDSNs string
+		archiveDSN         string
 		jsonPath           string
 		timeout            time.Duration
 	)
 	fs.StringVar(&orderDSNs, "order-dsns", defaultSeedOrderDSNs, "comma-separated order DB DSNs; the i-th is order_db_i")
 	fs.StringVar(&idxDSNs, "merchant-index-dsns", "",
 		"optional, comma-separated merchant index DB DSNs, the i-th is merchant_index_db_i; when empty merchant stats and queries are skipped")
+	fs.StringVar(&archiveDSN, "archive-dsn", "",
+		"optional, order_archive_db (cold archive) DSN; when empty the report has no cold archive section")
 	fs.IntVar(&cfg.Runs, "runs", 2000, "runs of each query class")
 	fs.IntVar(&cfg.CompareRuns, "compare-runs", 20, "runs of each side of the offset vs cursor comparison")
 	fs.IntVar(&cfg.DeepPage, "page", 500, "page number used as the deep page")
 	fs.IntVar(&cfg.PageSize, "page-size", 20, "rows per page")
 	fs.IntVar(&cfg.TopN, "top", 5, "number of heavy users and big merchants")
-	fs.BoolVar(&cfg.Analyze, "analyze", false, "ANALYZE LOCAL TABLE every table first so the sizes are fresh")
+	fs.BoolVar(&cfg.Analyze, "analyze", false, "ANALYZE LOCAL TABLE every table first (including the cold tables) so the sizes are fresh; without it sizes are InnoDB persistent stats and may be stale")
 	fs.Uint64Var(&cfg.Seed, "seed", 1, "random seed for query parameters")
 	fs.StringVar(&jsonPath, "json", "", "also write the report as JSON to this file (- for stdout instead of the text)")
 	fs.DurationVar(&timeout, "timeout", 30*time.Minute, "overall timeout")
@@ -212,6 +215,19 @@ func seedReportCmd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer closeIdx()
+	archiveDBs, closeArchive, err := openDBs(ctx, archiveDSN, "archive", false, 4)
+	if err != nil {
+		logger.Error("connect failed", "error", err)
+		return 1
+	}
+	defer closeArchive()
+	if len(archiveDBs) > 1 {
+		fmt.Fprintln(stderr, "-archive-dsn takes one DSN")
+		return 2
+	}
+	if len(archiveDBs) == 1 {
+		cfg.ArchiveDB = archiveDBs[0]
+	}
 	if len(cfg.OrderDBs) == 0 {
 		fmt.Fprintln(stderr, "-order-dsns is empty")
 		return 2

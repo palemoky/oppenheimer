@@ -61,7 +61,12 @@ CREATE TABLE %s (
 	order_id BIGINT NOT NULL, sku_id BIGINT NOT NULL, quantity INT NOT NULL, unit_price BIGINT NOT NULL DEFAULT 0,
 	created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY (order_id, sku_id)
 );
-`, sharding.Table("orders", slot), sharding.Table("order_items", slot))
+CREATE TABLE %s (
+	payment_id BIGINT NOT NULL, order_id BIGINT NOT NULL, succeeded TINYINT NOT NULL, amount BIGINT NOT NULL,
+	disposition TINYINT NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	PRIMARY KEY (payment_id), KEY idx_payment_results_order (order_id)
+);
+`, sharding.Table("orders", slot), sharding.Table("order_items", slot), sharding.Table("payment_results", slot))
 		}
 		sb.WriteString(`CREATE TABLE outbox (
 	id BIGINT NOT NULL AUTO_INCREMENT, topic VARCHAR(128) NOT NULL, msg_key VARBINARY(128) NOT NULL,

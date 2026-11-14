@@ -94,6 +94,8 @@ type checker struct {
 	s   *Snapshot
 	led []ledger.Entry
 	res Result
+	// archiveInFlight 为 true 时，热库冷库同时有同一个订单只记 note（归档任务正在跑）。
+	archiveInFlight bool
 }
 
 func (c *checker) fail(check int, subject, format string, args ...any) {
@@ -109,7 +111,7 @@ func skuSubj(id int64) string   { return "sku " + strconv.FormatInt(id, 10) }
 
 // Check 逐条执行 7.3.3 的检查，不在第一条失败时停下。
 func Check(in Input) *Result {
-	c := &checker{s: in.Snapshot, led: in.Ledger}
+	c := &checker{s: in.Snapshot, led: in.Ledger, archiveInFlight: in.ArchiveInFlight}
 	c.res.Counts.Unknown = map[ledger.Op]int{}
 	c.res.Counts.HTTP5xx = map[ledger.Op]int{}
 	c.res.Counts.GaveUpFound = map[string]int{}
@@ -126,6 +128,7 @@ func Check(in Input) *Result {
 	c.infrastructure() // 17–18
 	c.logs()           // 19
 	c.merchantIndex()  // 20
+	c.archive()        // 21
 
 	slices.SortStableFunc(c.res.Violations, func(a, b Violation) int {
 		return cmp.Or(cmp.Compare(a.Check, b.Check), cmp.Compare(a.Subject, b.Subject))
@@ -544,13 +547,19 @@ func (c *checker) merchantIndex() {
 		c.fail(CheckMerchantIndex, "merchant index", "build shard router: %v", err)
 		return
 	}
-	cnt := &MerchantIndexCounts{Orders: len(d.Orders), Rows: len(d.Index)}
-	c.res.Counts.MerchantIndex = cnt
-
-	orders := make(map[int64]MerchantOrderRow, len(d.Orders))
+	// 订单侧是热库并上冷库（归档后订单只在冷库里，索引行保留）。同一订单两边都有时取热库的。
+	orders := make(map[int64]MerchantOrderRow, len(d.Orders)+len(d.ColdOrders))
 	for _, o := range d.Orders {
 		orders[o.OrderID] = o
 	}
+	for _, o := range d.ColdOrders {
+		if _, ok := orders[o.OrderID]; !ok {
+			orders[o.OrderID] = o
+		}
+	}
+	cnt := &MerchantIndexCounts{Orders: len(orders), Rows: len(d.Index)}
+	c.res.Counts.MerchantIndex = cnt
+
 	var missing, extra, mismatch, misplaced merchantIndexIssues
 	seen := make(map[int64]bool, len(d.Index))
 	for _, row := range slices.SortedFunc(slices.Values(d.Index), func(a, b MerchantOrderRow) int {

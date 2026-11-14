@@ -35,6 +35,9 @@ type Sources struct {
 	// （chaos 和 bench 不启动 CDC 与 orderindex，不会给这些库）。
 	MerchantIndexDBs []*sql.DB
 
+	// ArchiveDB 是冷库（order_archive_db）。为 nil 时不做第 21 条，第 20 条也只和热库的订单表比。
+	ArchiveDB *sql.DB
+
 	// Redis 是闸门所在的实例，RedisPrefix 是服务的 REDIS_PREFIX。
 	Redis       *redis.Client
 	RedisPrefix string
@@ -106,6 +109,7 @@ func Collect(ctx context.Context, src Sources, initial map[int64]int64) (*Snapsh
 		{"order_db", collectOrders},
 		{"payment_db", collectPayments},
 		{"merchant index", collectMerchantIndex},
+		{"cold archive", collectArchive},
 		{"stock gate", collectGate},
 		{"dead letter topics", collectDLQ},
 		{"inventory log", collectLog},
@@ -243,6 +247,14 @@ func collectMerchantIndex(ctx context.Context, src Sources, s *Snapshot) error {
 			if err := queryEach(ctx, src.OrderDBs[db], q, scan(slot, &data.Orders)); err != nil {
 				return err
 			}
+		}
+	}
+
+	// 归档把订单从热库搬到冷库，索引行保留，所以订单侧要并上冷库。冷库的表不分片，同样排除造数的订单。
+	if src.ArchiveDB != nil {
+		q := "SELECT order_id, merchant_id, status, total_amount, version FROM orders_archive" + notSeeded("") + " AND merchant_id IS NOT NULL"
+		if err := queryEach(ctx, src.ArchiveDB, q, scan(-1, &data.ColdOrders)); err != nil {
+			return err
 		}
 	}
 

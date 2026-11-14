@@ -57,20 +57,8 @@ func (r *Report) WriteText(w io.Writer) error {
 		return err
 	}
 
-	for _, q := range r.Queries {
-		add("%s\t%d\t%.2f\t%.2f\t%.2f\t%.1f", q.Name, q.Runs, q.P50Ms, q.P99Ms, q.MaxMs, q.AvgRows)
-	}
-	if err := flush("query latency", "query\truns\tp50 ms\tp99 ms\tmax ms\tavg rows"); err != nil {
+	if err := writeQueries(w, "query latency", r.Queries, &rows, flush); err != nil {
 		return err
-	}
-
-	fmt.Fprintln(w, "\n== explain (first run of each query) ==")
-	for _, q := range r.Queries {
-		fmt.Fprintf(w, "%s\n  %s\n", q.Name, strings.Join(strings.Fields(q.SQL), " "))
-		for _, e := range q.Explain {
-			fmt.Fprintf(w, "  -> table=%s type=%s key=%s rows=%d filtered=%.0f%% extra=%q\n",
-				e.Table, e.Type, e.Key, e.Rows, e.Filtered, e.Extra)
-		}
 	}
 
 	for _, c := range r.Compare {
@@ -81,7 +69,79 @@ func (r *Report) WriteText(w io.Writer) error {
 		"case\tpage\toffset\toffset p50/max ms\tcursor p50/max ms\trows fetched (offset)\trows fetched (cursor)\tsame page"); err != nil {
 		return err
 	}
+	if r.Archive != nil {
+		if err := r.Archive.writeText(w); err != nil {
+			return err
+		}
+	}
 	for _, n := range r.Notes {
+		fmt.Fprintf(w, "note: %s\n", n)
+	}
+	return nil
+}
+
+// writeQueries 写一张延迟表和每类查询的执行计划。表格行借用调用方的 rows，flush 把它们写出去。
+func writeQueries(w io.Writer, title string, qs []QueryStat, rows *[]string, flush func(title, header string) error) error {
+	for _, q := range qs {
+		*rows = append(*rows, fmt.Sprintf("%s\t%d\t%.2f\t%.2f\t%.2f\t%.1f", q.Name, q.Runs, q.P50Ms, q.P99Ms, q.MaxMs, q.AvgRows))
+	}
+	if err := flush(title, "query\truns\tp50 ms\tp99 ms\tmax ms\tavg rows"); err != nil {
+		return err
+	}
+	writeExplain(w, "explain (first run of each query)", qs)
+	return nil
+}
+
+func writeExplain(w io.Writer, title string, qs []QueryStat) {
+	fmt.Fprintf(w, "\n== %s ==\n", title)
+	for _, q := range qs {
+		fmt.Fprintf(w, "%s\n  %s\n", q.Name, strings.Join(strings.Fields(q.SQL), " "))
+		for _, e := range q.Explain {
+			fmt.Fprintf(w, "  -> table=%s type=%s key=%s rows=%d filtered=%.0f%% extra=%q", e.Table, e.Type, e.Key, e.Rows, e.Filtered, e.Extra)
+			if e.Partitions != "" {
+				fmt.Fprintf(w, " partitions=%s", e.Partitions)
+			}
+			fmt.Fprintln(w)
+		}
+	}
+}
+
+// writeText 写冷库一节。
+func (a *ArchiveReport) writeText(w io.Writer) error {
+	var rows []string
+	flush := func(title, header string) error {
+		err := section(w, title, header, rows)
+		rows = rows[:0]
+		return err
+	}
+	for _, t := range a.Tables {
+		rows = append(rows, fmt.Sprintf("%s\t%d\t%s\t%s\t%.1f", t.Table, t.Rows, mib(t.DataBytes), mib(t.IndexBytes), t.BytesPerRow))
+	}
+	if err := flush("cold archive: tables (rows exact, sizes summed over partitions)", "table\trows\tdata MiB\tindex MiB\tbytes/row"); err != nil {
+		return err
+	}
+	for _, p := range a.Partitions {
+		rows = append(rows, fmt.Sprintf("%s\t%s\t%d\t%s\t%s", p.Table, p.Partition, p.EstRows, mib(p.DataBytes), mib(p.IndexBytes)))
+	}
+	if err := flush("cold archive: partitions (rows are ESTIMATES)", "table\tpartition\test. rows\tdata MiB\tindex MiB"); err != nil {
+		return err
+	}
+	for _, c := range a.Compression {
+		ratio := "n/a"
+		if c.Ratio > 0 {
+			ratio = fmt.Sprintf("%.2f", c.Ratio)
+		}
+		rows = append(rows, fmt.Sprintf("%s\t%d\t%.1f\t%d\t%.1f\t%s", c.Table, c.HotRows, c.HotBytesPerRow, c.ColdRows, c.ColdBytesPerRow, ratio))
+	}
+	if err := flush("cold archive: bytes per row, hot vs cold", "table\thot rows\thot bytes/row\tcold rows\tcold bytes/row\thot/cold"); err != nil {
+		return err
+	}
+	if len(a.Queries) == 0 {
+		fmt.Fprintln(w, "\n== cold archive: query latency ==\n(no queries)")
+	} else if err := writeQueries(w, "cold archive: query latency", a.Queries, &rows, flush); err != nil {
+		return err
+	}
+	for _, n := range a.Notes {
 		fmt.Fprintf(w, "note: %s\n", n)
 	}
 	return nil

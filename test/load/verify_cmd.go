@@ -37,6 +37,8 @@ type sourceFlags struct {
 	kafkaBrokers, kafkaPrefix           string
 	// merchantIndexDSNs 可选：给了才对账商家索引（verify 的第 20 条）。
 	merchantIndexDSNs string
+	// archiveDSN 可选：给了才对账冷库（verify 的第 21 条，并让第 20 条把冷库的订单算进订单侧）。只有 verify 注册这个参数。
+	archiveDSN string
 }
 
 func (f *sourceFlags) register(fs *flag.FlagSet) {
@@ -98,6 +100,14 @@ func (f *sourceFlags) open(ctx context.Context) (verify.Sources, func(), error) 
 		}
 		closers = append(closers, func() { _ = db.Close() })
 		src.MerchantIndexDBs = append(src.MerchantIndexDBs, db)
+	}
+	if f.archiveDSN != "" {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: f.archiveDSN, MaxOpenConns: 4})
+		if err != nil {
+			return fail(fmt.Errorf("open archive db: %w", err))
+		}
+		closers = append(closers, func() { _ = db.Close() })
+		src.ArchiveDB = db
 	}
 	rdb, err := redisx.Open(ctx, redisx.Config{Addr: f.redisAddr, ReadTimeout: 5 * time.Second})
 	if err != nil {
@@ -177,8 +187,13 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 		sf                          sourceFlags
 		ledgerPath, initial, invLog string
 		timeout                     time.Duration
+		archiveSettled              bool
 	)
 	sf.register(fs)
+	fs.StringVar(&sf.archiveDSN, "archive-dsn", "",
+		"optional, order_archive_db (cold archive) DSN; when empty verify check 21 is skipped and check 20 compares the index with the hot dbs only")
+	fs.BoolVar(&archiveSettled, "archive-settled", true,
+		"the archive job has finished: an order id in both the hot and the cold db fails check 21; false only reports the count")
 	fs.StringVar(&ledgerPath, "ledger", "tmp/load/ledger.jsonl", "client ledger written by run")
 	fs.StringVar(&initial, "initial", "", "initial stock of every sku, e.g. 1001=500,1002=500 (required)")
 	fs.StringVar(&invLog, "inventory-log", "", "inventory service log file, checked for gate corrections")
@@ -216,8 +231,8 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 		logger.Error("collect failed", "error", err)
 		return 1
 	}
-	res := verify.Check(verify.Input{Snapshot: snap, Ledger: entries})
-	printResult(stdout, res, snap, len(entries))
+	res := verify.Check(verify.Input{Snapshot: snap, Ledger: entries, ArchiveInFlight: !archiveSettled})
+	printResult(stdout, res, snap, len(entries), archiveSettled)
 	if res.Failed() {
 		return 1
 	}
@@ -242,7 +257,7 @@ func readLedger(path string, logger *slog.Logger) ([]ledger.Entry, error) {
 	return out, nil
 }
 
-func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerLines int) {
+func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerLines int, archiveSettled bool) {
 	c := res.Counts
 	p := func(format string, args ...any) { fmt.Fprintf(w, format+"\n", args...) }
 	p("== verify summary ==")
@@ -270,6 +285,15 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 			mi.Orders, mi.Rows, mi.Missing, mi.Extra, mi.Mismatch, mi.Misplaced)
 	} else {
 		p("[20] merchant index: skipped (no -merchant-index-dsns)")
+	}
+	if a := snap.Archive; a != nil {
+		last = verify.CheckArchive
+		p("[21] cold archive: %d orders in the cold db (%d in the hot dbs); non-final %d, too new %d, also in the hot dbs %d, without items %d, "+
+			"orphan items %d, orphan payment results %d; hot orphan items %d, hot orphan payment results %d (archive settled: %t)",
+			a.ColdOrders, a.HotOrders, a.NonFinal.N, a.TooNew.N, a.Both.N, a.NoItems.N,
+			a.ItemOrphans.N, a.PaymentOrphans.N, a.HotItemOrphans.N, a.HotPaymentOrphans.N, archiveSettled)
+	} else {
+		p("[21] cold archive: skipped (no -archive-dsn)")
 	}
 	for _, n := range res.Notes {
 		p("note: %s", n)
