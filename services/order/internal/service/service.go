@@ -256,6 +256,9 @@ func (s *Service) now() time.Time {
 
 var errInternal = status.Error(codes.Internal, "internal error")
 
+// errShardUnavailable 是订单所在的分片暂时不可读写时返回给调用方的错误，见 internal。
+var errShardUnavailable = status.Error(codes.Unavailable, "order shard is temporarily unavailable, retry later")
+
 func invalidArgument(format string, args ...any) error {
 	return errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, format, args...)
 }
@@ -267,6 +270,12 @@ func orderNotFound(orderID int64) error {
 // internal 记录真实原因后返回不带细节的 Internal。
 // op 说明是哪一步失败，作为日志字段而不是消息，保持消息为常量便于检索。
 func (s *Service) internal(ctx context.Context, op string, err error, attrs ...any) error {
+	// 分片表不存在：扩容切换期间这个 slot 的表在旧库上被改名作围栏（ADR-0015），几秒后路由切到新库。
+	// 这是“暂时不可用、稍后重试”，不是内部错误；告诉调用方可以重试，日志也不按 ERROR 记。
+	if mysqlx.IsNoSuchTable(err) {
+		s.logger.WarnContext(ctx, "shard unavailable", append(attrs, "op", op, "error", err)...)
+		return errShardUnavailable
+	}
 	s.logger.ErrorContext(ctx, "internal error", append(attrs, "op", op, "error", err)...)
 	return errInternal
 }

@@ -60,16 +60,16 @@ func tables(t *testing.T, db *sql.DB) []string {
 	return names
 }
 
-// 按生产布局（sharding.OrderLayout）迁移各个库，每个库只有自己的 4 组表加一张 outbox。
+// 按生产布局（sharding.OrderLayout）迁移各个库，每个库只有自己的 4 组表加 outbox 和 shard_meta。
 func TestMigrationsCreateOnlyOwnSlots(t *testing.T) {
 	t.Parallel()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for db := range r.DBs() {
 		conn := testdb.NewTemplate(t, Migrations, MigrationsDir, MigrationData{Slots: r.SlotsOf(db)})
-		want := []string{"outbox"}
+		want := []string{"outbox", "shard_meta"}
 		for _, s := range r.SlotsOf(db) {
 			for _, base := range []string{"orders", "order_items", "payment_results"} {
 				want = append(want, sharding.Table(base, s))
@@ -86,7 +86,7 @@ func TestMigrationsCreateOnlyOwnSlots(t *testing.T) {
 // 下次启动整版重跑，必须能成功并补齐其余的表。
 func TestMigrationResumesAfterPartialRun(t *testing.T) {
 	t.Parallel()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,8 +125,9 @@ func TestMigrationResumesAfterPartialRun(t *testing.T) {
 	if err := mysqlx.MigrateTemplate(t.Context(), db, Migrations, MigrationsDir, data); err != nil {
 		t.Fatalf("migrate after partial run: %v", err)
 	}
-	if got := len(tables(t, db)); got != len(creates) {
-		t.Errorf("tables after resume = %d, want %d", got, len(creates))
+	// 00001 的表全部补齐，另加 00003 的 shard_meta。
+	if got := len(tables(t, db)); got != len(creates)+1 {
+		t.Errorf("tables after resume = %d, want %d", got, len(creates)+1)
 	}
 }
 
@@ -145,15 +146,17 @@ func hasColumn(t *testing.T, db *sql.DB, table, column string) bool {
 // MySQL 没有 ADD COLUMN IF NOT EXISTS，整版重跑要靠迁移里对 information_schema 的判断。
 func TestAddColumnMigrationResumesAfterPartialRun(t *testing.T) {
 	t.Parallel()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := MigrationData{Slots: r.SlotsOf(0)}
 	db := testdb.NewTemplate(t, Migrations, MigrationsDir, data)
 
-	// 回到“00002 跑了一半”：去掉它的版本记录，再把后一半表的两列删掉。
-	testdb.MustExec(t, db, `DELETE FROM goose_db_version WHERE version_id = 2`)
+	// 回到“00002 跑了一半”：去掉它和之后各版本的记录（00002 没跑完时后面的版本不可能已经记上，
+	// 留着的话 goose 会因为出现了比库里版本号更低的未执行迁移而拒绝），再把后一半表的两列删掉。
+	// 后面的版本会跟着重跑一遍，它们同样必须可重入。
+	testdb.MustExec(t, db, `DELETE FROM goose_db_version WHERE version_id >= 2`)
 	undone := data.Slots[len(data.Slots)/2:]
 	for _, s := range undone {
 		testdb.MustExec(t, db, "ALTER TABLE "+sharding.Table("orders", s)+" DROP COLUMN merchant_id, DROP COLUMN version")

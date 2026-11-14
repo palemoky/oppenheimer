@@ -38,7 +38,7 @@ func newDB(t *testing.T, service string) *sql.DB {
 // 每个库还有一张 outbox。表结构与 services/order 的迁移一致。
 func newOrderDBs(t *testing.T) []*sql.DB {
 	t.Helper()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,24 +252,26 @@ func TestCollectAndProbe(t *testing.T) {
 
 func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// 传入的订单库个数与布局不一致时报错，而不是按传入的个数重算布局、把 slot 分到错误的库上。
-func TestOrderShardsRejectsWrongDBCount(t *testing.T) {
+// 订单库的个数必须能构成合法的布局（2 的幂，不超过 slot 数）；合法时每个 slot 恰好归一个库。
+func TestOrderShardsFollowsDBCount(t *testing.T) {
 	t.Parallel()
-	for _, n := range []int{0, 1, sharding.OrderDBs + 1} {
+	for _, n := range []int{0, 3, 16} {
 		if _, err := orderShards(Sources{OrderDBs: make([]*sql.DB, n)}); err == nil {
 			t.Errorf("orderShards with %d dbs succeeded, want error", n)
 		}
 	}
-	shards, err := orderShards(Sources{OrderDBs: make([]*sql.DB, sharding.OrderDBs)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	total := 0
-	for _, slots := range shards {
-		total += len(slots)
-	}
-	if total != sharding.OrderSlots {
-		t.Errorf("shards cover %d slots, want %d", total, sharding.OrderSlots)
+	for _, n := range []int{1, 2, 4, 8} {
+		shards, err := orderShards(Sources{OrderDBs: make([]*sql.DB, n)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, slots := range shards {
+			total += len(slots)
+		}
+		if len(shards) != n || total != sharding.OrderSlots {
+			t.Errorf("%d dbs: %d shards cover %d slots, want %d", n, len(shards), total, sharding.OrderSlots)
+		}
 	}
 }
 
@@ -291,7 +293,7 @@ func newMerchantIndexDBs(t *testing.T) []*sql.DB {
 // 商家索引对账读库：造出一致、缺失、多余、不一致、放错 slot 各一种情况，Collect 读出两侧，Check 逐类报出。
 func TestCollectAndCheckMerchantIndex(t *testing.T) {
 	ords, idx := newOrderDBs(t), newMerchantIndexDBs(t)
-	or, err := sharding.New(sharding.OrderLayout())
+	or, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}

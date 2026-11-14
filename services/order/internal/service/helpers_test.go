@@ -155,7 +155,7 @@ const testSlots = sharding.OrderSlots
 
 func newRouter(t testing.TB) *sharding.Router {
 	t.Helper()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}

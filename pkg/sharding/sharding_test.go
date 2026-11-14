@@ -119,3 +119,44 @@ func TestMerchantIndexLayout(t *testing.T) {
 		}
 	}
 }
+
+// 成倍扩容（ADR-0015）：库数翻倍后，每个旧库恰好搬走一半 slot，全部搬给同一个新库（旧库号加旧库数），
+// 留下的 slot 库号不变。
+func TestDoublingMovesHalfOfEachDBToOneNewDB(t *testing.T) {
+	t.Parallel()
+	for _, dbs := range []int{1, 2, 4} {
+		before, err := New(OrderLayout(dbs))
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := New(OrderLayout(dbs * 2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for db := range dbs {
+			var stay, move int
+			for _, s := range before.SlotsOf(db) {
+				switch after.DB(s) {
+				case db:
+					stay++
+				case db + dbs:
+					move++
+				default:
+					t.Errorf("%d -> %d dbs: slot %d moves from db %d to db %d", dbs, dbs*2, s, db, after.DB(s))
+				}
+			}
+			if stay != move || stay == 0 {
+				t.Errorf("%d -> %d dbs: db %d keeps %d slots and moves %d", dbs, dbs*2, db, stay, move)
+			}
+		}
+	}
+}
+
+func TestOrderLayoutRejectsInvalidDBCount(t *testing.T) {
+	t.Parallel()
+	for _, dbs := range []int{0, 3, 16} {
+		if _, err := New(OrderLayout(dbs)); err == nil {
+			t.Errorf("OrderLayout(%d) accepted", dbs)
+		}
+	}
+}

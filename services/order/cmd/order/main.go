@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -87,7 +88,7 @@ const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
 // 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
-// payment 各 50，合计 150，刚好放得下。分片后 order 连 sharding.OrderDBs 个库、每个库一个池，
+// payment 各 50，合计 150，刚好放得下。分片后 order 连两个库、每个库一个池，
 // 仍用 50 就是 100，合计 200，超过上限后新连接会被拒（Too many connections）。每个库取 25，
 // 两个库合计 50，与分片前持平。库分到不同实例上之后，每个池只占自己那个实例的预算，可以调大。
 const defaultMySQLMaxOpenConns = 25
@@ -158,18 +159,21 @@ func loadConfig() (config, error) {
 	for d := range strings.SplitSeq(cmp.Or(os.Getenv("MYSQL_DSNS"), defaultMySQLDSNs), ",") {
 		cfg.mysqlDSNs = append(cfg.mysqlDSNs, strings.TrimSpace(d))
 	}
-	// 分片布局见 sharding.OrderLayout，是代码里的常量，不随配置变。
-	if len(cfg.mysqlDSNs) != sharding.OrderDBs || slices.Contains(cfg.mysqlDSNs, "") {
-		return cfg, fmt.Errorf("MYSQL_DSNS must have exactly %d non-empty DSNs (order_db_0 .. order_db_%d), got %d",
-			sharding.OrderDBs, sharding.OrderDBs-1, len(cfg.mysqlDSNs))
+	// 库数等于 DSN 的个数（ADR-0015），第 i 个是 i 号库。个数是否合法（2 的幂，不超过 slot 数）由
+	// sharding.New 判断；顺序写反、个数与数据不符由启动时的 shard_meta 核对挡住。
+	if slices.Contains(cfg.mysqlDSNs, "") {
+		return cfg, errors.New("MYSQL_DSNS has an empty DSN")
+	}
+	if _, err := sharding.New(sharding.OrderLayout(len(cfg.mysqlDSNs))); err != nil {
+		return cfg, fmt.Errorf("MYSQL_DSNS has %d DSNs: %w", len(cfg.mysqlDSNs), err)
 	}
 	if v := os.Getenv("MYSQL_REPLICA_DSNS"); v != "" {
 		for d := range strings.SplitSeq(v, ",") {
 			cfg.mysqlReplicaDSNs = append(cfg.mysqlReplicaDSNs, strings.TrimSpace(d))
 		}
-		if len(cfg.mysqlReplicaDSNs) != sharding.OrderDBs || slices.Contains(cfg.mysqlReplicaDSNs, "") {
-			return cfg, fmt.Errorf("MYSQL_REPLICA_DSNS must have exactly %d non-empty DSNs (replicas of order_db_0 .. order_db_%d), got %d",
-				sharding.OrderDBs, sharding.OrderDBs-1, len(cfg.mysqlReplicaDSNs))
+		if len(cfg.mysqlReplicaDSNs) != len(cfg.mysqlDSNs) || slices.Contains(cfg.mysqlReplicaDSNs, "") {
+			return cfg, fmt.Errorf("MYSQL_REPLICA_DSNS must have one non-empty DSN per entry of MYSQL_DSNS (%d), got %d",
+				len(cfg.mysqlDSNs), len(cfg.mysqlReplicaDSNs))
 		}
 	}
 	switch m := cmp.Or(os.Getenv("ORDER_READ_MODE"), "primary"); m {
@@ -327,7 +331,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	router, err := sharding.New(sharding.OrderLayout())
+	router, err := sharding.New(sharding.OrderLayout(len(cfg.mysqlDSNs)))
 	if err != nil {
 		return err
 	}
@@ -338,7 +342,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			return fmt.Errorf("open order db %d: %w", i, err)
 		}
 		defer db.Close()
-		// 每个库只建自己的 slot 的表。扩容时新库要接收的 slot 由迁移工具建，不由启动迁移建。
+		// 每个库只建自己的 slot 的表。扩容时新库的表是从旧库复制过来的（ADR-0015），这里的迁移在它上面
+		// 整个重跑一遍，靠每条 DDL 可重入而成为空操作，只补上一张空的 outbox。
 		if err := mysqlx.MigrateTemplate(ctx, db, order.Migrations, order.MigrationsDir,
 			order.MigrationData{Slots: router.SlotsOf(i)}); err != nil {
 			return fmt.Errorf("migrate order db %d: %w", i, err)
@@ -358,6 +363,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			replicas[i] = db
 		}
 		storeOpts = append(storeOpts, store.WithReplicas(replicas))
+	}
+	// 在任何读写之前核对：DSN 列表里第 i 个库确实是 i 号库，库里记的总库数与配置一致。
+	if err := store.EnsureShardMeta(ctx, dbs, router); err != nil {
+		return err
 	}
 	st, err := store.New(dbs, router, storeOpts...)
 	if err != nil {
@@ -497,6 +506,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderPaymentEvents),
 		Topics: []string{paymentsTopic},
 		Logger: logger,
+		// 支付结果不能因为订单库抖了一下就进死信：钱已经收了，这条消息是订单变成已支付的唯一途径，
+		// 没有任何任务会重发它（设计文档 1b 的 5.4：长期 notified = 0 的支付单没有人扫）。
+		// 默认的 5 次重试合计只有约 1.5 秒，订单库的一次主从切换、扩容时被搬的 slot 的不可用窗口
+		// （ADR-0015，表被改名期间读写报“表不存在”）都比它长。所以普通错误无限重试，分区停在这里等库恢复；
+		// 业务上的异常由 handler 给出明确的处置，消息本身有问题的由 handler 标成 Permanent 直接进死信，
+		// 都不会走到这里的重试。代价是一条始终失败的消息会一直挡住它所在的分区，要靠积压告警发现（阶段 3）。
+		MaxAttempts: math.MaxInt,
 	}, svc.PaymentEventsHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return err

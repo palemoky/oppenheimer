@@ -27,6 +27,7 @@ const (
 	errLockWaitTimeout = 1205
 	errDeadlock        = 1213
 	errCheckViolated   = 3819
+	errNoSuchTable     = 1146
 )
 
 // Config 是连接池配置。零值字段使用默认值。
@@ -140,6 +141,12 @@ func IsLockWaitTimeout(err error) bool { return hasNumber(err, errLockWaitTimeou
 
 // IsCheckViolation 判断 err 是否为违反 CHECK 约束。
 func IsCheckViolation(err error) bool { return hasNumber(err, errCheckViolated) }
+
+// IsNoSuchTable 判断 err 是否为表不存在。
+//
+// 订单库扩容时，要搬走的分片表在旧库上被改名作为围栏（ADR-0015），之后按旧路由来的读写得到这个错误。
+// 它表示“这个分片暂时不可用”，调用方应当稍后重试，不是数据或代码的问题。
+func IsNoSuchTable(err error) bool { return hasNumber(err, errNoSuchTable) }
 
 func hasNumber(err error, number uint16) bool {
 	myErr, ok := errors.AsType[*mysql.MySQLError](err)

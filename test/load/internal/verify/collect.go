@@ -51,13 +51,10 @@ type Sources struct {
 
 // orderShards 列出每个订单库上的每张分片表所在的库和 slot。对账工具允许全分片扫描。
 //
-// 布局取 sharding.OrderLayout，与 order 服务是同一份。传入的库数必须与布局一致：少给一个库时
-// 若按传入的个数重算布局，slot 会被分到错误的库上，对账就悄悄漏读了分片。
+// 布局取 sharding.OrderLayout，库数等于传入的库的个数，与 order 服务的算法是同一份（ADR-0015）。
+// 少给一个库不会悄悄漏读：按更少的库数算出的布局会去库里找不属于它的 slot 的表，查询直接报表不存在。
 func orderShards(src Sources) (map[int][]int, error) {
-	if len(src.OrderDBs) != sharding.OrderDBs {
-		return nil, fmt.Errorf("verify: got %d order dbs, layout has %d", len(src.OrderDBs), sharding.OrderDBs)
-	}
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(len(src.OrderDBs)))
 	if err != nil {
 		return nil, fmt.Errorf("build order shard router: %w", err)
 	}
@@ -66,6 +63,18 @@ func orderShards(src Sources) (map[int][]int, error) {
 		out[db] = r.SlotsOf(db)
 	}
 	return out, nil
+}
+
+// seededUserBase 是造数工具（load seed）的用户号起点，与 seed.UserBase 相同。
+//
+// 造出来的历史订单直接写进订单库，在 payment、inventory 里没有对应的支付单和预占，也不在账本里。
+// 对账只看真实流量产生的订单，按用户号把它们排除（设计文档 1c 的 5.3）。条件走 idx_orders_user
+// 的范围扫描，不会把几百万行造数读出来。
+const seededUserBase int64 = 1 << 40
+
+// notSeeded 返回排除造数订单的 WHERE 子句，col 前缀用于带表别名的查询。
+func notSeeded(prefix string) string {
+	return fmt.Sprintf(" WHERE %suser_id < %d", prefix, seededUserBase)
 }
 
 // ConsumedTopics 是被消费的 topic 的基础名，每个有一个死信 topic。
@@ -164,7 +173,7 @@ func collectOrders(ctx context.Context, src Sources, s *Snapshot) error {
 		for _, slot := range slots {
 			orders, items := sharding.Table("orders", slot), sharding.Table("order_items", slot)
 			if err := queryEach(ctx, conn, `SELECT order_id, user_id, status, total_amount, currency,
-		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM `+orders, func(r *sql.Rows) error {
+		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM `+orders+notSeeded(""), func(r *sql.Rows) error {
 				o := Order{Items: map[int64]int64{}}
 				if err := r.Scan(&o.OrderID, &o.UserID, &o.Status, &o.TotalAmount, &o.Currency,
 					&o.IdempotencyKey, &o.PaymentID, &o.FailReason); err != nil {
@@ -177,7 +186,7 @@ func collectOrders(ctx context.Context, src Sources, s *Snapshot) error {
 				return err
 			}
 			// 订单和明细同槽同库，明细只会落在订单所在的那张分片表。
-			if err := queryEach(ctx, conn, "SELECT order_id, sku_id, quantity FROM "+items, func(r *sql.Rows) error {
+			if err := queryEach(ctx, conn, "SELECT i.order_id, i.sku_id, i.quantity FROM "+items+" i JOIN "+orders+" o ON o.order_id = i.order_id"+notSeeded("o."), func(r *sql.Rows) error {
 				var orderID, sku, qty int64
 				if err := r.Scan(&orderID, &sku, &qty); err != nil {
 					return err
@@ -230,7 +239,7 @@ func collectMerchantIndex(ctx context.Context, src Sources, s *Snapshot) error {
 	for db, slots := range orderShards {
 		for _, slot := range slots {
 			q := "SELECT order_id, merchant_id, status, total_amount, version FROM " +
-				sharding.Table("orders", slot) + " WHERE merchant_id IS NOT NULL"
+				sharding.Table("orders", slot) + notSeeded("") + " AND merchant_id IS NOT NULL"
 			if err := queryEach(ctx, src.OrderDBs[db], q, scan(slot, &data.Orders)); err != nil {
 				return err
 			}
@@ -243,7 +252,7 @@ func collectMerchantIndex(ctx context.Context, src Sources, s *Snapshot) error {
 	}
 	for db, conn := range src.MerchantIndexDBs {
 		for _, slot := range r.SlotsOf(db) {
-			q := "SELECT order_id, merchant_id, status, total_amount, src_version FROM " + sharding.Table("merchant_orders", slot)
+			q := "SELECT order_id, merchant_id, status, total_amount, src_version FROM " + sharding.Table("merchant_orders", slot) + notSeeded("")
 			if err := queryEach(ctx, conn, q, scan(slot, &data.Index)); err != nil {
 				return err
 			}

@@ -5,6 +5,9 @@
 //	slot = 分片键 & (Slots-1)
 //	db   = slot % DBs
 //
+// 成倍扩容（DBs 翻倍）时，slot s 从 s % DBs 号库搬到 s % (2*DBs) 号库：每个旧库恰好搬走一半 slot，
+// 且只搬给一个新库（旧库号加 DBs），留下的 slot 库号不变。
+//
 // 订单号由 idgen 生成，最低 6 位是用户号的低 6 位（分片基因），所以按订单号和按用户号
 // 算出的 slot 相同。表名带全局 slot 号（orders_3），一个 slot 的表可以整体搬到另一个库，
 // 不用改名。布局的取舍见 ADR-0012。
@@ -26,18 +29,19 @@ type Config struct {
 	DBs   int
 }
 
-// 订单数据的分片布局（ADR-0012）：8 个 slot 分在 2 个库上。order 服务、对账工具和测试都引用这里，
+// OrderSlots 是订单数据的 slot 数（ADR-0012）。order 服务、对账工具和测试都引用这里，
 // 不各写一份：两处不一致时，按另一种布局去读的一方会悄悄漏掉分片。
 //
-// 写成常量而不是配置：配置错了数据就找不到了，改它是一次数据迁移，不是一次重启。
+// 写成常量而不是配置：改它要拆表，是一次数据迁移，不是一次重启。
 // 用常量而不是包级变量，是为了不让任何地方在运行时改掉它。
-const (
-	OrderSlots = 8
-	OrderDBs   = 2
-)
+const OrderSlots = 8
 
-// OrderLayout 返回订单数据的分片布局，即 Config{Slots: OrderSlots, DBs: OrderDBs}。
-func OrderLayout() Config { return Config{Slots: OrderSlots, DBs: OrderDBs} }
+// OrderLayout 返回订单数据在 dbs 个库上的分片布局。
+//
+// 库数不是常量（ADR-0015）：它等于部署配置里订单库 DSN 的个数，成倍扩容时从 2 变 4。
+// 配置和数据对不上的风险由每个库里的 shard_meta 表挡住：order 启动时核对本库的序号和总库数，
+// 不符就拒绝启动，见 services/order/internal/store.EnsureShardMeta。
+func OrderLayout(dbs int) Config { return Config{Slots: OrderSlots, DBs: dbs} }
 
 // 商家维度订单索引的分片布局（ADR-0014）：4 个 slot 分在 2 个库上，按 merchant_id 分片。
 // 它和订单的布局互相独立：同一个订单在订单库里按 user_id 落 slot，在索引库里按 merchant_id 落 slot。

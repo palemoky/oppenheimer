@@ -23,7 +23,7 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	router, err := sharding.New(sharding.OrderLayout())
+	router, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func (f *fixture) rows(t *testing.T, base string, slot int, orderID int64) int {
 
 func TestNewValidatesDatabases(t *testing.T) {
 	t.Parallel()
-	router, err := sharding.New(sharding.OrderLayout())
+	router, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}

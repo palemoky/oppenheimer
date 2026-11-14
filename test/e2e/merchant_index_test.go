@@ -557,7 +557,7 @@ func (o *orderShards) forUser(user int64) *sql.DB { return o.dbs[o.router.DB(o.r
 
 func orderTable(t testing.TB, user int64) string {
 	t.Helper()
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +571,7 @@ func openOrderDBs(t testing.TB) *orderShards {
 	if len(dsns) == 0 {
 		return nil
 	}
-	r, err := sharding.New(sharding.OrderLayout())
+	r, err := sharding.New(sharding.OrderLayout(2))
 	if err != nil {
 		t.Fatal(err)
 	}
