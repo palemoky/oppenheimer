@@ -1,13 +1,16 @@
 package service
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
@@ -32,6 +35,11 @@ const listTimeout = 3 * time.Second
 // 这里没有能证明新鲜的依据，所以读主库。这条查询走 idx_orders_user、只读一个分片的一小段索引，
 // 主库多承担它的代价不大。以后要分流，需要在每个写订单的地方再按用户打一份 pin 和 GTID 标记
 // （用户和订单在同一个库，按订单读出的主库位置对用户同样有效）。
+//
+// 已归档的订单（设计文档 1c 第 6.6 节）：配置了冷库时，结果是热库和冷库的并集按订单号倒序的精确分页，
+// 游标仍然是订单号。先查热库，必要时（见 mayNeedCold）再用同样的条件查冷库，两边归并（见 mergeNewestFirst）。
+// 先热后冷，理由同 loadCold：数据只从热流向冷、写冷在删热之前，一个订单在两次查询之间被归档，
+// 先查热时它还在热库，后查冷时它已经在冷库，至少一边看得到；反过来两边都可能看不到。
 func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
 	q, err := validateListUserOrders(req)
 	if err != nil {
@@ -43,6 +51,14 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 	if err != nil {
 		return nil, s.internal(ctx, "list user orders", err, "user_id", req.GetUserId())
 	}
+	if s.cold != nil && s.mayNeedCold(rows, more) {
+		cold, moreCold, err := s.cold.ListUserOrders(ctx, q)
+		if err != nil {
+			// 不悄悄只返回热库的部分：那样这一页会漏掉已归档的订单，而且 more 可能是错的，翻页就此结束。
+			return nil, s.internal(ctx, "list archived user orders", err, "user_id", req.GetUserId())
+		}
+		rows, more = mergeNewestFirst(rows, more, cold, moreCold, q.Limit)
+	}
 	resp := &orderv1.ListUserOrdersResponse{Orders: make([]*orderv1.OrderSummary, 0, len(rows))}
 	for _, r := range rows {
 		resp.Orders = append(resp.Orders, toSummaryProto(r))
@@ -51,6 +67,40 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 		resp.NextBeforeOrderId = rows[len(rows)-1].OrderID
 	}
 	return resp, nil
+}
+
+// mayNeedCold 判断热库这一页（hot、moreHot）之外，是否还需要查冷库才能得出精确的一页。
+//
+// 热库返回了满页（moreHot 为真，说明后面肯定还有），而且这一页最后一条的订单号新于 now - MinHotAge 时不需要：
+// 冷库里的订单号都早于 now - MinHotAge（不变量 3；now 只会往后走，这条只会更宽松），
+// 比这一页的每一条都小，挤不进这一页；more 也已经确定为真。活跃用户的头几页因此只走热库。
+//
+// 条件里必须有 moreHot：热库刚好用完一页（或不满一页）时，后面有没有下一页要看冷库里还有没有，
+// 不查冷库就会在冷库还有订单时答 more=false，翻页提前结束。
+func (s *Service) mayNeedCold(hot []store.OrderSummary, moreHot bool) bool {
+	return !moreHot || archive.MaybeCold(hot[len(hot)-1].OrderID, s.now())
+}
+
+// mergeNewestFirst 把热库和冷库各自按同样的条件取出的一页（各至多 limit 条，按订单号倒序）归并成
+// 两库并集的一页：按订单号倒序、去重、取前 limit 条，并算出并集里这一页之后是否还有。
+//
+// 为什么这一页是对的：记 H、C 为两库里满足条件的全部订单，U = H ∪ C。U 的前 limit 条里任何一条 x，
+// 如果来自 H，则 H 里比 x 大的都在 U 里也比 x 大，不到 limit 条，所以 x 在 H 的前 limit 条里；C 同理。
+// 所以 U 的前 limit 条都在 hot ∪ cold 里，hot ∪ cold 的前 limit 条就是 U 的前 limit 条。
+//
+// 为什么 more 是对的（more 为真当且仅当 |U| > limit）：
+//   - moreHot 为真说明 |H| > limit，于是 |U| ≥ |H| > limit；moreCold 同理；
+//   - 两者都为假时 hot = H、cold = C，归并去重的结果就是整个 U，|U| > limit 当且仅当归并结果多于 limit 条。
+//
+// 一个订单可能在“已写冷、未删热”的瞬间两边都有，内容相同（设计文档 1c 第 6.3 节不变量 1），只留一条。
+// 热库那条排在前面、稳定排序保持这个先后、CompactFunc 留每段相同元素的第一个，所以留下的是热库那条。
+// 两边各至多 MaxListPageSize 条，拼起来整体排序就够了，不值得手写双指针归并。
+func mergeNewestFirst(hot []store.OrderSummary, moreHot bool, cold []store.OrderSummary, moreCold bool, limit int) ([]store.OrderSummary, bool) {
+	all := slices.Concat(hot, cold)
+	slices.SortStableFunc(all, func(a, b store.OrderSummary) int { return cmp.Compare(b.OrderID, a.OrderID) })
+	all = slices.CompactFunc(all, func(a, b store.OrderSummary) bool { return a.OrderID == b.OrderID })
+	more := moreHot || moreCold || len(all) > limit
+	return all[:min(len(all), limit)], more
 }
 
 func validateListUserOrders(req *orderv1.ListUserOrdersRequest) (store.UserOrdersQuery, error) {

@@ -19,6 +19,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
@@ -285,6 +286,16 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 	o, err := orderFromSubmitted(m)
 	if err != nil {
 		return err
+	}
+
+	// 订单号老到可能已经归档的，不再落库（设计文档 1c 第 6.6 节，不变量“数据只从热到冷”）。
+	// 这只会是一条被重放的陈年消息。放它过去的话，热库里会重新插入一个已经归档的订单号：
+	// 新行的版本号从 0 开始、状态是创建失败，而读路径先查热库，会用它盖住冷库里真正的订单。
+	// 在认领之前丢弃；它的占用早已被回收任务处理。
+	if archive.MaybeCold(o.OrderID, s.now()) {
+		s.logger.ErrorContext(ctx, "order submission dropped, order id is older than the minimum hot age",
+			"order_id", o.OrderID, "accepted_at", idgen.Time(o.OrderID).Format(time.RFC3339), "min_hot_age", archive.MinHotAge.String())
+		return nil
 	}
 
 	// 1. 认领。占用不存在说明它已被回收（受理方发消息失败后撤销，或回收任务），

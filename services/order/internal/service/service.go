@@ -38,6 +38,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/outbox"
 	"github.com/palemoky/oppenheimer/pkg/retry"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/order/internal/archive"
 	"github.com/palemoky/oppenheimer/services/order/internal/readmark"
 	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
@@ -165,6 +166,10 @@ type Deps struct {
 	OrderCache *cache.Cache[*orderv1.Order]
 	// Marks 是读己之写的标记（闸门所在的 Redis 实例）。Config.ReadMode 为 ReadPrimary 时可以为空。
 	Marks *readmark.Marks
+	// Cold 可选，冷库（已归档订单，设计文档 1c 第 6 节）。为空时没有冷库路径：
+	// 热库里没有的订单就是不存在。有数据归档之后必须配置，否则已归档的订单查不到，
+	// 针对它们的支付结果会被当成“订单不存在”而要求退款。
+	Cold *store.Cold
 }
 
 // Service 实现 orderv1.OrderServiceServer。
@@ -196,6 +201,7 @@ type Service struct {
 	pinTTL         time.Duration
 	gtidTTL        time.Duration
 	gtidWait       time.Duration
+	cold           *store.Cold
 }
 
 // New 返回 Service。读模式与依赖不匹配（要读从库却没有从库或标记）时返回错误：
@@ -245,6 +251,7 @@ func New(d Deps, cfg Config) (*Service, error) {
 		pinTTL:         cmp.Or(cfg.ReadPinTTL, DefaultReadPinTTL),
 		gtidTTL:        cmp.Or(cfg.ReadGTIDTTL, DefaultReadGTIDTTL),
 		gtidWait:       cmp.Or(cfg.ReadGTIDWait, DefaultReadGTIDWait),
+		cold:           d.Cold,
 	}, nil
 }
 
@@ -648,6 +655,8 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 // display 为 true 表示结果只用来展示（GetOrder），第一次读行可以按读模式走从库（见 loadDisplayRow）。
 // 最后那次复查无论如何都读主库：“订单不存在”只由主库说了算。否则从库落后时，一个已经走到终态、
 // 占用已归还而从库还没复制到的订单会被答成不存在，还可能把不存在写进缓存。
+//
+// 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
 	var (
 		o           *orderv1.Order
@@ -681,7 +690,37 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 		}
 		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
 	}
-	return s.loadRow(ctx, orderID)
+	if o, ok, err := s.loadRow(ctx, orderID); err != nil || ok {
+		return o, ok, err
+	}
+	// 走到这里，热库主库已经确认没有这一行。这是 fetch 里唯一一个返回“不存在”的出口
+	// （上面从库或第一次读没查到的情况都会落到这里或合成 CREATING），所以冷库只在这里查一次。
+	return s.loadCold(ctx, orderID)
+}
+
+// loadCold 在热库主库确认没有订单之后查冷库（设计文档 1c 第 6.6 节）。ok 为 false 表示订单不存在。
+//
+// 只能在热库主库确认没有之后调用，不能提前、不能和热库并行：数据只从热流向冷，而且归档任务写冷在删热之前。
+// 先查热没查到，要么订单不存在，要么已经从热库删了，而删之前冷库里一定已经有了，所以接着查冷不会漏。
+// 反过来先查冷再查热，会在“还没写冷”时查冷、“已经删热”后查热，两头落空，把一个存在的订单说成不存在。
+// 也不能拿从库的“没有”当依据：从库没有的行主库上可能有，而一个留在热库里的订单（例如卡住的非终态旧订单）
+// 永远不会进冷库，只问冷库就会把它答成不存在。“热库没有”和“不存在”一样只由主库说了算，
+// 所以 fetch 里从库没查到时一定先回主库确认，再到这里。
+//
+// 订单号新于 now - MinHotAge 的一定不在冷库，直接答不存在，不碰冷库：热订单的读路径没有额外开销，
+// 冷库不可用也不影响它们。冷库查询出错时返回错误而不是“不存在”，上层不会把它写进负缓存。
+func (s *Service) loadCold(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
+	if s.cold == nil || !archive.MaybeCold(orderID, s.now()) {
+		return nil, false, nil
+	}
+	o, err := s.cold.GetOrder(ctx, orderID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, s.internal(ctx, "load archived order", err, "order_id", orderID)
+	}
+	return toProto(o), true, nil
 }
 
 // loadDisplayRow 是展示读的 loadRow：按读模式和标记决定读主库还是从库（见 useReplica）。

@@ -85,6 +85,10 @@ const (
 const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
 
+// archiveMaxOpenConns 是冷库的连接池上限。冷库只承接旧订单的查询，量很小；
+// 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
+const archiveMaxOpenConns = 10
+
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
 // 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
@@ -111,6 +115,8 @@ type config struct {
 	readPinTTL       time.Duration
 	readGTIDTTL      time.Duration
 	readGTIDWait     time.Duration
+	// archiveDSN 是冷库（已归档订单）的 DSN，为空表示没有冷库路径。
+	archiveDSN string
 	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
 	mysqlMaxOpenConns int
 	workerID          int64
@@ -190,6 +196,7 @@ func loadConfig() (config, error) {
 	if cfg.readMode != service.ReadPrimary && cfg.mysqlReplicaDSNs == nil {
 		return cfg, fmt.Errorf("ORDER_READ_MODE=%s needs MYSQL_REPLICA_DSNS", cfg.readMode)
 	}
+	cfg.archiveDSN = strings.TrimSpace(os.Getenv("ARCHIVE_DSN"))
 	maxOpen, err := envInt("MYSQL_MAX_OPEN_CONNS", defaultMySQLMaxOpenConns)
 	if err != nil {
 		return cfg, err
@@ -372,6 +379,22 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 冷库是可选的只读依赖（设计文档 1c 第 6 节）。一旦有订单归档过就必须配上，
+	// 否则已归档的订单查不到。迁移在这里也跑一遍，和归档任务用的是同一套、同一把迁移锁。
+	var cold *store.Cold
+	if cfg.archiveDSN != "" {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns})
+		if err != nil {
+			return fmt.Errorf("open archive db: %w", err)
+		}
+		defer db.Close()
+		if err := mysqlx.MigrateTemplate(ctx, db, order.ArchiveMigrations, order.ArchiveMigrationsDir,
+			order.NewArchiveMigrationData()); err != nil {
+			return fmt.Errorf("migrate archive db: %w", err)
+		}
+		cold = store.NewCold(db)
+	}
+	logger.Info("order archive", "configured", cold != nil)
 
 	ids, err := idgen.New(cfg.workerID)
 	if err != nil {
@@ -472,6 +495,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		OrderCache: orderCache,
 		// 标记放在闸门那个实例上（noeviction）：被淘汰的标记等于提前到期。
 		Marks: readmark.New(rdb, cfg.redisPrefix),
+		Cold:  cold,
 	}, service.Config{
 		PaymentTimeout:    cfg.paymentTimeout,
 		IdempotencyTTL:    cfg.idempotencyTTL,

@@ -189,6 +189,8 @@ type env struct {
 	// replicas 是 store 的“从库”（见 envOptions），没有从库时为空。
 	replicas []*sql.DB
 	marks    *readmark.Marks
+	// coldDB 是冷库（见 envOptions.cold），没有时为空。
+	coldDB *sql.DB
 
 	// consumed[db] 是 consumeEvents 在第 db 个库的 outbox 里已经处理到的行数；
 	// simulated 是它代替库存服务发起的调用次数。
@@ -244,6 +246,8 @@ type envOptions struct {
 	// pinTTL、gtidWait 对应 Config 的同名字段，零值用默认值。
 	pinTTL   time.Duration
 	gtidWait time.Duration
+	// cold 为 true 时建一个冷库并接到 Service 上。
+	cold bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -319,7 +323,12 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 	}
 	sender := &fakeSender{}
 	e := &env{dbs: dbs, router: router, relays: relays, replicas: replicas, marks: marks}
-	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger, Marks: marks}, Config{
+	var cold *store.Cold
+	if opts.cold {
+		e.coldDB = testdb.NewTemplate(t, order.ArchiveMigrations, order.ArchiveMigrationsDir, order.NewArchiveMigrationData())
+		cold = store.NewCold(e.coldDB)
+	}
+	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger, Marks: marks, Cold: cold}, Config{
 		Clock:            clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,
