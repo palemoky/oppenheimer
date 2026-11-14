@@ -96,7 +96,8 @@
              - 实测要点（490 万行的 `index`）：无差异时树 4.8 秒、传约 1.7 万个摘要，全量归并 7.8 秒、545 MB；1 行差异多 0.3 秒；9612 行均匀散布的差异打中 95% 的节点，树比归并慢。交叉点取决于差异落在多少个节点里。
              - 推送后的 CI（`b09a74e`）：27 项里 26 项通过，新模块的 `lint (./services/recon)` 30 秒、`test (./services/recon)` 1 分 39 秒。失败的一项是 `envoy`（`make envoy-validate`）：前三个配置 OK，`deploy/envoy/orderindex.yaml` 那一次什么也没输出就失败了。这次推送没有改 `deploy/envoy/`，本机五个配置都通过。**根因没有找到**：原来的写法是 `docker run ... | tail -1 | grep OK`，失败时把校验器的输出丢掉了，日志里没有可看的东西。已把 `envoy-validate` 改成失败时打印 docker 的退出码和完整输出并重新推送；再出现时看那段输出（怀疑是 `docker run` 本身偶发失败，没有证据）。
              - 重新推送后（`1ac7c1c`）CI 27 项全部通过，`envoy` 这次也过了，所以那次失败的原因仍然不知道（最长的是 e2e 3 分 52 秒，其次 `test (./services/order)` 3 分 44 秒）。
-             - 下一步：1d 步骤六（埋点），动工前先细化设计文档。
+             - **增量对账（窗口的下界）已加，已分 2 个提交推送到 PR #7**（2026-11-14，主人提出）：`recon -since 26h` 只比最近 26 小时的订单，和 `-settle` 合成一个窗口；`archive` 不支持。设计文档 7.17，ADR-0022 有补充。`make lint` 和 recon 模块的测试通过；本机 `index` 全量 4.7 秒、`-since 26h` 0.27 秒。改的文件：`services/recon/` 下的 `sql.go`、`source.go`、`rows.go`、`compare.go`、`report.go`、`cmd/recon/main.go` 和测试，`Makefile` 的帮助，三份文档。
+             - 下一步：确认这次推送的 CI（`gh pr checks 7`）；然后是 1d 步骤六（埋点），动工前先细化设计文档。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
      - 按用户的列表固定读主库，没有分流到从库（要在写路径上按用户再打一份读己之写标记）。
@@ -142,7 +143,7 @@
   - `make e2e`、`make test` 不受影响，它们用旧的两个实例上独立的库。
 - 依赖在运行，六个服务**已停止**（2026-11-14 跑 1d 的压测前停的）。要起来用 `ORDER_DBS=4 make run`。停止时按进程号杀 `scripts/run-local.sh`，不要用 `pkill -f`（见会话日志的教训）。
 - 共享的 `mysql` 实例的 `max_connections` 是 400（compose 里设的）。
-- 对账：`ORDER_DBS=4 make recon`（只读，约 6 秒；不带 `ORDER_DBS=4` 会报 `orders_2` 不存在）。实测的原始输出和归档前的快照在 `tmp/recon/`。2026-11-14 最后一次运行四对加 `archive` 都没有差异。
+- 对账：`ORDER_DBS=4 make recon`（只读，约 6 秒；增量用 `RECON_ARGS="-since 26h"`；不带 `ORDER_DBS=4` 会报 `orders_2` 不存在）。实测的原始输出和归档前的快照在 `tmp/recon/`。2026-11-14 最后一次运行四对加 `archive` 都没有差异。
 - 归档：`ORDER_DBS=4 make archive`（本机是 4 个库，不带 `ORDER_DBS=4` 会被 `shard_meta` 校验拒绝），`make archive-dry-run` 只数不搬，`make archive-reclaim` 重建热表回收空间，参数用 `ARCHIVE_ARGS` 传。这次实跑的原始输出在 `tmp/archive/`。
 - Kafka 的 Web 界面：`make kafka-ui` 启动 kafbat-ui（compose 的 `ui` profile，只读，http://127.0.0.1:8090），`make kafka-ui-down` 停止。看消费组的 lag 要点进具体的消费组。消息体是 protobuf，没有配置解码，看到的是原始字节。当前处于运行状态。
 - 造数：`make seed-orders`（可中断续跑）、`make seed-report`。扩容：`scripts/expand.sh`（不带参数看用法），演练的状态文件在 `tmp/expand/`。
