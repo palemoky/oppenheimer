@@ -39,6 +39,7 @@
 
 1. 下一步：
    - 步骤四已分 6 个提交推送（`baa80e3` 到 `e2a01c8`，在 draft PR #6 里），CI 的 24 项检查全部通过（2026-11-14）。
+   - **CI 偶发失败，根因没有找到**：文档提交 `9a219ff` 的那次运行里，`test (./pkg)` 的 `TestMigrateConcurrentOnEmptyDB` 失败一次，8 个并发迁移中的一个报 `missing zero version migration`（goose 在版本表存在但没有 0 号记录时报这个错）。这次提交只改了文档，前一次运行（`e2a01c8`，代码相同）是通过的；本机带 `-race` 连跑 150 次没有复现。已经排除的：迁移锁的加锁、解锁和锁名（`pkg/mysqlx` 的 `getLockLocker`）读下来没有问题；goose v3.30.0 的 `up` 是先拿锁再建版本表、再读版本。一个没有证实的怀疑：MySQL 的建表会隐式提交，goose 把“建版本表”和“插入 0 号记录”放在一个事务里并带重试，如果插入那一步失败过一次，重试时看到表已存在就直接往下走，读到的是空表。再出现时先看失败的是不是第一个拿到锁的迁移。这关系到多实例同时在空库上启动，不只是测试问题。
    - 步骤四的结果在设计文档 5.11。最后一次 `make lint test e2e` 通过（2026-11-14，扩容之后）。`make chaos` 这次没有跑。
    - **补商家索引这一半的造数报告**：索引消费者只有约 2000 行/秒，演练结束时积压约 547 万条。追上后（`kafka-consumer-groups.sh --describe --group orderindex.cdc-orders` 的 lag 归零）跑 `make seed-report SEED_ARGS="-order-dsns <4 个库的 DSN，见 scripts/expand.sh env>"`，把索引的均匀度和商家列表的延迟补进 5.11，勾掉计划里对应的一项。
    - 然后做 **1c 步骤五**（冷热归档），动工前先细化设计文档第 6 节并写 ADR，主人确认后再实现。归档就用本机现在这批 500 万单的数据。
