@@ -9,13 +9,30 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"time"
 )
 
+// 压测模式。
+const (
+	// ModeClosed 是闭环：每个虚拟用户提交、轮询到终态、再提交下一单。系统变慢时请求也跟着变少。
+	ModeClosed = "closed"
+	// ModeOpen 是开环：按固定的到达速率发请求，不管上一个有没有返回。见 open.go。
+	ModeOpen = "open"
+)
+
 // Config 是一次压测的参数。
 type Config struct {
+	// Mode 是 ModeClosed 或 ModeOpen，空表示闭环。
+	Mode string
+	// Rate、MaxInFlight、Drain 只用于开环：每秒发出的下单请求数、在途请求上限、
+	// 发送停止后收尾（轮询受理订单的最终状态）的最长时间。
+	Rate        float64
+	MaxInFlight int
+	Drain       time.Duration
+
 	// BaseURL 是网关地址，例如 http://127.0.0.1:8080。
 	BaseURL string
 	// Concurrency 是虚拟用户数。
@@ -115,6 +132,24 @@ func (c *Config) Validate() error {
 	}
 	if len(c.RunID) > maxRunIDLen {
 		errs = append(errs, fmt.Errorf("run id longer than %d characters", maxRunIDLen))
+	}
+	switch c.Mode {
+	case "", ModeClosed:
+	case ModeOpen:
+		if !(c.Rate > 0) || math.IsInf(c.Rate, 0) {
+			errs = append(errs, errors.New("open mode: rate must be > 0"))
+		}
+		if c.Duration <= 0 || c.Orders > 0 {
+			errs = append(errs, errors.New("open mode: set duration (and not orders)"))
+		}
+		if c.MaxInFlight < 1 {
+			errs = append(errs, errors.New("open mode: max in flight must be >= 1"))
+		}
+		if c.Drain <= 0 {
+			errs = append(errs, errors.New("open mode: drain must be > 0"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("mode must be %s or %s", ModeClosed, ModeOpen))
 	}
 	return errors.Join(errs...)
 }

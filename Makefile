@@ -102,11 +102,11 @@ chaos: build ## 杀进程对账测试：压测期间随机 kill -9 服务，静�
 	scripts/chaos.sh
 
 .PHONY: bench
-bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本）
+bench: build ## 下单吞吐压测：在独立的 bench_* 库上逐档启动服务并压测（需要先 make up，BENCH_* 变量见脚本；BENCH_OPEN=1 加开环档位，BENCH_POLL=1 加轮询压力对比）
 	scripts/bench.sh
 
 .PHONY: load
-load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"
+load: ## 压测网关（需要服务已启动），参数用 LOAD_ARGS 传，例如 make load LOAD_ARGS="-c 100 -duration 30s"（开环：-mode open -rate 1000 -duration 30s）
 	go run ./test/load run $(LOAD_ARGS)
 
 .PHONY: seed

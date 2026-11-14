@@ -1,6 +1,7 @@
 // Command load 是订单系统的压测工具。
 //
-//	load run [flags]      对网关压测，输出指标和客户端账本
+//	load run [flags]      对网关压测（闭环或开环），输出指标和客户端账本
+//	load poll [flags]     只查询订单的压力，用来叠加在下单压力上
 //	load verify [flags]       用账本和服务端数据对账（7.3.3 节）
 //	load wait-quiet [flags]   等系统静止（7.3.2 节第 3 步）
 //	load warmup [flags]       通过库存服务把 SKU 装载进闸门
@@ -37,7 +38,8 @@ func main() {
 const usage = `usage: load <command> [flags]
 
 commands:
-  run      run the load test against the gateway
+  run      run the load test against the gateway (-mode closed|open)
+  poll         query recently accepted orders at a steady rate (read pressure beside a run)
   verify       reconcile a ledger against server data (design 7.3.3)
   wait-quiet   wait until outboxes, consumer lag, unfinished orders and gate holds are all zero
   warmup       load skus into the stock gate through the inventory service
@@ -55,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "run":
 		return runCmd(args[1:], stdout, stderr)
+	case "poll":
+		return pollCmd(args[1:], stdout, stderr)
 	case "verify":
 		return verifyCmd(args[1:], stdout, stderr)
 	case "wait-quiet":
@@ -85,15 +89,20 @@ func runCmd(args []string, stdout, stderr io.Writer) int {
 		jsonPath   string
 		logLevel   string
 	)
+	fs.StringVar(&cfg.Mode, "mode", runner.ModeClosed, "closed: virtual users submit, poll to a final state, then submit again; "+
+		"open: send at a fixed arrival rate (-rate) regardless of responses, poll the accepted orders after the run")
+	fs.Float64Var(&cfg.Rate, "rate", 0, "open mode: order submissions per second (required, > 0)")
+	fs.IntVar(&cfg.MaxInFlight, "max-in-flight", 2000, "open mode: max requests in flight; a request due while the limit is reached is not sent and counted as dropped")
+	fs.DurationVar(&cfg.Drain, "drain", 60*time.Second, "open mode: max time after sending stops to poll the accepted orders to a final state")
 	fs.StringVar(&cfg.BaseURL, "addr", "http://127.0.0.1:8080", "gateway base URL")
-	fs.IntVar(&cfg.Concurrency, "c", 50, "number of virtual users")
+	fs.IntVar(&cfg.Concurrency, "c", 50, "number of virtual users (closed mode)")
 	fs.DurationVar(&cfg.Duration, "duration", 0, "stop starting new orders after this long (exclusive with -orders)")
 	fs.Int64Var(&cfg.Orders, "orders", 0, "total number of orders to submit (exclusive with -duration)")
 	fs.StringVar(&skus, "skus", "1001,1002", "comma-separated sku ids, one picked at random per order")
 	fs.IntVar(&quantity, "qty", 1, "quantity per order")
 	fs.Float64Var(&cfg.PayRatio, "pay", 0.5, "fraction of landed orders to pay")
 	fs.Float64Var(&cfg.CancelRatio, "cancel", 0.2, "fraction of landed orders to cancel; the rest are left to time out")
-	fs.DurationVar(&cfg.PollInterval, "poll-interval", 100*time.Millisecond, "interval between order queries")
+	fs.DurationVar(&cfg.PollInterval, "poll-interval", 100*time.Millisecond, "interval between order queries (open mode: between drain sweeps)")
 	fs.DurationVar(&cfg.PollTimeout, "poll-timeout", 30*time.Second, "give up polling one order after this long (per stage)")
 	fs.DurationVar(&cfg.RequestTimeout, "req-timeout", 5*time.Second, "timeout of a single HTTP request")
 	fs.IntVar(&cfg.SubmitAttempts, "submit-attempts", 5, "max submit requests per order, retries reuse the idempotency key")

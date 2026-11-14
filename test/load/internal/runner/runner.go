@@ -88,7 +88,12 @@ func Run(ctx context.Context, cfg Config, led *ledger.Writer) (*Report, error) {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = newHTTPClient(cfg.Concurrency)
+		if cfg.Mode == ModeOpen {
+			// 开环下在途请求可以到 MaxInFlight 个，连接池跟着它走，否则会不停地新建连接。
+			cfg.HTTPClient = newHTTPClient(cfg.MaxInFlight)
+		} else {
+			cfg.HTTPClient = newHTTPClient(cfg.Concurrency)
+		}
 	}
 
 	rootCtx, cancelRoot := context.WithCancel(ctx)
@@ -99,6 +104,10 @@ func Run(ctx context.Context, cfg Config, led *ledger.Writer) (*Report, error) {
 		var cancelWindow context.CancelFunc
 		windowCtx, cancelWindow = context.WithTimeout(rootCtx, cfg.Duration)
 		defer cancelWindow()
+	}
+
+	if cfg.Mode == ModeOpen {
+		return runOpen(ctx, cfg, led)
 	}
 
 	r := &runner{
