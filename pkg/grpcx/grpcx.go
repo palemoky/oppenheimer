@@ -162,6 +162,8 @@ func isServerFault(code codes.Code) bool {
 // Dial 创建到 target 的客户端连接。连接是惰性建立的，Dial 本身不会因为对端不可达而失败。
 //
 // 1a 阶段服务间走明文。没有自带截止时间的调用会被加上 DefaultCallTimeout。
+//
+// 要给这条连接上的调用单独设一个更短的时限（逐跳收紧），加上 WithHopTimeout。
 func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	base := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -172,6 +174,33 @@ func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 		return nil, fmt.Errorf("grpcx: dial %s: %w", target, err)
 	}
 	return conn, nil
+}
+
+// SidecarMargin 是进程里的单跳时限比 Envoy 边车出站路由的 timeout 多出来的那一截。
+//
+// 一跳的预算是边车路由上的那个数（比如 3 秒）；进程里的时限取“预算加这一截”，只做兜底。
+// 两个数不能相等，更不能让进程里的更短：进程里的计时器先启动，相等时总是调用方先放手，边车看到的是
+// “调用方断开了”，而不是“上游超时了”。实测只有边车自己的路由超时到期才计入异常检测（设计文档 1d 的 5.3），
+// 调用方先放手的话，一个卡住的下游永远不会被摘除，每个请求都要等满时限。让边车先超时，它才能数到
+// 连续 5 次并把下游摘掉。兜底的用处是边车不在（直连）或者边车自己卡住时，调用方仍然会放手。
+const SidecarMargin = 500 * time.Millisecond
+
+// WithHopTimeout 给这条连接上的每次调用设一个时限：这一跳最多等 d，同时不超过调用方 ctx 里剩下的时间。
+//
+// 用来逐跳收紧时限（设计文档 1d 的 5.6）。总时限只在入口设一次，经 ctx 往下传；如果每一跳都把剩下的时间
+// 原样交给下一跳，下游卡住时这条链上的每一层会在同一刻超时，谁都来不及做任何处理。给下一跳的时限比自己的短，
+// 上一跳在它超时之后还有时间返回明确的错误或者走降级。
+//
+// 和 timeoutInterceptor 的区别：那个只在调用方没带截止时间时才加一个兜底，这个不管带没带都生效，取两者中更早的。
+// 同一跳在 Envoy 边车的出站路由上也有时限（deploy/envoy/）。d 应当等于边车的那个数加上 SidecarMargin：
+// 边车先超时，慢下游才会被摘除；进程里的保证边车不在或出问题时调用方仍然按时放手。
+func WithHopTimeout(d time.Duration) grpc.DialOption {
+	return grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// context.WithTimeout 本来就取父 ctx 的截止时间和新时限中更早的一个。
+		ctx, cancel := context.WithTimeout(ctx, d)
+		defer cancel()
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
 }
 
 func timeoutInterceptor(timeout time.Duration) grpc.UnaryClientInterceptor {

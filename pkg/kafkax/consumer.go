@@ -7,6 +7,7 @@ import (
 	"hash/maphash"
 	"log/slog"
 	"maps"
+	"math/rand/v2"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -881,7 +882,10 @@ func (c *Consumer) backoff(attempt int) time.Duration {
 		}
 		d *= 2
 	}
-	return min(d, c.cfg.RetryMax)
+	d = min(d, c.cfg.RetryMax)
+	// 加抖动：在 [0.8d, 1.2d) 里均匀取。没有抖动时，同一时刻失败的一批消息（下游挂了，各分区、各 lane、
+	// 各实例都在重试同一个下游）会在同一时刻再试，下游刚恢复就迎来一个同步的洪峰。
+	return d - d/5 + rand.N(2*d/5+1) //nolint:gosec // 抖动不需要密码学强度的随机数
 }
 
 // invoke 调用 handler，把 panic 转成普通错误：一条坏消息不应该让整个进程退出，
