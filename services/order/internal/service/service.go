@@ -647,55 +647,65 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 // fetch 按 order_id 返回订单的当前状态，不核对归属。ok 为 false 表示订单不存在。
 // 返回的错误已经是对外的 gRPC 状态。
 //
-// 受理之后、落库之前，订单库里还没有这一行，这时以闸门里的占用为准，合成一个 CREATING 的订单
-// （只有商品和数量）。占用从受理一直活到订单进入终态，所以“行不存在且占用也不存在”只有两种可能：
-// 订单从未受理过或已被回收；或者在两次读之间订单落库、走完了终态、占用被归还。
-// 后一种用再读一次订单行排除。
+// 先读闸门里的占用，再决定要不要读订单库（设计文档 1d 的 2.4）。占用从受理一直活到订单进入终态，
+// 它的状态说明了订单行可能在哪里：
+//   - 有占用、未认领：落库还没开始。落库流程先认领再插入订单行，所以主库上不可能有这一行。
+//     直接从占用合成一个 CREATING 的订单（只有商品和数量），不读订单库。排队等落库的订单被轮询时
+//     只打 Redis，不和落库抢订单库的连接。
+//   - 有占用、已认领：订单行可能已经在主库上（也可能是“认领了、行还没插入”的那一小段）。
+//     读订单行，没有就从占用合成。
+//   - 没有占用：订单从未受理过、已被回收，或者已经走到终态、占用已归还。读订单行。
 //
-// display 为 true 表示结果只用来展示（GetOrder），第一次读行可以按读模式走从库（见 loadDisplayRow）。
-// 最后那次复查无论如何都读主库：“订单不存在”只由主库说了算。否则从库落后时，一个已经走到终态、
-// 占用已归还而从库还没复制到的订单会被答成不存在，还可能把不存在写进缓存。
+// 为什么没有占用时读一次行就够了：订单走到终态是先提交订单行、发事件，库存服务消费事件之后才归还占用。
+// 所以“占用已经没有了”的那一刻，终态的订单行早已提交，随后这次读（主库）一定看得到；读不到就是不存在。
+// 原来的顺序是先读行、再读占用、再读一次行，第三步就是为了排除“两次读之间订单走完了终态”，
+// 先读占用之后这个窗口不存在了。
+//
+// 未认领时直接答 CREATING 可能比真实状态旧一瞬间（读完占用的下一刻落库开始了）。占用本来就不带状态，
+// 原来的顺序在同样的时刻也会答 CREATING，下一次查询就会更新。
+//
+// display 为 true 表示结果只用来展示（GetOrder），读行可以按读模式走从库（见 loadDisplayRow）。
+// “订单行不存在”无论如何由主库确认：从库没有时再读一次主库。否则从库落后时，一个已经落库
+// 而从库还没复制到的订单会被答成 CREATING（状态往回退）或者不存在（还可能把不存在写进缓存）。
+//
+// 读占用失败（Redis 不可用）时退回到只读订单行：已经落库的订单照常能查到，只有行不存在时才报不可用，
+// 因为这时分不清它是在排队还是不存在。
 //
 // 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
-	var (
-		o           *orderv1.Order
-		ok          bool
-		fromReplica bool
-		err         error
-	)
-	if display {
-		o, ok, fromReplica, err = s.loadDisplayRow(ctx, orderID)
-	} else {
-		o, ok, err = s.loadRow(ctx, orderID)
-	}
-	if err != nil || ok {
-		return o, ok, err
-	}
-	hold, ok, err := s.gate.Get(ctx, orderID)
+	hold, held, err := s.gate.Get(ctx, orderID)
 	if err != nil {
-		s.logger.WarnContext(ctx, "read hold failed", "order_id", orderID, "error", err)
+		s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
+		if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
+			return o, ok, err
+		}
 		return nil, false, status.Error(codes.Unavailable, "stock gate unavailable, retry later")
 	}
-	if ok {
-		// 从库没有这一行而占用已被认领：落库流程先 Claim 再写订单行，所以“已认领”说明主库上可能已经有行，
-		// 只是从库还没复制到。这时以主库为准，否则一个已经 PENDING_PAYMENT 的订单会被答成 CREATING，
-		// 用户看到状态往回退。未认领说明落库还没开始，主库上不可能有行，直接合成，不多读主库。
-		// 用认领状态做判断，把这次主库读限制在确实需要的时候，而不是每次从库查不到都读主库。
-		if fromReplica && hold.Claimed {
-			if o, found, err := s.loadRow(ctx, orderID); err != nil || found {
-				return o, found, err
-			}
-			// 主库也没有：已认领、订单行还没插入的那一小段时间，按占用合成。
-		}
+	if held && !hold.Claimed {
 		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
 	}
-	if o, ok, err := s.loadRow(ctx, orderID); err != nil || ok {
+	if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
 		return o, ok, err
 	}
-	// 走到这里，热库主库已经确认没有这一行。这是 fetch 里唯一一个返回“不存在”的出口
-	// （上面从库或第一次读没查到的情况都会落到这里或合成 CREATING），所以冷库只在这里查一次。
+	if held {
+		// 已认领、主库上还没有行：落库正在进行，按占用合成。
+		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
+	}
+	// 走到这里，占用没有，热库主库也确认没有这一行。这是 fetch 里唯一一个返回“不存在”的出口，
+	// 冷库只在这里查一次。
 	return s.loadCold(ctx, orderID)
+}
+
+// loadConfirmed 读已落库的订单行。ok 为 false 时“没有这一行”是主库确认过的：
+// display 为 true 时先按读模式读（可能是从库），从库没有再读一次主库。
+func (s *Service) loadConfirmed(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
+	if display {
+		o, ok, fromReplica, err := s.loadDisplayRow(ctx, orderID)
+		if err != nil || ok || !fromReplica {
+			return o, ok, err
+		}
+	}
+	return s.loadRow(ctx, orderID)
 }
 
 // loadCold 在热库主库确认没有订单之后查冷库（设计文档 1c 第 6.6 节）。ok 为 false 表示订单不存在。

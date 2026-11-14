@@ -89,6 +89,14 @@ const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 // 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
 const archiveMaxOpenConns = 10
 
+// defaultSubmitConcurrency 是 SUBMIT_CONCURRENCY 的默认值：落库消费者在一个分区内同时处理的消息数
+// （设计文档 1d 的 2.2）。
+//
+// 串行时落库约 400 单/秒，瓶颈是每条消息依次等两次订单库事务和一次 Reserve 的往返，MySQL 和 inventory
+// 都很空闲。8 × 4 个分区 = 同时 32 单在途，低于默认的订单库连接池总和（25 × 2 个库 = 50），
+// 不会让落库自己在连接池上排队。改大之前先看启动时的连接池检查（checkSubmitConcurrency）。
+const defaultSubmitConcurrency = 8
+
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
 // 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
@@ -119,6 +127,8 @@ type config struct {
 	archiveDSN string
 	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
 	mysqlMaxOpenConns int
+	// submitConcurrency 是落库消费者每个分区的并发度，见 defaultSubmitConcurrency。
+	submitConcurrency int
 	workerID          int64
 	inventoryAddr     string
 	paymentTimeout    time.Duration
@@ -205,6 +215,16 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("MYSQL_MAX_OPEN_CONNS must be positive")
 	}
 	cfg.mysqlMaxOpenConns = int(maxOpen)
+	// 只校验下限。上限不在这里拒绝：它和连接池的关系取决于库数和分区数，启动时只做检查和警告
+	// （checkSubmitConcurrency）。1 就是 1d 之前的分区内串行，可以用来对比或回退。
+	concurrency, err := envInt("SUBMIT_CONCURRENCY", defaultSubmitConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if concurrency < 1 {
+		return cfg, errors.New("SUBMIT_CONCURRENCY must be at least 1")
+	}
+	cfg.submitConcurrency = int(concurrency)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -295,6 +315,35 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+// checkSubmitConcurrency 比较落库的在途上限和订单库连接池的总和，前者更大时打一条 WARN（设计文档 1d 的 2.7）。
+//
+// 同时在途的落库数最多是“并发度 × 分区数”，它们按订单号分散在各个订单库上；连接池的总和是
+// “每个库的池 × 库数”。前者长期超过后者时，落库会在连接池上排队，加并发换不来吞吐，
+// 还会和查询、中继、sweeper 抢同一个池。
+//
+// 只警告、不拒绝启动，因为这个比较只是粗略的上界估计：
+//   - 一条落库只在两次短事务（写订单行、改成待支付）里占用连接，等 Reserve 的往返期间不占，
+//     在途数超过池子不等于池子被占满；
+//   - 分区数用的是 eventx.Partitions（本机建 topic 时的分区数），线上 topic 的实际分区数可能不同；
+//     多个副本分摊分区时，每个进程实际持有的分区更少；
+//   - 订单不一定均匀落在各个库上，均匀时每个库分到的在途数是总数除以库数，不均匀时个别库会更多。
+//
+// 所以阈值取“在途上限超过连接池总和”，也就是平均每个库的在途数超过它自己的池子，越过它几乎一定排队；
+// 没越过也不保证不排队（不均匀、其他路径同时占用），要靠压测时看连接池的等待指标。
+func checkSubmitConcurrency(logger *slog.Logger, cfg config) {
+	inFlight := cfg.submitConcurrency * eventx.Partitions
+	pool := cfg.mysqlMaxOpenConns * len(cfg.mysqlDSNs)
+	if inFlight > pool {
+		logger.Warn("submit consumer may queue on the order db connection pools: "+
+			"max in-flight landings (SUBMIT_CONCURRENCY x partitions) exceed the total pool size (MYSQL_MAX_OPEN_CONNS x dbs)",
+			"max_in_flight", inFlight, "submit_concurrency", cfg.submitConcurrency, "partitions", eventx.Partitions,
+			"total_pool", pool, "mysql_max_open_conns", cfg.mysqlMaxOpenConns, "dbs", len(cfg.mysqlDSNs))
+		return
+	}
+	logger.Info("submit consumer concurrency", "max_in_flight", inFlight, "submit_concurrency", cfg.submitConcurrency,
+		"partitions", eventx.Partitions, "total_pool", pool)
 }
 
 func envInt(key string, def int64) (int64, error) {
@@ -541,11 +590,22 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 落库消费者在分区内按 key 并发（设计文档 1d 的 2.2、2.3，ADR-0017）。能这样做的前提是：
+	// 消息的 key 是订单号，kafkax 保证同一个 key 总在同一条 lane 上串行；而处理一条消息碰到的数据
+	// ——闸门里这个订单的占用、订单行、订单明细、这个订单的 outbox 事件——都属于这个订单，
+	// 不同订单的消息之间没有共享的可变状态，也没有先后要求。
+	// 库存的行属于 SKU 而不是订单，不同订单会同时预占同一个 SKU，但那发生在 inventory 服务里，
+	// 由它的行锁保护（1a 起有并发测试），不在这个消费者里。同一个用户的不同订单共用的只有
+	// (user_id, idempotency_key) 唯一键，由数据库保证。
+	// 代价是重启和再平衡后重复投递变成常态（提交的是连续完成的前缀），handler 本来就按至少一次设计。
+	// 支付结果和延迟关单的消费者保持串行：量小，延迟消费者也不允许并发。
+	checkSubmitConcurrency(logger, cfg)
 	submitConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
-		Config: kcfg,
-		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderSubmit),
-		Topics: []string{submitTopic},
-		Logger: logger,
+		Config:      kcfg,
+		Group:       eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderSubmit),
+		Topics:      []string{submitTopic},
+		Logger:      logger,
+		Concurrency: cfg.submitConcurrency,
 		// 落库要调 inventory 的 Reserve。默认的 5 次重试合计只有约 1.5 秒，inventory 重启一次
 		// （几秒）就足以把消息送进死信：订单最后由 sweeper 置为失败，数据一致，但用户的订单
 		// 因为依赖方抖了一下就没了。10 次合计约 26 秒，盖得住一次重启；再长就不值得让
