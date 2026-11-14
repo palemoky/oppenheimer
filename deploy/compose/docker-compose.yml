@@ -29,6 +29,11 @@ services:
       - --binlog-row-metadata=FULL
       - --character-set-server=utf8mb4
       - --default-time-zone=+00:00
+      # 默认的 151 不够用。这个实例上的连接池加起来已经是 164：inventory 50、payment 50、
+      # 商家索引 2 个库各 25、订单冷库 10、归档任务 4；集成测试的临时库也都建在它上面，
+      # 服务开着的时候跑测试会报 1040（Too many connections）。每个连接的固定开销很小，
+      # 给到 400 留出测试并行跑的余量。真正的约束仍然是各服务自己的连接池上限。
+      - --max-connections=400
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-oppenheimer}
       MYSQL_DATABASE: oppenheimer
