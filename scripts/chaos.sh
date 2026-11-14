@@ -175,6 +175,7 @@ done
 
 log "building load tool"
 (cd "$ROOT" && go build -o "$BIN/load" ./test/load)
+(cd "$ROOT" && go build -o "$BIN/recon" ./services/recon/cmd/recon)
 
 log "run dir $RUN_DIR, kafka prefix $KAFKA_PREFIX, redis prefix $REDIS_PREFIX"
 sql=""
@@ -318,6 +319,14 @@ tick
 "$BIN/load" verify $SRC_FLAGS -ledger "$LEDGER" -initial "$INITIAL" -inventory-log "$RUN_DIR/inventory.log" \
   2>"$RUN_DIR/verify.log" | tee "$RUN_DIR/verify.txt"
 verify_code=${PIPESTATUS[0]}
+# 第二套检查（ADR-0022）：对账工具比订单对支付单、订单对预占。它和 load verify 的第 4 到 8 项查的是同一批
+# 不变式，实现完全独立（在数据库里算摘要再下钻，不读账本），两套互相印证。系统已经静止，所以不设水位线。
+# chaos 的环境没有从库和商家索引，replica、index 两对不跑。
+MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" \
+  PAYMENT_DSN="$(dsn payment_db)" INVENTORY_DSN="$(dsn inventory_db)" \
+  "$BIN/recon" -pairs payment,stock -settle 0 -recheck 1s -json "$RUN_DIR/recon.json" \
+  2>"$RUN_DIR/recon.log" | tee "$RUN_DIR/recon.txt"
+recon_code=${PIPESTATUS[0]}
 set -e
 
 {
@@ -331,10 +340,10 @@ set -e
     echo "unexpected exits: 0"
   fi
   grep -E '^(accepted|landed|drain) ' "$RUN_DIR/load-report.txt" 2>/dev/null || true
-  echo "load exit $load_code, wait-quiet exit $quiet_code, verify exit $verify_code"
+  echo "load exit $load_code, wait-quiet exit $quiet_code, verify exit $verify_code, recon exit $recon_code"
 } | tee -a "$EVENTS"
 
-if [ "$quiet_code" = 0 ] && [ "$verify_code" = 0 ] && [ ! -f "$RUN_DIR/unexpected-exits" ]; then
+if [ "$quiet_code" = 0 ] && [ "$verify_code" = 0 ] && [ "$recon_code" = 0 ] && [ ! -f "$RUN_DIR/unexpected-exits" ]; then
   log "CHAOS PASS"
   exit 0
 fi
