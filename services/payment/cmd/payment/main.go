@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
 	"github.com/palemoky/oppenheimer/pkg/app"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
@@ -38,7 +40,8 @@ const serviceName = "payment"
 // kafkaStartTimeout 是启动时连接 Kafka、建 topic 的时限。
 const kafkaStartTimeout = 30 * time.Second
 
-// redisSetupTimeout 是启动时连接 Redis 的时限。
+// redisSetupTimeout 是启动时探测 Redis 的时限。到时还连不上也照样启动（redisx.OpenLazy），
+// 它只是不让一个卡住的连接拖住启动。
 const redisSetupTimeout = 10 * time.Second
 
 // payment 调 order（创建支付单前查订单）这一跳的时限（设计文档 1d 的 5.6）。
@@ -73,6 +76,8 @@ type config struct {
 	redisPrefix    string
 	outboxInterval time.Duration
 	processor      processor.Config
+	// drainDelay 是收到退出信号后摘流的等待，见 app.Options.DrainDelay。
+	drainDelay time.Duration
 }
 
 func main() {
@@ -119,6 +124,9 @@ func loadConfig() (config, error) {
 			return config{}, fmt.Errorf("invalid PROCESSOR_BATCH_SIZE %q", v)
 		}
 	}
+	if cfg.drainDelay, err = app.DrainDelayFromEnv(); err != nil {
+		return config{}, err
+	}
 	return cfg, nil
 }
 
@@ -155,7 +163,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	rctx, cancelRedis := context.WithTimeout(ctx, redisSetupTimeout)
-	rdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.redisAddr})
+	// Redis 此刻连不上也照样启动（设计文档 1d 的 6.10）。这里只有周期任务的 leader 锁用它，
+	// 而锁都是 lock.FailOpen：Redis 不可用时每个副本都跑，正确性靠条件更新。运行中坏了能放行，
+	// 启动时坏着也应该能起来（1b 留下的问题：以前这里会启动失败）。
+	rdb, err := redisx.OpenLazy(rctx, redisx.Config{Addr: cfg.redisAddr}, logger)
 	cancelRedis()
 	if err != nil {
 		return fmt.Errorf("open redis: %w", err)
@@ -227,12 +238,31 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupPaymentOrderEvents),
 		Topics: []string{eventx.Topic(cfg.kafkaPrefix, eventx.OrderEvents)},
 		Logger: logger,
+		// 普通错误不设重试上限，分区停在这条消息上等依赖恢复（设计文档 1d 的 6.2、6.5，ADR-0021）。
+		// 这里处理的是订单服务对支付结果的答复：接受就标记已答复，要求退款就退款。这条答复是这笔支付
+		// 得到处置的唯一途径，没有任务会重发它；默认的 5 次（合计约 1.5 秒）之后进死信，支付库抖一下
+		// 就会让一笔该退的款没人退，只能等人发现后手工重放。
+		// handler 返回普通错误只在支付库不可用（或超时）时；支付单还是 PENDING（ErrPaymentPending）
+		// 也会自己结束：处理器会把每一笔 PENDING 的支付单做完。消息本身有问题的（解不开、没有 payment_id、
+		// 支付单不存在、订单号对不上、不认识的答复）由 handler 标成 Permanent，仍然直接进死信。
+		// 代价：一条 handler 没识别出来的坏消息会一直挡住它的分区，要靠消费积压的告警发现（阶段 3）。
+		MaxAttempts: math.MaxInt,
 	}, consumer.New(st, logger, now).Kafka(consumer.DefaultTimeout))
 	if err != nil {
 		return fmt.Errorf("create order events consumer: %w", err)
 	}
 
-	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.HealthHandler(serviceName))
+	// 内部端口：存活和就绪探测、降级开关。不经过 gateway。
+	// payment 没有可降级的功能，开关集合是空的；照样挂上 GET /degrade（返回空列表），
+	// 故障注入的脚本可以对每个服务用同一种方式查询。DEGRADE 里写了任何名字都拒绝启动。
+	switches := degrade.New(serviceName, logger)
+	if err := switches.Apply(os.Getenv(degrade.Env)); err != nil {
+		return err
+	}
+	readiness := &app.Readiness{}
+	admin := app.AdminMux(serviceName, readiness)
+	switches.Register(admin)
+	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, admin)
 	if err != nil {
 		return err
 	}
@@ -244,9 +274,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
-	// app.Run 按相反顺序停止：先停 gRPC 不再受理新支付，再停 processor（不再产生新事件），
+	// app.RunWith 按相反顺序停止。收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查
+	// 变成不可用，继续正常服务 DRAIN_DELAY 这么久，让负载均衡把流量挪走（本机默认 0）。然后
+	// 先停 gRPC 不再受理新支付，再停 processor（不再产生新事件），
 	// 再停消费者，然后停中继（它最后一轮会把 processor 刚写的事件发出去），健康检查最后停。
-	return app.Run(ctx, logger, httpServer, relay, orderEvents, proc, grpcServer)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay},
+		httpServer, relay, orderEvents, proc, grpcServer)
 }
 
 // newLeader 创建一把按 name 竞争的 leader 锁。

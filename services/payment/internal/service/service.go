@@ -75,11 +75,13 @@ func (s *Service) CreatePayment(ctx context.Context, req *paymentv1.CreatePaymen
 		}
 		// 订单服务暂时不可用不是本服务的内部错误：如实告诉调用方可以稍后重试，
 		// 网关才能返回 503 而不是 500。DEADLINE_EXCEEDED 走到这里说明调用方的 ctx 还有效，
-		// 是这一跳自己的时限（orderHopTimeout）到了：order 慢，同样答 UNAVAILABLE。
+		// 是这一跳自己的时限（orderHopTimeout）到了：order 慢，同样算不可用。
+		// 用降级错误而不是 UNAVAILABLE（理由见 errx.Degraded）：payment 是好的，坏的是 order。
+		// 返回 UNAVAILABLE 的话，gateway 的边车连续 5 次就把 payment 整个摘掉，不调 order 的查支付也跟着不可用。
 		switch status.Code(err) {
 		case codes.Unavailable, codes.DeadlineExceeded:
 			s.logger.WarnContext(ctx, "order service unavailable", "error", err)
-			return nil, status.Error(codes.Unavailable, "order service unavailable")
+			return nil, errx.Degraded(errx.ReasonOrderUnavailable, "order service unavailable, retry later")
 		default:
 			return nil, s.internal(ctx, "get order", err)
 		}

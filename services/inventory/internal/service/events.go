@@ -64,6 +64,12 @@ func (s *Service) HandleOrderEvent(ctx context.Context, ev *eventv1.OrderEvent) 
 			"op", op, "order_id", orderID, "reason", errx.Reason(err), "error", err.Error())
 		return kafkax.Permanent(fmt.Errorf("%s order %d: %w", op, orderID, err))
 	}
+	if errors.Is(err, errCorruptReservation) {
+		// 数据本身不对，重试不会变。和上面一样送进死信由人判断，不让它一直挡住分区。
+		s.logger.ErrorContext(ctx, "reservation data is corrupt",
+			"op", op, "order_id", orderID, "error", err.Error())
+		return kafkax.Permanent(fmt.Errorf("%s order %d: %w", op, orderID, err))
+	}
 	return fmt.Errorf("%s order %d: %w", op, orderID, err)
 }
 

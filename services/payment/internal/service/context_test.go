@@ -13,6 +13,7 @@ import (
 
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/services/payment/internal/service"
 	"github.com/palemoky/oppenheimer/services/payment/internal/testkit"
@@ -117,12 +118,12 @@ func TestCreatePaymentContextErrors(t *testing.T) {
 	})
 
 	t.Run("hop timeout to order", func(t *testing.T) {
-		// 调用方的 ctx 还有效，order 那一跳自己的时限到了：下游慢，UNAVAILABLE。
+		// 调用方的 ctx 还有效，order 那一跳自己的时限到了：下游慢，答降级错误（ORDER_UNAVAILABLE）。
 		svc, logs := newSvc(ordersFunc{Orders: e.orders, get: func(context.Context) error {
 			return status.Error(codes.DeadlineExceeded, "context deadline exceeded")
 		}})
 		_, err := svc.CreatePayment(t.Context(), req)
-		wantErr(t, err, codes.Unavailable, "")
+		wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderUnavailable)
 		logs.want(t, 0, 1)
 	})
 

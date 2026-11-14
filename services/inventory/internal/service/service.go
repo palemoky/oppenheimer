@@ -5,17 +5,21 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
 	"github.com/palemoky/oppenheimer/pkg/retry"
@@ -68,6 +72,46 @@ func WithStockCache(c *cache.Cache[*inventoryv1.GetStockResponse], ttl time.Dura
 			s.stockCache, s.stockCacheTTL = c, ttl
 		}
 	}
+}
+
+// errCorruptReservation 标记“预占的数据本身不对”（状态值不认识、已预占却没有明细）。
+// 重试多少次结果都一样，处理订单事件时遇到它直接进死信（见 HandleOrderEvent）：
+// 消费者对普通错误不设重试上限（ADR-0021），不标出来的话这一条消息会永远挡住它的分区。
+var errCorruptReservation = errors.New("corrupt reservation")
+
+// SwitchCache 是库存查询缓存的降级开关（设计文档 1d 的 6.9）：关掉之后 GetStock 不经过缓存，每次都读库。
+// 由 NewStockCache 登记；没开缓存（STOCK_CACHE_TTL=0）时不登记。
+const SwitchCache = "cache"
+
+// NewStockCache 创建 GetStock 的查询缓存，接上降级开关和一个状态变化时记日志的熔断器（设计文档 1d 的 6.6）：
+// Redis 连续出错或开关被关掉时，查询不碰 Redis、直接读库。set 为 nil 时不登记开关（测试用）。
+func NewStockCache(client redis.Cmdable, prefix string, logger *slog.Logger, set *degrade.Set) (*cache.Cache[*inventoryv1.GetStockResponse], error) {
+	var sw *degrade.Switch
+	if set != nil {
+		sw = set.Switch(SwitchCache, "stock queries skip the cache and read the database")
+	}
+	c, err := cache.New(cache.Config{
+		Client:    client,
+		KeyPrefix: prefix,
+		Logger:    logger,
+		Switch:    sw,
+		Breaker: breaker.New(breaker.Config{Name: "stock-cache", OnChange: func(name string, from, to breaker.State) {
+			logger.Warn("cache redis breaker changed", "breaker", name, "from", from.String(), "to", to.String())
+		}}),
+	}, cache.ProtoCodec[*inventoryv1.GetStockResponse]{})
+	if err != nil {
+		return nil, fmt.Errorf("new stock cache: %w", err)
+	}
+	if sw != nil {
+		sw.Watch(func() degrade.Status {
+			st := c.Breaker().Stats()
+			return degrade.Status{
+				Degraded: st.State != breaker.Closed,
+				Detail:   fmt.Sprintf("redis=%s(opens=%d,rejected=%d)", st.State, st.Opens, st.Rejected),
+			}
+		})
+	}
+	return c, nil
 }
 
 // New 返回使用 st 和库存闸门 gate 的 Service。
@@ -276,7 +320,7 @@ func (s *Service) confirm(ctx context.Context, orderID int64) error {
 		case store.StatusReserved:
 			return settle(ctx, tx, orderID, store.StatusConfirmed, tx.PendConfirm)
 		default:
-			return errors.New("unknown reservation status")
+			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
 }
@@ -323,7 +367,7 @@ func (s *Service) release(ctx context.Context, orderID int64) error {
 		case store.StatusReserved:
 			return settle(ctx, tx, orderID, store.StatusReleased, tx.PendRelease)
 		default:
-			return errors.New("unknown reservation status")
+			return fmt.Errorf("%w: unknown reservation status %v", errCorruptReservation, st)
 		}
 	})
 }
@@ -347,7 +391,7 @@ func settle(ctx context.Context, tx *store.Tx, orderID int64, to store.Status, p
 		return err
 	}
 	if len(items) == 0 {
-		return errors.New("reserved reservation has no items")
+		return fmt.Errorf("%w: reserved reservation of order %d has no items", errCorruptReservation, orderID)
 	}
 	for _, it := range items {
 		if err := pend(ctx, orderID, it.SKUID, it.Quantity); err != nil {
@@ -417,7 +461,7 @@ func (s *Service) inTx(ctx context.Context, fn func(*store.Tx) error) error {
 }
 
 // toStatus 把 handler 的错误转换为返回给调用方的 gRPC 错误。
-// 业务错误原样返回；其他错误在这里记录细节，对外只给出不含内部信息的 Internal。
+// 业务错误原样返回；闸门（Redis）的错误是降级错误；其他错误在这里记录细节，对外只给出不含内部信息的 Internal。
 func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...any) error {
 	if errx.Reason(err) != "" {
 		return err
@@ -425,8 +469,11 @@ func (s *Service) toStatus(ctx context.Context, op string, err error, attrs ...a
 	switch {
 	case errors.Is(err, errGate):
 		// MySQL 的那一步已经提交（或根本没开始，如 WarmUp），调用方重试即可补上。
+		// 用降级错误而不是 UNAVAILABLE（理由见 errx.Degraded）：坏的是闸门的 Redis，不是 inventory。
+		// 返回 UNAVAILABLE 的话，order 的边车连续 5 次就把 inventory 整个摘掉，不碰 Redis 的 Reserve 也跟着不可用。
+		// 排在取消、超时之前：闸门的调用因为这个请求的时限到了而失败，多半是 Redis 慢或连不上，照样算降级。
 		s.logger.WarnContext(ctx, "stock gate operation failed", append([]any{"op", op, "error", err.Error()}, attrs...)...)
-		return status.Error(codes.Unavailable, "stock gate unavailable, retry later")
+		return errx.Degraded(errx.ReasonStockGateUnavailable, "stock gate unavailable, retry later")
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, "request canceled")
 	case errors.Is(err, context.DeadlineExceeded):

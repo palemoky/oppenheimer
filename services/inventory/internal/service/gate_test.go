@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/palemoky/oppenheimer/api/eventx"
 	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	"github.com/palemoky/oppenheimer/pkg/errx"
@@ -302,7 +303,7 @@ func TestHandleOrderEventImpossibleKeepsGate(t *testing.T) {
 	}
 }
 
-// TestGRPCConfirmReleaseUseGate：排障用的 gRPC 接口与事件走同一条路径，闸门失败时返回可重试的 Unavailable。
+// TestGRPCConfirmReleaseUseGate：排障用的 gRPC 接口与事件走同一条路径，闸门失败时返回可重试的降级错误。
 func TestGRPCConfirmReleaseUseGate(t *testing.T) {
 	e := newEnv(t)
 	e.seed(t, 1, 100, 10)
@@ -316,9 +317,13 @@ func TestGRPCConfirmReleaseUseGate(t *testing.T) {
 	}
 
 	restore := e.breakGate(t)
-	if err := e.confirm(t.Context(), 7); status.Code(err) != codes.Unavailable {
-		t.Fatalf("Confirm with redis down = %v, want Unavailable", err)
+	err := e.confirm(t.Context(), 7)
+	assertErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
+	if !errx.IsDegraded(err) {
+		t.Fatalf("Confirm with redis down = %v, want a degraded error", err)
 	}
+	err = e.release(t.Context(), 8)
+	assertErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 	restore()
 	mustOK(t, e.confirm(t.Context(), 7))
 	mustOK(t, e.release(t.Context(), 8))
@@ -373,4 +378,99 @@ func TestGateIdentityLifecycle(t *testing.T) {
 
 	e.assertStock(t, 1, 17, 0, 3)
 	e.assertGate(t, 1, 17, 0)
+}
+
+// TestWarmUpGateUnavailable：闸门（Redis）不可用时 WarmUp 返回降级错误（FAILED_PRECONDITION 加原因码），
+// 不是 UNAVAILABLE：后者会被 order 的边车算作 inventory 的失败，把不碰 Redis 的 Reserve 也一起摘掉。
+// 读 MySQL 失败仍是 inventory 自己的错误，不在这里。
+func TestWarmUpGateUnavailable(t *testing.T) {
+	e := newEnv(t)
+	e.seed(t, 1, 100, 10)
+
+	restore := e.breakGate(t)
+	_, err := e.svc.WarmUp(t.Context(), &inventoryv1.WarmUpRequest{SkuIds: []int64{1}})
+	assertErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
+	if !errx.IsDegraded(err) || status.Code(err) == codes.Unavailable {
+		t.Fatalf("WarmUp with redis down = %v, want a degraded error", err)
+	}
+	restore()
+
+	// 恢复后重试即可装载。
+	e.warmUp(t, 1)
+	e.assertGate(t, 1, 10, 0)
+}
+
+// TestOrderEventGateDownRetriedUntilRecovered：闸门长时间不可用时，订单事件的 handler 每次都返回可重试的错误
+// （消费者不设重试上限，消息不进死信）；每次重试 MySQL 那一步都是幂等重放，不会重复确认或释放、不多记增量。
+// 闸门恢复后再处理一次，占用被结清或归还，闸门和 MySQL 对得上，available + reserved + sold 守恒（seed 的检查）。
+func TestOrderEventGateDownRetriedUntilRecovered(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   func(int64) *eventv1.OrderEvent
+		// reserved 为 false 时订单没有预占成功就失败了（空回滚）。
+		reserved bool
+		// 处理之后 SKU 1：MySQL 的 (available, sold)，恢复后闸门的 avail。
+		available, sold, avail int64
+		// 订单 7 在 stock_pending 里应有的行数：预占一行，确认或释放一行；空回滚没有。
+		pending int
+	}{
+		{"paid", paidEvent, true, 7, 3, 7, 2},
+		{"cancelled", cancelledEvent, true, 10, 0, 10, 2},
+		{"closed", closedEvent, true, 10, 0, 10, 2},
+		{"failed before reserve", failedEvent, false, 10, 0, 10, 0},
+	}
+	const attempts = 5
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.seed(t, 1, 100, 10)
+			e.warmUp(t, 1)
+			if got := e.hold(t, 7, 1, 1, 3); got != stockgate.Held {
+				t.Fatalf("hold = %v", got)
+			}
+			if c.reserved {
+				_, err := e.reserve(t.Context(), 7, 1, 3)
+				mustOK(t, err)
+			}
+
+			// 经消费者的 handler 处理，和线上一样带解码和处理时限。
+			_, value, err := eventx.MarshalOrderEvent(c.ev(7))
+			mustOK(t, err)
+			h := e.svc.OrderEventHandler(0)
+			msg := kafkax.Message{Value: value}
+
+			restore := e.breakGate(t)
+			for i := range attempts {
+				err := h(t.Context(), msg)
+				if err == nil || kafkax.IsPermanent(err) || !errors.Is(err, errGate) {
+					t.Fatalf("attempt %d with redis down = %v, want retryable gate error", i+1, err)
+				}
+				// MySQL 那一步第一次就提交了，之后每次都是幂等重放：数量和增量的行数都不再变。
+				e.assertStock(t, 1, c.available, 0, c.sold)
+				if n := e.pendingRows(t, 7); n != c.pending {
+					t.Fatalf("attempt %d: %d stock_pending rows of order 7, want %d", i+1, n, c.pending)
+				}
+			}
+			restore()
+			// 闸门还是原样：占用没有被结清或归还。这时恒等式偏差恰好是“已确认未结清”的数量（paid）或 0。
+			e.assertGate(t, 1, 7, 3)
+
+			// Redis 恢复后消费者的下一次重试：MySQL 重放，闸门补上。
+			mustOK(t, h(t.Context(), msg))
+			e.assertStock(t, 1, c.available, 0, c.sold)
+			e.assertGate(t, 1, c.avail, 0)
+			if n := e.pendingRows(t, 7); n != c.pending {
+				t.Errorf("%d stock_pending rows of order 7 after recovery, want %d", n, c.pending)
+			}
+			if _, exists, err := e.gate.Get(t.Context(), 7); err != nil || exists {
+				t.Errorf("hold of order 7 exists = %v, err = %v; want gone", exists, err)
+			}
+			if d := e.deviation(t, 1); d != 0 {
+				t.Errorf("deviation = %d, want 0", d)
+			}
+			// 再来一次（至少一次投递）也无害。
+			mustOK(t, h(t.Context(), msg))
+			e.assertGate(t, 1, c.avail, 0)
+		})
+	}
 }
