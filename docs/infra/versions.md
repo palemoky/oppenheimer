@@ -36,6 +36,7 @@
 | twmb/franz-go | v1.22.3 | 稳定版 | 2026-11-11 | Kafka 客户端，见 ADR-0007；管理接口 `pkg/kadm` v1.20.0 |
 | redis/go-redis | v9.23.0 | 稳定版 | 2026-11-11 | Redis 客户端，见 ADR-0007 |
 | go-mysql-org/go-mysql | v1.16.0 | 稳定版 | 2026-11-13 | CDC 服务读 binlog 用它的 `replication` 包（ADR-0014）。GitHub 的 API 当时访问不了，版本是从仓库的标签列表和 Go 模块代理核对的；已实测能从 MySQL 9.7.4 读到列名、行映像和提交时间 |
+| kafbat-ui | v1.5.0 | 稳定版 | 2026-11-14 | Kafka 的 Web 界面，镜像 `ghcr.io/kafbat/kafka-ui:v1.5.0`（tag 带 `v`），GitHub releases 上的最新正式版，发布于 2026-04-20。仅本机开发用，profile `ui`，只读，宿主机端口 8090（`KAFKA_UI_PORT`），见下 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
 ## 本机 compose 的 MySQL 实例（2026-11-13）
@@ -72,6 +73,14 @@ CDC 伪装成从库读 binlog，要占用 server-id，不能和上表以及彼�
 CDC 的集成测试每个用例用一个 10 万以上的随机 server-id，避免并行的用例互相踢掉连接。
 
 CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只读，账号靠复制到达）。
+
+## 本机 compose 的 kafbat-ui（2026-11-14）
+
+属于 compose 的 `ui` profile，平时 `make up` 和 CI 不启动；`make kafka-ui` 启动并打印地址，`make kafka-ui-down` 删除，`make down` 也会带上它。
+
+| compose 服务 | 用途 | 宿主机端口 | 备注 |
+|---|---|---|---|
+| `kafka-ui` | 看 topic、消息、消费组 lag | 8090（只绑 127.0.0.1） | 连 `kafka:19092`；`KAFKA_CLUSTERS_0_READONLY=true` 只读；不设登录；堆上限 256 MB，容器上限 512 MB；未配置 protobuf serde |
 
 ## 待引入（引入时查证并移到上表）
 

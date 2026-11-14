@@ -153,12 +153,12 @@ up: up-core ## 启动 MySQL（含 order 两个分片的主从）、Redis（含�
 	@MYSQL_ROOT_PASSWORD=$(MYSQL_ROOT_PASSWORD) scripts/mysql-replication.sh
 
 .PHONY: down
-down: ## 停止本地依赖，保留数据
-	$(COMPOSE) down
+down: ## 停止本地依赖（含 kafbat-ui），保留数据
+	$(COMPOSE) --profile ui down
 
 .PHONY: down-volumes
-down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例）
-	$(COMPOSE) --profile expand down --volumes
+down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例和 kafbat-ui）
+	$(COMPOSE) --profile expand --profile ui down --volumes
 
 .PHONY: expand-up
 expand-up: ## 启动扩容演练用的 4 个 MySQL 容器（profile expand）并等待就绪；之后用 scripts/expand.sh 分阶段演练
@@ -168,6 +168,18 @@ expand-up: ## 启动扩容演练用的 4 个 MySQL 容器（profile expand）并
 expand-down: ## 停止并删除扩容演练的 4 个容器及其数据卷（不影响其他实例）
 	$(COMPOSE) --profile expand rm -f -s -v mysql-order-2 mysql-order-2-replica mysql-order-3 mysql-order-3-replica
 	@docker volume rm -f oppenheimer_mysql-order-2-data oppenheimer_mysql-order-2-replica-data oppenheimer_mysql-order-3-data oppenheimer_mysql-order-3-replica-data
+
+KAFKA_UI_PORT ?= 8090
+export KAFKA_UI_PORT
+
+.PHONY: kafka-ui
+kafka-ui: ## 启动 Kafka 的 Web 界面 kafbat-ui（profile ui，只读）并等待就绪，打印访问地址
+	$(COMPOSE) --profile ui up -d --wait kafka-ui
+	@echo "kafbat-ui: http://127.0.0.1:$(KAFKA_UI_PORT)"
+
+.PHONY: kafka-ui-down
+kafka-ui-down: ## 停止并删除 kafbat-ui 容器（不影响其他实例）
+	$(COMPOSE) --profile ui rm -f -s -v kafka-ui
 
 .PHONY: ps
 ps: ## 查看本地依赖的状态
