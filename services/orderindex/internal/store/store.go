@@ -167,6 +167,14 @@ func (s *Store) locate(merchantID int64) (*sql.DB, *statements) {
 func (s *Store) UpsertSQL(slot int) string { return s.stmts[slot].upsert }
 
 // Upsert 把 r 写进它的商家所在的 slot，只有 r.Version 大于已有行的版本时才覆盖。syncedAt 写入 synced_at。
+//
+// 并发写不同订单时的锁（REPEATABLE READ，单语句自动提交）：表上只有主键一个唯一索引，
+// idx_merchant_status 是普通二级索引，不做唯一性检查。新行只在主键和二级索引上各加插入意向锁；
+// 撞上已有行时对主键上的那一行加 next-key 排他锁，再按主键改行、改二级索引项（只加记录锁）。
+// 每条语句只锁自己那个订单的行和它前面的间隙，持锁到自动提交为止，不会再去等别的订单的锁，
+// 所以不同订单之间最多是短暂的锁等待（插入恰好落在别人锁住的间隙里），形不成环，不会死锁。
+// 万一 InnoDB 判了死锁或锁等待超时，错误原样返回（不是 Permanent），由消费者原地重试。
+// indexer.TestConcurrentLanes* 用 32 路并发实测过，没有出现锁冲突。
 func (s *Store) Upsert(ctx context.Context, r Row, syncedAt time.Time) (Outcome, error) {
 	db, st := s.locate(r.MerchantID)
 	var paidAt sql.NullTime

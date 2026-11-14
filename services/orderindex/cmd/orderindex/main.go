@@ -42,17 +42,35 @@ const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3306)/merchant_index_db
 	"root:oppenheimer@tcp(127.0.0.1:3306)/merchant_index_db_1"
 
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个索引库的连接池上限。
-// 与 order 相同：两个库合计 50。写入由消费者的分区 worker 串行发出（每个分区同时只有一条），
-// 查询是短的范围扫描，用不了更多。
+//
+// 需求：同时在途的写入最多是 INDEX_CONCURRENCY × eventx.Partitions = 16 × 4 = 64 条，按商家哈希分到两个库上，
+// 平均每库 32 条（商家分布不均时一个库可能更多）。再加上 gRPC 的列表查询，都是短的范围扫描。
+//
+// 预算：本机两个索引库和 inventory_db、payment_db、订单冷库在同一个 MySQL 实例上，max_connections 151。
+// 各服务的池上限：inventory 50、payment 50（mysqlx 默认）、order 的冷库 10、archiver 的冷库 4，
+// 加上本服务 2 × 25 = 50，合计 164，已经超过 151（只是各池很少同时打满）。所以这里不再加大，保持每库 25。
+//
+// 池比在途写入少时多出来的写入在 database/sql 的池上排队（受 indexer.DefaultWriteTimeout 约束），
+// 不会出错，只是限住了并发。实测（indexer.TestThroughputByConcurrency，本机测试库）在途 32 条以上吞吐就平了，
+// 每库 25 和 32 差别在噪声以内：瓶颈是 MySQL 每次提交的刷盘（单行一个事务），不是连接数。
+// 库分到独立实例上之后，可以按 INDEX_CONCURRENCY × 分区数 / 库数 调大。
 const defaultMySQLMaxOpenConns = 25
+
+// defaultIndexConcurrency 是 INDEX_CONCURRENCY 的默认值：消费者每个分区内同时处理的消息数（设计文档 1d 2.5）。
+//
+// 消息的 key 是订单号，写入按行版本号幂等，同一个订单仍串行、不同订单之间乱序也收敛，所以可以分区内并发。
+// 16 × 4 个分区 = 64 路在途写入，已超过连接池（2 × 25），再大只是在池上排队。
+const defaultIndexConcurrency = 16
 
 type config struct {
 	httpAddr          string
 	grpcAddr          string
 	mysqlDSNs         []string
 	mysqlMaxOpenConns int
-	kafkaBrokers      []string
-	kafkaPrefix       string
+	// indexConcurrency 是消费者每个分区的并发度，见 defaultIndexConcurrency。
+	indexConcurrency int
+	kafkaBrokers     []string
+	kafkaPrefix      string
 }
 
 func main() {
@@ -87,6 +105,14 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("MYSQL_MAX_OPEN_CONNS must be positive")
 	}
 	cfg.mysqlMaxOpenConns = int(maxOpen)
+	concurrency, err := envInt("INDEX_CONCURRENCY", defaultIndexConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if concurrency < 1 {
+		return cfg, errors.New("INDEX_CONCURRENCY must be at least 1")
+	}
+	cfg.indexConcurrency = int(concurrency)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -164,7 +190,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		// kafkax 对普通错误的处理是“原地重试 MaxAttempts 次后进死信、分区继续”，所以取最大值让它永远不到上限；
 		// 退避封顶在 RetryMax（默认 5 秒），日志里每 5 秒一条重试告警。
 		// 只有反序列化失败（kafkax.Permanent）会直接进死信，理由见 indexer.Handler。
+		//
+		// 分区内并发之后“停住”分两步：一条一直失败的消息先只停住它所在的 lane（同一 lane 上排在它后面的订单
+		// 也跟着等），其他 lane 继续处理；提交的位点停在它前面不动，所以它和它之后的消息都不会被跳过。
+		// 已分发未提交的消息到 MaxUncommitted（默认 1024）时整个分区停止分发，和串行时一样停住。
+		// 代价是重启后要重放最多这么多条，写入按版本号幂等，重放只产生 Stale。
+		// 表结构被改坏时后面的消息多半也失败，各 lane 很快都会停住。
 		MaxAttempts: math.MaxInt,
+		Concurrency: cfg.indexConcurrency,
 	}, ix.Handler(indexer.DefaultWriteTimeout))
 	if err != nil {
 		return err

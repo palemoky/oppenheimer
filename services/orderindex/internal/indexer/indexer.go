@@ -130,7 +130,13 @@ func (ix *Indexer) Apply(ctx context.Context, ch *cdcv1.RowChange) (Result, erro
 // 错误的处理（配合 main 里 MaxAttempts 取最大值）：
 //   - 消息不是 RowChange（反序列化失败）：kafkax.Permanent，直接进死信，分区继续。它不对应任何一张表的结构问题，
 //     而 topic 是压缩保留的，同一个订单的下一个版本到来时索引会被修正。
-//   - 表结构不符（ErrSchema）和写库失败：普通错误，原地重试、分区停在这条消息上，日志持续报错，不跳过。
+//   - 表结构不符（ErrSchema）和写库失败：普通错误，原地重试，日志持续报错，不跳过。分区内并发时停住的是
+//     这条消息所在的 lane，位点停在它前面；其他 lane 继续，直到未提交的消息数到 MaxUncommitted 整个分区才停。
+//     死锁、锁等待超时也走这条路：InnoDB 已回滚这条单语句的事务，原样重试即可。
+//
+// 并发安全：分区内并发（kafkax ConsumerConfig.Concurrency > 1）时它会被多个 goroutine 同时调用。
+// 每条消息只用自己的局部变量，没有跨消息的状态；Store 的语句在构造时渲染好、只读，连接由 database/sql
+// 的池分配；Stats 有锁。同一个订单的消息由 kafkax 保证串行，不同订单之间的先后由版本号兜住。
 func (ix *Indexer) Handler(timeout time.Duration) kafkax.Handler {
 	return func(ctx context.Context, msg kafkax.Message) error {
 		ch := &cdcv1.RowChange{}
