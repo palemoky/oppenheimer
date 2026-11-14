@@ -248,6 +248,8 @@ type envOptions struct {
 	gtidWait time.Duration
 	// cold 为 true 时建一个冷库并接到 Service 上。
 	cold bool
+	// ids 非空时代替默认的发号器。
+	ids IDGenerator
 }
 
 func newEnv(t *testing.T) *env {
@@ -328,7 +330,7 @@ func newEnvWith(t *testing.T, opts envOptions) *env {
 		e.coldDB = testdb.NewTemplate(t, order.ArchiveMigrations, order.ArchiveMigrationsDir, order.NewArchiveMigrationData())
 		cold = store.NewCold(e.coldDB)
 	}
-	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: ids, Logger: logger, Marks: marks, Cold: cold}, Config{
+	svc := mustNew(t, Deps{Store: st, Gate: gate, Sender: sender, Inventory: inv, IDs: cmp.Or[IDGenerator](opts.ids, ids), Logger: logger, Marks: marks, Cold: cold}, Config{
 		Clock:            clock.Now,
 		OrderEventsTopic: testEventsTopic,
 		SubmitTopic:      testSubmitTopic,

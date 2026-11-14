@@ -70,6 +70,14 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	if err != nil {
 		return nil, err
 	}
+	// 闸门说“这个幂等键已经受理过”，而受理的正是这次调用刚生成的订单号：占用是这次调用自己写的。
+	// Redis 客户端在读超时之后会自动重试命令；Hold 的脚本第一次已经在 Redis 里执行成功、只是回复没收到时，
+	// 重试的那一次看到的就是自己刚写下的幂等键。订单号由发号器保证每次调用都不同，所以订单号相同
+	// 只可能是这种情况。按受理成功继续往下走（发消息）。当成“以前受理过”的话不会发消息，
+	// 用户拿到 202，占用却等不到落库，宽限期一过被回收，订单凭空消失。
+	if res.Outcome == stockgate.Duplicate && res.OrderID == orderID {
+		res.Outcome = stockgate.Held
+	}
 	switch res.Outcome {
 	case stockgate.Held:
 	case stockgate.Duplicate:
