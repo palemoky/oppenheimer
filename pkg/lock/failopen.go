@@ -10,6 +10,14 @@ import (
 // failOpenWarnEvery 是锁持续不可用期间重复告警的最小间隔。
 const failOpenWarnEvery = 30 * time.Second
 
+// failOpenCooldown 是锁出错之后多久不再去问它，这段时间直接放行。
+//
+// 没有它的话，Redis 不可用期间每一轮都要先等一次失败的加锁（连接被拒绝时 go-redis 还会重试几次）才放行，
+// 每 100 毫秒一轮的 outbox 中继会被拖成约每秒一轮，事件延迟跟着变大。锁本来就只是为了省事，
+// 不值得让任务为它等。代价是 Redis 恢复之后最多还有这么久是每个副本都在跑，和故障期间一样，无害。
+// 它是一个最小的熔断器：出错即打开，到时间再试一次。
+const failOpenCooldown = 2 * time.Second
+
 // Allower 是 FailOpen 包装的对象，与 worker.Guard 的方法集相同。
 // 在这里重复声明是为了不让 lock 依赖 worker。
 type Allower interface {
@@ -25,6 +33,8 @@ type FailOpenGuard struct {
 	mu       sync.Mutex
 	degraded bool
 	lastWarn time.Time
+	// skipUntil 之前不问内层 Guard，直接放行。
+	skipUntil time.Time
 }
 
 // FailOpen 包装一个 Guard：它无法判断（返回错误）时放行，而不是跳过这一轮。
@@ -47,6 +57,9 @@ func FailOpen(inner Allower, logger *slog.Logger) *FailOpenGuard {
 // Allow 在内层 Guard 出错时返回 true。调用方的 ctx 已结束时不放行：那是进程在退出，
 // 不是锁不可用。
 func (f *FailOpenGuard) Allow(ctx context.Context) (bool, error) {
+	if f.skipping() {
+		return true, nil
+	}
 	ok, err := f.inner.Allow(ctx)
 	if err == nil {
 		f.recovered()
@@ -59,10 +72,17 @@ func (f *FailOpenGuard) Allow(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+func (f *FailOpenGuard) skipping() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.now().Before(f.skipUntil)
+}
+
 func (f *FailOpenGuard) warn(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := f.now()
+	f.skipUntil = now.Add(failOpenCooldown)
 	if f.degraded && now.Sub(f.lastWarn) < failOpenWarnEvery {
 		return
 	}

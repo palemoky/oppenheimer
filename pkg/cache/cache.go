@@ -26,7 +26,11 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
 	"golang.org/x/sync/singleflight"
+
+	"github.com/palemoky/oppenheimer/pkg/breaker"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 )
 
 // 存进 Redis 的值的第一个字节是标记，用来区分“缓存了不存在”和“缓存了一个值”。
@@ -35,6 +39,9 @@ const (
 	tagNull  byte = 0
 	tagValue byte = 1
 )
+
+// readTimeout 是 Get 进来时读一次缓存的时限。正常的往返在 1 毫秒以内，200 毫秒容得下一次 TCP 重传。
+const readTimeout = 200 * time.Millisecond
 
 // redisWarnEvery 是 Redis 持续出错期间重复告警的最小间隔。
 const redisWarnEvery = 10 * time.Second
@@ -80,6 +87,11 @@ type Config struct {
 	WaitMax time.Duration
 	// Logger 为空时用 slog.Default()。
 	Logger *slog.Logger
+	// Breaker 是保护这个 Redis 的熔断器（设计文档 1d 的 6.6）。为 nil 时用默认参数建一个。
+	// 多个 Cache 连同一个 Redis 时可以共用一个，让它们一起打开、一起恢复。
+	Breaker *breaker.Breaker
+	// Switch 是人工关掉这个缓存的开关，可以为 nil。关掉时和熔断器打开时一样：不碰 Redis，每次都回源。
+	Switch *degrade.Switch
 }
 
 // Loaded 是回源的结果。TTL 由回源方决定，因为它取决于读到的内容（例如订单的状态）。
@@ -107,6 +119,9 @@ type Cache[T any] struct {
 	waitStep    time.Duration
 	waitMax     time.Duration
 
+	breaker *breaker.Breaker
+	off     *degrade.Switch
+
 	flight singleflight.Group
 	// lastWarn 是上一次记录 Redis 错误的时刻（UnixNano），用来限频。
 	lastWarn atomic.Int64
@@ -133,6 +148,11 @@ func New[T any](cfg Config, codec Codec[T]) (*Cache[T], error) {
 		lockTTL:     orDefault(cfg.LockTTL, 3*time.Second),
 		waitStep:    orDefault(cfg.WaitStep, 20*time.Millisecond),
 		waitMax:     orDefault(cfg.WaitMax, 200*time.Millisecond),
+		breaker:     cfg.Breaker,
+		off:         cfg.Switch,
+	}
+	if c.breaker == nil {
+		c.breaker = breaker.New(breaker.Config{Name: "cache"})
 	}
 	switch {
 	case c.jitter == 0:
@@ -159,25 +179,45 @@ type entry[T any] struct {
 	found bool
 }
 
+// Breaker 返回保护这个缓存的 Redis 的熔断器，给状态展示用。
+func (c *Cache[T]) Breaker() *breaker.Breaker { return c.breaker }
+
 // Get 返回 key 的值。未命中时调用 load，并按 Loaded.TTL 写入（Found 为 false 时写空值）。
 //
 // load 返回错误时不写缓存，错误原样返回：数据库故障不能被缓存成“不存在”。
 // Redis 出错时退化为直接调用 load，不返回 Redis 的错误。
 //
+// Redis 连续出错之后熔断器打开，这期间的 Get 完全不碰 Redis、直接回源，不再每次都先在 Redis 上失败一回；
+// 冷却之后放一次读去探测，成功就恢复。开关被关掉时同样直接回源。只有进入 Get 时的这一次读喂熔断器：
+// 它失败了，这次调用后面的写入和加锁也都不做，所以熔断器打开期间没有任何 Redis 调用。
+//
 // load 使用的是“发起这次回源的那个调用”的 ctx。它被取消时，搭便车的调用不会跟着失败，
 // 而是各自再回源一次。
 func (c *Cache[T]) Get(ctx context.Context, key string, load func(context.Context) (Loaded[T], error)) (value T, found bool, err error) {
-	e, hit, rerr := c.read(ctx, key)
-	if hit {
-		return e.value, e.found, nil
-	}
-	redisOK := rerr == nil
-	if !redisOK {
-		if ctx.Err() != nil {
+	redisOK := false
+	if done, ok := c.allow(); ok {
+		// 这一次读有自己的短时限：缓存是为了快，Redis 挂住时不能让每个请求先等满客户端的读超时（1 秒）
+		// 才回源。熔断器要数到连续几次失败才打开，没有这个时限的话打开之前的每个请求都多等 1 秒
+		// （故障注入实测，设计文档 1d 的 6.18）。
+		rctx, cancel := context.WithTimeout(ctx, readTimeout)
+		e, hit, rerr := c.read(rctx, key)
+		cancel()
+		switch {
+		case rerr == nil:
+			done(breaker.Success)
+		case ctx.Err() != nil:
+			// 调用方自己取消或到期，说明不了 Redis 的状态。
+			done(breaker.Ignored)
 			var zero T
 			return zero, false, ctx.Err()
+		default:
+			done(breaker.Failure)
+			c.warn("cache read failed, loading from source", key, rerr)
 		}
-		c.warn("cache read failed, loading from source", key, rerr)
+		if hit {
+			return e.value, e.found, nil
+		}
+		redisOK = rerr == nil
 	}
 
 	ch := c.flight.DoChan(key, func() (any, error) {
@@ -201,6 +241,15 @@ func (c *Cache[T]) Get(ctx context.Context, key string, load func(context.Contex
 		var zero T
 		return zero, false, res.Err
 	}
+}
+
+// allow 报告这次 Get 要不要读 Redis。要读时返回的 done 用来把读的结果告诉熔断器。
+func (c *Cache[T]) allow() (done func(breaker.Outcome), ok bool) {
+	if c.off.Off() {
+		return nil, false
+	}
+	done, err := c.breaker.Allow()
+	return done, err == nil
 }
 
 func isContextErr(err error) bool {

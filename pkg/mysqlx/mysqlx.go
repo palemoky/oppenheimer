@@ -50,6 +50,22 @@ type Config struct {
 // 时间按 UTC 读写并解析为 time.Time；UPDATE 的受影响行数取“实际被修改的行数”
 // （驱动默认行为，这里显式固定），因为条件更新靠它判断状态转换是否由本次调用完成。
 func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
+	db, err := OpenLazy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("mysqlx: ping: %w", err)
+	}
+	return db, nil
+}
+
+// OpenLazy 和 Open 一样配置连接池，但不验证连通性：数据库此刻连不上也返回连接池，第一次使用时才建连接。
+//
+// 给可选的依赖用（从库、冷库，设计文档 1d 的 6.10）：它们在运行中坏了都能降级，启动时坏着也不该让服务起不来。
+// 自己的主库仍然用 Open，连不上就启动失败。只有 DSN 本身写错才返回错误。
+func OpenLazy(cfg Config) (*sql.DB, error) {
 	parsed, err := mysql.ParseDSN(cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("mysqlx: parse dsn: %w", err)
@@ -83,11 +99,6 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(orDefault(cfg.ConnMaxLifetime, 30*time.Minute))
 	db.SetConnMaxIdleTime(orDefault(cfg.ConnMaxIdleTime, 5*time.Minute))
-
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("mysqlx: ping: %w", err)
-	}
 	return db, nil
 }
 

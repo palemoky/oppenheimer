@@ -65,13 +65,34 @@ type healthResponse struct {
 	Status  string `json:"status"`
 }
 
-// HealthHandler 返回只提供 GET /healthz 的 handler，用于存活探测。
-func HealthHandler(service string) http.Handler {
+// HealthHandler 返回只提供存活探测（和一个永远就绪的就绪探测）的 handler。
+// 需要真实的就绪状态或者要往同一个端口上挂别的内部接口时用 AdminMux。
+func HealthHandler(service string) http.Handler { return AdminMux(service, nil) }
+
+// AdminMux 返回服务内部端口用的 mux，带两个探测：
+//
+//	GET /healthz  存活：进程能响应就是 200。
+//	GET /readyz   就绪：r.Ready() 为真是 200，否则 503。r 为 nil 时永远是 200。
+//
+// 调用方可以接着往上挂别的内部接口（比如 degrade.Set.Register）。这个端口不经过 gateway。
+func AdminMux(service string, r *Readiness) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// 写响应失败说明客户端已断开，没有可做的补救。
-		_ = json.MarshalWrite(w, healthResponse{Service: service, Status: "ok"})
+		writeHealth(w, http.StatusOK, healthResponse{Service: service, Status: "ok"})
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !r.Ready() {
+			writeHealth(w, http.StatusServiceUnavailable, healthResponse{Service: service, Status: "not ready"})
+			return
+		}
+		writeHealth(w, http.StatusOK, healthResponse{Service: service, Status: "ready"})
 	})
 	return mux
+}
+
+func writeHealth(w http.ResponseWriter, code int, v healthResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	// 写响应失败说明客户端已断开，没有可做的补救。
+	_ = json.MarshalWrite(w, v)
 }

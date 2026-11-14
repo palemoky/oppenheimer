@@ -66,6 +66,10 @@ func (s *Server) Start(context.Context) error {
 	return nil
 }
 
+// Drain 实现 app.Drainer：把健康检查置为不可用，在途和新来的调用照常处理。
+// 停止流程一开始就调用，让看健康检查的负载均衡在摘流的等待期间把流量挪走。
+func (s *Server) Drain() { s.health.Shutdown() }
+
 // Stop 实现 app.Component：先把健康状态置为不可用，再等待在途调用结束；ctx 到期则强制关闭。
 func (s *Server) Stop(ctx context.Context) error {
 	s.health.Shutdown()
