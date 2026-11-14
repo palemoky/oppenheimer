@@ -42,15 +42,27 @@ type UserOrdersQuery struct {
 // 那样要扫描整张表里这个状态的所有订单再排序，一个状态的订单量随全站订单增长，而不是随这个用户。
 // 索引被改名或删掉时这条语句直接报错，而不是悄悄变成慢查询。
 func (s *Store) ListUserOrders(ctx context.Context, q UserOrdersQuery, src Source) (orders []OrderSummary, more bool, err error) {
-	if q.UserID <= 0 {
-		return nil, false, fmt.Errorf("store: list user orders: user_id must be positive, got %d", q.UserID)
-	}
-	if q.Limit <= 0 {
-		return nil, false, fmt.Errorf("store: list user orders: limit must be positive, got %d", q.Limit)
+	if err := q.validate(); err != nil {
+		return nil, false, err
 	}
 	slot := s.router.ForUser(q.UserID)
-	query, args := userOrdersSQL(s.tables[slot].orders, q)
-	rows, err := s.sourceOf(slot, src).QueryContext(ctx, query, args...)
+	return listUserOrders(ctx, s.sourceOf(slot, src), s.tables[slot].orders, q)
+}
+
+func (q UserOrdersQuery) validate() error {
+	if q.UserID <= 0 {
+		return fmt.Errorf("store: list user orders: user_id must be positive, got %d", q.UserID)
+	}
+	if q.Limit <= 0 {
+		return fmt.Errorf("store: list user orders: limit must be positive, got %d", q.Limit)
+	}
+	return nil
+}
+
+// listUserOrders 在 table 上执行用户订单列表的查询。热表和冷库的表列名、索引名相同，共用这一份。
+func listUserOrders(ctx context.Context, db queryer, table string, q UserOrdersQuery) (orders []OrderSummary, more bool, err error) {
+	query, args := userOrdersSQL(table, q)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("list orders of user %d: %w", q.UserID, err)
 	}

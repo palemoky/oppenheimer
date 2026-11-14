@@ -130,6 +130,12 @@ func GeneOf(shardKey int64) int64 { return shardKey & geneMask }
 // Gene 返回 ID 中嵌入的基因。
 func Gene(id int64) int64 { return id & geneMask }
 
+// LowerBound 返回生成时间不早于 t 的 ID 的下界：时间早于 t 的 ID 都小于它，其余的都不小于它。
+// t 早于 Epoch 时返回 0。用来把“早于某个时间”换成主键上的范围条件（归档的截止点、按时间分区的边界）。
+func LowerBound(t time.Time) int64 {
+	return max(t.Sub(Epoch).Milliseconds(), 0) << timeShift
+}
+
 // Time 返回 ID 的生成时间，精确到毫秒。
 func Time(id int64) time.Time {
 	return Epoch.Add(time.Duration(id>>timeShift) * time.Millisecond)
