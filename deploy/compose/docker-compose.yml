@@ -197,6 +197,143 @@ services:
       - 127.0.0.1:${MYSQL_ORDER_1_REPLICA_PORT:-3322}:3306
     volumes:
       - mysql-order-1-replica-data:/var/lib/mysql
+  # ---- 扩容演练（1c 步骤四，设计文档 5.7）：order 从 2 个库扩到 4 个库时新增的两个分片 ----
+  # 属于 profile `expand`，平时 make up 不会启动；由 make expand-up 启动，scripts/expand.sh 负责复制和提升。
+  # 配置与上面的 order 实例一致。差别只有 restart: CLONE 完成后 mysqld 会退出重启，官方镜像里
+  # mysqld 没有守护进程，靠容器的重启策略把它拉起来。
+  mysql-order-2:
+    <<: *mysql-shard
+    profiles: ["expand"]
+    restart: unless-stopped
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=31
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_2_PORT:-3331}:3306
+    volumes:
+      - mysql-order-2-data:/var/lib/mysql
+
+  mysql-order-2-replica:
+    <<: *mysql-shard
+    profiles: ["expand"]
+    restart: unless-stopped
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --relay-log=relay-bin
+      - --server-id=32
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_2_REPLICA_PORT:-3332}:3306
+    volumes:
+      - mysql-order-2-replica-data:/var/lib/mysql
+
+  mysql-order-3:
+    <<: *mysql-shard
+    profiles: ["expand"]
+    restart: unless-stopped
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --server-id=41
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_3_PORT:-3341}:3306
+    volumes:
+      - mysql-order-3-data:/var/lib/mysql
+
+  mysql-order-3-replica:
+    <<: *mysql-shard
+    profiles: ["expand"]
+    restart: unless-stopped
+    command:
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --character-set-server=utf8mb4
+      - --default-time-zone=+00:00
+      - --performance-schema=OFF
+      - --innodb-buffer-pool-size=64M
+      - --innodb-buffer-pool-instances=1
+      - --innodb-log-buffer-size=8M
+      - --innodb-adaptive-hash-index=OFF
+      - --max-connections=100
+      - --table-open-cache=400
+      - --table-definition-cache=400
+      - --table-open-cache-instances=2
+      - --thread-cache-size=8
+      - --host-cache-size=0
+      - --key-buffer-size=1M
+      - --tmp-table-size=16M
+      - --max-heap-table-size=16M
+      - --mysqlx=OFF
+      - --replica-parallel-workers=2
+      - --relay-log=relay-bin
+      - --server-id=42
+    ports:
+      - 127.0.0.1:${MYSQL_ORDER_3_REPLICA_PORT:-3342}:3306
+    volumes:
+      - mysql-order-3-replica-data:/var/lib/mysql
 
   redis:
     image: redis:8.10.3
@@ -281,5 +418,9 @@ volumes:
   mysql-order-0-replica-data:
   mysql-order-1-data:
   mysql-order-1-replica-data:
+  mysql-order-2-data:
+  mysql-order-2-replica-data:
+  mysql-order-3-data:
+  mysql-order-3-replica-data:
   redis-data:
   kafka-data:

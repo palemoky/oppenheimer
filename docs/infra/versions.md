@@ -49,6 +49,12 @@
 | `mysql-order-0-replica` | `order_db_0` 从库 | 3312 | 12 |
 | `mysql-order-1` | `order_db_1` 主库 | 3321 | 21 |
 | `mysql-order-1-replica` | `order_db_1` 从库 | 3322 | 22 |
+| `mysql-order-2` | 扩容演练（profile `expand`）：`order_db_2` 主库，由 `mysql-order-0` CLONE 而来 | 3331 | 31 |
+| `mysql-order-2-replica` | `order_db_2` 从库 | 3332 | 32 |
+| `mysql-order-3` | 扩容演练（profile `expand`）：`order_db_3` 主库，由 `mysql-order-1` CLONE 而来 | 3341 | 41 |
+| `mysql-order-3-replica` | `order_db_3` 从库 | 3342 | 42 |
+
+后四个实例属于 compose 的 `expand` profile，平时 `make up` 不启动；`make expand-up` 启动，`make expand-down` 连同数据卷删除，复制和提升由 `scripts/expand.sh` 完成（设计文档 1c 的 5.7）。镜像和参数与其他 order 实例一致，只多了 `restart: unless-stopped`：CLONE 完成后 mysqld 会退出，官方镜像里没有守护进程，靠容器的重启策略拉起。CLONE 插件在官方镜像里可用（`INSTALL PLUGIN clone SONAME 'mysql_clone.so'`，实测 9.7.4）。
 
 复制由 `scripts/mysql-replication.sh` 建立（`make up` 会调用，可重复运行）。从库用 `--relay-log=relay-bin` 固定了中继日志的文件名（默认取主机名，容器重建后会找不到旧文件）；复制元数据损坏时脚本会按从库的 `gtid_executed` 重新配置。
 
@@ -60,6 +66,8 @@ CDC 伪装成从库读 binlog，要占用 server-id，不能和上表以及彼�
 |---|---|---|
 | `order-0` | `mysql-order-0-replica` | 1011 |
 | `order-1` | `mysql-order-1-replica` | 1021 |
+| `order-2` | `mysql-order-2-replica`（扩容后） | 1031 |
+| `order-3` | `mysql-order-3-replica`（扩容后） | 1041 |
 
 CDC 的集成测试每个用例用一个 10 万以上的随机 server-id，避免并行的用例互相踢掉连接。
 

@@ -56,12 +56,19 @@ func rules(prefix string) []capture.Rule {
 
 func main() {
 	resetName := flag.String("reset-checkpoint", "", "给这条流水线的位点写墓碑后退出，下次启动时重做全量")
+	printName := flag.String("print-checkpoint", "",
+		"把这条流水线已确认的位点（GTID 集合）打印到标准输出后退出；没有位点或全量还没做完时报错。日志改写到标准错误")
 	flag.Parse()
 
-	logger := logx.New(serviceName, os.Stdout, logx.LevelFromEnv())
+	// 打印位点时标准输出只留那一行 GTID 集合，方便脚本直接取用（scripts/expand.sh 用它判断 CDC 是否越过围栏）。
+	logOut := os.Stdout
+	if *printName != "" {
+		logOut = os.Stderr
+	}
+	logger := logx.New(serviceName, logOut, logx.LevelFromEnv())
 	slog.SetDefault(logger)
 
-	if err := run(context.Background(), logger, *resetName); err != nil {
+	if err := run(context.Background(), logger, *resetName, *printName); err != nil {
 		logger.Error("service exited with error", "error", err)
 		os.Exit(1)
 	}
@@ -122,7 +129,7 @@ func producerOpts() []kgo.Opt {
 	}
 }
 
-func run(ctx context.Context, logger *slog.Logger, resetName string) error {
+func run(ctx context.Context, logger *slog.Logger, resetName, printName string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -156,6 +163,23 @@ func run(ctx context.Context, logger *slog.Logger, resetName string) error {
 			return err
 		}
 		logger.Info("checkpoint reset; the pipeline will redo the snapshot on next start", "pipeline", resetName)
+		return nil
+	}
+
+	if printName != "" {
+		cp, err := checkpoints.Load(startCtx, printName)
+		if err != nil {
+			return err
+		}
+		switch {
+		case cp == nil:
+			return fmt.Errorf("pipeline %s has no checkpoint", printName)
+		case cp.GetSnapshot() != nil:
+			// 全量期间位点停在全量开始前的集合，不代表增量已经读到那里之后的任何位置。
+			return fmt.Errorf("pipeline %s is still in its snapshot (at table %s)", printName, cp.GetSnapshot().GetTable())
+		}
+		// MySQL 输出的 GTID 集合在多个来源之间带换行，压成一行。
+		fmt.Println(strings.Join(strings.Fields(cp.GetGtidSet()), ""))
 		return nil
 	}
 

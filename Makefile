@@ -118,6 +118,20 @@ seed: ## 向本地 inventory_db 写入示例 SKU（服务至少启动过一次�
 		 ON DUPLICATE KEY UPDATE name = VALUES(name);" 2>/dev/null
 	@echo "seeded sku 1001, 1002, 1003 (merchant 1), 2001 (merchant 2)"
 
+# 造数（设计 1c 的 5.3）。DSN 与 scripts/run-local.sh 一致；SEED_ARGS 里的同名参数会覆盖这里的默认值。
+.PHONY: seed-orders
+seed-orders: ## 直接向订单主库灌历史订单（order 至少启动过一次），可中断续跑，参数用 SEED_ARGS 传，例如 SEED_ARGS="-orders 100000"
+	go run ./test/load seed \
+		-order-dsns "root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3311)/order_db_0,root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3321)/order_db_1" \
+		$(SEED_ARGS)
+
+.PHONY: seed-report
+seed-report: ## 灌数之后量分片均匀度、查询延迟、偏移量对游标（只读），参数用 SEED_ARGS 传，例如 SEED_ARGS="-analyze -json tmp/seed-report.json"
+	go run ./test/load seed-report \
+		-order-dsns "root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3311)/order_db_0,root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:3321)/order_db_1" \
+		-merchant-index-dsns "root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:$(MYSQL_PORT))/merchant_index_db_0,root:$(MYSQL_ROOT_PASSWORD)@tcp(127.0.0.1:$(MYSQL_PORT))/merchant_index_db_1" \
+		$(SEED_ARGS)
+
 ## ---------- 本地依赖 ----------
 
 # up 和 up-core 共用：启动核心依赖并建 inventory_db、payment_db。
@@ -143,8 +157,17 @@ down: ## 停止本地依赖，保留数据
 	$(COMPOSE) down
 
 .PHONY: down-volumes
-down-volumes: ## 停止本地依赖并删除全部数据
-	$(COMPOSE) down --volumes
+down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例）
+	$(COMPOSE) --profile expand down --volumes
+
+.PHONY: expand-up
+expand-up: ## 启动扩容演练用的 4 个 MySQL 容器（profile expand）并等待就绪；之后用 scripts/expand.sh 分阶段演练
+	$(COMPOSE) --profile expand up -d --wait mysql-order-2 mysql-order-2-replica mysql-order-3 mysql-order-3-replica
+
+.PHONY: expand-down
+expand-down: ## 停止并删除扩容演练的 4 个容器及其数据卷（不影响其他实例）
+	$(COMPOSE) --profile expand rm -f -s -v mysql-order-2 mysql-order-2-replica mysql-order-3 mysql-order-3-replica
+	@docker volume rm -f oppenheimer_mysql-order-2-data oppenheimer_mysql-order-2-replica-data oppenheimer_mysql-order-3-data oppenheimer_mysql-order-3-replica-data
 
 .PHONY: ps
 ps: ## 查看本地依赖的状态
