@@ -13,28 +13,26 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/testdb"
 )
 
-// 迁移文件里的 outbox 建表语句必须与 outbox.Schema 一致：SQL 文件引用不了 Go 常量，
-// 只能抄一份，这里防止两边改了一边。比较时忽略空白差异；迁移文件为了可重入多了 IF NOT EXISTS，
-// 比较前给 Schema 补上。
+// 迁移跑完之后，outbox 的表结构必须与 outbox.Schema 一致：SQL 文件引用不了 Go 常量，表是分几个迁移文件
+// 建成现在这样的（00001 建表，00004 加 trace_context），这里防止两边改了一边。
+// 比的是数据库里实际的表结构，不是迁移文件的文本。
 func TestOutboxMigrationMatchesSchema(t *testing.T) {
 	t.Parallel()
-	rendered, err := mysqlx.RenderMigrations(Migrations, MigrationsDir, MigrationData{Slots: []int{0}})
-	if err != nil {
+	migrated := testdb.NewTemplate(t, Migrations, MigrationsDir, MigrationData{Slots: []int{0}})
+	plain, _ := testdb.Empty(t)
+	testdb.MustExec(t, plain, outbox.Schema)
+	if got, want := showCreateOutbox(t, migrated), showCreateOutbox(t, plain); got != want {
+		t.Errorf("outbox after migrations differs from outbox.Schema\nmigrated:\n%s\nschema:\n%s", got, want)
+	}
+}
+
+func showCreateOutbox(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var name, ddl string
+	if err := db.QueryRowContext(t.Context(), "SHOW CREATE TABLE outbox").Scan(&name, &ddl); err != nil {
 		t.Fatal(err)
 	}
-	b, err := fs.ReadFile(rendered, "00001_init.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	const plain, reentrant = "CREATE TABLE outbox", "CREATE TABLE IF NOT EXISTS outbox"
-	rest, ok := strings.CutPrefix(outbox.Schema, plain)
-	if !ok {
-		t.Fatalf("outbox.Schema does not start with %q", plain)
-	}
-	normalize := func(s string) string { return strings.Join(strings.Fields(s), " ") }
-	if !strings.Contains(normalize(string(b)), normalize(reentrant+rest)+";") {
-		t.Errorf("00001_init.sql does not contain outbox.Schema (with IF NOT EXISTS) verbatim")
-	}
+	return ddl
 }
 
 func tables(t *testing.T, db *sql.DB) []string {
