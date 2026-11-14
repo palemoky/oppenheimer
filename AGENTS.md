@@ -81,6 +81,9 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 - 错误必须处理或显式向上返回，用 `fmt.Errorf("...: %w", err)` 包装。
 - 所有跨进程调用带 `context` 和超时。时限逐跳收紧：总时限只在入口设一次，每一跳给下一跳单独设一个更短的时限（服务之间用 `grpcx.WithHopTimeout`），同一个数也写在 Envoy 边车的出站路由上（`deploy/envoy/`），两处要一致。见 ADR-0020。
 - 重试的规则：只重试幂等的操作；一条调用链上只有一层重试（同步调用链上不重试，由客户端带幂等键重试；异步的由消费者重试）；退避带抖动；重试有上限，耗尽后的去向要明确。客户端库可能自己重试（go-redis 默认会），非幂等的操作要先确认它被执行两次的后果。
+- “自己是好的、依赖坏了或功能被关掉”时返回 `errx.Degraded`（`FAILED_PRECONDITION` 加降级原因码），不要返回 `UNAVAILABLE`：调用方的边车会把 `UNAVAILABLE` 算成这个服务的失败，连续 5 次就把整个服务摘掉。gateway 按原因码映射成 503。见设计文档 1d 的 6.16。
+- 边车看不到的依赖（Redis、MySQL 的从库和冷库）用 `pkg/breaker` 熔断；可以降级的功能在 `pkg/degrade` 登记开关，自动降级和人工开关走同一条代码路径。可选的依赖不能挡住启动（`redisx.OpenLazy`、`mysqlx.OpenLazy`）。
+- 消费者对普通错误不设重试上限（依赖不可用时让分区停住等它恢复），死信只收 handler 标成 `kafkax.Permanent` 的。所以 handler 里“数据本身不对、重试也不会成功”的错误必须标成 `Permanent`，否则会永久挡住分区。见 ADR-0021。
 - 服务之间的熔断和并发上限在 Envoy 边车的配置里，不在业务代码里；改之前先读设计文档 1d 的 5.3（实测的行为和三个坑）。
 - 并发代码必须有 `-race` 测试；一致性逻辑（幂等、扣减、状态机）必须有并发场景的测试。
 - 提交前通过 `make lint test`。CI（`.github/workflows/ci.yml`）会对每个 go module 跑 lint、build、vet 和带 `-race` 的测试。
