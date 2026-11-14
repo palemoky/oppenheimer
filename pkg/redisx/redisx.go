@@ -57,6 +57,10 @@ func Open(ctx context.Context, cfg Config) (*redis.Client, error) {
 		WriteTimeout: cmp(cfg.WriteTimeout, time.Second),
 		PoolSize:     cfg.PoolSize,
 		MinIdleConns: cfg.MinIdleConns,
+		// 让命令遵守调用方 ctx 的截止时间和取消。go-redis 默认不看 ctx：不开的话，调用方给一次 Redis 调用
+		// 设的时限（比如“这次查询最多等 50 毫秒”）不起作用，真正生效的只有上面的 ReadTimeout（1 秒），
+		// 调用方取消了命令也照样等到底。1d 做网关限流时发现（设计文档 1d 的 4.16）。
+		ContextTimeoutEnabled: true,
 	}
 	if opts.PoolSize <= 0 {
 		opts.PoolSize = DefaultPoolSize
