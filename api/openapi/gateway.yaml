@@ -14,7 +14,10 @@ info:
     - 时间是 RFC 3339 格式的 UTC 时间。
     - 请求体里出现未定义的字段会被拒绝（400）。
     - 所有错误响应的结构相同，见 `Error`。500 的响应不透出内部错误消息。
-    - 网关按客户端地址、按用户加接口、按接口限流，超出时返回 429（`RATE_LIMITED`），见 `TooManyRequests`。
+    - 网关按客户端地址、按用户加接口、按接口限流，查库存和商家订单列表还按路径里的 ID 限流（热点参数），
+      超出时返回 429（`RATE_LIMITED`），见 `TooManyRequests`。
+    - 访问日志里的 499 表示客户端在响应返回前断开了连接（Nginx 的约定，不是标准状态码）。
+      客户端收不到这个响应，所以各接口不声明它。
     - 存活探测 `GET /healthz` 由各服务统一提供，不属于本接口。
 servers:
   - url: http://localhost:8080
@@ -429,13 +432,17 @@ components:
             $ref: '#/components/schemas/Error'
     TooManyRequests:
       description: |
-        请求被拒绝，没有产生任何效果（没有调用下游，没有创建或修改任何东西）。原因码有两种，客户端的处理不同：
+        请求被拒绝，没有产生任何效果（没有创建或修改任何东西）。原因码有三种，客户端的处理不同：
 
         - `RATE_LIMITED`：调用方自己太快了，超出了配额。按 `Retry-After` 等待之后再重试，不要立刻重试。
           `message` 里说明是哪一维的限制：`ip`（同一个客户端地址的所有请求）、`user`（同一个用户对这个接口）、
-          `route`（这个接口所有用户的总量）。其他用户、其他接口通常不受影响。
+          `route`（这个接口所有用户的总量）、`hot`（这个接口下同一个参数值的所有请求，不分用户：
+          查库存按 `sku_id`，商家订单列表按 `merchant_id`）。其他用户、其他接口通常不受影响。
         - `BACKLOGGED`：只在下单时出现。系统忙（等待落库的订单积压过多），与调用方的速率无关，所有人都应当退避；
           稍后用同一个 `Idempotency-Key` 重试即可。
+        - `READ_BUSY`：只在查询订单时出现（查单个订单、订单列表，以及创建支付单时对订单的检查）。
+          订单服务同时处理的查询已经到了上限，这个上限是为了给下单的落库留出数据库连接。
+          与调用方自己的速率无关，稍后重试即可；没有 `Retry-After`。
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
@@ -446,6 +453,7 @@ components:
     Error:
       description: |
         其他错误。下游不可用为 503（`UNAVAILABLE`），下游超时为 504（`DEADLINE_EXCEEDED`），其余为 500。
+        下游响应太慢时通常也是 503：服务之间的代理先于网关超时，返回的是“不可用”。两者对客户端的含义相同，稍后重试。
       content:
         application/json:
           schema:

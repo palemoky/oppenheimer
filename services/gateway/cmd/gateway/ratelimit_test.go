@@ -49,6 +49,19 @@ func TestLoadRateLimitConfigDefaults(t *testing.T) {
 			t.Errorf("default user[%s] = %v, want %v", id, cfg.user[id], want)
 		}
 	}
+	// 热点参数（设计 5.8 的表）：只有这两个接口，没有单独设的值。
+	wantHot := map[string]ratelimit.Limit{"getStock": {Rate: 500, Burst: 1000}, "listMerchantOrders": {Rate: 50, Burst: 100}}
+	if len(cfg.hot) != len(wantHot) {
+		t.Errorf("hot = %v, want %v", cfg.hot, wantHot)
+	}
+	for id, want := range wantHot {
+		if cfg.hot[id] != want {
+			t.Errorf("default hot[%s] = %v, want %v", id, cfg.hot[id], want)
+		}
+	}
+	if len(cfg.hotItems) != 0 {
+		t.Errorf("hot items = %v, want none", cfg.hotItems)
+	}
 	if cfg.redisAddr != "127.0.0.1:6380" || cfg.redisPrefix != "" {
 		t.Errorf("redis = %q prefix %q", cfg.redisAddr, cfg.redisPrefix)
 	}
@@ -66,6 +79,8 @@ func TestLoadRateLimitConfigOverrides(t *testing.T) {
 		"RATE_LIMIT_IP":             "off",
 		"RATE_LIMIT_USER":           "createOrder=1/2,getOrder=off",
 		"RATE_LIMIT_ROUTE":          "createOrder=3000/6000",
+		"RATE_LIMIT_HOT":            "getStock=100/200",
+		"RATE_LIMIT_HOT_ITEMS":      " getStock:1001=5000/10000, listMerchantOrders:7=off ,",
 		"RATE_LIMIT_REDIS_TIMEOUT":  "5ms",
 		"RATE_LIMIT_REDIS_COOLDOWN": "3s",
 		"RATE_LIMIT_REDIS_PREFIX":   "custom:",
@@ -87,6 +102,27 @@ func TestLoadRateLimitConfigOverrides(t *testing.T) {
 	if cfg.route["createOrder"] != (ratelimit.Limit{Rate: 3000, Burst: 6000}) || cfg.route["getOrder"].Enabled() {
 		t.Errorf("route = %v", cfg.route)
 	}
+	if cfg.hot["getStock"] != (ratelimit.Limit{Rate: 100, Burst: 200}) {
+		t.Errorf("hot[getStock] = %v", cfg.hot["getStock"])
+	}
+	if cfg.hot["listMerchantOrders"] != httpapi.DefaultHotLimits()["listMerchantOrders"] {
+		t.Errorf("hot[listMerchantOrders] should keep its default, got %v", cfg.hot["listMerchantOrders"])
+	}
+	wantItems := map[httpapi.HotItem]ratelimit.Limit{
+		{Operation: "getStock", Value: 1001}:        {Rate: 5000, Burst: 10000},
+		{Operation: "listMerchantOrders", Value: 7}: {},
+	}
+	if len(cfg.hotItems) != len(wantItems) {
+		t.Errorf("hot items = %v, want %v", cfg.hotItems, wantItems)
+	}
+	for k, want := range wantItems {
+		if got, ok := cfg.hotItems[k]; !ok || got != want {
+			t.Errorf("hot item %v = %v, %v; want %v", k, got, ok, want)
+		}
+	}
+	if got := formatHotItems(cfg.hotItems); got != "getStock:1001=5000/10000,listMerchantOrders:7=off" {
+		t.Errorf("formatHotItems = %q", got)
+	}
 	if cfg.redisTimeout != 5*time.Millisecond || cfg.redisCooldown != 3*time.Second || cfg.redisPrefix != "custom:" {
 		t.Errorf("redis settings = %v %v %q", cfg.redisTimeout, cfg.redisCooldown, cfg.redisPrefix)
 	}
@@ -107,6 +143,22 @@ func TestLoadRateLimitConfigOff(t *testing.T) {
 	defer closeFn()
 	if rl != nil || rep != nil {
 		t.Errorf("RATE_LIMIT=off created limiters: %v %v", rl, rep)
+	}
+
+	// RATE_LIMIT=off 时热点这一维也不生效（上面已经没有任何限流器）；单独把热点整个关掉：
+	cfg, err = loadRateLimitConfig(envMap(map[string]string{"RATE_LIMIT_HOT": "off", "RATE_LIMIT_REDIS_ADDR": ""}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, l := range cfg.hot {
+		if l.Enabled() {
+			t.Errorf("hot[%s] = %v, want off", id, l)
+		}
+	}
+	rl, _, closeHot := newRateLimit(t.Context(), slog.New(slog.DiscardHandler), cfg)
+	defer closeHot()
+	if rl.Hot != nil {
+		t.Errorf("hot limiter = %T, want nil when RATE_LIMIT_HOT=off", rl.Hot)
 	}
 
 	// 一维整个关掉。
@@ -164,6 +216,26 @@ func TestLoadRateLimitConfigErrors(t *testing.T) {
 		{map[string]string{"TRUSTED_PROXIES": "10.0.0.0/40"}, "TRUSTED_PROXIES"},
 		// 关掉限流时写错的配置照样报出来。
 		{map[string]string{"RATE_LIMIT": "off", "RATE_LIMIT_USER": "bogus=1/1"}, "bogus"},
+		// 热点参数：规范里没有的、规范里有但没有热点参数的、格式错误、重复。
+		{map[string]string{"RATE_LIMIT_HOT": "getStok=1/1"}, "unknown operationId"},
+		{map[string]string{"RATE_LIMIT_HOT": "getOrder=1/1"}, "does not take this limit"},
+		{map[string]string{"RATE_LIMIT_HOT": "getStock=1"}, "RATE_LIMIT_HOT"},
+		{map[string]string{"RATE_LIMIT_HOT": "getStock"}, "RATE_LIMIT_HOT"},
+		{map[string]string{"RATE_LIMIT_HOT": "getStock=0/1"}, "getStock"},
+		{map[string]string{"RATE_LIMIT_HOT": "getStock=1/2,getStock=off"}, "more than once"},
+		{map[string]string{"RATE_LIMIT": "off", "RATE_LIMIT_HOT": "createOrder=1/1"}, "createOrder"},
+		// 个别参数值：未知的、没有热点参数的 operationId，不是正整数的参数值，格式错误，重复。
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStok:1=1/1"}, "unknown operationId"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getOrder:1=1/1"}, "does not take this limit"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:abc=1/1"}, "not a positive integer"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:0=1/1"}, "not a positive integer"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:-5=1/1"}, "not a positive integer"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock=1/1"}, "RATE_LIMIT_HOT_ITEMS"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:1"}, "RATE_LIMIT_HOT_ITEMS"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:=1/1"}, "RATE_LIMIT_HOT_ITEMS"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": ":1=1/1"}, "RATE_LIMIT_HOT_ITEMS"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:1=fast"}, "getStock:1=fast"},
+		{map[string]string{"RATE_LIMIT_HOT_ITEMS": "getStock:1=1/1,getStock:01=2/2"}, "more than once"},
 	}
 	for _, tt := range tests {
 		_, err := loadRateLimitConfig(envMap(tt.env))
@@ -192,6 +264,13 @@ func TestNewRateLimitWithoutRedis(t *testing.T) {
 	}
 	if _, ok := rl.IP.(*ratelimit.Local); !ok {
 		t.Errorf("ip limiter = %T, want local", rl.IP)
+	}
+	// 热点默认开着，用单独的一个进程内限流器，不和按 IP 的共用。
+	if hot, ok := rl.Hot.(*ratelimit.Local); !ok || hot == rl.IP {
+		t.Errorf("hot limiter = %T (same as ip: %v), want its own local limiter", rl.Hot, rl.Hot == rl.IP)
+	}
+	if rl.HotLimits["getStock"] != cfg.hot["getStock"] {
+		t.Errorf("hot limits not passed on: %v", rl.HotLimits)
 	}
 
 	// 按用户和按接口都关掉时不建限流器（也就不会连 Redis）。

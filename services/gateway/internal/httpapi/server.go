@@ -13,12 +13,22 @@ import (
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (
 	// DefaultCallTimeout 是单个请求内所有下游调用的总时限。
 	DefaultCallTimeout = 5 * time.Second
+	// DownstreamHopBudget 是 gateway 给任一下游的单跳预算（设计文档 1d 5.6）。总时限 5 秒，给下游 3 秒：
+	// 下游超时之后 gateway 还来得及返回明确的错误，而不是和下游在同一刻一起超时。
+	// 这个数写在 deploy/envoy/gateway.yaml 四条出站路由的 timeout 上（TestHopTimeoutMatchesEnvoy 核对），由边车执行：
+	// 只有边车自己的路由超时到期才计入异常检测，慢下游才会被摘除。
+	DownstreamHopBudget = 3 * time.Second
+	// DownstreamHopTimeout 是进程里的单跳时限，由 grpcx.WithHopTimeout 加在每条下游连接上。
+	// 比预算多 grpcx.SidecarMargin：让边车先超时（理由见那个常量），进程里的只在边车不在或卡住时兜底。
+	// 所以正常情况下，下游超时时客户端看到的是边车返回的 503（Unavailable），不是 504。
+	DownstreamHopTimeout = DownstreamHopBudget + grpcx.SidecarMargin
 	// maxBodyBytes 限制请求体大小，防止客户端用超大 body 占用内存。
 	maxBodyBytes = 1 << 20
 )
@@ -84,8 +94,8 @@ func New(deps Deps, cfg Config) http.Handler {
 	// 限流挂在这个分组上，只作用于规范里的接口：没匹配到路由的 404 不经过它，
 	// 健康检查挂在外层的 mux 上（cmd/gateway），也不经过它。
 	// 顺序：按 IP 在识别用户之前（最便宜，挡没有身份的洪水）；按用户和接口在识别用户之后、设置下游时限之前
-	// （限流器有自己的时限，不占用下游调用的预算）。
-	rl, limitIP, limitShared := newRateLimiter(cfg.RateLimit)
+	// （限流器有自己的时限，不占用下游调用的预算）；热点参数在按用户之后（先按用户限，再看这个值是不是被打爆了）。
+	rl, limitIP, limitShared, limitHot := newRateLimiter(cfg.RateLimit)
 	s.rl = rl
 	var mw []gin.HandlerFunc
 	if limitIP {
@@ -94,6 +104,9 @@ func New(deps Deps, cfg Config) http.Handler {
 	mw = append(mw, s.requireUser)
 	if limitShared {
 		mw = append(mw, s.limitUserAndRoute)
+	}
+	if limitHot {
+		mw = append(mw, s.limitHot)
 	}
 	mw = append(mw, s.withDeadline)
 	api := r.Group("", mw...)

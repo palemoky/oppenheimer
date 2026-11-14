@@ -382,8 +382,9 @@ func TestRateLimiterCancelledRequestIsNotLetThrough(t *testing.T) {
 	req.Header.Set("X-User-Id", "7")
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, req)
-	if rec.Code == http.StatusOK || rec.Code == http.StatusTooManyRequests {
-		t.Errorf("status = %d for a cancelled request", rec.Code)
+	// 客户端已经走了：499，既不放行，也不当成被限流。
+	if rec.Code != 499 {
+		t.Errorf("status = %d for a cancelled request, want 499", rec.Code)
 	}
 	if e.order.calls != 0 {
 		t.Errorf("downstream calls = %d, want 0", e.order.calls)

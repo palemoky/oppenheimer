@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,9 @@ type rateLimitConfig struct {
 	ip      ratelimit.Limit
 	// user 和 route 含规范里的每一个 operationId。
 	user, route map[string]ratelimit.Limit
+	// hot 含每一个有热点参数的 operationId（httpapi.HotOperationIDs）；hotItems 是个别参数值单独的限额。
+	hot      map[string]ratelimit.Limit
+	hotItems map[httpapi.HotItem]ratelimit.Limit
 	// redisAddr 为空表示不用 Redis，按用户和按接口的也在进程内。
 	redisAddr      string
 	redisPrefix    string
@@ -50,6 +54,10 @@ type rateLimitConfig struct {
 //   - RATE_LIMIT_USER：按接口覆盖每个用户的限额，"operationId=速率/桶,..."，值可以是 off；
 //     整个变量是 off 表示这一维全部不限。没写到的接口用 httpapi.DefaultUserLimits。
 //   - RATE_LIMIT_ROUTE：每个接口所有用户合计的限额，格式同上，默认全部不限。
+//   - RATE_LIMIT_HOT：热点参数限流，这个接口下每个参数值（SKU、商家）一个桶，格式同上。只能写有热点参数的接口
+//     （getStock、listMerchantOrders），没写到的用 httpapi.DefaultHotLimits（每个 SKU 500/1000、每个商家 50/100）。
+//   - RATE_LIMIT_HOT_ITEMS：个别参数值单独的限额，"operationId:参数值=速率/桶,..."，例如 getStock:1001=5000/10000。
+//     覆盖这个接口的默认值（包括 RATE_LIMIT_HOT 里设成 off 的：那样只限单独列出来的值）。默认没有。
 //   - RATE_LIMIT_REDIS_ADDR：按用户和按接口的桶放在哪个 Redis。没设时用 CACHE_REDIS_ADDR（和 inventory 的查询缓存
 //     是同一个实例），它也没设时用 127.0.0.1:6380；设成空字符串表示不用 Redis，全部在进程内。
 //   - RATE_LIMIT_REDIS_PREFIX：键前缀。没设时用 REDIS_PREFIX（e2e 和压测靠它隔离每一轮的键）。
@@ -80,6 +88,12 @@ func loadRateLimitConfig(lookup func(string) (string, bool)) (rateLimitConfig, e
 	}
 	if cfg.route, err = httpapi.ParseOperationLimits(get("RATE_LIMIT_ROUTE"), nil); err != nil {
 		return rateLimitConfig{}, fmt.Errorf("invalid RATE_LIMIT_ROUTE: %w", err)
+	}
+	if cfg.hot, err = httpapi.ParseHotLimits(get("RATE_LIMIT_HOT"), httpapi.DefaultHotLimits()); err != nil {
+		return rateLimitConfig{}, fmt.Errorf("invalid RATE_LIMIT_HOT: %w", err)
+	}
+	if cfg.hotItems, err = httpapi.ParseHotItems(get("RATE_LIMIT_HOT_ITEMS")); err != nil {
+		return rateLimitConfig{}, fmt.Errorf("invalid RATE_LIMIT_HOT_ITEMS: %w", err)
 	}
 
 	// “没设”和“设成空”含义不同：前者用默认的缓存实例，后者表示不用 Redis。所以用 lookup 的第二个返回值区分。
@@ -166,6 +180,14 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 		// 按 IP 永远在进程内：它是第一道闸，不能依赖 Redis（设计 4.4）。
 		rl.IP = ratelimit.NewLocal(ratelimit.LocalConfig{})
 	}
+	if anyEnabled(cfg.hot) || anyEnabled(cfg.hotItems) {
+		// 热点参数也在进程内（为什么不放 Redis 见 httpapi.RateLimit.Hot），但单独一个实例，不和按 IP 的共用：
+		// 客户端地址的数量没有上限，共用的话地址多起来会把热点的桶挤出去（被挤掉的桶下次是满的，等于放宽）。
+		// 键的数量是 SKU 数加商家数，容量和按 IP 的一样用默认上限。
+		rl.Hot = ratelimit.NewLocal(ratelimit.LocalConfig{MaxKeys: ratelimit.DefaultMaxKeys})
+		rl.HotLimits = cfg.hot
+		rl.HotItems = cfg.hotItems
+	}
 
 	var fallbacks func() int64
 	useRedis := false
@@ -203,6 +225,8 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 		"ip", cfg.ip.String(),
 		"user", formatLimits(cfg.user),
 		"route", formatLimits(cfg.route),
+		"hot", formatLimits(cfg.hot),
+		"hot_items", formatHotItems(cfg.hotItems),
 		"trusted_proxies", formatPrefixes(cfg.trustedProxies),
 		"redis", useRedis,
 	}
@@ -220,7 +244,7 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 	return rl, reporter, closeFn
 }
 
-func anyEnabled(m map[string]ratelimit.Limit) bool {
+func anyEnabled[K comparable](m map[K]ratelimit.Limit) bool {
 	for _, l := range m {
 		if l.Enabled() {
 			return true
@@ -234,6 +258,18 @@ func formatLimits(m map[string]ratelimit.Limit) string {
 	parts := make([]string, 0, len(m))
 	for _, id := range slices.Sorted(maps.Keys(m)) {
 		parts = append(parts, id+"="+m[id].String())
+	}
+	return strings.Join(parts, ",")
+}
+
+// formatHotItems 把个别参数值的限额写成 "operationId:参数值=速率/桶,..."（排好序），和配置的格式一致。
+func formatHotItems(m map[httpapi.HotItem]ratelimit.Limit) string {
+	items := slices.SortedFunc(maps.Keys(m), func(a, b httpapi.HotItem) int {
+		return cmp.Or(cmp.Compare(a.Operation, b.Operation), cmp.Compare(a.Value, b.Value))
+	})
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		parts = append(parts, it.Operation+":"+strconv.FormatInt(it.Value, 10)+"="+m[it].String())
 	}
 	return strings.Join(parts, ",")
 }

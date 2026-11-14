@@ -21,16 +21,18 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/ratelimit"
 )
 
-// 网关限流（设计文档 1d 第 4 节，ADR-0019）。三个维度：
+// 网关限流（设计文档 1d 第 4 节和 5.8，ADR-0019）。四个维度：
 //
 //   - 按客户端地址（ip）：进程内的令牌桶，所有接口共用一个桶。在识别用户之前判断，挡没有身份的洪水，
 //     被它拒绝的请求不做任何别的事。它不依赖 Redis：打垮 Redis 不应当等于关掉第一道闸。
 //   - 按用户加接口（user）和按接口（route）：一次 Allow 判断两个桶，全有或全无，
 //     请求被接口的总量拒绝时不消耗用户自己的配额。平时在 Redis 里（所有实例共用），Redis 不可用时
 //     由 ratelimit.Fallback 退回进程内。
+//   - 热点参数（hot）：只对 hotParams 表里的接口，按路径里某个参数的值（SKU、商家）一个值一个桶，不分用户。
+//     进程内，见 limitHot 和 RateLimit.Hot。
 //
 // 中间件的顺序（从外到内）：requestLog → recoverPanic → limitIP → requireUser → limitUserAndRoute
-// → withDeadline → handler。被任何一维拒绝的请求都不调用下游。
+// → limitHot → withDeadline → handler。被任何一维拒绝的请求都不调用下游。
 
 // codeRateLimited 是被限流时的原因码。下单的背压是 429 BACKLOGGED，两者要分开：
 // BACKLOGGED 是系统忙，所有人都该退避；RATE_LIMITED 是这个调用方自己太快了。
@@ -60,6 +62,25 @@ var operations = [...]operation{
 	{http.MethodGet, "/api/v1/orders/:order_id/payment", "getPayment"},
 	{http.MethodGet, "/api/v1/skus/:sku_id/stock", "getStock"},
 	{http.MethodGet, "/api/v1/merchants/:merchant_id/orders", "listMerchantOrders"},
+}
+
+// hotParam 是一个接口的热点参数：用路径里哪个参数的值分桶，以及每个值默认的桶。
+type hotParam struct {
+	// name 是规范里路径模板中的参数名（{sku_id}），也就是 gin 的 c.Param 用的名字。
+	// TestHotParamsMatchSpec 保证它确实出现在这个接口的路径模板里。
+	name string
+	def  ratelimit.Limit
+}
+
+// hotParams 是“operationId → 热点参数”的表（设计文档 1d 5.8 的表），默认值只在这里写一份。
+// 不在表里的接口没有热点限流，RATE_LIMIT_HOT 里写它们是配置错误。
+//
+// 下单不按 SKU 做热点限流：库存闸门已经按 SKU 原子地放行，卖完了的请求在闸门就返回了。
+var hotParams = map[string]hotParam{
+	// 商品页的展示读，大促时所有人都在刷同一个 SKU。
+	"getStock": {name: "sku_id", def: ratelimit.Limit{Rate: 500, Burst: 1000}},
+	// 一个大商家的订单列表是范围查询，比查库存贵得多，阈值低一个数量级。
+	"listMerchantOrders": {name: "merchant_id", def: ratelimit.Limit{Rate: 50, Burst: 100}},
 }
 
 // defaultUserLimits 是按用户的默认限额（设计文档 1d 4.2 的表），默认值只在这里写一份。
@@ -92,21 +113,45 @@ func OperationIDs() []string {
 // DefaultUserLimits 返回按用户的默认限额（operationId → 限额）的副本。
 func DefaultUserLimits() map[string]ratelimit.Limit { return maps.Clone(defaultUserLimits) }
 
+// HotOperationIDs 返回有热点参数的接口的 operationId，按字母序。
+func HotOperationIDs() []string { return slices.Sorted(maps.Keys(hotParams)) }
+
+// DefaultHotLimits 返回热点参数每个值的默认限额（operationId → 限额）。
+func DefaultHotLimits() map[string]ratelimit.Limit {
+	out := make(map[string]ratelimit.Limit, len(hotParams))
+	for id, hp := range hotParams {
+		out[id] = hp.def
+	}
+	return out
+}
+
 // ParseOperationLimits 解析按接口的限额配置："operationId=速率/桶,..."，例如 "createOrder=5/10,getOrder=off"。
 // 结果包含每一个接口：配置里写到的用配置的值（off 表示不限），没写到的用 base 里的（base 里也没有就是不限）。
 // 整个字符串是 "off" 时所有接口都不限；空字符串时就是 base。
 // 出现规范里没有的 operationId、同一个接口写了两次、格式错误时返回错误，指出是哪一项。
 func ParseOperationLimits(s string, base map[string]ratelimit.Limit) (map[string]ratelimit.Limit, error) {
-	out := make(map[string]ratelimit.Limit, len(operations))
+	return parseLimits(s, OperationIDs(), base)
+}
+
+// ParseHotLimits 解析热点参数的限额配置（RATE_LIMIT_HOT），格式和规则同 ParseOperationLimits，限额指的是这个接口下
+// 每个参数值的桶。结果只包含 hotParams 里的接口；写了规范里有、但没有热点参数的接口也是错误
+// （这一维对它没有意义，写了多半是写错了接口）。
+func ParseHotLimits(s string, base map[string]ratelimit.Limit) (map[string]ratelimit.Limit, error) {
+	return parseLimits(s, HotOperationIDs(), base)
+}
+
+// parseLimits 是 ParseOperationLimits 和 ParseHotLimits 的实现，ids 是允许出现的 operationId。
+func parseLimits(s string, ids []string, base map[string]ratelimit.Limit) (map[string]ratelimit.Limit, error) {
+	out := make(map[string]ratelimit.Limit, len(ids))
 	s = strings.TrimSpace(s)
 	if s == "off" {
-		for _, op := range operations {
-			out[op.id] = ratelimit.Limit{}
+		for _, id := range ids {
+			out[id] = ratelimit.Limit{}
 		}
 		return out, nil
 	}
-	for _, op := range operations {
-		out[op.id] = base[op.id]
+	for _, id := range ids {
+		out[id] = base[id]
 	}
 	seen := make(map[string]bool)
 	for item := range strings.SplitSeq(s, ",") {
@@ -120,7 +165,7 @@ func ParseOperationLimits(s string, base map[string]ratelimit.Limit) (map[string
 			return nil, fmt.Errorf("%q: want operationId=rate/burst or operationId=off", item)
 		}
 		if _, known := out[id]; !known {
-			return nil, fmt.Errorf("%q: unknown operationId %q (known: %s)", item, id, strings.Join(OperationIDs(), ", "))
+			return nil, unknownOperation(item, id, ids)
 		}
 		if seen[id] {
 			return nil, fmt.Errorf("%q: operationId %q given more than once", item, id)
@@ -131,6 +176,61 @@ func ParseOperationLimits(s string, base map[string]ratelimit.Limit) (map[string
 			return nil, fmt.Errorf("%q: %w", item, err)
 		}
 		out[id] = l
+	}
+	return out, nil
+}
+
+// unknownOperation 是配置里出现了不允许的 operationId 时的错误。区分“规范里根本没有”和“有，但这一维不适用”，
+// 后者多半是把配置写到了错误的变量里。
+func unknownOperation(item, id string, allowed []string) error {
+	known := strings.Join(allowed, ", ")
+	if slices.ContainsFunc(operations[:], func(op operation) bool { return op.id == id }) {
+		return fmt.Errorf("%q: operation %q does not take this limit (allowed: %s)", item, id, known)
+	}
+	return fmt.Errorf("%q: unknown operationId %q (known: %s)", item, id, known)
+}
+
+// HotItem 标识热点限流里的一个参数值：某个接口下的某个 SKU 或商家。
+type HotItem struct {
+	Operation string
+	Value     int64
+}
+
+// ParseHotItems 解析个别参数值的限额（RATE_LIMIT_HOT_ITEMS）："operationId:参数值=速率/桶,..."，
+// 例如 "getStock:1001=5000/10000"（某个大促的 SKU）。值也可以是 off（这个值不限）。
+// operationId 必须有热点参数，参数值必须是正整数（和 handler 接受的 ID 一样）；同一项写两次、格式错误都返回错误，
+// 指出是哪一项。
+func ParseHotItems(s string) (map[HotItem]ratelimit.Limit, error) {
+	out := make(map[HotItem]ratelimit.Limit)
+	ids := HotOperationIDs()
+	for item := range strings.SplitSeq(s, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		target, value, hasValue := strings.Cut(item, "=")
+		id, raw, hasParam := strings.Cut(target, ":")
+		id, raw = strings.TrimSpace(id), strings.TrimSpace(raw)
+		if !hasValue || !hasParam || id == "" || raw == "" {
+			return nil, fmt.Errorf("%q: want operationId:value=rate/burst or operationId:value=off", item)
+		}
+		hp, hot := hotParams[id]
+		if !hot {
+			return nil, unknownOperation(item, id, ids)
+		}
+		n, valid := parseID(raw)
+		if !valid {
+			return nil, fmt.Errorf("%q: %s %q is not a positive integer", item, hp.name, raw)
+		}
+		key := HotItem{Operation: id, Value: n}
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("%q: %s:%d given more than once", item, id, n)
+		}
+		l, err := ratelimit.Parse(value)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		out[key] = l
 	}
 	return out, nil
 }
@@ -151,6 +251,20 @@ type RateLimit struct {
 	// 没有的项不限。键应当来自 ParseOperationLimits（它校验 operationId），这里不认识的键不起作用。
 	User, Route map[string]ratelimit.Limit
 
+	// Hot 是热点参数的限流器，应当是进程内的、单独的一个实例（不和按 IP 的共用：两者的键空间不同，
+	// 一边的键多了会把另一边的桶挤出去）。为 nil、或者 HotLimits 和 HotItems 都不限时，这一维不限，中间件也不挂。
+	//
+	// 状态放在进程里而不是 Redis（设计文档 1d 5.8）：热点保护要的是“别让一个 SKU 把这个实例占满”，
+	// 每个实例挡住打到自己身上的那一份就够了，不需要跨实例精确。而且被打爆的恰恰是热点值，
+	// 放进 Redis 等于把所有实例对同一个热点的请求再汇聚到同一个 Redis 键上，制造出一个新的热点，
+	// 每个请求还多一次往返。代价是总量是 实例数 × 单实例的阈值，阈值按单实例来配。
+	Hot ratelimit.Limiter
+	// HotLimits 以 operationId 为键，是这个接口下每个参数值默认的桶，应当来自 ParseHotLimits。
+	// 不在 hotParams 里的接口不起作用。
+	HotLimits map[string]ratelimit.Limit
+	// HotItems 是个别参数值单独的桶，覆盖 HotLimits 里这个接口的默认值，应当来自 ParseHotItems。
+	HotItems map[HotItem]ratelimit.Limit
+
 	// Stats 收集被拒绝的次数，给 RateLimitReporter 汇总。为 nil 时内部建一个（没有人读）。
 	Stats *RateLimitStats
 }
@@ -162,17 +276,19 @@ const (
 	dimIP dimension = iota
 	dimUser
 	dimRoute
+	dimHot
 	numDimensions
 )
 
 // dimensionNames 是对外的维度名，出现在 429 的错误信息和汇总日志里。客户端和测试依赖它们，不要改。
-var dimensionNames = [numDimensions]string{"ip", "user", "route"}
+var dimensionNames = [numDimensions]string{"ip", "user", "route", "hot"}
 
 // rateLimitedMessages 是 429 的错误信息，预先拼好，拒绝时不必每次格式化。
 var rateLimitedMessages = [numDimensions]string{
 	"rate limit exceeded: ip",
 	"rate limit exceeded: user",
 	"rate limit exceeded: route",
+	"rate limit exceeded: hot",
 }
 
 // routeKey 是查 operation 的键。用结构体而不是拼接的字符串，查表时不分配内存。
@@ -187,6 +303,19 @@ type opLimits struct {
 	// routeKey 是接口的桶的键 "r:<operationId>"。
 	routeKey    string
 	user, route ratelimit.Limit
+	// hot 为 nil 表示这个接口没有热点限流（没有热点参数，或者配置成全部不限）。
+	hot *hotLimits
+}
+
+// hotLimits 是一个接口的热点限流参数。
+type hotLimits struct {
+	// param 是路径参数的名字。
+	param string
+	// keyPrefix 是 "h:<operationId>:"，桶的键是它加上规范化的参数值。
+	keyPrefix string
+	// def 是每个参数值默认的桶；items 是个别参数值单独的桶，按解析后的整数查（查表不分配内存）。
+	def   ratelimit.Limit
+	items map[int64]ratelimit.Limit
 }
 
 // rateLimiter 是 server 里限流用到的状态。
@@ -195,21 +324,23 @@ type rateLimiter struct {
 	ipLimit ratelimit.Limit
 	trusted []netip.Prefix
 	shared  ratelimit.Limiter
+	hot     ratelimit.Limiter
 	ops     map[routeKey]*opLimits
 	stats   *RateLimitStats
 }
 
 // newRateLimiter 按配置建好查表用的结构；返回 nil 表示不限流。
-// 两个返回的布尔值说明要不要挂按 IP 的、按用户和接口的中间件。
-func newRateLimiter(cfg *RateLimit) (rl *rateLimiter, limitIP, limitShared bool) {
+// 三个返回的布尔值说明要不要挂按 IP 的、按用户和接口的、热点参数的中间件。
+func newRateLimiter(cfg *RateLimit) (rl *rateLimiter, limitIP, limitShared, limitHot bool) {
 	if cfg == nil {
-		return nil, false, false
+		return nil, false, false, false
 	}
 	rl = &rateLimiter{
 		ip:      cfg.IP,
 		ipLimit: cfg.IPLimit,
 		trusted: slices.Clone(cfg.TrustedProxies),
 		shared:  cfg.Shared,
+		hot:     cfg.Hot,
 		ops:     make(map[routeKey]*opLimits, len(operations)),
 		stats:   cmp.Or(cfg.Stats, &RateLimitStats{}),
 	}
@@ -221,14 +352,44 @@ func newRateLimiter(cfg *RateLimit) (rl *rateLimiter, limitIP, limitShared bool)
 			user:          cfg.User[op.id],
 			route:         cfg.Route[op.id],
 		}
+		ol.hot = newHotLimits(op.id, cfg)
 		rl.ops[routeKey{op.method, op.path}] = ol
 		if ol.user.Enabled() || ol.route.Enabled() {
 			limitShared = true
 		}
+		if ol.hot != nil {
+			limitHot = true
+		}
 	}
 	limitIP = rl.ip != nil && rl.ipLimit.Enabled()
 	limitShared = limitShared && rl.shared != nil
-	return rl, limitIP, limitShared
+	limitHot = limitHot && rl.hot != nil
+	return rl, limitIP, limitShared, limitHot
+}
+
+// newHotLimits 返回接口 id 的热点限流参数；没有热点参数、或者默认值和所有单独设的值都不限时返回 nil。
+func newHotLimits(id string, cfg *RateLimit) *hotLimits {
+	hp, ok := hotParams[id]
+	if !ok {
+		return nil
+	}
+	h := &hotLimits{param: hp.name, keyPrefix: "h:" + id + ":", def: cfg.HotLimits[id]}
+	enabled := h.def.Enabled()
+	for item, l := range cfg.HotItems {
+		if item.Operation != id {
+			continue
+		}
+		if h.items == nil {
+			h.items = make(map[int64]ratelimit.Limit)
+		}
+		// 单独设成 off 的也要记下：它覆盖默认值，表示这个值不限。
+		h.items[item.Value] = l
+		enabled = enabled || l.Enabled()
+	}
+	if !enabled {
+		return nil
+	}
+	return h
 }
 
 // op 返回当前请求的接口；不在表里时返回 nil（TestOperationsMatchSpec 保证 API 分组里的路由都在表里）。
@@ -276,6 +437,44 @@ func (s *server) limitUserAndRoute(c *gin.Context) {
 	}
 }
 
+// limitHot 按热点参数限流：这个接口下同一个参数值（SKU、商家）的所有请求共用一个桶，不分用户。
+// 在 limitUserAndRoute 之后：一个用户自己刷得太快应当报 user，被按用户拒绝的请求也不消耗这个值的公共额度。
+// 在 withDeadline 之前：进程内的判断没有网络往返，但也没有理由占用下游调用的预算。
+//
+// 参数值不是正整数时不限流、直接放过，由 handler 照原来的方式返回 400：垃圾值不该在限流器里占桶
+// （换着花样写垃圾值就能不断建新桶，把真正的热点挤出去）。桶的键用解析后的整数重新格式化，
+// 不用原始字符串：parseID 接受 "007"、"+7"，按原始字符串分桶的话换个写法就能绕过同一个 SKU 的限额。
+func (s *server) limitHot(c *gin.Context) {
+	rl := s.rl
+	op := rl.op(c)
+	if op == nil || op.hot == nil {
+		return
+	}
+	h := op.hot
+	n, ok := parseID(c.Param(h.param))
+	if !ok {
+		return
+	}
+	limit := h.def
+	if l, set := h.items[n]; set {
+		limit = l
+	}
+	if !limit.Enabled() {
+		return
+	}
+	// 键在栈上的缓冲区里拼好，只在转成 string 时分配一次（限流器要把它存成 map 的键）。
+	var buf [64]byte
+	key := string(strconv.AppendInt(append(buf[:0], h.keyPrefix...), n, 10))
+	d, err := rl.hot.Allow(c.Request.Context(), ratelimit.Request{Key: key, Limit: limit})
+	if err != nil {
+		s.rateLimiterFailed(c, dimHot, err)
+		return
+	}
+	if !d.Allowed {
+		s.rejectRateLimited(c, op, dimHot, d.RetryAfter)
+	}
+}
+
 // rejectRateLimited 写出 429 RATE_LIMITED 并中止请求。不记日志：洪水来时每个请求一条日志会成为第二个问题，
 // 只计数，由 RateLimitReporter 周期性地汇总成一条。requestLog 照常记这个请求的访问日志。
 func (s *server) rejectRateLimited(c *gin.Context, op *opLimits, dim dimension, retryAfter time.Duration) {
@@ -296,8 +495,9 @@ func retryAfterSeconds(d time.Duration) int64 {
 // rateLimiterFailed 处理限流器自己出错的情况。
 //
 // Fallback 已经把 Redis 的失败退回了进程内的限流器，走到这里只有两种可能：调用方取消了请求，
-// 或者进程内的限流器也出错了（只会是参数不合法这类代码缺陷）。前者按下游调用被取消一样结束请求；
-// 后者放行：限流是保护措施，不能因为它自己的问题拒绝正常的请求。dim 只用于日志。
+// 或者进程内的限流器也出错了（只会是参数不合法这类代码缺陷）。前者按下游调用被取消一样结束请求
+// （客户端断开时是 499，见 writeGRPCError）；后者放行：限流是保护措施，不能因为它自己的问题拒绝正常的请求。
+// dim 只用于日志。
 func (s *server) rateLimiterFailed(c *gin.Context, dim dimension, err error) {
 	ctx := c.Request.Context()
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -403,7 +603,7 @@ func (r *RateLimitReporter) Flush(ctx context.Context) {
 	attrs := []slog.Attr{
 		slog.String("interval", r.interval.String()),
 		slog.Int64("denied_total", total),
-		// denied 里每一项是 "维度.operationId": 次数，维度是 ip、user、route。
+		// denied 里每一项是 "维度.operationId": 次数，维度是 ip、user、route、hot。
 		slog.GroupAttrs("denied", denied...),
 	}
 	if r.fallbacks != nil {

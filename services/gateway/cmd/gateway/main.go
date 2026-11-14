@@ -44,22 +44,24 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	// Dial 是惰性的，下游暂时不可达不会阻止 gateway 启动。
-	orderConn, err := grpcx.Dial(orderAddr)
+	// 每条下游连接都加单跳时限（设计文档 1d 5.6），和 Envoy 边车出站路由的 timeout 是同一个数。
+	hop := grpcx.WithHopTimeout(httpapi.DownstreamHopTimeout)
+	orderConn, err := grpcx.Dial(orderAddr, hop)
 	if err != nil {
 		return fmt.Errorf("dial order: %w", err)
 	}
 	defer orderConn.Close()
-	inventoryConn, err := grpcx.Dial(inventoryAddr)
+	inventoryConn, err := grpcx.Dial(inventoryAddr, hop)
 	if err != nil {
 		return fmt.Errorf("dial inventory: %w", err)
 	}
 	defer inventoryConn.Close()
-	paymentConn, err := grpcx.Dial(paymentAddr)
+	paymentConn, err := grpcx.Dial(paymentAddr, hop)
 	if err != nil {
 		return fmt.Errorf("dial payment: %w", err)
 	}
 	defer paymentConn.Close()
-	orderIndexConn, err := grpcx.Dial(orderIndexAddr)
+	orderIndexConn, err := grpcx.Dial(orderIndexAddr, hop)
 	if err != nil {
 		return fmt.Errorf("dial orderindex: %w", err)
 	}

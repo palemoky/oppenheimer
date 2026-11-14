@@ -14,9 +14,14 @@ import (
 
 	"github.com/palemoky/oppenheimer/pkg/ratelimit"
 	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
+
+	"github.com/palemoky/oppenheimer/pkg/grpcx"
 )
 
-const specPath = "../../../../api/openapi/gateway.yaml"
+const (
+	specPath         = "../../../../api/openapi/gateway.yaml"
+	envoyGatewayPath = "../../../../deploy/envoy/gateway.yaml"
+)
 
 // specOperation 是规范里的一个 operation。
 type specOperation struct {
@@ -115,6 +120,107 @@ func TestOperationsMatchSpec(t *testing.T) {
 		if _, ok := table[routeKey{rt.Method, rt.Path}]; !ok {
 			t.Errorf("generated route %s %s is missing from operations", rt.Method, rt.Path)
 		}
+	}
+}
+
+// TestHotParamsMatchSpec 保证 hotParams 表里的接口都在规范里，参数名确实出现在这个接口的路径模板中
+// （规范把 {sku_id} 改了名而表没跟上时，c.Param 拿到空字符串，热点限流悄悄失效），默认值合法。
+func TestHotParamsMatchSpec(t *testing.T) {
+	specOps, _ := loadSpec(t)
+	byID := map[string]specOperation{}
+	for _, so := range specOps {
+		byID[so.id] = so
+	}
+	if len(hotParams) == 0 {
+		t.Fatal("hotParams is empty")
+	}
+	for id, hp := range hotParams {
+		so, ok := byID[id]
+		if !ok {
+			t.Errorf("hot operation %s is not in the spec", id)
+			continue
+		}
+		if !strings.Contains(so.path, "{"+hp.name+"}") {
+			t.Errorf("hot operation %s: parameter %q is not in its path template %s", id, hp.name, so.path)
+		}
+		// 中间件按 operations 表里的 gin 模板认路由，c.Param 用的是那里的名字，也核对一遍。
+		for _, op := range operations {
+			if op.id == id && !strings.Contains(op.path, ":"+hp.name) {
+				t.Errorf("hot operation %s: parameter %q is not in the gin route %s", id, hp.name, op.path)
+			}
+		}
+		if !hp.def.Enabled() || hp.def.Validate() != nil {
+			t.Errorf("default hot limit of %s is %+v, want a valid enabled limit", id, hp.def)
+		}
+	}
+}
+
+// TestHopTimeoutMatchesEnvoy 核对三个数的关系：Envoy 边车每条出站路由的 timeout 等于 DownstreamHopBudget；
+// 进程里的 DownstreamHopTimeout 比它长 grpcx.SidecarMargin（边车必须先超时，慢下游才会被摘除）；
+// 两者都严格短于 gateway 的总时限。改了一处忘了别处时失败。
+func TestHopTimeoutMatchesEnvoy(t *testing.T) {
+	raw, err := os.ReadFile(envoyGatewayPath)
+	if err != nil {
+		t.Fatalf("read envoy config: %v", err)
+	}
+	var doc struct {
+		StaticResources struct {
+			Listeners []struct {
+				Name         string `yaml:"name"`
+				FilterChains []struct {
+					Filters []struct {
+						TypedConfig struct {
+							RouteConfig struct {
+								VirtualHosts []struct {
+									Routes []struct {
+										Route struct {
+											Timeout string `yaml:"timeout"`
+										} `yaml:"route"`
+									} `yaml:"routes"`
+								} `yaml:"virtual_hosts"`
+							} `yaml:"route_config"`
+						} `yaml:"typed_config"`
+					} `yaml:"filters"`
+				} `yaml:"filter_chains"`
+			} `yaml:"listeners"`
+		} `yaml:"static_resources"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse envoy config: %v", err)
+	}
+	if DownstreamHopTimeout != DownstreamHopBudget+grpcx.SidecarMargin || grpcx.SidecarMargin <= 0 {
+		t.Errorf("DownstreamHopTimeout %v must be DownstreamHopBudget %v plus a positive grpcx.SidecarMargin %v: "+
+			"the sidecar has to time out first or a slow downstream is never ejected", DownstreamHopTimeout, DownstreamHopBudget, grpcx.SidecarMargin)
+	}
+	if DownstreamHopTimeout >= DefaultCallTimeout {
+		t.Errorf("DownstreamHopTimeout %v must be shorter than DefaultCallTimeout %v", DownstreamHopTimeout, DefaultCallTimeout)
+	}
+	// gateway 的边车只有出站监听，四个下游各一个。
+	want := map[string]bool{"to_order": true, "to_inventory": true, "to_payment": true, "to_orderindex": true}
+	for _, l := range doc.StaticResources.Listeners {
+		if !want[l.Name] {
+			t.Errorf("unexpected listener %q; update this test if the gateway got a new downstream", l.Name)
+			continue
+		}
+		delete(want, l.Name)
+		if len(l.FilterChains) == 0 || len(l.FilterChains[0].Filters) == 0 ||
+			len(l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts) == 0 ||
+			len(l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts[0].Routes) == 0 {
+			t.Errorf("listener %s: no route found", l.Name)
+			continue
+		}
+		raw := l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts[0].Routes[0].Route.Timeout
+		got, err := time.ParseDuration(raw)
+		if err != nil {
+			t.Errorf("listener %s: route timeout %q: %v", l.Name, raw, err)
+			continue
+		}
+		if got != DownstreamHopBudget {
+			t.Errorf("listener %s: route timeout = %v, DownstreamHopBudget = %v; they must match", l.Name, got, DownstreamHopBudget)
+		}
+	}
+	for name := range want {
+		t.Errorf("outbound listener %s is missing from the envoy config", name)
 	}
 }
 
