@@ -70,7 +70,22 @@ func hop(ctx context.Context, d time.Duration, fn func(context.Context) error) e
 
 // gateCall 是对库存闸门的一次调用，统一加 gateTimeout。所有闸门调用都经过它，不在调用点各写一遍。
 func (s *Service) gateCall(ctx context.Context, fn func(context.Context) error) error {
-	return hop(ctx, gateTimeout, fn)
+	return s.gateCallWithin(ctx, gateTimeout, fn)
+}
+
+// gateCallWithin 是时限为 d 的一次闸门调用，经过闸门的熔断器（设计文档 1d 的 6.4）。
+//
+// 熔断器打开时不访问 Redis，立刻返回一个 isBreakerOpen 为真的错误：Redis 坏着的时候，
+// 受理、查询、落库不用每次都等满时限才知道。闸门的方法把业务结果（库存不足、占用不存在）放在返回值里，
+// 返回错误就是 Redis 或脚本出了问题，所以除了调用方自己取消之外的错误都算失败。
+func (s *Service) gateCallWithin(ctx context.Context, d time.Duration, fn func(context.Context) error) error {
+	done, err := s.gateBreaker.Allow()
+	if err != nil {
+		return fmt.Errorf("stock gate: %w", err)
+	}
+	err = hop(ctx, d, fn)
+	done(depOutcome(ctx, err))
+	return err
 }
 
 // gateGet、gateHold 是最常用的两个闸门调用的简写。

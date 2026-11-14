@@ -210,7 +210,7 @@ func (e *env) readModeService(t *testing.T, mode ReadMode, withCache bool) *Serv
 	t.Helper()
 	d := Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, Logger: e.svc.logger, Marks: e.marks}
 	if withCache {
-		c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger)
+		c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

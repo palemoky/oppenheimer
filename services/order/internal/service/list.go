@@ -38,7 +38,7 @@ const listTimeout = 3 * time.Second
 // （用户和订单在同一个库，按订单读出的主库位置对用户同样有效）。
 //
 // 已归档的订单（设计文档 1c 第 6.6 节）：配置了冷库时，结果是热库和冷库的并集按订单号倒序的精确分页，
-// 游标仍然是订单号。先查热库，必要时（见 mayNeedCold）再用同样的条件查冷库，两边归并（见 mergeNewestFirst）。
+// 游标仍然是订单号。冷库不可用时不整页失败，返回精确的前一段并设 ArchiveUnavailable（见 listHotOnly）。先查热库，必要时（见 mayNeedCold）再用同样的条件查冷库，两边归并（见 mergeNewestFirst）。
 // 先热后冷，理由同 loadCold：数据只从热流向冷、写冷在删热之前，一个订单在两次查询之间被归档，
 // 先查热时它还在热库，后查冷时它已经在冷库，至少一边看得到；反过来两边都可能看不到。
 func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrdersRequest) (*orderv1.ListUserOrdersResponse, error) {
@@ -54,20 +54,69 @@ func (s *Service) ListUserOrders(ctx context.Context, req *orderv1.ListUserOrder
 		return nil, s.listError(ctx, "list user orders", hopErr(lctx, err), req.GetUserId())
 	}
 	if s.cold != nil && s.mayNeedCold(rows, more) {
+		const op = "list archived user orders"
 		cold, moreCold, err := s.listCold(lctx, q)
-		if err != nil {
+		switch {
+		case err == nil:
+			rows, more = mergeNewestFirst(rows, more, cold, moreCold, q.Limit)
+		case s.archiveUnavailable(lctx, op, err, "user_id", req.GetUserId()):
+			// 冷库不可用：返回精确的前一段，并明说不完整（设计文档 1d 的 6.8）。
+			return s.listHotOnly(rows)
+		default:
+			// 调用方取消、超时，本服务给列表的总时限到了，名额满：按原来的方式返回错误。
 			// 不悄悄只返回热库的部分：那样这一页会漏掉已归档的订单，而且 more 可能是错的，翻页就此结束。
-			return nil, s.listError(ctx, "list archived user orders", hopErr(lctx, err), req.GetUserId())
+			return nil, s.listError(ctx, op, hopErr(lctx, err), req.GetUserId())
 		}
-		rows, more = mergeNewestFirst(rows, more, cold, moreCold, q.Limit)
 	}
+	resp := newListResponse(rows)
+	if more {
+		resp.NextBeforeOrderId = rows[len(rows)-1].OrderID
+	}
+	return resp, nil
+}
+
+func newListResponse(rows []store.OrderSummary) *orderv1.ListUserOrdersResponse {
 	resp := &orderv1.ListUserOrdersResponse{Orders: make([]*orderv1.OrderSummary, 0, len(rows))}
 	for _, r := range rows {
 		resp.Orders = append(resp.Orders, toSummaryProto(r))
 	}
-	if more {
-		resp.NextBeforeOrderId = rows[len(rows)-1].OrderID
+	return resp
+}
+
+// listHotOnly 是冷库不可用时的列表：热库这一页里订单号晚于冷热分界的那一段（!archive.MaybeCold），
+// 带上 ArchiveUnavailable 和指向这一段最后一条的游标。这一段为空时返回 errArchiveUnavailable。
+//
+// 为什么这一段是精确的（和冷库正常时那一页的前 n 条完全相同）：沿用 mergeNewestFirst 的记号，
+// H、C 是两库里满足条件（用户、状态、游标之前）的全部订单，U = H ∪ C，hot 是热库按订单号倒序的前 limit 条。
+// 记 P 为 hot 里 !MaybeCold 的那些行，m 为 P 里最小的订单号。
+//  1. P 是 hot 的一个前缀：MaybeCold 只看订单号里的时间，订单号越小时间越早（时间在订单号的高位），
+//     所以 MaybeCold 随订单号单调，倒序排列的 hot 里一旦出现 MaybeCold 的行，后面的都是。
+//  2. C 里没有大于 m 的订单：冷库里的订单号都早于 now - MinHotAge（设计文档 1c 第 6.3 节不变量 3；
+//     now 只会往后走，这条只会更宽松），对它们 MaybeCold 为真；而 m 的 MaybeCold 为假，由单调性，
+//     任何大于 m 的订单号 MaybeCold 也为假，不可能在 C 里。
+//  3. 所以 U 里大于等于 m 的订单都在 H 里。H 里大于等于 m 的订单排在 m 前面，m 在 hot（H 的前 limit 条）里，
+//     它们也都在 hot 里，并且由单调性都是 !MaybeCold，也就都在 P 里。反过来 P ⊆ H ⊆ U。
+//     于是 P 恰好是 U 里大于等于 m 的全部订单，也就是 U 按倒序的前 |P| 条：和冷库正常时那一页的前 |P| 条相同，
+//     不多（没有不满足条件的）、不少（没有漏掉冷库里的）、顺序一样。
+//
+// 为什么游标 m 可以接着用：下一次请求取的是 U 里小于 m 的订单，和正常翻页的语义完全一样；
+// 由 3，大于等于 m 的已经全部返回过了，接着取不会漏也不会重。那时冷库恢复了就是正常的一页（热冷归并），
+// 还没恢复就再返回下一段（通常为空，因为 P 已经到了冷热分界，于是得到 ARCHIVE_UNAVAILABLE）。
+// 游标总是给出，即使 U 里其实已经没有更早的订单：没有冷库就不知道“后面还有没有”，不能答 more=false。
+//
+// 这一段为空（游标已经翻过冷热分界，或者 hot 的第一条就可能在冷库）时没有任何能确定的东西，返回降级错误。
+func (s *Service) listHotOnly(hot []store.OrderSummary) (*orderv1.ListUserOrdersResponse, error) {
+	now := s.now()
+	n := len(hot)
+	if i := slices.IndexFunc(hot, func(r store.OrderSummary) bool { return archive.MaybeCold(r.OrderID, now) }); i >= 0 {
+		n = i
 	}
+	if n == 0 {
+		return nil, errArchiveUnavailable
+	}
+	resp := newListResponse(hot[:n])
+	resp.ArchiveUnavailable = true
+	resp.NextBeforeOrderId = hot[n-1].OrderID
 	return resp, nil
 }
 
@@ -82,14 +131,9 @@ func (s *Service) listHot(ctx context.Context, q store.UserOrdersQuery) ([]store
 	return s.store.ListUserOrders(ctx, q, store.Primary)
 }
 
-// listCold 读冷库，占冷库的名额，最多 coldTimeout（与 loadCold 相同）。
+// listCold 读冷库，经过 coldRead（迁移、开关、熔断器、名额，最多 coldTimeout，与 loadCold 相同）。
 func (s *Service) listCold(ctx context.Context, q store.UserOrdersQuery) (rows []store.OrderSummary, more bool, err error) {
-	release, err := acquire(s.limits.cold)
-	if err != nil {
-		return nil, false, err
-	}
-	defer release()
-	err = hop(ctx, coldTimeout, func(ctx context.Context) error {
+	err = s.coldRead(ctx, func(ctx context.Context) error {
 		var err error
 		rows, more, err = s.cold.ListUserOrders(ctx, q)
 		return err

@@ -218,7 +218,7 @@ func newLimitScene(t *testing.T, withCache bool) *limitScene {
 	sc.svc = e.serviceWith(t, func(d *Deps, c *Config) {
 		c.ReadMaxConcurrency = 2
 		if withCache {
-			oc, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger)
+			oc, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -400,7 +400,8 @@ func TestColdReadLimitAndTimeout(t *testing.T) {
 
 	err = <-stuck
 	elapsed := time.Since(start)
-	wantErr(t, err, codes.Unavailable, "")
+	// 冷库这一跳超时：降级错误（设计文档 1d 的 6.8），记一条 WARN。
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonArchiveUnavailable)
 	if elapsed < coldTimeout-50*time.Millisecond || elapsed > coldTimeout+time.Second {
 		t.Errorf("stuck cold read returned after %s, want about %s", elapsed, coldTimeout)
 	}
@@ -494,11 +495,11 @@ func TestGateTimeout(t *testing.T) {
 		t.Errorf("GetOrder with a stuck gate took %s, want about %s", elapsed, gateTimeout)
 	}
 	_, err := getOrder(t, svc, 424242, 1)
-	wantErr(t, err, codes.Unavailable, "")
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 
 	start = time.Now()
 	_, err = svc.SubmitOrder(t.Context(), submitReq(1, "stuck", items(skuA, 1)))
-	wantErr(t, err, codes.Unavailable, "")
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 	// Hold 一次 gateTimeout，撤销（abandon）再一次。
 	if elapsed := time.Since(start); elapsed > 2*gateTimeout+500*time.Millisecond {
 		t.Errorf("SubmitOrder with a stuck gate took %s, want about %s", elapsed, 2*gateTimeout)

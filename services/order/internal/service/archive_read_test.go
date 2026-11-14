@@ -86,7 +86,7 @@ func (e *env) coldService(t *testing.T, cold *store.Cold, withCache bool) *Servi
 		Logger: e.svc.logger, Marks: e.marks, Cold: cold,
 	}
 	if withCache {
-		c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger)
+		c, err := NewOrderCache(e.rdb, e.prefix, e.svc.logger, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -218,10 +218,9 @@ func TestGetOrderColdStoreDown(t *testing.T) {
 		_, err := getOrder(t, svc, newID, 1)
 		wantErr(t, err, codes.NotFound, errx.ReasonOrderNotFound)
 
+		// 冷库这一跳出错（调用方还在等）：降级错误，不是 INTERNAL（设计文档 1d 的 6.8）。
 		_, err = getOrder(t, svc, o.GetOrderId(), 1)
-		if errx.Code(err) != codes.Internal {
-			t.Fatalf("archived order with the cold store down: err = %v, want Internal", err)
-		}
+		wantErr(t, err, codes.FailedPrecondition, errx.ReasonArchiveUnavailable)
 	}
 	if _, ok := e.cacheEntry(t, o.GetOrderId()); ok {
 		t.Fatal("cold store error was cached")
@@ -429,8 +428,8 @@ func TestListUserOrdersWithArchive(t *testing.T) {
 	}
 }
 
-// 热库里新订单超过一页时，第一页只走热库：冷库不可用也成功。翻到要看冷库的那一页时返回错误，
-// 而不是悄悄只返回热库的部分。
+// 热库里新订单超过一页时，第一页只走热库：冷库不可用也成功。翻到要看冷库的那一页时，
+// 返回热库里新于冷热分界的那一段并明说不完整（ArchiveUnavailable），而不是悄悄只返回热库的部分。
 func TestListUserOrdersSkipsColdForFreshPage(t *testing.T) {
 	t.Parallel()
 	e := newColdEnv(t)
@@ -447,16 +446,29 @@ func TestListUserOrdersSkipsColdForFreshPage(t *testing.T) {
 	if len(resp.GetOrders()) != 2 || resp.GetNextBeforeOrderId() == 0 {
 		t.Fatalf("first page = %v, want 2 orders and a next page", resp)
 	}
-	// 第二页热库只剩一条，没有满页：后面有没有更多要看冷库。
-	_, err = e.svc.ListUserOrders(t.Context(), listReq(1, 2, resp.GetNextBeforeOrderId()))
-	if errx.Code(err) != codes.Internal {
-		t.Fatalf("second page with the cold store down: err = %v, want Internal", err)
+	if resp.GetArchiveUnavailable() {
+		t.Error("first page answered from the hot store alone is marked archive_unavailable")
 	}
-	// 页大小超过热库的订单数，第一页就要看冷库。
-	_, err = e.svc.ListUserOrders(t.Context(), listReq(1, 5, 0))
-	if errx.Code(err) != codes.Internal {
-		t.Fatalf("page larger than the hot orders with the cold store down: err = %v, want Internal", err)
+	// 第二页热库只剩一条，没有满页：后面有没有更多要看冷库。这一条是新订单，返回它并明说不完整。
+	second, err := e.svc.ListUserOrders(t.Context(), listReq(1, 2, resp.GetNextBeforeOrderId()))
+	if err != nil {
+		t.Fatalf("second page with the cold store down: %v", err)
 	}
+	if len(second.GetOrders()) != 1 || !second.GetArchiveUnavailable() ||
+		second.GetNextBeforeOrderId() != second.GetOrders()[0].GetOrderId() {
+		t.Fatalf("second page = %v, want the one fresh order, archive_unavailable and a cursor at it", second)
+	}
+	// 页大小超过热库的订单数，第一页就要看冷库：返回三条新订单并明说不完整。
+	all, err := e.svc.ListUserOrders(t.Context(), listReq(1, 5, 0))
+	if err != nil {
+		t.Fatalf("page larger than the hot orders with the cold store down: %v", err)
+	}
+	if len(all.GetOrders()) != 3 || !all.GetArchiveUnavailable() {
+		t.Fatalf("page of 5 = %v, want the 3 fresh orders and archive_unavailable", all)
+	}
+	// 接着取：热库里没有更早的了，能确定的一段为空，答降级错误。
+	_, err = e.svc.ListUserOrders(t.Context(), listReq(1, 5, all.GetNextBeforeOrderId()))
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonArchiveUnavailable)
 }
 
 // 热库刚好一页、最后一条还是新订单，而冷库还有：不能因为最后一条是新的就跳过冷库，

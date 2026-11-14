@@ -18,6 +18,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -31,7 +32,9 @@ import (
 	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
 	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/mysqlx"
@@ -96,6 +99,10 @@ type Config struct {
 	OrderCacheTTL time.Duration
 	// OrderCacheNullTTL 是“订单不存在”在查询缓存里的保留时长，默认 DefaultOrderCacheNullTTL。
 	OrderCacheNullTTL time.Duration
+	// BreakerFailures、BreakerCooldown 是进程里各熔断器（闸门、落库健康）的参数，
+	// 默认 breaker.DefaultFailures、breaker.DefaultCooldown。测试里调小。
+	BreakerFailures int
+	BreakerCooldown time.Duration
 	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
 	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
 	Backlog stockgate.BacklogLimit
@@ -171,10 +178,16 @@ type Deps struct {
 	OrderCache *cache.Cache[*orderv1.Order]
 	// Marks 是读己之写的标记（闸门所在的 Redis 实例）。Config.ReadMode 为 ReadPrimary 时可以为空。
 	Marks *readmark.Marks
+	// Degrade 可选，本服务的降级开关（设计文档 1d 的 6.9）。Service 把自己的开关登记到上面。
+	// 为空时用一个私有的 Set：开关都在默认值，代码路径相同。
+	Degrade *degrade.Set
 	// Cold 可选，冷库（已归档订单，设计文档 1c 第 6 节）。为空时没有冷库路径：
 	// 热库里没有的订单就是不存在。有数据归档之后必须配置，否则已归档的订单查不到，
 	// 针对它们的支付结果会被当成“订单不存在”而要求退款。
 	Cold *store.Cold
+	// ColdMigrate 可选，给冷库建表。非空时冷库在它第一次成功之前不可用（展示读立刻返回 ARCHIVE_UNAVAILABLE），
+	// 由 ArchiveMigrator 在后台重试到成功（设计文档 1d 的 6.8）；为空表示冷库的表已经建好。
+	ColdMigrate func(ctx context.Context) error
 }
 
 // Service 实现 orderv1.OrderServiceServer。
@@ -209,6 +222,27 @@ type Service struct {
 	cold           *store.Cold
 	// limits 是展示读和冷库读的并发上限，见 protect.go。
 	limits readLimits
+
+	// 以下是降级（设计文档 1d 第 6 节），见 degrade.go。
+	degrade *degrade.Set
+	// swAdmission 关掉时拒绝新的下单。
+	swAdmission *degrade.Switch
+	// gateBreaker 保护闸门所在的 Redis，所有闸门调用都经过它（gateCall）。
+	gateBreaker *breaker.Breaker
+	// gateRecoveredAt 是 gateBreaker 最近一次回到关闭的时刻（UnixNano），0 表示没有打开过。
+	gateRecoveredAt atomic.Int64
+	// landing 是每个订单库的落库健康（下标是库号），见 admitLanding。
+	landing         []*landingHealth
+	landingCooldown time.Duration
+	// 读路径的降级，见 readdegrade.go。
+	// replicas 是每个订单库的从库的健康标记（下标是库号），没有配置从库时为空。
+	replicas  []*replicaHealth
+	swReplica *degrade.Switch
+	// coldBreaker 保护冷库；coldReady 表示冷库的表已经建好（ArchiveMigrator），coldMigrate 是建表的函数。
+	coldBreaker *breaker.Breaker
+	coldReady   atomic.Bool
+	coldMigrate func(ctx context.Context) error
+	swArchive   *degrade.Switch
 }
 
 // New 返回 Service。读模式与依赖不匹配（要读从库却没有从库或标记）时返回错误：
@@ -242,7 +276,11 @@ func New(d Deps, cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{
+	set := d.Degrade
+	if set == nil {
+		set = degrade.New("order", logger)
+	}
+	s := &Service{
 		store:          d.Store,
 		gate:           d.Gate,
 		sender:         d.Sender,
@@ -268,7 +306,35 @@ func New(d Deps, cfg Config) (*Service, error) {
 		gtidWait:       cmp.Or(cfg.ReadGTIDWait, DefaultReadGTIDWait),
 		cold:           d.Cold,
 		limits:         limits,
-	}, nil
+		degrade:        set,
+	}
+	cooldown := cmp.Or(cfg.BreakerCooldown, breaker.DefaultCooldown)
+	s.gateBreaker = s.newBreaker(gateBreakerName, cfg.BreakerFailures, cooldown)
+	s.landingCooldown = cooldown
+	s.landing = make([]*landingHealth, dbs)
+	for i := range s.landing {
+		s.landing[i] = &landingHealth{b: s.newBreaker("landing-db-"+strconv.Itoa(i), cfg.BreakerFailures, cooldown)}
+	}
+	s.swAdmission = set.Switch(SwitchAdmission, "reject new orders (503); queries, cancellation and payment keep working")
+	s.swAdmission.Watch(s.admissionStatus)
+
+	// 从库：初始都不健康，探测（ReplicaProber）连续通过之后才读（设计文档 1d 的 6.7）。
+	if d.Store != nil && d.Store.HasReplicas() {
+		s.replicas = make([]*replicaHealth, dbs)
+		for i := range s.replicas {
+			s.replicas[i] = newReplicaHealth()
+		}
+	}
+	s.swReplica = set.Switch(SwitchReplicaRead, "display reads use the primary only")
+	s.swReplica.Watch(s.replicaStatus)
+	// 冷库：有建表函数时等它成功（ArchiveMigrator），没有时认为表已经建好。
+	s.coldBreaker = s.newBreaker("archive", cfg.BreakerFailures, cooldown)
+	s.coldMigrate = d.ColdMigrate
+	s.coldReady.Store(d.Cold != nil && d.ColdMigrate == nil)
+	s.swArchive = set.Switch(SwitchArchiveRead,
+		"archived orders are not read: their queries return 503, user lists stop at the hot/cold boundary")
+	s.swArchive.Watch(s.archiveStatus)
+	return s, nil
 }
 
 // now 截断到微秒：列是 DATETIME(6)，MySQL 写入时会四舍五入多余的精度，
@@ -577,15 +643,35 @@ const (
 //
 // 不做进程间的重建互斥：按订单号的 key 没有热点，而非终态订单的回源结果又不写缓存，
 // 互斥多出的两次 Redis 往返换不来东西（设计文档 7.2.5）。
-func NewOrderCache(client redis.Cmdable, prefix string, logger *slog.Logger) (*cache.Cache[*orderv1.Order], error) {
+//
+// set 不为 nil 时把缓存的开关（SwitchCache）登记到它上面：关掉之后查询不经过缓存。
+// 缓存的 Redis 出错时由 cache 包里的熔断器自动跳过（设计文档 1d 的 6.6），GET /degrade 上能看到它的状态。
+func NewOrderCache(client redis.Cmdable, prefix string, logger *slog.Logger, set *degrade.Set) (*cache.Cache[*orderv1.Order], error) {
+	var sw *degrade.Switch
+	if set != nil {
+		sw = set.Switch(SwitchCache, "order queries skip the cache and read the database")
+	}
 	c, err := cache.New(cache.Config{
 		Client:      client,
 		KeyPrefix:   prefix,
 		DisableLock: true,
 		Logger:      logger,
+		Switch:      sw,
+		Breaker: breaker.New(breaker.Config{Name: "order-cache", OnChange: func(name string, from, to breaker.State) {
+			logger.Warn("cache redis breaker changed", "breaker", name, "from", from.String(), "to", to.String())
+		}}),
 	}, cache.ProtoCodec[*orderv1.Order]{})
 	if err != nil {
 		return nil, fmt.Errorf("new order cache: %w", err)
+	}
+	if sw != nil {
+		sw.Watch(func() degrade.Status {
+			st := c.Breaker().Stats()
+			return degrade.Status{
+				Degraded: st.State != breaker.Closed,
+				Detail:   fmt.Sprintf("redis=%s(opens=%d,rejected=%d)", st.State, st.Opens, st.Rejected),
+			}
+		})
 	}
 	return c, nil
 }
@@ -693,7 +779,7 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 // 而从库还没复制到的订单会被答成 CREATING（状态往回退）或者不存在（还可能把不存在写进缓存）。
 //
 // 读占用失败（Redis 不可用）时退回到只读订单行：已经落库的订单照常能查到，只有行不存在时才报不可用，
-// 因为这时分不清它是在排队还是不存在。
+// 因为这时分不清它是在排队还是不存在。闸门的熔断器打开之后，读占用立刻返回、不再等满时限（设计文档 1d 的 6.4）。
 //
 // 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
@@ -703,11 +789,14 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 			// 调用方已经取消或超时：不必再去读订单行，按调用方的原因作答（不记 ERROR）。
 			return nil, false, s.internal(ctx, "read hold", err, "order_id", orderID)
 		}
-		s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
+		// 熔断器打开期间闸门根本没被访问，每个查询都记一条的话会刷屏；打开和恢复各有一条日志（breakerChanged）。
+		if !isBreakerOpen(err) {
+			s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
+		}
 		if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
 			return o, ok, err
 		}
-		return nil, false, status.Error(codes.Unavailable, "stock gate unavailable, retry later")
+		return nil, false, errHoldPending
 	}
 	if held && !hold.Claimed {
 		return s.creatingProto(orderID, hold.UserID, holdItems(hold.Items), hold.At), true, nil
@@ -767,31 +856,33 @@ func (s *Service) loadDisplayPrimary(ctx context.Context, orderID int64) (*order
 // 订单号新于 now - MinHotAge 的一定不在冷库，直接答不存在，不碰冷库：热订单的读路径没有额外开销，
 // 冷库不可用也不影响它们。冷库查询出错时返回错误而不是“不存在”，上层不会把它写进负缓存。
 //
-// 冷库读有并发上限和 coldTimeout（设计文档 1d 的 5.7）：冷库卡住时旧订单的查询最多占住几个协程、各等 1 秒，
-// 答 UNAVAILABLE（这一跳超时）或 RESOURCE_EXHAUSTED（名额满），不会把热订单的查询一起拖住。
+// 冷库读有并发上限和 coldTimeout（设计文档 1d 的 5.7），还有熔断器（设计文档 1d 的 6.8，见 coldRead）：
+// 冷库还没迁移完、熔断器打开、开关关掉时立刻答 ARCHIVE_UNAVAILABLE（降级错误），不访问冷库；
+// 冷库这一跳超时或出错（调用方还在等）时也答它，熔断器打开之前最多有几个查询各等 1 秒。
+// 名额满答 RESOURCE_EXHAUSTED；调用方取消、超时按 contextError 映射。都不会把热订单的查询一起拖住。
 // 展示读和 lookup 都经过这里，冷库的名额对两者一样：它保护的是冷库的连接池，而冷库上没有写路径要让。
 func (s *Service) loadCold(ctx context.Context, orderID int64) (*orderv1.Order, bool, error) {
 	if s.cold == nil || !archive.MaybeCold(orderID, s.now()) {
 		return nil, false, nil
 	}
-	release, err := acquire(s.limits.cold)
-	if err != nil {
-		return nil, false, err
-	}
-	defer release()
 	var o *store.Order
-	err = hop(ctx, coldTimeout, func(ctx context.Context) error {
+	err := s.coldRead(ctx, func(ctx context.Context) error {
 		var err error
 		o, err = s.cold.GetOrder(ctx, orderID)
 		return err
 	})
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		return nil, false, nil
-	}
-	if err != nil {
+	case err == nil:
+		return toProto(o), true, nil
+	case s.archiveUnavailable(ctx, "load archived order", err, "order_id", orderID):
+		return nil, false, errArchiveUnavailable
+	case errors.Is(err, errReadBusy):
+		return nil, false, err
+	default:
 		return nil, false, s.internal(ctx, "load archived order", err, "order_id", orderID)
 	}
-	return toProto(o), true, nil
 }
 
 // loadDisplayRow 是展示读的 loadRow：按读模式和标记决定读主库还是从库（见 useReplica）。
@@ -799,13 +890,15 @@ func (s *Service) loadCold(ctx context.Context, orderID int64) (*orderv1.Order, 
 // 从库出错（不是“没有这一行”）或超过 replicaTimeout 时改读主库，不让一个出问题的从库拖垮查询。
 //
 // 从库读不占展示读的名额（名额是给主库的，见 loadDisplayPrimary）。从库不单独设上限：它的连接池只有展示读
-// 和 sweeper 的扫描在用，没有写路径需要让；从库卡住时每次读最多等 replicaTimeout 就退回主库，
-// 退回的那次读照常占主库的名额，所以从库出问题也不会让主库上的查询超过上限。
+// 和 sweeper 的扫描在用，没有写路径需要让；从库卡住时第一个读到它的请求等满 replicaTimeout 就退回主库，
+// 并把这个从库标记为不健康，之后的请求直接读主库；退回的读照常占主库的名额，所以从库出问题也不会让主库上
+// 的查询超过上限。
 func (s *Service) loadDisplayRow(ctx context.Context, orderID int64) (o *orderv1.Order, ok, fromReplica bool, err error) {
 	if !s.useReplica(ctx, orderID) {
 		o, ok, err = s.loadDisplayPrimary(ctx, orderID)
 		return o, ok, false, err
 	}
+	db := s.store.DBOfOrder(orderID)
 	var row *store.Order
 	err = hop(ctx, replicaTimeout, func(ctx context.Context) error {
 		var err error
@@ -820,25 +913,43 @@ func (s *Service) loadDisplayRow(ctx context.Context, orderID int64) (o *orderv1
 		// 调用方已经取消或超时，退回主库也来不及了。
 		return nil, false, false, s.internal(ctx, "load order from replica", err, "order_id", orderID)
 	case err != nil:
-		// 包括这一跳的超时（errHopTimeout）：从库慢，主库还来得及。
-		s.logger.WarnContext(ctx, "read order from replica failed, reading primary", "order_id", orderID, "error", err)
+		// 包括这一跳的超时（errHopTimeout）：从库慢，主库还来得及。立刻把这个从库标记为不健康，
+		// 之后的展示读和 sweeper 不再试它，直到探测连续通过（设计文档 1d 的 6.7）；只在状态变化时记日志。
+		s.markReplicaUnhealthy(ctx, db, err)
 		o, ok, err = s.loadDisplayPrimary(ctx, orderID)
 		return o, ok, false, err
 	}
 	return toProto(row), true, true, nil
 }
 
-// useReplica 决定这一次展示读能否读从库。任何不确定（标记读不到、等不到从库）都退回主库：
+// useReplica 决定这一次展示读能否读从库。任何不确定（从库不健康、标记读不到、等不到从库）都退回主库：
 // 主库多承担一次读只是慢一点，读到旧数据是错的。
+//
+// 先看不访问任何依赖就能回答的条件（开关、健康标记、闸门刚恢复），都通过了才读标记：
+// 从库不健康时不必为读标记再碰一次 Redis，也不做 WaitReplica。
 func (s *Service) useReplica(ctx context.Context, orderID int64) bool {
-	if s.readMode == ReadPrimary {
+	if s.readMode == ReadPrimary || s.swReplica.Off() {
 		return false
 	}
-	mctx, cancel := context.WithTimeout(ctx, markTimeout)
-	m, err := s.marks.Get(mctx, orderID)
-	cancel()
+	db := s.store.DBOfOrder(orderID)
+	if !s.replicaHealthy(db) {
+		return false
+	}
+	// 闸门的 Redis 刚恢复：故障期间的写入没有打上标记，“没有标记”不能当作“最近没写过”。
+	if s.gateRecoveredWithin(s.marksDistrustWindow()) {
+		return false
+	}
+	var m readmark.Mark
+	err := s.markCall(ctx, func(ctx context.Context) error {
+		var err error
+		m, err = s.marks.Get(ctx, orderID)
+		return err
+	})
 	if err != nil {
-		s.logger.WarnContext(ctx, "read marks failed, reading primary", "order_id", orderID, "error", err)
+		// 熔断器打开期间 Redis 根本没被访问，逐条记会刷屏（打开和恢复各有一条日志）。
+		if !isBreakerOpen(err) {
+			s.logger.WarnContext(ctx, "read marks failed, reading primary", "order_id", orderID, "error", err)
+		}
 		return false
 	}
 	if m.Pinned {
@@ -847,7 +958,12 @@ func (s *Service) useReplica(ctx context.Context, orderID int64) bool {
 	if s.readMode == ReadGTID && m.GTID != "" {
 		caught, err := s.store.WaitReplica(ctx, orderID, m.GTID, s.gtidWait)
 		if err != nil {
-			s.logger.WarnContext(ctx, "wait replica failed, reading primary", "order_id", orderID, "error", err)
+			if ctx.Err() == nil && !isServerAnswer(err) {
+				// 从库连不上或挂住了（不是 MySQL 回答的错误，也不是调用方取消）：和读从库出错一样立刻标记。
+				s.markReplicaUnhealthy(ctx, db, err)
+			} else {
+				s.logger.WarnContext(ctx, "wait replica failed, reading primary", "order_id", orderID, "error", err)
+			}
 			return false
 		}
 		return caught
@@ -962,26 +1078,29 @@ func (s *Service) pin(ctx context.Context, orderID int64) {
 	if s.readMode == ReadPrimary {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, markTimeout)
-	defer cancel()
-	if err := s.marks.Pin(ctx, orderID, s.pinTTL); err != nil {
+	err := s.markCall(ctx, func(ctx context.Context) error { return s.marks.Pin(ctx, orderID, s.pinTTL) })
+	// 闸门的熔断器打开时跳过、不记日志：这段时间里没有标记的写入由 marksDistrustWindow 兜住。
+	if err != nil && !isBreakerOpen(err) {
 		s.logger.WarnContext(ctx, "pin order before write failed", "order_id", orderID, "error", err)
 	}
 }
 
 // stamp 在写入提交之后读出主库位置记进标记（只在 ReadGTID 下）。失败的处理同 pin。
 // 读位置和写标记共用一个时限：两步合起来才有用，任何一步拖住都不该让调用方继续等。
+//
+// 写标记经过闸门的熔断器（markCall），它的结果按这个共用时限的 ctx 归类：读位置用掉了时限、
+// 写标记跟着超时的话算 Ignored，不把主库的慢记到 Redis 头上。Redis 挂住的情况由 pin 和读标记数出来。
 func (s *Service) stamp(ctx context.Context, orderID int64) {
 	if s.readMode != ReadGTID {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, markTimeout)
+	sctx, cancel := context.WithTimeout(ctx, markTimeout)
 	defer cancel()
-	pos, err := s.store.PrimaryPosition(ctx, orderID)
+	pos, err := s.store.PrimaryPosition(sctx, orderID)
 	if err == nil {
-		err = s.marks.Stamp(ctx, orderID, pos, s.gtidTTL)
+		err = s.markCall(sctx, func(mctx context.Context) error { return s.marks.Stamp(mctx, orderID, pos, s.gtidTTL) })
 	}
-	if err != nil {
+	if err != nil && !isBreakerOpen(err) {
 		s.logger.WarnContext(ctx, "stamp order after write failed", "order_id", orderID, "error", err)
 	}
 }

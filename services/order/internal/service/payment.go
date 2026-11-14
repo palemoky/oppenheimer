@@ -204,10 +204,17 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 // 会因为热库里订单和处理记录都没有了，而对一个正常付清的订单要求退款。
 //
 // 冷库查询失败时返回错误，消费者原地重试：不能在不知道订单是否存在的情况下给出涉及退款的答复。
+// 两次冷库查询经过冷库的熔断器（coldDecisionRead）：打开时立刻失败（错误不是 ErrNotFound，同样重试），
+// 每次最多 coldTimeout，不在热库的事务里等满事件的时限。只有 ErrNotFound 才算“冷库里没有”。
 func (s *Service) archivedReply(ctx context.Context, ev *eventv1.PaymentEvent) (
 	reply *eventv1.PaymentResultHandled, ref store.OrderRef, archived bool, err error,
 ) {
-	o, err := s.cold.GetOrder(ctx, ev.GetOrderId())
+	var o *store.Order
+	err = s.coldDecisionRead(ctx, func(ctx context.Context) error {
+		var err error
+		o, err = s.cold.GetOrder(ctx, ev.GetOrderId())
+		return err
+	})
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, ref, false, nil
 	}
@@ -215,7 +222,10 @@ func (s *Service) archivedReply(ctx context.Context, ev *eventv1.PaymentEvent) (
 		return nil, ref, false, fmt.Errorf("load archived order %d: %w", ev.GetOrderId(), err)
 	}
 	ref = store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}
-	switch _, err := s.cold.GetPaymentResult(ctx, ev.GetOrderId(), ev.GetPaymentId()); {
+	switch err := s.coldDecisionRead(ctx, func(ctx context.Context) error {
+		_, err := s.cold.GetPaymentResult(ctx, ev.GetOrderId(), ev.GetPaymentId())
+		return err
+	}); {
 	case err == nil:
 		return nil, ref, true, nil
 	case !errors.Is(err, store.ErrNotFound):

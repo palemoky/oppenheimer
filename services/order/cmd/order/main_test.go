@@ -168,3 +168,43 @@ func TestArchiveMaxConcurrencyConfig(t *testing.T) {
 		})
 	}
 }
+
+// ORDER_READ_MAX_LAG：window 模式下必须小于 ORDER_READ_PIN_TTL，否则拒绝启动；其余模式不受这条限制。
+func TestReadMaxLagConfig(t *testing.T) {
+	for _, c := range []struct {
+		name, mode, maxLag, pinTTL string
+		want                       time.Duration // 0 表示应当拒绝
+	}{
+		{"default", "", "", "", service.DefaultReplicaMaxLag},
+		{"window default", "window", "", "", service.DefaultReplicaMaxLag},
+		{"window below pin", "window", "1500ms", "3s", 1500 * time.Millisecond},
+		// 最大延迟加一个探测间隔（1 秒）不能达到 pin 的时长。
+		{"window plus probe interval reaches pin", "window", "2s", "3s", 0},
+		{"window equal to pin", "window", "3s", "3s", 0},
+		{"window above pin", "window", "5s", "3s", 0},
+		{"window default lag with a short pin", "window", "", "500ms", 0},
+		{"gtid above pin", "gtid", "5s", "3s", 5 * time.Second},
+		{"not positive", "", "0s", "", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("MYSQL_DSN", "")
+			t.Setenv("ORDER_READ_MODE", c.mode)
+			t.Setenv("MYSQL_REPLICA_DSNS", "root:x@tcp(127.0.0.1:1)/a,root:x@tcp(127.0.0.1:1)/b")
+			t.Setenv("ORDER_READ_MAX_LAG", c.maxLag)
+			t.Setenv("ORDER_READ_PIN_TTL", c.pinTTL)
+			cfg, err := loadConfig()
+			if c.want == 0 {
+				if err == nil {
+					t.Fatalf("ORDER_READ_MAX_LAG=%q ORDER_READ_PIN_TTL=%q accepted in mode %q, want error", c.maxLag, c.pinTTL, c.mode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.readMaxLag != c.want {
+				t.Fatalf("readMaxLag = %s, want %s", cfg.readMaxLag, c.want)
+			}
+		})
+	}
+}

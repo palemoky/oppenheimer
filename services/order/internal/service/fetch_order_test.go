@@ -6,6 +6,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 )
 
 // 本文件测试 fetch 的读顺序：先读占用，再决定要不要读订单库（设计文档 1d 的 2.4）。
@@ -79,6 +80,7 @@ func TestGateDownStillServesLandedOrders(t *testing.T) {
 	}
 	for _, id := range []int64{queued.GetOrderId(), 424242} {
 		_, err := e.getOrder(t, id, 1)
-		wantErr(t, err, codes.Unavailable, "")
+		// 降级错误（不是 UNAVAILABLE，见 errx.Degraded）：分不清它是在排队还是不存在。
+		wantErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 	}
 }

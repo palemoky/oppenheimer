@@ -124,6 +124,10 @@ message ListUserOrdersResponse {
   repeated OrderSummary orders = 1;
   // 下一页的游标；0 表示没有更多了。
   int64 next_before_order_id = 2;
+  // 为 true 表示冷库（已归档的订单）暂时不可用，这一页只有不可能在冷库里的那一段（订单号晚于冷热分界的）。
+  // 返回的每一行都是精确的，只是更早的订单没有列出来；这时 next_before_order_id 指向这一段的最后一行，
+  // 冷库恢复之后用它可以接着取。见设计文档 1d 的 6.8。
+  bool archive_unavailable = 3;
 }
 
 // OrderSummary 是用户订单列表里的一行。

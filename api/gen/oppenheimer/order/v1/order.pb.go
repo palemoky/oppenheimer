@@ -584,8 +584,12 @@ type ListUserOrdersResponse struct {
 	Orders []*OrderSummary        `protobuf:"bytes,1,rep,name=orders,proto3" json:"orders,omitempty"`
 	// 下一页的游标；0 表示没有更多了。
 	NextBeforeOrderId int64 `protobuf:"varint,2,opt,name=next_before_order_id,json=nextBeforeOrderId,proto3" json:"next_before_order_id,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// 为 true 表示冷库（已归档的订单）暂时不可用，这一页只有不可能在冷库里的那一段（订单号晚于冷热分界的）。
+	// 返回的每一行都是精确的，只是更早的订单没有列出来；这时 next_before_order_id 指向这一段的最后一行，
+	// 冷库恢复之后用它可以接着取。见设计文档 1d 的 6.8。
+	ArchiveUnavailable bool `protobuf:"varint,3,opt,name=archive_unavailable,json=archiveUnavailable,proto3" json:"archive_unavailable,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ListUserOrdersResponse) Reset() {
@@ -630,6 +634,13 @@ func (x *ListUserOrdersResponse) GetNextBeforeOrderId() int64 {
 		return x.NextBeforeOrderId
 	}
 	return 0
+}
+
+func (x *ListUserOrdersResponse) GetArchiveUnavailable() bool {
+	if x != nil {
+		return x.ArchiveUnavailable
+	}
+	return false
 }
 
 // OrderSummary 是用户订单列表里的一行。
@@ -855,10 +866,11 @@ const file_oppenheimer_order_v1_order_proto_rawDesc = "" +
 	"\auser_id\x18\x01 \x01(\x03R\x06userId\x129\n" +
 	"\x06status\x18\x02 \x01(\x0e2!.oppenheimer.order.v1.OrderStatusR\x06status\x12\x1b\n" +
 	"\tpage_size\x18\x03 \x01(\x05R\bpageSize\x12&\n" +
-	"\x0fbefore_order_id\x18\x04 \x01(\x03R\rbeforeOrderId\"\x85\x01\n" +
+	"\x0fbefore_order_id\x18\x04 \x01(\x03R\rbeforeOrderId\"\xb6\x01\n" +
 	"\x16ListUserOrdersResponse\x12:\n" +
 	"\x06orders\x18\x01 \x03(\v2\".oppenheimer.order.v1.OrderSummaryR\x06orders\x12/\n" +
-	"\x14next_before_order_id\x18\x02 \x01(\x03R\x11nextBeforeOrderId\"\xc9\x02\n" +
+	"\x14next_before_order_id\x18\x02 \x01(\x03R\x11nextBeforeOrderId\x12/\n" +
+	"\x13archive_unavailable\x18\x03 \x01(\bR\x12archiveUnavailable\"\xc9\x02\n" +
 	"\fOrderSummary\x12\x19\n" +
 	"\border_id\x18\x01 \x01(\x03R\aorderId\x129\n" +
 	"\x06status\x18\x02 \x01(\x0e2!.oppenheimer.order.v1.OrderStatusR\x06status\x122\n" +

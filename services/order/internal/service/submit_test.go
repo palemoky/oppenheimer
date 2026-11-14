@@ -158,12 +158,10 @@ func TestSubmitWarmUp(t *testing.T) {
 		t.Error("sent messages for a rejected request")
 	}
 
-	// 预热失败：UNAVAILABLE，之后用同一幂等键重试成功。
+	// 预热失败：降级错误（INVENTORY_UNAVAILABLE），之后用同一幂等键重试成功。
 	e.inv.inject("WarmUp", fault{err: errTimeout})
 	_, err = e.svc.SubmitOrder(t.Context(), submitReq(1, "scarce", items(skuScarce, 1)))
-	if errx.Code(err) != codes.Unavailable {
-		t.Fatalf("err = %v, want Unavailable", err)
-	}
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonInventoryUnavailable)
 	e.submit(t, 1, "scarce", items(skuScarce, 1))
 	e.wantGate(t, skuScarce, 0, 1)
 }
@@ -317,9 +315,7 @@ func TestSubmitSendFailure(t *testing.T) {
 			e := newEnv(t)
 			e.sender.inject(sendFault{persist: []bool{persisted, persisted}, errs: []error{errSend, errSend}})
 			_, err := e.svc.SubmitOrder(t.Context(), submitReq(1, "k", items(skuA, 2)))
-			if errx.Code(err) != codes.Unavailable {
-				t.Fatalf("err = %v, want Unavailable", err)
-			}
+			wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderQueueUnavailable)
 			// 占用已归还，幂等键已删除。
 			e.wantGate(t, skuA, 1000, 0)
 
@@ -416,17 +412,13 @@ func TestSubmitGateUnavailable(t *testing.T) {
 		Logger: slog.New(slog.DiscardHandler),
 	}, Config{Clock: e.clock.Now})
 	_, err = svc.SubmitOrder(t.Context(), submitReq(1, "k", items(skuA, 1)))
-	if errx.Code(err) != codes.Unavailable {
-		t.Fatalf("err = %v, want Unavailable", err)
-	}
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 	if e.sender.sendCount() != 0 {
 		t.Errorf("sends = %d, want 0", e.sender.sendCount())
 	}
-	// 查询也是 UNAVAILABLE，而不是把“读不到占用”当成订单不存在。
+	// 查询也是“闸门不可用”，而不是把“读不到占用”当成订单不存在。
 	_, err = svc.GetOrder(t.Context(), &orderv1.GetOrderRequest{OrderId: 12345, UserId: 1})
-	if errx.Code(err) != codes.Unavailable {
-		t.Fatalf("GetOrder err = %v, want Unavailable", err)
-	}
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonStockGateUnavailable)
 }
 
 // 等待落库的订单积压过多时拒绝受理：返回可重试的 RESOURCE_EXHAUSTED，不扣库存、不发消息；

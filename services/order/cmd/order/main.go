@@ -23,6 +23,7 @@ import (
 	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 	"github.com/palemoky/oppenheimer/pkg/app"
 	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
@@ -65,9 +66,6 @@ const defaultAdmitMaxQueue = 10000
 // 它用来容忍零星的孤儿占用（受理方在发消息前崩溃，要等宽限期才被回收），不让一两个孤儿挡住受理；
 // 真正的积压是成千上万个。
 const defaultAdmitMaxStale = 100
-
-// submitMaxAttempts 是下单消息的最大处理次数，理由见创建消费者的地方。
-const submitMaxAttempts = 10
 
 // 周期任务的 leader 锁（设计文档 7.1）。持有者崩溃后锁要等 TTL 过期才能被别的副本接手，
 // 这段时间任务没人跑：中继的空窗直接表现为事件延迟，取得短；其余任务本来就是低频兜底，取 15 秒。
@@ -142,6 +140,8 @@ type config struct {
 	readPinTTL       time.Duration
 	readGTIDTTL      time.Duration
 	readGTIDWait     time.Duration
+	// readMaxLag 是从库允许的最大延迟（ORDER_READ_MAX_LAG），从库的健康探测用它，见 service.ReplicaProber。
+	readMaxLag time.Duration
 	// archiveDSN 是冷库（已归档订单）的 DSN，为空表示没有冷库路径。
 	archiveDSN string
 	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
@@ -169,6 +169,8 @@ type config struct {
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
 	orderCacheTTL     time.Duration
 	orderCacheNullTTL time.Duration
+	// drainDelay 是停止前摘流的等待（DRAIN_DELAY），见 app.Options。
+	drainDelay time.Duration
 }
 
 func main() {
@@ -351,11 +353,25 @@ func loadConfig() (config, error) {
 	if cfg.readGTIDWait, err = envDuration("ORDER_READ_GTID_WAIT", service.DefaultReadGTIDWait); err != nil {
 		return cfg, err
 	}
+	if cfg.readMaxLag, err = envDuration("ORDER_READ_MAX_LAG", service.DefaultReplicaMaxLag); err != nil {
+		return cfg, err
+	}
+	// window 模式靠 pin 的时长假设从库的延迟：pin 到期之后的读交给从库。探测允许的延迟不小于 pin 的时长时，
+	// 一个被判为健康的从库仍可能还没复制到 pin 已经到期的写入，读到自己刚写的数据的旧版本（设计文档 1d 的 6.7）。
+	// 要把探测的间隔也算进去：延迟在两次探测之间还会继续涨，被发现时最坏已经是“最大延迟 + 一个探测间隔”。
+	if worst := cfg.readMaxLag + service.DefaultReplicaProbeInterval; cfg.readMode == service.ReadWindow && worst >= cfg.readPinTTL {
+		return cfg, fmt.Errorf("ORDER_READ_MAX_LAG (%s) plus the probe interval (%s) must be shorter than ORDER_READ_PIN_TTL (%s) "+
+			"in window read mode, otherwise reads after the pin expires can miss the caller's own writes",
+			cfg.readMaxLag, service.DefaultReplicaProbeInterval, cfg.readPinTTL)
+	}
 	cfg.cacheRedisAddr = cmp.Or(os.Getenv("CACHE_REDIS_ADDR"), cfg.redisAddr)
 	if cfg.orderCacheTTL, err = envDurationOrZero("ORDER_CACHE_TTL", service.DefaultOrderCacheTTL); err != nil {
 		return cfg, err
 	}
 	if cfg.orderCacheNullTTL, err = envDuration("ORDER_CACHE_NULL_TTL", service.DefaultOrderCacheNullTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.drainDelay, err = app.DrainDelayFromEnv(); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -454,7 +470,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if cfg.mysqlReplicaDSNs != nil {
 		replicas := make([]*sql.DB, router.DBs())
 		for i, dsn := range cfg.mysqlReplicaDSNs {
-			db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
+			// 从库连不上不阻止启动（设计文档 1d 的 6.7、6.10）：它们初始被标记为不健康，展示读和 sweeper 读主库，
+			// 探测（ReplicaProber）连续通过之后自动用上。所以不 ping，只有 DSN 写错才失败。
+			db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
 			if err != nil {
 				return fmt.Errorf("open order db %d replica: %w", i, err)
 			}
@@ -473,19 +491,24 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	// 冷库是可选的只读依赖（设计文档 1c 第 6 节）。一旦有订单归档过就必须配上，
-	// 否则已归档的订单查不到。迁移在这里也跑一遍，和归档任务用的是同一套、同一把迁移锁。
-	var cold *store.Cold
+	// 否则已归档的订单查不到。迁移也由 order 跑，和归档任务用的是同一套、同一把迁移锁。
+	// 冷库连不上不阻止启动（设计文档 1d 的 6.8、6.10）：不 ping，迁移交给 ArchiveMigrator 在后台重试，
+	// 成功之前旧订单的查询立刻返回 ARCHIVE_UNAVAILABLE，近期订单不受影响。
+	var (
+		cold        *store.Cold
+		coldMigrate func(context.Context) error
+	)
 	if cfg.archiveDSN != "" {
-		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns})
+		db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns})
 		if err != nil {
 			return fmt.Errorf("open archive db: %w", err)
 		}
 		defer db.Close()
-		if err := mysqlx.MigrateTemplate(ctx, db, order.ArchiveMigrations, order.ArchiveMigrationsDir,
-			order.NewArchiveMigrationData()); err != nil {
-			return fmt.Errorf("migrate archive db: %w", err)
-		}
 		cold = store.NewCold(db)
+		coldMigrate = func(ctx context.Context) error {
+			return mysqlx.MigrateTemplate(ctx, db, order.ArchiveMigrations, order.ArchiveMigrationsDir,
+				order.NewArchiveMigrationData())
+		}
 	}
 	logger.Info("order archive", "configured", cold != nil)
 
@@ -502,7 +525,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	rctx, rcancel := context.WithTimeout(ctx, redisStartTimeout)
 	defer rcancel()
-	rdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.redisAddr})
+	// Redis 此刻连不上也照样启动（设计文档 1d 的 6.10）：受理会被闸门的熔断器拒绝，查询已落库的订单、
+	// 支付结果、取消都不依赖它。Redis 故障期间重启或发布的实例要能回来承担这些。
+	rdb, err := redisx.OpenLazy(rctx, redisx.Config{Addr: cfg.redisAddr}, logger)
 	if err != nil {
 		return err
 	}
@@ -510,7 +535,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer rdb.Close()
 	gate := stockgate.New(rdb, cfg.redisPrefix)
 
-	orderCache, closeCache, err := openOrderCache(ctx, logger, cfg, rdb)
+	// 降级开关（设计文档 1d 的 6.9）。各组件把自己的开关登记上来；全部登记完之后再读 DEGRADE 里的初始值。
+	switches := degrade.New(serviceName, logger)
+	orderCache, closeCache, err := openOrderCache(ctx, logger, cfg, rdb, switches)
 	if err != nil {
 		return err
 	}
@@ -587,8 +614,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Logger:     logger,
 		OrderCache: orderCache,
 		// 标记放在闸门那个实例上（noeviction）：被淘汰的标记等于提前到期。
-		Marks: readmark.New(rdb, cfg.redisPrefix),
-		Cold:  cold,
+		Marks:       readmark.New(rdb, cfg.redisPrefix),
+		Cold:        cold,
+		ColdMigrate: coldMigrate,
+		Degrade:     switches,
 	}, service.Config{
 		PaymentTimeout:    cfg.paymentTimeout,
 		IdempotencyTTL:    cfg.idempotencyTTL,
@@ -608,6 +637,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		ArchiveMaxConcurrency: cfg.archiveMaxConcurrency,
 	})
 	if err != nil {
+		return err
+	}
+	// 开关都登记完了（缓存的在 openOrderCache，其余在 service.New）。名字写错在这里就拒绝启动：
+	// 被悄悄忽略的话，人以为关了其实没关。
+	if err := switches.Apply(os.Getenv(degrade.Env)); err != nil {
 		return err
 	}
 	cfg.sweeper.Guard = lock.FailOpen(sweeperLeader, logger)
@@ -653,11 +687,18 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Topics:      []string{submitTopic},
 		Logger:      logger,
 		Concurrency: cfg.submitConcurrency,
-		// 落库要调 inventory 的 Reserve。默认的 5 次重试合计只有约 1.5 秒，inventory 重启一次
-		// （几秒）就足以把消息送进死信：订单最后由 sweeper 置为失败，数据一致，但用户的订单
-		// 因为依赖方抖了一下就没了。10 次合计约 26 秒，盖得住一次重启；再长就不值得让
-		// 整个分区等它，交给死信和 sweeper。
-		MaxAttempts: submitMaxAttempts,
+		// 普通错误不设重试上限，分区停在这条消息上等依赖恢复（设计文档 1d 的 6.2、6.5，ADR-0021）。
+		// handler 返回普通错误只有一种含义：依赖不可用（闸门认领不了、订单库写不进去、库存服务调不通）。
+		// 这时每条消息都会失败，把一条挪进死信没有用，后面的照样失败；全部挪进去之后，一次会自己恢复的
+		// 故障就变成了要人逐条处理的数据问题：闸门不可用超过重试的总时长，已受理的订单认领不了、进了死信，
+		// Redis 恢复后占用被回收，用户拿到过 202 的订单凭空消失（原来是 10 次、约 26 秒）。
+		// 消息本身有问题的由 handler 标成 Permanent，仍然直接进死信。
+		// 不设上限不等于永远重试，每条消息都有自己的终点：
+		//   - 闸门恢复后认领成功，继续落库；已经过了支付时限的直接置为失败。
+		//   - 订单行写进去之后一直预占不了的，sweeper 在创建超时后把它置为失败，下一次重试看到终态就结束。
+		//   - 占用被回收或归还了的，下一次重试认领不到，丢弃。
+		// 代价：一条 handler 没识别出来的坏消息会一直挡住它的分区，要靠消费积压的告警发现（阶段 3）。
+		MaxAttempts: math.MaxInt,
 	}, svc.SubmitHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return err
@@ -673,7 +714,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.HealthHandler(serviceName))
+	// 内部端口：存活和就绪探测、降级开关。不经过 gateway。
+	readiness := &app.Readiness{}
+	admin := app.AdminMux(serviceName, readiness)
+	switches.Register(admin)
+	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, admin)
 	if err != nil {
 		return err
 	}
@@ -684,10 +729,26 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	readLimitReporter := svc.ReadLimitReporter(service.DefaultReadLimitReportInterval)
+	// 读路径降级的两个后台任务（设计文档 1d 的 6.7、6.8）：从库的健康探测（只在配了从库时），冷库的后台迁移（只在配了冷库时）。
+	var background []app.Component
+	if st.HasReplicas() {
+		prober, err := svc.ReplicaProber(service.DefaultReplicaProbeInterval, cfg.readMaxLag)
+		if err != nil {
+			return err
+		}
+		background = append(background, prober)
+	}
+	if m := svc.ArchiveMigrator(); m != nil {
+		background = append(background, m)
+	}
 	logger.Info("listening", "http_addr", httpServer.Addr().String(), "grpc_addr", grpcServer.Addr().String())
 
 	// 停止顺序与列出的顺序相反：
-	//  1. sweeper、回收任务：纯后台扫描，随时可以停，下次启动接着扫。
+	//  0. 收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查变成不可用，继续正常服务
+	//     DRAIN_DELAY 这么久，让负载均衡把流量挪走，然后才开始下面的停止。本机默认 0。
+	//  1. sweeper、回收任务、从库探测、冷库迁移：纯后台任务，随时可以停，下次启动接着做。
+	//     从库探测停了之后健康标记停在最后的状态，冷库迁移停了之后冷库保持不可用；此后 gRPC 还在处理
+	//     在途请求，它们按这两个状态读，都是安全的一侧（最多是从库刚坏而没被发现，请求路径上读出错会立刻标记）。
 	//  2. gRPC：不再受理新请求，并等在途的 SubmitOrder 做完。受理是“Hold → 发消息”两步，
 	//     中途被打断会留下孤儿占用（只能等回收任务），所以让它们在 Redis 和生产者都还可用时走完。
 	//  3. 三个消费者：支付结果、延迟关单、落库。它们写 outbox，必须在中继之前停；
@@ -704,12 +765,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		components = append(components, r)
 	}
 	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
-	return app.Run(ctx, logger, components...)
+	components = append(components, background...)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, components...)
 }
 
 // openOrderCache 按配置创建订单查询缓存。ORDER_CACHE_TTL=0 时缓存为 nil（关闭）。
 // 缓存实例与闸门是同一个地址时复用 rdb，不另开连接池；否则新开一个客户端，由返回的 closeFn 关闭。
-func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb redis.Cmdable) (
+func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb redis.Cmdable, switches *degrade.Set) (
 	c *cache.Cache[*orderv1.Order], closeFn func(), err error,
 ) {
 	closeFn = func() {}
@@ -721,14 +783,15 @@ func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb re
 	if cfg.cacheRedisAddr != cfg.redisAddr {
 		rctx, cancel := context.WithTimeout(ctx, redisStartTimeout)
 		defer cancel()
-		cdb, err := redisx.Open(rctx, redisx.Config{Addr: cfg.cacheRedisAddr})
+		// 缓存是可选的依赖，连不上不阻止启动：查询直接回源（cache 包里的熔断器），恢复后自动用上。
+		cdb, err := redisx.OpenLazy(rctx, redisx.Config{Addr: cfg.cacheRedisAddr}, logger)
 		if err != nil {
 			return nil, closeFn, fmt.Errorf("open cache redis: %w", err)
 		}
 		closeFn = func() { _ = cdb.Close() }
 		client = cdb
 	}
-	c, err = service.NewOrderCache(client, cfg.redisPrefix, logger)
+	c, err = service.NewOrderCache(client, cfg.redisPrefix, logger, switches)
 	if err != nil {
 		closeFn()
 		return nil, func() {}, err

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/palemoky/oppenheimer/api/eventx"
@@ -27,8 +26,10 @@ import (
 // 所以用独立的 ctx；它是尽力而为的。归还占用（abandon）同样用独立的 ctx，时限是闸门调用统一的 gateTimeout。
 const releaseTimeout = time.Second
 
-func errUnavailable(msg string) error {
-	return status.Error(codes.Unavailable, msg+", retry with the same idempotency key")
+// errRetry 是“这一次没有受理，原因是暂时的”对外的错误。按降级错误返回（errx.Degraded），不用 UNAVAILABLE：
+// 这些都是 order 的依赖出了问题，不是 order 自己不行了，不应该让调用方的边车把 order 摘掉。
+func errRetry(reason, msg string) error {
+	return errx.Degraded(reason, "%s, retry with the same idempotency key", msg)
 }
 
 // ---------- 受理 ----------
@@ -49,6 +50,17 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	defer cancel()
 
 	userID := req.GetUserId()
+	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。两项检查都在 Hold 之前：被拒绝时什么都没有发生。
+	if s.swAdmission.Off() {
+		return nil, errAdmissionOff
+	}
+	settle, err := s.admitLanding(userID)
+	if err != nil {
+		return nil, err
+	}
+	published := false
+	defer func() { settle(published) }()
+
 	orderID, err := s.ids.Next(userID)
 	if err != nil {
 		return nil, s.internal(ctx, "generate order id", err, "user_id", userID)
@@ -85,7 +97,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		o, err := s.lookup(ctx, res.OrderID, userID)
 		if errx.Reason(err) == errx.ReasonOrderNotFound {
 			// 幂等键还在，订单和占用都没了：刚好被回收（回收会同时删掉幂等键），重试就会重新受理。
-			return nil, errUnavailable("previous attempt was abandoned")
+			return nil, errRetry(errx.ReasonStockGateUnavailable, "previous attempt was abandoned")
 		}
 		if err != nil {
 			return nil, err
@@ -115,6 +127,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	if err := s.publish(ctx, hreq, items, expire); err != nil {
 		return s.publishFailed(ctx, orderID, userID, items, accepted, err)
 	}
+	published = true
 	return &orderv1.SubmitOrderResponse{Order: s.creatingProto(orderID, userID, items, accepted)}, nil
 }
 
@@ -137,7 +150,7 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 	warm, err := s.warmUp(ctx, skus)
 	if err != nil {
 		s.logger.WarnContext(ctx, "warm up stock gate failed", "sku_ids", skus, "error", err)
-		return res, errUnavailable("inventory unavailable")
+		return res, errRetry(errx.ReasonInventoryUnavailable, "inventory unavailable")
 	}
 	if missing := warm.GetMissing(); len(missing) > 0 {
 		return stockgate.HoldResult{Outcome: stockgate.NotLoaded, SKUID: slices.Min(missing)}, nil
@@ -195,12 +208,18 @@ func (s *Service) warmUp(ctx context.Context, skus []int64) (*inventoryv1.WarmUp
 // 例外是 Hold 的请求在网络上比撤销晚到 Redis（Hold 的包丢了、重传时撤销已经走另一条连接先到）：撤销看到
 // “占用不存在”，随后 Hold 才执行，留下一个孤儿占用，由回收任务在宽限期后归还。这个窗口在加时限之前就有，
 // 时限变短只是让它更容易出现。
+//
+// 闸门的熔断器没有放行时（isBreakerOpen）不属于“结果未知”：Hold 根本没有发给 Redis，没有东西要撤销，
+// 直接拒绝，也不逐条记日志（Redis 坏着的时候每个下单请求都会走到这里）。
 func (s *Service) holdUnknown(ctx context.Context, orderID int64, holdErr error) error {
+	if isBreakerOpen(holdErr) {
+		return errGateUnavailable
+	}
 	s.logger.WarnContext(ctx, "hold outcome unknown", "order_id", orderID, "error", holdErr)
 	if _, err := s.abandon(ctx, orderID); err != nil {
 		s.logger.WarnContext(ctx, "abandon hold failed, left for reaper", "order_id", orderID, "error", err)
 	}
-	return errUnavailable("stock gate unavailable")
+	return errGateUnavailable
 }
 
 // abandon 撤销一个受理失败的订单的占用：只对未认领的占用生效，并删除指向它的幂等键，
@@ -282,7 +301,7 @@ func (s *Service) publishFailed(ctx context.Context, orderID, userID int64, item
 			return &orderv1.SubmitOrderResponse{Order: o}, nil
 		}
 	}
-	return nil, errUnavailable("order queue unavailable")
+	return nil, errRetry(errx.ReasonOrderQueueUnavailable, "order queue unavailable")
 }
 
 func gateItems(items []store.Item) []stockgate.Item {
@@ -330,6 +349,8 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 		return err
 	})
 	if err != nil {
+		// 闸门不可用：返回错误，消费者停在这条消息上重试，直到 Redis 恢复（不进死信，见 cmd/order 里消费者的配置）。
+		// 不报告给落库健康：闸门有自己的熔断器，受理那一侧会因为它而拒绝。
 		return fmt.Errorf("claim hold of order %d: %w", o.OrderID, err)
 	}
 	if !ok {
@@ -358,12 +379,14 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 			// 3. 订单号不存在而唯一键冲突：幂等键在 Redis 里过期后的重放。
 			return s.dropReplay(ctx, o)
 		default:
+			s.landingFailed(ctx, o.OrderID)
 			return fmt.Errorf("load order %d: %w", o.OrderID, gerr)
 		}
 	case errors.Is(err, store.ErrWrongShard):
 		// orderFromSubmitted 已经按基因挡过，走到这里说明两边的判断不一致。重试也一样，进死信。
 		return fmt.Errorf("%w: insert order %d: %w", ErrInvalidEvent, o.OrderID, err)
 	case err != nil:
+		s.landingFailed(ctx, o.OrderID)
 		return fmt.Errorf("insert order %d: %w", o.OrderID, err)
 	}
 
@@ -384,14 +407,35 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 
 	// 4. 推进：同步 Reserve。被拒绝时 advance 已把订单置为 FAILED 并写了 failed 事件，
 	// 库存服务据此 Release 并归还占用，这里不用再做什么。
+	// 落库健康（设计文档 1d 的 6.5）只在这一次真的调用了库存服务时报告：订单已经不是 CREATING 的话
+	// advance 什么都不做，说明不了依赖的状态。
+	exercised := o.Status == orderv1.OrderStatus_ORDER_STATUS_CREATING
+	orderID := o.OrderID
 	o, err = s.advance(ctx, o)
 	if err != nil {
+		// ErrUnrecoverable 是库存服务回答了、但回答的内容有问题，不是它不可用。
+		if exercised && !errors.Is(err, ErrUnrecoverable) {
+			s.landingFailed(ctx, orderID)
+		}
 		return err
+	}
+	if exercised {
+		// 库存服务回答了（预占成功或者业务上拒绝），订单库也写进去了。
+		s.reportLanding(orderID, true)
 	}
 	if o.Status == orderv1.OrderStatus_ORDER_STATUS_FAILED {
 		s.logger.InfoContext(ctx, "order failed", "order_id", o.OrderID, "reason", o.FailReason)
 	}
 	return nil
+}
+
+// landingFailed 把一次因为依赖不可用而失败的落库告诉落库健康。
+// 消费者被强制停止（ctx 被取消）时的失败不算：那是进程在退出，不是依赖坏了。
+func (s *Service) landingFailed(ctx context.Context, orderID int64) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	s.reportLanding(orderID, false)
 }
 
 // dropReplay 处理幂等键在 Redis 过期后的重放：订单库里同一个 (user_id, 幂等键) 早已有订单 A，
