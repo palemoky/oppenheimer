@@ -1,4 +1,4 @@
-// Command gateway 是 gateway 服务的入口：对外 HTTP，对内调用 order、payment、inventory 三个服务。
+// Command gateway 是 gateway 服务的入口：对外 HTTP，对内调用 order、payment、inventory、orderindex 四个服务。
 package main
 
 import (
@@ -9,13 +9,14 @@ import (
 	"net/http"
 	"os"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/app"
-	"github.com/palemoky/Oppenheimer/pkg/grpcx"
-	"github.com/palemoky/Oppenheimer/pkg/logx"
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/app"
+	"github.com/palemoky/oppenheimer/pkg/grpcx"
+	"github.com/palemoky/oppenheimer/pkg/logx"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi"
 )
 
 const serviceName = "gateway"
@@ -35,6 +36,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	orderAddr := cmp.Or(os.Getenv("ORDER_ADDR"), "127.0.0.1:9081")
 	inventoryAddr := cmp.Or(os.Getenv("INVENTORY_ADDR"), "127.0.0.1:9082")
 	paymentAddr := cmp.Or(os.Getenv("PAYMENT_ADDR"), "127.0.0.1:9083")
+	orderIndexAddr := cmp.Or(os.Getenv("ORDERINDEX_ADDR"), "127.0.0.1:9084")
 
 	// Dial 是惰性的，下游暂时不可达不会阻止 gateway 启动。
 	orderConn, err := grpcx.Dial(orderAddr)
@@ -52,11 +54,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("dial payment: %w", err)
 	}
 	defer paymentConn.Close()
+	orderIndexConn, err := grpcx.Dial(orderIndexAddr)
+	if err != nil {
+		return fmt.Errorf("dial orderindex: %w", err)
+	}
+	defer orderIndexConn.Close()
 
 	api := httpapi.New(httpapi.Deps{
-		Order:     orderv1.NewOrderServiceClient(orderConn),
-		Payment:   paymentv1.NewPaymentServiceClient(paymentConn),
-		Inventory: inventoryv1.NewInventoryServiceClient(inventoryConn),
+		Order:      orderv1.NewOrderServiceClient(orderConn),
+		Payment:    paymentv1.NewPaymentServiceClient(paymentConn),
+		Inventory:  inventoryv1.NewInventoryServiceClient(inventoryConn),
+		OrderIndex: orderindexv1.NewOrderIndexServiceClient(orderIndexConn),
 	}, httpapi.Config{Logger: logger})
 
 	// 健康检查探针很频繁，单独挂在 mux 上，不经过 API 的鉴权和请求日志。

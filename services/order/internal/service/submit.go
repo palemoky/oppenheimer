@@ -11,14 +11,16 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/order/internal/archive"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // releaseTimeout 是受理失败后归还占用的时限。这一步在请求的 ctx 可能已经到期之后执行，
@@ -286,9 +288,19 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 		return err
 	}
 
+	// 订单号老到可能已经归档的，不再落库（设计文档 1c 第 6.6 节，不变量“数据只从热到冷”）。
+	// 这只会是一条被重放的陈年消息。放它过去的话，热库里会重新插入一个已经归档的订单号：
+	// 新行的版本号从 0 开始、状态是创建失败，而读路径先查热库，会用它盖住冷库里真正的订单。
+	// 在认领之前丢弃；它的占用早已被回收任务处理。
+	if archive.MaybeCold(o.OrderID, s.now()) {
+		s.logger.ErrorContext(ctx, "order submission dropped, order id is older than the minimum hot age",
+			"order_id", o.OrderID, "accepted_at", idgen.Time(o.OrderID).Format(time.RFC3339), "min_hot_age", archive.MinHotAge.String())
+		return nil
+	}
+
 	// 1. 认领。占用不存在说明它已被回收（受理方发消息失败后撤销，或回收任务），
 	// 或者订单早已走到终态、占用已被归还（重复投递）。两种情况都应当丢弃这条消息。
-	hold, ok, err := s.gate.Claim(ctx, o.OrderID)
+	hold, ok, err := s.gate.Claim(ctx, o.OrderID, s.now())
 	if err != nil {
 		return fmt.Errorf("claim hold of order %d: %w", o.OrderID, err)
 	}
@@ -303,7 +315,11 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 
 	// 2. 写订单行（CREATING）。订单号已存在是重复投递，读出来继续推进。
 	o.UpdatedAt = s.now()
+	s.pin(ctx, o.OrderID)
 	err = s.store.InsertOrder(ctx, o)
+	if err == nil {
+		s.stamp(ctx, o.OrderID)
+	}
 	switch {
 	case errors.Is(err, store.ErrDuplicate):
 		existing, gerr := s.store.GetOrder(ctx, o.OrderID)
@@ -316,6 +332,9 @@ func (s *Service) HandleOrderSubmitted(ctx context.Context, m *eventv1.OrderSubm
 		default:
 			return fmt.Errorf("load order %d: %w", o.OrderID, gerr)
 		}
+	case errors.Is(err, store.ErrWrongShard):
+		// orderFromSubmitted 已经按基因挡过，走到这里说明两边的判断不一致。重试也一样，进死信。
+		return fmt.Errorf("%w: insert order %d: %w", ErrInvalidEvent, o.OrderID, err)
 	case err != nil:
 		return fmt.Errorf("insert order %d: %w", o.OrderID, err)
 	}
@@ -379,6 +398,10 @@ func orderFromSubmitted(m *eventv1.OrderSubmitted) (*store.Order, error) {
 	switch {
 	case m.GetOrderId() <= 0 || m.GetUserId() <= 0:
 		return nil, invalid("order_id and user_id must be positive")
+	case idgen.Gene(m.GetOrderId()) != idgen.GeneOf(m.GetUserId()):
+		// 订单号由受理方以 user_id 为分片键生成，基因必然一致。不一致说明上游有缺陷，
+		// 写进去的话按用户和按订单号会找到两个不同的分片。在认领之前拒绝：占用留给回收任务。
+		return nil, invalid("order id gene %d does not match user %d", idgen.Gene(m.GetOrderId()), m.GetUserId())
 	case m.GetIdempotencyKey() == "" || len(m.GetIdempotencyKey()) > maxIdempotencyKeyLen:
 		return nil, invalid("bad idempotency key")
 	case len(m.GetRequestHash()) != 32:

@@ -11,12 +11,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 func TestLandSuccess(t *testing.T) {
@@ -87,7 +87,7 @@ func TestLandTwice(t *testing.T) {
 			if n := e.orderRows(t); n != 1 {
 				t.Fatalf("orders = %d, want 1", n)
 			}
-			if n := e.count(t, "SELECT COUNT(*) FROM order_items"); n != 1 {
+			if n := e.count(t, "order_items", ""); n != 1 {
 				t.Errorf("order_items = %d, want 1", n)
 			}
 			if n := e.inv.appliedCount("Reserve"); n != 1 {
@@ -219,6 +219,7 @@ func TestLandReserveRejected(t *testing.T) {
 		{"insufficient stock", nil, errx.ReasonInsufficientStock},
 		{"sku not found", errx.New(codes.NotFound, errx.ReasonSKUNotFound, "gone"), errx.ReasonSKUNotFound},
 		{"reservation released", errx.New(codes.FailedPrecondition, errx.ReasonReservationReleased, "released"), errx.ReasonReservationReleased},
+		{"mixed merchants", errx.New(codes.FailedPrecondition, errx.ReasonMixedMerchants, "mixed"), errx.ReasonMixedMerchants},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,6 +444,62 @@ func TestLandUnrecoverable(t *testing.T) {
 	e.wantGate(t, skuHuge, 1000, 0)
 }
 
+// 订单落到待支付时记下 Reserve 返回的商家，每次状态变更行版本号加一。
+func TestLandRecordsMerchantAndBumpsVersion(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	o := e.submit(t, 1, "k", items(skuA, 1, skuB, 1))
+	e.mustLand(t, o.GetOrderId())
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
+	if stored.MerchantID != fakeMerchant {
+		t.Errorf("merchant_id = %d, want %d", stored.MerchantID, fakeMerchant)
+	}
+	if stored.Version != 1 {
+		t.Errorf("version after CREATING -> PENDING_PAYMENT = %d, want 1", stored.Version)
+	}
+
+	if _, err := e.svc.CancelOrder(t.Context(), &orderv1.CancelOrderRequest{OrderId: o.GetOrderId(), UserId: 1}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	stored = e.load(t, o.GetOrderId())
+	if stored.Version != 2 || stored.MerchantID != fakeMerchant {
+		t.Errorf("after cancel: version = %d, merchant_id = %d; want 2, %d", stored.Version, stored.MerchantID, fakeMerchant)
+	}
+}
+
+// 订单里的 SKU 属于不同商家：库存服务拒绝，订单创建失败，库存和闸门都还回去。
+func TestLandMixedMerchants(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.inv.setMerchant(skuB, fakeMerchant+1)
+	o := e.submit(t, 1, "k", items(skuA, 1, skuB, 1))
+	e.mustLand(t, o.GetOrderId())
+	stored := e.load(t, o.GetOrderId())
+	wantStatus(t, stored, orderv1.OrderStatus_ORDER_STATUS_FAILED)
+	if stored.FailReason != errx.ReasonMixedMerchants || stored.MerchantID != 0 {
+		t.Errorf("fail_reason = %q, merchant_id = %d", stored.FailReason, stored.MerchantID)
+	}
+	e.wantEvents(t, o.GetOrderId(), "failed")
+	e.consumeEvents(t)
+	wantStock(t, e.inv, skuA, 1000, 0, 0)
+	wantStock(t, e.inv, skuB, 1000, 0, 0)
+	e.wantGate(t, skuA, 1000, 0)
+	e.wantGate(t, skuB, 1000, 0)
+}
+
+// Reserve 成功但没有带回商家：订单不能走到待支付，保持 CREATING 等创建超时。
+func TestLandReserveWithoutMerchant(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.inv.setMerchant(skuA, 0)
+	o := e.submit(t, 1, "k", items(skuA, 1))
+	if err := e.land(t, o.GetOrderId()); !errors.Is(err, ErrUnrecoverable) {
+		t.Fatalf("err = %v, want unrecoverable", err)
+	}
+	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CREATING)
+}
+
 func TestLandInvalidMessage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -459,12 +516,16 @@ func TestLandInvalidMessage(t *testing.T) {
 		}
 	}
 	for name, mutate := range map[string]func(m *eventv1.OrderSubmitted){
-		"no user":   func(m *eventv1.OrderSubmitted) { m.UserId = 0 },
-		"no key":    func(m *eventv1.OrderSubmitted) { m.IdempotencyKey = "" },
-		"bad hash":  func(m *eventv1.OrderSubmitted) { m.RequestHash = []byte{1} },
-		"no items":  func(m *eventv1.OrderSubmitted) { m.Items = nil },
-		"bad qty":   func(m *eventv1.OrderSubmitted) { m.Items[0].Quantity = 0 },
-		"no expire": func(m *eventv1.OrderSubmitted) { m.ExpireTime = nil },
+		"no user": func(m *eventv1.OrderSubmitted) { m.UserId = 0 },
+		// 订单号 1 的基因是 1，用户 2 的基因是 2：毒消息，不重试。
+		"gene mismatch": func(m *eventv1.OrderSubmitted) { m.UserId = 2 },
+		// 基因只差在 slot 位以上（1 和 9 都落在 slot 1）也拒绝：idgen 嵌入的是完整的 6 位基因。
+		"gene high bits": func(m *eventv1.OrderSubmitted) { m.UserId = 9 },
+		"no key":         func(m *eventv1.OrderSubmitted) { m.IdempotencyKey = "" },
+		"bad hash":       func(m *eventv1.OrderSubmitted) { m.RequestHash = []byte{1} },
+		"no items":       func(m *eventv1.OrderSubmitted) { m.Items = nil },
+		"bad qty":        func(m *eventv1.OrderSubmitted) { m.Items[0].Quantity = 0 },
+		"no expire":      func(m *eventv1.OrderSubmitted) { m.ExpireTime = nil },
 	} {
 		m := valid()
 		mutate(m)

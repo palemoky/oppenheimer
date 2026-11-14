@@ -10,17 +10,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/outbox"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/payment"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/processor"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/service"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/store"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/testkit"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/outbox"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/payment"
+	"github.com/palemoky/oppenheimer/services/payment/internal/processor"
+	"github.com/palemoky/oppenheimer/services/payment/internal/service"
+	"github.com/palemoky/oppenheimer/services/payment/internal/store"
+	"github.com/palemoky/oppenheimer/services/payment/internal/testkit"
 )
 
 const (

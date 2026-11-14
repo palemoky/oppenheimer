@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	commonv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
+	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
 )
 
 // Clock 是手动推进的时钟，并发安全。
@@ -104,6 +104,11 @@ func (o *Orders) GetOrder(_ context.Context, in *orderv1.GetOrderRequest, _ ...g
 
 // SubmitOrder 实现 OrderServiceClient，payment 不会调用。
 func (o *Orders) SubmitOrder(context.Context, *orderv1.SubmitOrderRequest, ...grpc.CallOption) (*orderv1.SubmitOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+// ListUserOrders 实现 OrderServiceClient，payment 不会调用。
+func (o *Orders) ListUserOrders(context.Context, *orderv1.ListUserOrdersRequest, ...grpc.CallOption) (*orderv1.ListUserOrdersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 

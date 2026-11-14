@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/outbox"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/payment"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/store"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/outbox"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/payment"
+	"github.com/palemoky/oppenheimer/services/payment/internal/store"
 )
 
 // 读到 PENDING 之后、条件更新之前，另一个实例已经完成了转换：这次更新影响 0 行，不能写事件。

@@ -7,15 +7,15 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/worker"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/pkg/worker"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 // SweeperConfig 是后台任务的配置，零值字段使用默认值。
 type SweeperConfig struct {
 	// Interval 是两轮扫描之间的间隔，默认 30 秒。
 	Interval time.Duration
-	// BatchSize 是每类扫描每轮最多处理的订单数，默认 100。
+	// BatchSize 是每类扫描每轮在每个 slot 上最多处理的订单数，默认 100。
 	BatchSize int
 	// CreateTimeout 是订单落库后停留在 CREATING 的时限，超过后置为失败，默认 1 分钟。
 	// 应明显大于一次 Reserve 调用的超时，否则会和正常进行中的落库抢。
@@ -24,6 +24,12 @@ type SweeperConfig struct {
 	// 很多，按受理时刻算的话，积压超过这个时限的订单一落库就会被 sweeper 和消费者抢着处理，
 	// 恰好在削峰最需要的时候成批失败。CREATING 的行在落库之后不会再被更新，updated_at 就是落库时间。
 	CreateTimeout time.Duration
+	// SlotTimeout 是每个 slot 一轮的时限，涵盖列出和处理这一批，默认 10 秒。
+	//
+	// 驱动没有设读超时，一个库挂起（连上了但不响应，而不是拒绝连接）时查询会一直等下去；
+	// 不设时限的话整轮卡在这个库上，另一个库上的 slot 也扫不到。超时只放弃这个 slot 这一轮，
+	// 没做完的订单下一轮会被重新扫到。
+	SlotTimeout time.Duration
 	// Guard 可选，决定这一轮是否运行。多副本时用分布式锁让只有一个副本在扫（设计文档 7.1）。
 	Guard worker.Guard
 }
@@ -34,6 +40,8 @@ const (
 	DefaultSweepInterval  = 30 * time.Second
 	DefaultSweepBatchSize = 100
 	DefaultCreateTimeout  = time.Minute
+	// 一批 100 个订单、每个一次条件更新加写事件，正常几百毫秒内做完，10 秒足够宽裕。
+	DefaultSweepSlotTimeout = 10 * time.Second
 )
 
 // Sweeper 是订单服务的后台任务，实现 app.Component：
@@ -56,6 +64,7 @@ func NewSweeper(svc *Service, cfg SweeperConfig) (*Sweeper, error) {
 	cfg.Interval = cmp.Or(cfg.Interval, DefaultSweepInterval)
 	cfg.BatchSize = cmp.Or(cfg.BatchSize, DefaultSweepBatchSize)
 	cfg.CreateTimeout = cmp.Or(cfg.CreateTimeout, DefaultCreateTimeout)
+	cfg.SlotTimeout = cmp.Or(cfg.SlotTimeout, DefaultSweepSlotTimeout)
 	s := &Sweeper{
 		svc:    svc,
 		cfg:    cfg,
@@ -88,16 +97,66 @@ func (s *Sweeper) Start(ctx context.Context) error { return s.loop.Start(ctx) }
 func (s *Sweeper) Stop(ctx context.Context) error { return s.loop.Stop(ctx) }
 
 // RunOnce 执行一轮两类扫描。单个订单失败只记日志，不中断整轮。
+//
+// 订单分在多个 slot 上，每一轮依次扫所有 slot，每个 slot 各取一批（BatchSize 是每个 slot 的上限）。
+// 某个库不可用时，它上面的 slot 列表失败、记日志后跳过，不影响其他库的 slot；
+// 库挂起不响应时，每个 slot 最多耗 SlotTimeout，之后照常扫下一个 slot。
 func (s *Sweeper) RunOnce(ctx context.Context) {
 	now := s.svc.now()
-	s.closeExpired(ctx, now)
-	s.failStaleCreating(ctx, now)
+	for slot := range s.svc.store.Router().Slots() {
+		if ctx.Err() != nil {
+			return
+		}
+		s.sweepSlot(ctx, slot, now)
+	}
 }
 
-func (s *Sweeper) closeExpired(ctx context.Context, now time.Time) {
-	refs, err := s.svc.store.ListExpired(ctx, now, s.cfg.BatchSize)
+// sweepSlot 在 SlotTimeout 内对一个 slot 做两类扫描。
+func (s *Sweeper) sweepSlot(ctx context.Context, slot int, now time.Time) {
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.SlotTimeout)
+	defer cancel()
+	s.closeExpired(ctx, slot, now)
+	s.failStaleCreating(ctx, slot, now)
+}
+
+// list 先在从库上列出候选，从库出错时在同一个 slot 的时限内改用主库再列一次。
+//
+// 扫描可以走从库：列表只用来找候选，真正的状态转换是主库上带前置条件的更新。从库旧了只有两种后果：
+// 还没复制到的订单这一轮看不到，下一轮（或延迟消息）再处理；已在主库上被支付、取消的订单还被列出来，
+// 对它做的条件更新影响 0 行、不写事件，只是白做一次。两者都不会让订单走错状态。
+// 从库读挂了就退回主库，不让兜底任务因为从库停摆。
+//
+// 从库那次查询只给 slot 剩余时限的一半：从库挂起（连得上但不响应）时，如果它和主库共用整个 slot 的时限，
+// 会把时限耗光，退回主库时已经没有时间，这个 slot 这一轮就被跳过；从库一直挂着，兜底任务就一直不工作。
+// 留下的另一半给主库那次查询和处理这一批订单。按剩余时间而不是固定的 SlotTimeout/2 算：一个 slot 依次做
+// 两类扫描，第二次列表开始时 slot 的时限已经用掉一部分，固定的一半可能把剩下的全部占掉。
+// 没有从库时直接查一次主库，不加这层时限。
+func (s *Sweeper) list(ctx context.Context, slot int, kind string,
+	query func(ctx context.Context, src store.Source) ([]store.OrderRef, error),
+) ([]store.OrderRef, error) {
+	if !s.svc.store.HasReplicas() {
+		return query(ctx, store.Primary)
+	}
+	budget := s.cfg.SlotTimeout / 2
+	if dl, ok := ctx.Deadline(); ok {
+		budget = time.Until(dl) / 2
+	}
+	rctx, cancel := context.WithTimeout(ctx, budget)
+	refs, err := query(rctx, store.Replica)
+	cancel()
+	if err == nil {
+		return refs, nil
+	}
+	s.logger.WarnContext(ctx, "list on replica failed, retrying on primary", "kind", kind, "slot", slot, "error", err)
+	return query(ctx, store.Primary)
+}
+
+func (s *Sweeper) closeExpired(ctx context.Context, slot int, now time.Time) {
+	refs, err := s.list(ctx, slot, "expired", func(ctx context.Context, src store.Source) ([]store.OrderRef, error) {
+		return s.svc.store.ListExpired(ctx, slot, now, s.cfg.BatchSize, src)
+	})
 	if err != nil {
-		s.logger.ErrorContext(ctx, "list expired orders failed", "error", err)
+		s.logger.ErrorContext(ctx, "list expired orders failed", "slot", slot, "error", err)
 		return
 	}
 	for _, r := range refs {
@@ -118,10 +177,12 @@ func (s *Sweeper) closeOrder(ctx context.Context, r store.OrderRef, now time.Tim
 	// !ok：扫描之后被支付或取消抢先了，事件由抢先的一方写。
 }
 
-func (s *Sweeper) failStaleCreating(ctx context.Context, now time.Time) {
-	refs, err := s.svc.store.ListStaleCreating(ctx, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize)
+func (s *Sweeper) failStaleCreating(ctx context.Context, slot int, now time.Time) {
+	refs, err := s.list(ctx, slot, "stale creating", func(ctx context.Context, src store.Source) ([]store.OrderRef, error) {
+		return s.svc.store.ListStaleCreating(ctx, slot, now.Add(-s.cfg.CreateTimeout), s.cfg.BatchSize, src)
+	})
 	if err != nil {
-		s.logger.ErrorContext(ctx, "list stale creating orders failed", "error", err)
+		s.logger.ErrorContext(ctx, "list stale creating orders failed", "slot", slot, "error", err)
 		return
 	}
 	for _, r := range refs {

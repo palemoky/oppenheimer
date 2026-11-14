@@ -9,11 +9,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
 )
 
 // closeDue 把受理时为 orderID 发出的延迟关单消息交给 handler 处理一次。
@@ -37,13 +37,13 @@ func TestCloseDueExpired(t *testing.T) {
 	e := newEnv(t)
 	o := e.mustPending(t, 1, "k")
 	e.clock.Advance(DefaultPaymentTimeout + time.Millisecond)
-	kicks := e.relay.kicks.Load()
+	kicks := e.kicks()
 	if err := e.closeDue(t, o.GetOrderId()); err != nil {
 		t.Fatal(err)
 	}
 	wantStatus(t, e.load(t, o.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_CLOSED)
 	e.wantEvents(t, o.GetOrderId(), "closed")
-	if e.relay.kicks.Load() <= kicks {
+	if e.kicks() <= kicks {
 		t.Error("relay was not kicked after close")
 	}
 	// 重复投递、sweeper 再扫：不再写事件。

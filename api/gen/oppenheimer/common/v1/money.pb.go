@@ -85,7 +85,7 @@ const file_oppenheimer_common_v1_money_proto_rawDesc = "" +
 	"\x06amount\x18\x01 \x01(\x03R\x06amount\x12\x1a\n" +
 	"\bcurrency\x18\x02 \x01(\tR\bcurrencyB\xe5\x01\n" +
 	"\x19com.oppenheimer.common.v1B\n" +
-	"MoneyProtoP\x01ZFgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1;commonv1\xa2\x02\x03OCX\xaa\x02\x15Oppenheimer.Common.V1\xca\x02\x15Oppenheimer\\Common\\V1\xe2\x02!Oppenheimer\\Common\\V1\\GPBMetadata\xea\x02\x17Oppenheimer::Common::V1b\x06proto3"
+	"MoneyProtoP\x01ZFgithub.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1;commonv1\xa2\x02\x03OCX\xaa\x02\x15Oppenheimer.Common.V1\xca\x02\x15Oppenheimer\\Common\\V1\xe2\x02!Oppenheimer\\Common\\V1\\GPBMetadata\xea\x02\x17Oppenheimer::Common::V1b\x06proto3"
 
 var (
 	file_oppenheimer_common_v1_money_proto_rawDescOnce sync.Once

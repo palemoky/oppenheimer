@@ -20,8 +20,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/worker"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/worker"
 )
 
 // Schema 是 outbox 表的建表语句。各服务把它放进自己的迁移文件（表名固定为 outbox）。

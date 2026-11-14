@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	eventv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/retry"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	eventv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/retry"
+	"github.com/palemoky/oppenheimer/services/order/internal/archive"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 const (
@@ -73,7 +74,8 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 		reply   *eventv1.PaymentResultHandled
 	)
 	now := s.now()
-	err := s.inTx(ctx, paymentTxRetry, func(tx *store.Tx) error {
+	// 事务落在订单所在的分片上：订单行、payment_results 和 outbox 都在那个库里。
+	err := s.inTx(ctx, paymentTxRetry, ev.GetOrderId(), func(tx *store.Tx) error {
 		handled, reply = false, nil
 
 		// 先锁订单行：同一订单的重复投递在此排队，与取消、关单的条件更新也互斥。
@@ -94,6 +96,28 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 			return nil
 		case !errors.Is(err, store.ErrNotFound):
 			return err
+		}
+
+		// 热库里既没有订单也没有处理记录，而订单号老到可能已经归档：以冷库为准（见 archivedReply）。
+		// 顺序必须是先热后冷，上面两次热库查询已经做完。
+		if notFound && s.cold != nil && archive.MaybeCold(ev.GetOrderId(), now) {
+			r, aref, archived, err := s.archivedReply(ctx, ev)
+			if err != nil {
+				return err
+			}
+			if archived {
+				if r == nil {
+					return nil // 归档前已经处理过这笔支付
+				}
+				reply = r
+				answer := newEvent(aref, now)
+				answer.Body = &eventv1.OrderEvent_PaymentResultHandled{PaymentResultHandled: reply}
+				if err := s.addEvents(ctx, tx, answer); err != nil {
+					return err
+				}
+				handled = true
+				return nil
+			}
 		}
 
 		ref := store.OrderRef{OrderID: ev.GetOrderId(), UserID: ev.GetUserId()}
@@ -156,12 +180,52 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	if !handled {
 		return nil
 	}
-	s.kick()
+	s.afterCommit(ctx, ev.GetOrderId())
 	if reply.GetDisposition() == refundRequired {
 		s.logger.WarnContext(ctx, "payment requires refund",
 			"order_id", ev.GetOrderId(), "payment_id", ev.GetPaymentId(), "reason", reply.GetReason())
 	}
 	return nil
+}
+
+// archivedReply 给出对已归档订单的一笔支付结果的答复。调用方已经确认热库里没有这个订单、
+// 也没有这笔支付的处理记录。
+//
+//   - archived 为 false：冷库里也没有这个订单，调用方按“订单不存在”处理。
+//   - archived 为 true、reply 为 nil：冷库里有这笔支付的处理记录，是重复投递，什么都不用做。
+//   - archived 为 true、reply 非 nil：订单已归档，这笔支付没处理过。归档的订单都是终态、不可支付：
+//     支付失败只需知悉，支付成功则要求退款。和热库里对终态订单的处理结果相同。
+//
+// 不写任何记录。冷库不接受在线写入，而热库里已经没有这个订单，往热库的 payment_results 写
+// 会留下没有订单的孤儿行。不记录也是幂等的：答复只取决于冷库里不会再变的内容，
+// 重复投递每次都得出同样的答复，支付服务以第一次答复为准。
+//
+// 没有这条路径的话，归档之后重放一个已支付订单的支付结果（消费组位移被重置、上游重发），
+// 会因为热库里订单和处理记录都没有了，而对一个正常付清的订单要求退款。
+//
+// 冷库查询失败时返回错误，消费者原地重试：不能在不知道订单是否存在的情况下给出涉及退款的答复。
+func (s *Service) archivedReply(ctx context.Context, ev *eventv1.PaymentEvent) (
+	reply *eventv1.PaymentResultHandled, ref store.OrderRef, archived bool, err error,
+) {
+	o, err := s.cold.GetOrder(ctx, ev.GetOrderId())
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, ref, false, nil
+	}
+	if err != nil {
+		return nil, ref, false, fmt.Errorf("load archived order %d: %w", ev.GetOrderId(), err)
+	}
+	ref = store.OrderRef{OrderID: o.OrderID, UserID: o.UserID}
+	switch _, err := s.cold.GetPaymentResult(ctx, ev.GetOrderId(), ev.GetPaymentId()); {
+	case err == nil:
+		return nil, ref, true, nil
+	case !errors.Is(err, store.ErrNotFound):
+		return nil, ref, false, fmt.Errorf("load archived payment result %d: %w", ev.GetPaymentId(), err)
+	}
+	reply = &eventv1.PaymentResultHandled{PaymentId: ev.GetPaymentId(), Disposition: accepted}
+	if ev.GetCompleted().GetSucceeded() {
+		reply.Disposition, reply.Reason = refundRequired, errx.ReasonOrderNotPayable
+	}
+	return reply, ref, true, nil
 }
 
 // PaymentEventsHandler 把 HandlePaymentEvent 接到 Kafka 消费者上：解码消息、加上时限、

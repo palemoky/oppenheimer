@@ -19,15 +19,24 @@ import (
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
 )
 
 // Sources 是对账要读的外部数据源。
 type Sources struct {
 	InventoryDB *sql.DB
-	OrderDB     *sql.DB
-	PaymentDB   *sql.DB
+	// OrderDBs 按库序号排列，第 i 个是 order_db_i。订单按 slot 分表，slot 在库间的分布见 pkg/sharding。
+	OrderDBs  []*sql.DB
+	PaymentDB *sql.DB
+
+	// MerchantIndexDBs 按库序号排列，第 i 个是 merchant_index_db_i。为空时不检查商家索引
+	// （chaos 和 bench 不启动 CDC 与 orderindex，不会给这些库）。
+	MerchantIndexDBs []*sql.DB
+
+	// ArchiveDB 是冷库（order_archive_db）。为 nil 时不做第 21 条，第 20 条也只和热库的订单表比。
+	ArchiveDB *sql.DB
 
 	// Redis 是闸门所在的实例，RedisPrefix 是服务的 REDIS_PREFIX。
 	Redis       *redis.Client
@@ -41,6 +50,34 @@ type Sources struct {
 
 	// InventoryLog 是库存服务的日志文件，为空时不检查。
 	InventoryLog string
+}
+
+// orderShards 列出每个订单库上的每张分片表所在的库和 slot。对账工具允许全分片扫描。
+//
+// 布局取 sharding.OrderLayout，库数等于传入的库的个数，与 order 服务的算法是同一份（ADR-0015）。
+// 少给一个库不会悄悄漏读：按更少的库数算出的布局会去库里找不属于它的 slot 的表，查询直接报表不存在。
+func orderShards(src Sources) (map[int][]int, error) {
+	r, err := sharding.New(sharding.OrderLayout(len(src.OrderDBs)))
+	if err != nil {
+		return nil, fmt.Errorf("build order shard router: %w", err)
+	}
+	out := make(map[int][]int, len(src.OrderDBs))
+	for db := range src.OrderDBs {
+		out[db] = r.SlotsOf(db)
+	}
+	return out, nil
+}
+
+// seededUserBase 是造数工具（load seed）的用户号起点，与 seed.UserBase 相同。
+//
+// 造出来的历史订单直接写进订单库，在 payment、inventory 里没有对应的支付单和预占，也不在账本里。
+// 对账只看真实流量产生的订单，按用户号把它们排除（设计文档 1c 的 5.3）。条件走 idx_orders_user
+// 的范围扫描，不会把几百万行造数读出来。
+const seededUserBase int64 = 1 << 40
+
+// notSeeded 返回排除造数订单的 WHERE 子句，col 前缀用于带表别名的查询。
+func notSeeded(prefix string) string {
+	return fmt.Sprintf(" WHERE %suser_id < %d", prefix, seededUserBase)
 }
 
 // ConsumedTopics 是被消费的 topic 的基础名，每个有一个死信 topic。
@@ -71,6 +108,8 @@ func Collect(ctx context.Context, src Sources, initial map[int64]int64) (*Snapsh
 		{"inventory_db", collectInventory},
 		{"order_db", collectOrders},
 		{"payment_db", collectPayments},
+		{"merchant index", collectMerchantIndex},
+		{"cold archive", collectArchive},
 		{"stock gate", collectGate},
 		{"dead letter topics", collectDLQ},
 		{"inventory log", collectLog},
@@ -126,41 +165,112 @@ func collectInventory(ctx context.Context, src Sources, s *Snapshot) error {
 }
 
 func collectOrders(ctx context.Context, src Sources, s *Snapshot) error {
-	db := src.OrderDB
-	s.Orders = map[int64]Order{}
-	s.OrdersByIdem = map[IdemRef]int64{}
-	if err := queryEach(ctx, db, `SELECT order_id, user_id, status, total_amount, currency,
-		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM orders`, func(r *sql.Rows) error {
-		o := Order{Items: map[int64]int64{}}
-		if err := r.Scan(&o.OrderID, &o.UserID, &o.Status, &o.TotalAmount, &o.Currency,
-			&o.IdempotencyKey, &o.PaymentID, &o.FailReason); err != nil {
-			return err
-		}
-		s.Orders[o.OrderID] = o
-		s.OrdersByIdem[IdemRef{UserID: o.UserID, Key: o.IdempotencyKey}] = o.OrderID
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	if err := queryEach(ctx, db, "SELECT order_id, sku_id, quantity FROM order_items", func(r *sql.Rows) error {
-		var orderID, sku, qty int64
-		if err := r.Scan(&orderID, &sku, &qty); err != nil {
-			return err
-		}
-		if o, ok := s.Orders[orderID]; ok {
-			o.Items[sku] += qty
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	n, err := countPendingOutbox(ctx, db)
+	shards, err := orderShards(src)
 	if err != nil {
 		return err
 	}
-	s.OutboxPending["order"] = n
+	s.Orders = map[int64]Order{}
+	s.OrdersByIdem = map[IdemRef]int64{}
+	var pending int64
+	for db, slots := range shards {
+		conn := src.OrderDBs[db]
+		for _, slot := range slots {
+			orders, items := sharding.Table("orders", slot), sharding.Table("order_items", slot)
+			if err := queryEach(ctx, conn, `SELECT order_id, user_id, status, total_amount, currency,
+		idempotency_key, COALESCE(payment_id, 0), COALESCE(fail_reason, '') FROM `+orders+notSeeded(""), func(r *sql.Rows) error {
+				o := Order{Items: map[int64]int64{}}
+				if err := r.Scan(&o.OrderID, &o.UserID, &o.Status, &o.TotalAmount, &o.Currency,
+					&o.IdempotencyKey, &o.PaymentID, &o.FailReason); err != nil {
+					return err
+				}
+				s.Orders[o.OrderID] = o
+				s.OrdersByIdem[IdemRef{UserID: o.UserID, Key: o.IdempotencyKey}] = o.OrderID
+				return nil
+			}); err != nil {
+				return err
+			}
+			// 订单和明细同槽同库，明细只会落在订单所在的那张分片表。
+			if err := queryEach(ctx, conn, "SELECT i.order_id, i.sku_id, i.quantity FROM "+items+" i JOIN "+orders+" o ON o.order_id = i.order_id"+notSeeded("o."), func(r *sql.Rows) error {
+				var orderID, sku, qty int64
+				if err := r.Scan(&orderID, &sku, &qty); err != nil {
+					return err
+				}
+				if o, ok := s.Orders[orderID]; ok {
+					o.Items[sku] += qty
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		n, err := countPendingOutbox(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("order_db_%d: %w", db, err)
+		}
+		pending += n
+	}
+	s.OutboxPending["order"] = pending
+	return nil
+}
+
+// collectMerchantIndex 读出订单侧和索引侧的商家订单。没有给索引库时什么也不读，Snapshot.MerchantIndex 保持 nil。
+//
+// 订单侧的列（merchant_id、version）只在这里读，不碰 collectOrders 的查询，
+// 没有索引库时对账读的库表与加入这一项之前完全一样。
+func collectMerchantIndex(ctx context.Context, src Sources, s *Snapshot) error {
+	if len(src.MerchantIndexDBs) == 0 {
+		return nil
+	}
+	if len(src.MerchantIndexDBs) != sharding.MerchantIndexDBs {
+		return fmt.Errorf("verify: got %d merchant index dbs, layout has %d", len(src.MerchantIndexDBs), sharding.MerchantIndexDBs)
+	}
+	data := &MerchantIndexData{}
+	scan := func(slot int, rows *[]MerchantOrderRow) func(*sql.Rows) error {
+		return func(r *sql.Rows) error {
+			row := MerchantOrderRow{Slot: slot}
+			if err := r.Scan(&row.OrderID, &row.MerchantID, &row.Status, &row.TotalAmount, &row.Version); err != nil {
+				return err
+			}
+			*rows = append(*rows, row)
+			return nil
+		}
+	}
+
+	orderShards, err := orderShards(src)
+	if err != nil {
+		return err
+	}
+	for db, slots := range orderShards {
+		for _, slot := range slots {
+			q := "SELECT order_id, merchant_id, status, total_amount, version FROM " +
+				sharding.Table("orders", slot) + notSeeded("") + " AND merchant_id IS NOT NULL"
+			if err := queryEach(ctx, src.OrderDBs[db], q, scan(slot, &data.Orders)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 归档把订单从热库搬到冷库，索引行保留，所以订单侧要并上冷库。冷库的表不分片，同样排除造数的订单。
+	if src.ArchiveDB != nil {
+		q := "SELECT order_id, merchant_id, status, total_amount, version FROM orders_archive" + notSeeded("") + " AND merchant_id IS NOT NULL"
+		if err := queryEach(ctx, src.ArchiveDB, q, scan(-1, &data.ColdOrders)); err != nil {
+			return err
+		}
+	}
+
+	r, err := sharding.New(sharding.MerchantIndexLayout())
+	if err != nil {
+		return fmt.Errorf("build merchant index shard router: %w", err)
+	}
+	for db, conn := range src.MerchantIndexDBs {
+		for _, slot := range r.SlotsOf(db) {
+			q := "SELECT order_id, merchant_id, status, total_amount, src_version FROM " + sharding.Table("merchant_orders", slot) + notSeeded("")
+			if err := queryEach(ctx, conn, q, scan(slot, &data.Index)); err != nil {
+				return err
+			}
+		}
+	}
+	s.MerchantIndex = data
 	return nil
 }
 

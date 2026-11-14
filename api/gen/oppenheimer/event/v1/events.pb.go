@@ -7,7 +7,7 @@
 package eventv1
 
 import (
-	v1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
+	v1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -889,7 +889,7 @@ const file_oppenheimer_event_v1_events_proto_rawDesc = "" +
 	"\x1fPAYMENT_DISPOSITION_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPAYMENT_DISPOSITION_ACCEPTED\x10\x01\x12'\n" +
 	"#PAYMENT_DISPOSITION_REFUND_REQUIRED\x10\x02B\xdf\x01\n" +
-	"\x18com.oppenheimer.event.v1B\vEventsProtoP\x01ZDgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/event/v1;eventv1\xa2\x02\x03OEX\xaa\x02\x14Oppenheimer.Event.V1\xca\x02\x14Oppenheimer\\Event\\V1\xe2\x02 Oppenheimer\\Event\\V1\\GPBMetadata\xea\x02\x16Oppenheimer::Event::V1b\x06proto3"
+	"\x18com.oppenheimer.event.v1B\vEventsProtoP\x01ZDgithub.com/palemoky/oppenheimer/api/gen/oppenheimer/event/v1;eventv1\xa2\x02\x03OEX\xaa\x02\x14Oppenheimer.Event.V1\xca\x02\x14Oppenheimer\\Event\\V1\xe2\x02 Oppenheimer\\Event\\V1\\GPBMetadata\xea\x02\x16Oppenheimer::Event::V1b\x06proto3"
 
 var (
 	file_oppenheimer_event_v1_events_proto_rawDescOnce sync.Once

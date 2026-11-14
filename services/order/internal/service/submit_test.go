@@ -12,14 +12,14 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/redisx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/redisx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 func TestSubmitValidation(t *testing.T) {
@@ -119,7 +119,7 @@ func TestSubmitDoesNotTouchMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+	svc := mustNew(t, Deps{Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
 		Config{Clock: e.clock.Now, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic})
 	for _, it := range [][]*orderv1.SubmitOrderItem{items(skuA, 1), items(skuScarce, 5), items(skuMissing, 1)} {
 		_, err := svc.SubmitOrder(t.Context(), submitReq(1, fmt.Sprint(it), it))
@@ -359,7 +359,7 @@ func TestSubmitSendFailureAfterClaim(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			if _, _, err := e.gate.Claim(t.Context(), m.GetOrderId()); err != nil {
+			if _, _, err := e.gate.Claim(t.Context(), m.GetOrderId(), e.clock.Now()); err != nil {
 				t.Error(err)
 			}
 		},
@@ -411,7 +411,7 @@ func TestSubmitGateUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{
+	svc := mustNew(t, Deps{
 		Store: e.store, Gate: stockgate.New(broken, prefix), Sender: e.sender, Inventory: e.inv, IDs: ids,
 		Logger: slog.New(slog.DiscardHandler),
 	}, Config{Clock: e.clock.Now})
@@ -438,7 +438,7 @@ func TestSubmitBackpressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := New(Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+	svc := mustNew(t, Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
 		Config{
 			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
 			Backlog: stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1},
@@ -482,6 +482,60 @@ func TestSubmitBackpressure(t *testing.T) {
 		t.Fatalf("status = %v, want CREATING", o.GetStatus())
 	}
 	e.wantGate(t, skuA, 997, 3)
+}
+
+// 落库停住、排队的订单被回收之后，受理只放进少量探测订单；消费者恢复后，即使它最先处理的是
+// 占用早已被回收的消息（这条消息会被丢弃），也说明落库活着，受理随即恢复。
+func TestSubmitResumesAfterLandingDropsReapedOrder(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ids, err := idgen.New(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := mustNew(t, Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+		Config{
+			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
+			Backlog: stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1},
+		})
+	submit := func(user int64, key string) (*orderv1.Order, error) {
+		resp, err := svc.SubmitOrder(t.Context(), submitReq(user, key, items(skuA, 1)))
+		return resp.GetOrder(), err
+	}
+
+	// 两单受理之后消费者停住，宽限期过后被回收。
+	reaped, err := submit(1, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submit(2, "b"); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(DefaultReapGrace + time.Second)
+	if st := e.reaper.RunOnce(t.Context()); st.Returned != 2 {
+		t.Fatalf("reaped %d, want 2", st.Returned)
+	}
+
+	// 落库已超过 MaxWait 没有动静：只放进 MaxStale+1 个探测订单。
+	for i, key := range []string{"c", "d"} {
+		if _, err := submit(int64(3+i), key); err != nil {
+			t.Fatalf("probe %s: %v", key, err)
+		}
+	}
+	_, err = submit(5, "e")
+	wantErr(t, err, codes.ResourceExhausted, errx.ReasonBacklogged)
+
+	// 消费者恢复，先处理到已被回收的订单：丢弃它，但刷新了心跳。
+	e.mustLand(t, reaped.GetOrderId())
+	if _, ok := e.hold(t, reaped.GetOrderId()); ok {
+		t.Fatal("reaped order got a hold back")
+	}
+	if n := e.orderRows(t); n != 0 {
+		t.Fatalf("orders = %d, want 0", n)
+	}
+	if _, err := submit(5, "e"); err != nil {
+		t.Fatalf("after landing resumed: %v", err)
+	}
 }
 
 // 新 SKU 开卖瞬间的并发首单只触发一次预热，全部受理成功。

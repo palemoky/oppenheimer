@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/palemoky/Oppenheimer/test/load/internal/ledger"
-	"github.com/palemoky/Oppenheimer/test/load/internal/stats"
+	"github.com/palemoky/oppenheimer/test/load/internal/ledger"
+	"github.com/palemoky/oppenheimer/test/load/internal/stats"
 )
 
 // aggregator 汇总各虚拟用户的结果。一个请求只加一次锁，相比 HTTP 往返可以忽略。

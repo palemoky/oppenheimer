@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 // writeJSON 用 encoding/json/v2 输出响应。先序列化再写，失败时还能改成 500。

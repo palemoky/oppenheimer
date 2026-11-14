@@ -1,8 +1,8 @@
-module github.com/palemoky/Oppenheimer/test/e2e
+module github.com/palemoky/oppenheimer/test/e2e
 
 go 1.27
 
-require github.com/palemoky/Oppenheimer/pkg v0.0.0
+require github.com/palemoky/oppenheimer/pkg v0.0.0
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -14,4 +14,4 @@ require (
 	golang.org/x/sync v0.25.0 // indirect
 )
 
-replace github.com/palemoky/Oppenheimer/pkg => ../../pkg
+replace github.com/palemoky/oppenheimer/pkg => ../../pkg

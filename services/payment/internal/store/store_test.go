@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/payment"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/store"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/payment"
+	"github.com/palemoky/oppenheimer/services/payment/internal/store"
 )
 
 const (

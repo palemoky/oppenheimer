@@ -24,6 +24,7 @@ const (
 	ReasonReservationReleased  = "RESERVATION_RELEASED"
 	ReasonReservationConfirmed = "RESERVATION_CONFIRMED"
 	ReasonReservationMismatch  = "RESERVATION_MISMATCH"
+	ReasonMixedMerchants       = "MIXED_MERCHANTS"
 
 	ReasonOrderNotFound        = "ORDER_NOT_FOUND"
 	ReasonOrderNotCancellable  = "ORDER_NOT_CANCELLABLE"

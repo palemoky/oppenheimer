@@ -142,7 +142,7 @@ start_svc() {
   local s="$1" dir="$2" i pid
   case "$s" in
     inventory) env MYSQL_DSN="$(dsn inventory_db)" WORKER_ID=1 "$BIN/inventory" >"$dir/inventory.log" 2>&1 & ;;
-    order) env MYSQL_DSN="$(dsn order_db)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
+    order) env MYSQL_DSNS="$(dsn order_db_0),$(dsn order_db_1)" ARCHIVE_DSN="$(dsn order_archive_db)" WORKER_ID=2 "$BIN/order" >"$dir/order.log" 2>&1 & ;;
     payment) env MYSQL_DSN="$(dsn payment_db)" WORKER_ID=3 "$BIN/payment" >"$dir/payment.log" 2>&1 & ;;
     gateway) "$BIN/gateway" >"$dir/gateway.log" 2>&1 & ;;
   esac
@@ -166,7 +166,16 @@ cpu_seconds() {
 }
 
 # landed_count 打印进入 pending_payment 的订单数（不支付不取消，所以落库的订单都停在这个状态）。
-landed_count() { sql -e "SELECT COUNT(*) FROM ${DB_PREFIX}order_db.orders WHERE status = 2"; }
+# 订单分在两个库的 8 张分片表里，汇总时全部扫一遍。
+all_orders_sql() {
+  local cols="$1" tail="${2:-}" i out="" sep=""
+  for i in 0 1 2 3 4 5 6 7; do
+    out="$out${sep}SELECT $cols FROM ${DB_PREFIX}order_db_$((i % 2)).orders_$i $tail"
+    sep=" UNION ALL "
+  done
+  echo "$out"
+}
+landed_count() { sql -e "SELECT COUNT(*) FROM ($(all_orders_sql status "WHERE status = 2")) o"; }
 
 # ---------- 准备 ----------
 
@@ -215,7 +224,7 @@ run_one() {
   export REDIS_PREFIX="bench-$run_ts-$c-$n:"
 
   local q=""
-  for db in inventory_db order_db payment_db; do
+  for db in inventory_db order_db_0 order_db_1 order_archive_db payment_db; do
     q="$q DROP DATABASE IF EXISTS ${DB_PREFIX}${db}; CREATE DATABASE ${DB_PREFIX}${db};"
   done
   sql -e "$q"
@@ -260,8 +269,8 @@ run_one() {
     sleep 1
   done
   sql -e "SELECT COUNT(*), UNIX_TIMESTAMP(MIN(updated_at)), UNIX_TIMESTAMP(MAX(updated_at))
-    FROM ${DB_PREFIX}order_db.orders WHERE status = 2" >"$dir/db-landed.txt"
-  sql -e "SELECT status, COUNT(*) FROM ${DB_PREFIX}order_db.orders GROUP BY status" >"$dir/db-status.txt"
+    FROM ($(all_orders_sql "status, updated_at" "WHERE status = 2")) o" >"$dir/db-landed.txt"
+  sql -e "SELECT status, COUNT(*) FROM ($(all_orders_sql status)) o GROUP BY status" >"$dir/db-status.txt"
   stop_services
 
   local wall load_user load_sys

@@ -12,7 +12,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 // testTTL 尽量短，让依赖过期的测试不用等太久；又不能太短，否则 -race 下调度延迟会让

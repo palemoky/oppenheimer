@@ -1,6 +1,7 @@
 package stockgate_test
 
 import (
+	"errors"
 	"slices"
 	"strconv"
 	"sync"
@@ -10,8 +11,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 const ttl = time.Hour
@@ -298,7 +299,7 @@ func TestClaimAndReapAreMutuallyExclusive(t *testing.T) {
 		var reap stockgate.ReapResult
 		var wg sync.WaitGroup
 		wg.Go(func() {
-			_, ok, err := e.gate.Claim(t.Context(), res.OrderID)
+			_, ok, err := e.gate.Claim(t.Context(), res.OrderID, time.Now())
 			if err != nil {
 				t.Error(err)
 			}
@@ -354,7 +355,7 @@ func TestClaimAndGet(t *testing.T) {
 		t.Fatalf("Get = %+v", info)
 	}
 	for range 2 {
-		info, ok, err = e.gate.Claim(t.Context(), 7)
+		info, ok, err = e.gate.Claim(t.Context(), 7, time.Now())
 		if err != nil || !ok || !info.Claimed || !slices.Equal(info.Items, want) {
 			t.Fatalf("Claim = %+v, %v, %v", info, ok, err)
 		}
@@ -362,7 +363,7 @@ func TestClaimAndGet(t *testing.T) {
 	if r := must[stockgate.ReapResult](t)(e.gate.ReturnIfUnclaimed(t.Context(), 7)); r != stockgate.ReapClaimed {
 		t.Fatalf("reap claimed hold = %v, want ReapClaimed", r)
 	}
-	if _, ok, _ := e.gate.Claim(t.Context(), 999); ok {
+	if _, ok, _ := e.gate.Claim(t.Context(), 999, time.Now()); ok {
 		t.Fatal("claim of unknown order succeeded")
 	}
 }
@@ -435,7 +436,7 @@ func TestHoldsBefore(t *testing.T) {
 	// 认领后从待回收的列表移到已认领的列表：已认领的占用要活到订单结束，
 	// 留在原列表里会一直排在最前面，把后面的孤儿挡在回收任务的一批之外。
 	for range 2 { // 重复认领不改变结果
-		if _, ok, err := e.gate.Claim(t.Context(), 2); err != nil || !ok {
+		if _, ok, err := e.gate.Claim(t.Context(), 2, time.Now()); err != nil || !ok {
 			t.Fatalf("Claim = %v, %v", ok, err)
 		}
 	}
@@ -576,6 +577,10 @@ func TestHoldBacklog(t *testing.T) {
 		return st.Avail
 	}
 
+	// 落库在 start 还活着（心跳），这个测试只看第二条：排队超时的个数。
+	if _, _, err := e.gate.Claim(t.Context(), 999_999, start); err != nil {
+		t.Fatal(err)
+	}
 	// 三笔占用在 start 受理，之后一直没被认领。
 	var first stockgate.HoldResult
 	for i := range 3 {
@@ -620,7 +625,7 @@ func TestHoldBacklog(t *testing.T) {
 	}
 
 	// 认领之后不再算在队列里：认领一笔，剩下两笔超时，不多于 MaxStale。
-	if _, ok, err := e.gate.Claim(t.Context(), first.OrderID); err != nil || !ok {
+	if _, ok, err := e.gate.Claim(t.Context(), first.OrderID, late); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
 	if res := hold(late, "after-claim", limit); res.Outcome != stockgate.Held {
@@ -672,7 +677,7 @@ func TestHoldQueueLimit(t *testing.T) {
 	if res := hold("q3"); res.Outcome != stockgate.Backlogged || res.Queued != 3 {
 		t.Fatalf("4th hold: %+v, want BACKLOGGED with 3 queued", res)
 	}
-	if _, ok, err := e.gate.Claim(t.Context(), first); err != nil || !ok {
+	if _, ok, err := e.gate.Claim(t.Context(), first, time.Now()); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
 	if res := hold("q3"); res.Outcome != stockgate.Held {
@@ -705,5 +710,274 @@ func TestHoldQueueLimitConcurrent(t *testing.T) {
 	}
 	if n, err := e.rdb.ZCard(t.Context(), e.prefix+"gate:holds").Result(); err != nil || n != maxQueue {
 		t.Fatalf("queue length %d (%v), want %d", n, err, maxQueue)
+	}
+}
+
+// ---------- 落库心跳（第三条背压） ----------
+
+var stallLimit = stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 2}
+
+// holdAt 在 at 时刻用新的订单号和幂等键受理一件 SKU 1。
+func (e *env) holdAt(at time.Time, backlog stockgate.BacklogLimit) stockgate.HoldResult {
+	e.t.Helper()
+	id := e.nextID.Add(1)
+	res, err := e.gate.Hold(e.t.Context(), stockgate.HoldRequest{
+		OrderID: id, UserID: 7, IdempotencyKey: "k" + strconv.FormatInt(id, 10), RequestHash: []byte("h"),
+		Items: []stockgate.Item{item(1, 1)}, Now: at, IdempotencyTTL: ttl, Backlog: backlog,
+	})
+	if err != nil {
+		e.t.Errorf("hold order %d: %v", id, err)
+	}
+	return res
+}
+
+// admit 在 at 时刻连续受理最多 n 次，返回被受理的订单号；遇到 Backlogged 就停下。
+func (e *env) admit(at time.Time, n int, backlog stockgate.BacklogLimit) []int64 {
+	e.t.Helper()
+	var ids []int64
+	for range n {
+		res := e.holdAt(at, backlog)
+		switch res.Outcome {
+		case stockgate.Held:
+			ids = append(ids, res.OrderID)
+		case stockgate.Backlogged:
+			return ids
+		default:
+			e.t.Fatalf("hold: %+v", res)
+		}
+	}
+	return ids
+}
+
+func (e *env) claim(orderID int64, at time.Time) bool {
+	e.t.Helper()
+	_, ok, err := e.gate.Claim(e.t.Context(), orderID, at)
+	if err != nil {
+		e.t.Fatalf("claim %d: %v", orderID, err)
+	}
+	return ok
+}
+
+func (e *env) reap(ids []int64) {
+	e.t.Helper()
+	for _, id := range ids {
+		if r := must[stockgate.ReapResult](e.t)(e.gate.ReturnIfUnclaimed(e.t.Context(), id)); r != stockgate.ReapReturned {
+			e.t.Fatalf("reap %d = %v, want ReapReturned", id, r)
+		}
+	}
+}
+
+func (e *env) heartbeat() (int64, bool) {
+	e.t.Helper()
+	v, err := e.rdb.Get(e.t.Context(), e.prefix+"gate:claim_at").Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, false
+	}
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return v, true
+}
+
+// stall 让落库在 start 还活着、之后停住：受理一批，时间推过 MaxWait 后被第二条拒绝，
+// 回收任务把它们还掉。返回此刻的时间。
+func (e *env) stall(start time.Time) time.Time {
+	e.t.Helper()
+	e.claim(1, start)
+	queued := e.admit(start, 10, stallLimit)
+	if len(queued) != 10 {
+		e.t.Fatalf("live landing admitted %d, want 10", len(queued))
+	}
+	now := start.Add(stallLimit.MaxWait + time.Second)
+	if res := e.holdAt(now, stallLimit); res.Outcome != stockgate.Backlogged {
+		e.t.Fatalf("stale queue: %+v, want BACKLOGGED", res)
+	}
+	e.reap(queued)
+	return now
+}
+
+// 防止：落库停住时，回收任务把排队超时的占用还掉后受理重新打开，新订单再排到超时、再被回收，循环下去。
+// 心跳不会被回收抹掉：每个宽限期最多放进 MaxStale+1 个探测订单。
+func TestHoldStalledLandingDoesNotCycle(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 1000, 0)
+	now := e.stall(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+
+	for cycle := range 5 {
+		probes := e.admit(now, 50, stallLimit)
+		if int64(len(probes)) != stallLimit.MaxStale+1 {
+			t.Fatalf("cycle %d: admitted %d while landing is stalled, want %d", cycle, len(probes), stallLimit.MaxStale+1)
+		}
+		before := e.stock(1)
+		res := e.holdAt(now, stallLimit)
+		if res.Outcome != stockgate.Backlogged || res.Queued != stallLimit.MaxStale+1 {
+			t.Fatalf("cycle %d: %+v, want BACKLOGGED with %d queued", cycle, res, stallLimit.MaxStale+1)
+		}
+		if after := e.stock(1); after != before {
+			t.Fatalf("backlogged hold changed stock: %+v -> %+v", before, after)
+		}
+		now = now.Add(stallLimit.MaxWait + time.Second)
+		e.reap(probes)
+	}
+	e.assertStock(1, 1000, 0)
+}
+
+// 落库恢复：一次认领刷新心跳后受理恢复正常。占用不存在的认领也算，
+// 恢复后的消费者最先消费到的往往正是已被回收的订单的消息。
+func TestHoldResumesAfterClaim(t *testing.T) {
+	for name, claimLive := range map[string]bool{"hold exists": true, "hold reaped": false} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.load(1, 1000, 0)
+			now := e.stall(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+			probes := e.admit(now, 50, stallLimit)
+			if int64(len(probes)) != stallLimit.MaxStale+1 {
+				t.Fatalf("stalled landing admitted %d, want %d", len(probes), stallLimit.MaxStale+1)
+			}
+
+			target := int64(424242) // 已被回收或从未存在
+			if claimLive {
+				target = probes[0]
+			}
+			now = now.Add(time.Second)
+			if ok := e.claim(target, now); ok != claimLive {
+				t.Fatalf("claim %d = %v, want %v", target, ok, claimLive)
+			}
+			if got := e.admit(now, 20, stallLimit); len(got) != 20 {
+				t.Fatalf("after claim admitted %d, want 20", len(got))
+			}
+		})
+	}
+}
+
+// 冷启动：没有心跳、队列为空，第一批照常受理，直到队列超过 MaxStale。
+func TestHoldColdStart(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	e := newEnv(t)
+	e.load(1, 1000, 0)
+	if got := e.admit(now, 50, stallLimit); int64(len(got)) != stallLimit.MaxStale+1 {
+		t.Fatalf("cold start admitted %d, want %d", len(got), stallLimit.MaxStale+1)
+	}
+	if _, ok := e.heartbeat(); ok {
+		t.Fatal("Hold wrote the heartbeat")
+	}
+
+	// MaxStale 为 0 也不会因为没有心跳而永远关闭：放进一个探测订单。
+	e2 := newEnv(t)
+	e2.load(1, 1000, 0)
+	if got := e2.admit(now, 50, stockgate.BacklogLimit{MaxWait: time.Second}); len(got) != 1 {
+		t.Fatalf("cold start with MaxStale=0 admitted %d, want 1", len(got))
+	}
+}
+
+// 心跳只往前走；Get 不刷新心跳；重复认领、认领不存在的占用都推进心跳。
+func TestHeartbeat(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 1000, 0)
+	t0 := time.UnixMilli(1_700_000_000_000)
+	res := e.holdAt(t0, stockgate.BacklogLimit{})
+
+	if _, ok, err := e.gate.Get(t.Context(), res.OrderID); err != nil || !ok {
+		t.Fatalf("Get = %v, %v", ok, err)
+	}
+	if _, ok, err := e.gate.Get(t.Context(), 999); err != nil || ok {
+		t.Fatalf("Get unknown = %v, %v", ok, err)
+	}
+	if _, ok := e.heartbeat(); ok {
+		t.Fatal("Get wrote the heartbeat")
+	}
+
+	later := t0.Add(time.Minute)
+	if !e.claim(res.OrderID, later) {
+		t.Fatal("claim failed")
+	}
+	for _, at := range []time.Time{t0, later.Add(-time.Millisecond)} {
+		e.claim(999, at)
+		e.claim(res.OrderID, at)
+		if v, ok := e.heartbeat(); !ok || v != later.UnixMilli() {
+			t.Fatalf("heartbeat after an earlier claim = %d, %v; want %d", v, ok, later.UnixMilli())
+		}
+	}
+
+	latest := later.Add(time.Second)
+	e.claim(res.OrderID, latest) // 已认领过
+	if v, _ := e.heartbeat(); v != latest.UnixMilli() {
+		t.Fatalf("heartbeat after reclaim = %d, want %d", v, latest.UnixMilli())
+	}
+	e.claim(999, latest.Add(time.Second)) // 占用不存在
+	if v, _ := e.heartbeat(); v != latest.Add(time.Second).UnixMilli() {
+		t.Fatalf("heartbeat after claiming a missing hold = %d, want %d", v, latest.Add(time.Second).UnixMilli())
+	}
+	if _, _, err := e.gate.Get(t.Context(), res.OrderID); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := e.heartbeat(); v != latest.Add(time.Second).UnixMilli() {
+		t.Fatalf("Get moved the heartbeat to %d", v)
+	}
+}
+
+// MaxWait 为 0 时不看心跳，只有队列长度上限生效。
+func TestHoldNoMaxWaitIgnoresHeartbeat(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 1000, 0)
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	if got := e.admit(now, 20, stockgate.BacklogLimit{MaxStale: 0}); len(got) != 20 {
+		t.Fatalf("MaxWait=0 admitted %d, want 20", len(got))
+	}
+	if got := e.admit(now, 20, stockgate.BacklogLimit{MaxQueue: 25}); len(got) != 5 {
+		t.Fatalf("MaxQueue=25 admitted %d more, want 5", len(got))
+	}
+}
+
+// 并发受理和认领：心跳最终是最大的认领时间，库存恒等式成立，每个受理的订单恰好在一个队列里。
+func TestHoldAndClaimConcurrent(t *testing.T) {
+	e := newEnv(t)
+	const total = 1000
+	e.load(1, total, 0)
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	first := e.nextID.Load() + 1
+
+	var held, backlogged, claimed, maxBeat atomic.Int64
+	parallel(600, func(i int) {
+		if i%2 == 0 {
+			switch res := e.holdAt(now, stallLimit); res.Outcome {
+			case stockgate.Held:
+				held.Add(1)
+			case stockgate.Backlogged:
+				backlogged.Add(1)
+			default:
+				t.Errorf("hold: %+v", res)
+			}
+			return
+		}
+		// 认领一个可能已受理、可能还没受理的订单号，时间乱序。
+		at := now.Add(time.Duration(i%37) * time.Millisecond)
+		_, ok, err := e.gate.Claim(t.Context(), first+int64(i/2), at)
+		if err != nil {
+			t.Errorf("claim: %v", err)
+			return
+		}
+		if ok {
+			claimed.Add(1)
+		}
+		for {
+			cur := maxBeat.Load()
+			if at.UnixMilli() <= cur || maxBeat.CompareAndSwap(cur, at.UnixMilli()) {
+				break
+			}
+		}
+	})
+
+	if held.Load()+backlogged.Load() != 300 {
+		t.Fatalf("held=%d backlogged=%d, want 300 in total", held.Load(), backlogged.Load())
+	}
+	e.assertStock(1, total-held.Load(), held.Load())
+	queued := must[int64](t)(e.rdb.ZCard(t.Context(), e.prefix+"gate:holds").Result())
+	inClaimed := must[int64](t)(e.rdb.ZCard(t.Context(), e.prefix+"gate:claimed").Result())
+	if queued+inClaimed != held.Load() || inClaimed != claimed.Load() {
+		t.Fatalf("holds=%d claimed=%d, want %d in total and %d claimed", queued, inClaimed, held.Load(), claimed.Load())
+	}
+	if v, ok := e.heartbeat(); !ok || v != maxBeat.Load() {
+		t.Fatalf("heartbeat = %d, %v; want %d", v, ok, maxBeat.Load())
 	}
 }

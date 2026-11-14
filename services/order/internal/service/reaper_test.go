@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
 )
 
 // 未认领的旧占用被归还（并删除幂等键），宽限期内的和已认领的不动。
@@ -143,7 +143,7 @@ func TestReaperReportsStuckClaimedHolds(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	o := e.submit(t, 1, "stuck", items(skuA, 2))
-	if _, ok, err := e.svc.gate.Claim(t.Context(), o.GetOrderId()); err != nil || !ok {
+	if _, ok, err := e.svc.gate.Claim(t.Context(), o.GetOrderId(), e.clock.Now()); err != nil || !ok {
 		t.Fatalf("claim = %v, %v", ok, err)
 	}
 

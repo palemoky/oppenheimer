@@ -12,13 +12,13 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
-	"github.com/palemoky/Oppenheimer/services/inventory"
-	"github.com/palemoky/Oppenheimer/services/inventory/internal/store"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/services/inventory"
+	"github.com/palemoky/oppenheimer/services/inventory/internal/store"
 )
 
 type env struct {
@@ -232,7 +232,7 @@ func TestReserveIdempotent(t *testing.T) {
 
 	first, err := e.reserve(t.Context(), 7, 2, 1, 1, 2)
 	mustOK(t, err)
-	want := &inventoryv1.ReserveResponse{Items: []*inventoryv1.ReservedItem{
+	want := &inventoryv1.ReserveResponse{MerchantId: 1, Items: []*inventoryv1.ReservedItem{
 		{SkuId: 1, Quantity: 2, UnitPrice: toProtoMoney(store.Price{Amount: 100, Currency: "CNY"})},
 		{SkuId: 2, Quantity: 1, UnitPrice: toProtoMoney(store.Price{Amount: 250, Currency: "CNY"})},
 	}}
@@ -480,4 +480,58 @@ func TestReserveConcurrentDuplicateRejected(t *testing.T) {
 		}
 	}
 	e.assertStock(t, 1, 2, 0, 0)
+}
+
+// Reserve 返回 SKU 所属的商家并记在预占头上，重复调用返回同一个值。
+func TestReserveReturnsMerchant(t *testing.T) {
+	e := newEnv(t)
+	e.seed(t, 1, 100, 10)
+	e.seed(t, 2, 100, 10)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET merchant_id = 9 WHERE sku_id IN (1, 2)`)
+
+	first, err := e.reserve(t.Context(), 7, 1, 1, 2, 1)
+	mustOK(t, err)
+	if first.GetMerchantId() != 9 {
+		t.Fatalf("merchant_id = %d, want 9", first.GetMerchantId())
+	}
+	again, err := e.reserve(t.Context(), 7, 1, 1, 2, 1)
+	mustOK(t, err)
+	if !proto.Equal(again, first) {
+		t.Errorf("repeated Reserve = %v, want %v", again, first)
+	}
+
+	// 加 merchant_id 这一列之前写下的预占头上没有商家，重复调用时从 SKU 上取。
+	testdb.MustExec(t, e.db, `UPDATE reservation SET merchant_id = NULL WHERE order_id = 7`)
+	legacy, err := e.reserve(t.Context(), 7, 1, 1, 2, 1)
+	mustOK(t, err)
+	if !proto.Equal(legacy, first) {
+		t.Errorf("Reserve on a reservation without merchant = %v, want %v", legacy, first)
+	}
+	e.assertStock(t, 1, 9, 1, 0)
+	e.assertStock(t, 2, 9, 1, 0)
+}
+
+// 一个订单只属于一个商家：SKU 属于不同商家时整笔预占被拒绝，不留头记录，库存不变，
+// 之后同一个订单号换成单商家的内容可以预占成功。
+func TestReserveMixedMerchantsRejected(t *testing.T) {
+	e := newEnv(t)
+	e.seed(t, 1, 100, 10)
+	e.seed(t, 2, 100, 10)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET merchant_id = 9 WHERE sku_id = 2`)
+
+	_, err := e.reserve(t.Context(), 7, 1, 1, 2, 1)
+	assertErr(t, err, codes.FailedPrecondition, errx.ReasonMixedMerchants)
+	e.assertStock(t, 1, 10, 0, 0)
+	e.assertStock(t, 2, 10, 0, 0)
+
+	// 重复调用得到同样的拒绝。
+	_, err = e.reserve(t.Context(), 7, 1, 1, 2, 1)
+	assertErr(t, err, codes.FailedPrecondition, errx.ReasonMixedMerchants)
+
+	resp, err := e.reserve(t.Context(), 7, 2, 3)
+	mustOK(t, err)
+	if resp.GetMerchantId() != 9 {
+		t.Errorf("merchant_id = %d, want 9", resp.GetMerchantId())
+	}
+	e.assertStock(t, 2, 7, 3, 0)
 }

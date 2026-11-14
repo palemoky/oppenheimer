@@ -7,8 +7,8 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kadm"
 
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/testkafka"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/testkafka"
 )
 
 // 防止：EnsureTopics 返回后 topic 还查不到。创建是异步生效的，服务启动时紧接着创建消费者，

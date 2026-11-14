@@ -4,10 +4,13 @@ package main
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,23 +18,25 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
-	"github.com/palemoky/Oppenheimer/api/eventx"
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	"github.com/palemoky/Oppenheimer/pkg/app"
-	"github.com/palemoky/Oppenheimer/pkg/cache"
-	"github.com/palemoky/Oppenheimer/pkg/grpcx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/kafkax"
-	"github.com/palemoky/Oppenheimer/pkg/lock"
-	"github.com/palemoky/Oppenheimer/pkg/logx"
-	"github.com/palemoky/Oppenheimer/pkg/mysqlx"
-	"github.com/palemoky/Oppenheimer/pkg/outbox"
-	"github.com/palemoky/Oppenheimer/pkg/redisx"
-	"github.com/palemoky/Oppenheimer/pkg/stockgate"
-	"github.com/palemoky/Oppenheimer/services/order"
-	"github.com/palemoky/Oppenheimer/services/order/internal/service"
-	"github.com/palemoky/Oppenheimer/services/order/internal/store"
+	"github.com/palemoky/oppenheimer/api/eventx"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	"github.com/palemoky/oppenheimer/pkg/app"
+	"github.com/palemoky/oppenheimer/pkg/cache"
+	"github.com/palemoky/oppenheimer/pkg/grpcx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/kafkax"
+	"github.com/palemoky/oppenheimer/pkg/lock"
+	"github.com/palemoky/oppenheimer/pkg/logx"
+	"github.com/palemoky/oppenheimer/pkg/mysqlx"
+	"github.com/palemoky/oppenheimer/pkg/outbox"
+	"github.com/palemoky/oppenheimer/pkg/redisx"
+	"github.com/palemoky/oppenheimer/pkg/sharding"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
+	"github.com/palemoky/oppenheimer/services/order"
+	"github.com/palemoky/oppenheimer/services/order/internal/readmark"
+	"github.com/palemoky/oppenheimer/services/order/internal/service"
+	"github.com/palemoky/oppenheimer/services/order/internal/store"
 )
 
 const serviceName = "order"
@@ -69,30 +74,63 @@ const (
 	relayLockTTL = 5 * time.Second
 	taskLockTTL  = 15 * time.Second
 
-	relayLockName  = "order:outbox-relay"
-	sweeperLock    = "order:sweeper"
-	holdReaperLock = "order:hold-reaper"
+	// 每个库一个中继，锁名后面加库号：order:outbox-relay:0、order:outbox-relay:1。
+	relayLockPrefix = "order:outbox-relay:"
+	sweeperLock     = "order:sweeper"
+	holdReaperLock  = "order:hold-reaper"
 )
+
+// defaultMySQLDSNs 是 MYSQL_DSNS 的默认值，第 i 个是 order_db_i。
+// 两个库在两个 MySQL 实例上；它们的从库在 3312、3322，从库没有默认值（不设 MYSQL_REPLICA_DSNS 就是没有从库）。
+const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
+	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
+
+// archiveMaxOpenConns 是冷库的连接池上限。冷库只承接旧订单的查询，量很小；
+// 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
+const archiveMaxOpenConns = 10
+
+// defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
+//
+// 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
+// payment 各 50，合计 150，刚好放得下。分片后 order 连两个库、每个库一个池，
+// 仍用 50 就是 100，合计 200，超过上限后新连接会被拒（Too many connections）。每个库取 25，
+// 两个库合计 50，与分片前持平。库分到不同实例上之后，每个池只占自己那个实例的预算，可以调大。
+const defaultMySQLMaxOpenConns = 25
+
+// relayName 是第 db 个库的 outbox 中继的名字。各库必须不同：event-id 是“中继名:outbox 行 id”，
+// 行 id 是各库自己的自增列，名字相同时两个库的不同事件会有相同的 event-id，按 event-id 去重的下游会丢掉一条。
+func relayName(db int) string { return serviceName + "-" + strconv.Itoa(db) }
 
 // leaderReleaseTimeout 是退出时主动释放一把 leader 锁的时限。
 const leaderReleaseTimeout = 2 * time.Second
 
 type config struct {
-	httpAddr       string
-	grpcAddr       string
-	mysqlDSN       string
-	workerID       int64
-	inventoryAddr  string
-	paymentTimeout time.Duration
-	idempotencyTTL time.Duration
-	sweeper        service.SweeperConfig
-	reaper         service.ReaperConfig
-	backlog        stockgate.BacklogLimit
-	kafkaBrokers   []string
-	kafkaPrefix    string
-	outboxInterval time.Duration
-	redisAddr      string
-	redisPrefix    string
+	httpAddr string
+	grpcAddr string
+	// mysqlDSNs[i] 是第 i 个订单库（order_db_i）。
+	mysqlDSNs []string
+	// mysqlReplicaDSNs[i] 是 order_db_i 的从库，为空表示没有从库。
+	mysqlReplicaDSNs []string
+	readMode         service.ReadMode
+	readPinTTL       time.Duration
+	readGTIDTTL      time.Duration
+	readGTIDWait     time.Duration
+	// archiveDSN 是冷库（已归档订单）的 DSN，为空表示没有冷库路径。
+	archiveDSN string
+	// mysqlMaxOpenConns 是每个订单库的连接池上限，预算见 defaultMySQLMaxOpenConns。
+	mysqlMaxOpenConns int
+	workerID          int64
+	inventoryAddr     string
+	paymentTimeout    time.Duration
+	idempotencyTTL    time.Duration
+	sweeper           service.SweeperConfig
+	reaper            service.ReaperConfig
+	backlog           stockgate.BacklogLimit
+	kafkaBrokers      []string
+	kafkaPrefix       string
+	outboxInterval    time.Duration
+	redisAddr         string
+	redisPrefix       string
 	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
 	cacheRedisAddr string
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
@@ -114,12 +152,59 @@ func loadConfig() (config, error) {
 	cfg := config{
 		httpAddr:      cmp.Or(os.Getenv("HTTP_ADDR"), ":8081"),
 		grpcAddr:      cmp.Or(os.Getenv("GRPC_ADDR"), ":9081"),
-		mysqlDSN:      cmp.Or(os.Getenv("MYSQL_DSN"), "root:oppenheimer@tcp(127.0.0.1:3306)/order_db"),
 		inventoryAddr: cmp.Or(os.Getenv("INVENTORY_ADDR"), "127.0.0.1:9082"),
 		kafkaPrefix:   os.Getenv("KAFKA_PREFIX"),
 		redisAddr:     cmp.Or(os.Getenv("REDIS_ADDR"), "127.0.0.1:6379"),
 		redisPrefix:   os.Getenv("REDIS_PREFIX"),
 	}
+	// 旧的 MYSQL_DSN 指向分片前的 order_db，不能当作任何一个分片库。还设着它说明部署配置没跟上，
+	// 静默忽略会让服务连上默认的本机库，所以直接拒绝启动。
+	if os.Getenv("MYSQL_DSN") != "" {
+		return cfg, errors.New("MYSQL_DSN is no longer supported by order; set MYSQL_DSNS (order_db_0,order_db_1) instead")
+	}
+	for d := range strings.SplitSeq(cmp.Or(os.Getenv("MYSQL_DSNS"), defaultMySQLDSNs), ",") {
+		cfg.mysqlDSNs = append(cfg.mysqlDSNs, strings.TrimSpace(d))
+	}
+	// 库数等于 DSN 的个数（ADR-0015），第 i 个是 i 号库。个数是否合法（2 的幂，不超过 slot 数）由
+	// sharding.New 判断；顺序写反、个数与数据不符由启动时的 shard_meta 核对挡住。
+	if slices.Contains(cfg.mysqlDSNs, "") {
+		return cfg, errors.New("MYSQL_DSNS has an empty DSN")
+	}
+	if _, err := sharding.New(sharding.OrderLayout(len(cfg.mysqlDSNs))); err != nil {
+		return cfg, fmt.Errorf("MYSQL_DSNS has %d DSNs: %w", len(cfg.mysqlDSNs), err)
+	}
+	if v := os.Getenv("MYSQL_REPLICA_DSNS"); v != "" {
+		for d := range strings.SplitSeq(v, ",") {
+			cfg.mysqlReplicaDSNs = append(cfg.mysqlReplicaDSNs, strings.TrimSpace(d))
+		}
+		if len(cfg.mysqlReplicaDSNs) != len(cfg.mysqlDSNs) || slices.Contains(cfg.mysqlReplicaDSNs, "") {
+			return cfg, fmt.Errorf("MYSQL_REPLICA_DSNS must have one non-empty DSN per entry of MYSQL_DSNS (%d), got %d",
+				len(cfg.mysqlDSNs), len(cfg.mysqlReplicaDSNs))
+		}
+	}
+	switch m := cmp.Or(os.Getenv("ORDER_READ_MODE"), "primary"); m {
+	case "primary":
+		cfg.readMode = service.ReadPrimary
+	case "window":
+		cfg.readMode = service.ReadWindow
+	case "gtid":
+		cfg.readMode = service.ReadGTID
+	default:
+		return cfg, fmt.Errorf("ORDER_READ_MODE must be primary, window or gtid, got %q", m)
+	}
+	// 在这里就拒绝，而不是等 service.New：错误信息能直接指出缺的是哪个环境变量。
+	if cfg.readMode != service.ReadPrimary && cfg.mysqlReplicaDSNs == nil {
+		return cfg, fmt.Errorf("ORDER_READ_MODE=%s needs MYSQL_REPLICA_DSNS", cfg.readMode)
+	}
+	cfg.archiveDSN = strings.TrimSpace(os.Getenv("ARCHIVE_DSN"))
+	maxOpen, err := envInt("MYSQL_MAX_OPEN_CONNS", defaultMySQLMaxOpenConns)
+	if err != nil {
+		return cfg, err
+	}
+	if maxOpen <= 0 {
+		return cfg, errors.New("MYSQL_MAX_OPEN_CONNS must be positive")
+	}
+	cfg.mysqlMaxOpenConns = int(maxOpen)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -128,7 +213,6 @@ func loadConfig() (config, error) {
 	if len(cfg.kafkaBrokers) == 0 {
 		return cfg, errors.New("KAFKA_BROKERS has no broker addresses")
 	}
-	var err error
 	if cfg.outboxInterval, err = envDuration("OUTBOX_INTERVAL", 100*time.Millisecond); err != nil {
 		return cfg, err
 	}
@@ -194,6 +278,15 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
 	}
 	cfg.backlog.MaxStale = stale
+	if cfg.readPinTTL, err = envDuration("ORDER_READ_PIN_TTL", service.DefaultReadPinTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.readGTIDTTL, err = envDuration("ORDER_READ_GTID_TTL", service.DefaultReadGTIDTTL); err != nil {
+		return cfg, err
+	}
+	if cfg.readGTIDWait, err = envDuration("ORDER_READ_GTID_WAIT", service.DefaultReadGTIDWait); err != nil {
+		return cfg, err
+	}
 	cfg.cacheRedisAddr = cmp.Or(os.Getenv("CACHE_REDIS_ADDR"), cfg.redisAddr)
 	if cfg.orderCacheTTL, err = envDurationOrZero("ORDER_CACHE_TTL", service.DefaultOrderCacheTTL); err != nil {
 		return cfg, err
@@ -245,14 +338,63 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: cfg.mysqlDSN})
+	router, err := sharding.New(sharding.OrderLayout(len(cfg.mysqlDSNs)))
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	if err := mysqlx.Migrate(ctx, db, order.Migrations, order.MigrationsDir); err != nil {
+	dbs := make([]*sql.DB, router.DBs())
+	for i, dsn := range cfg.mysqlDSNs {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
+		if err != nil {
+			return fmt.Errorf("open order db %d: %w", i, err)
+		}
+		defer db.Close()
+		// 每个库只建自己的 slot 的表。扩容时新库的表是从旧库复制过来的（ADR-0015），这里的迁移在它上面
+		// 整个重跑一遍，靠每条 DDL 可重入而成为空操作，只补上一张空的 outbox。
+		if err := mysqlx.MigrateTemplate(ctx, db, order.Migrations, order.MigrationsDir,
+			order.MigrationData{Slots: router.SlotsOf(i)}); err != nil {
+			return fmt.Errorf("migrate order db %d: %w", i, err)
+		}
+		dbs[i] = db
+	}
+	var storeOpts []store.Option
+	if cfg.mysqlReplicaDSNs != nil {
+		replicas := make([]*sql.DB, router.DBs())
+		for i, dsn := range cfg.mysqlReplicaDSNs {
+			db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
+			if err != nil {
+				return fmt.Errorf("open order db %d replica: %w", i, err)
+			}
+			defer db.Close()
+			// 从库上不跑迁移：表结构经复制从主库过来，在从库上直接执行 DDL 会让两边分叉、打断复制。
+			replicas[i] = db
+		}
+		storeOpts = append(storeOpts, store.WithReplicas(replicas))
+	}
+	// 在任何读写之前核对：DSN 列表里第 i 个库确实是 i 号库，库里记的总库数与配置一致。
+	if err := store.EnsureShardMeta(ctx, dbs, router); err != nil {
 		return err
 	}
+	st, err := store.New(dbs, router, storeOpts...)
+	if err != nil {
+		return err
+	}
+	// 冷库是可选的只读依赖（设计文档 1c 第 6 节）。一旦有订单归档过就必须配上，
+	// 否则已归档的订单查不到。迁移在这里也跑一遍，和归档任务用的是同一套、同一把迁移锁。
+	var cold *store.Cold
+	if cfg.archiveDSN != "" {
+		db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns})
+		if err != nil {
+			return fmt.Errorf("open archive db: %w", err)
+		}
+		defer db.Close()
+		if err := mysqlx.MigrateTemplate(ctx, db, order.ArchiveMigrations, order.ArchiveMigrationsDir,
+			order.NewArchiveMigrationData()); err != nil {
+			return fmt.Errorf("migrate archive db: %w", err)
+		}
+		cold = store.NewCold(db)
+	}
+	logger.Info("order archive", "configured", cold != nil)
 
 	ids, err := idgen.New(cfg.workerID)
 	if err != nil {
@@ -283,20 +425,27 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer closeCache()
 
 	// 锁放在闸门那个实例上（noeviction），不放缓存实例：锁的 key 被淘汰等于凭空释放。
-	relayLeader, taskLockers, err := newLockers(logger, cfg, rdb)
+	relayLocker, taskLockers, err := newLockers(logger, cfg, rdb)
 	if err != nil {
 		return err
 	}
 	sweeperLeader := taskLockers.Leader(sweeperLock)
 	reaperLeader := taskLockers.Leader(holdReaperLock)
+	leaders := map[string]*lock.Leader{
+		sweeperLock:    sweeperLeader,
+		holdReaperLock: reaperLeader,
+	}
+	// 每个库的中继各有一把 leader 锁：两个库的中继互不依赖，可以由不同副本持有。
+	relayLeaders := make([]*lock.Leader, router.DBs())
+	for i := range relayLeaders {
+		name := relayLockPrefix + strconv.Itoa(i)
+		relayLeaders[i] = relayLocker.Leader(name)
+		leaders[name] = relayLeaders[i]
+	}
 	// 主动释放 leader 锁，让别的副本马上接手，而不是等锁过期。defer 在 app.Run 返回、
 	// 所有 Loop 都停下之后执行（停下之前释放，Loop 的下一轮 Allow 会把锁重新抢回来），
 	// 并且在 rdb.Close 之前（defer 后进先出）。
-	defer releaseLeaders(ctx, logger, map[string]*lock.Leader{
-		relayLockName:  relayLeader,
-		sweeperLock:    sweeperLeader,
-		holdReaperLock: reaperLeader,
-	})
+	defer releaseLeaders(ctx, logger, leaders)
 
 	kcfg := kafkax.Config{Brokers: cfg.kafkaBrokers, ClientID: serviceName}
 	ordersTopic := eventx.Topic(cfg.kafkaPrefix, eventx.OrderEvents)
@@ -316,37 +465,55 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	// 最后关闭：中继停下之后才不再发送。defer 按后进先出执行，它在 app.Run 返回后运行。
 	defer producer.Close()
-	relay, err := outbox.NewRelay(outbox.RelayConfig{
-		Name:     serviceName,
-		DB:       db,
-		Sender:   producer,
-		Logger:   logger,
-		Interval: cfg.outboxInterval,
-		Guard:    lock.FailOpen(relayLeader, logger),
-	})
-	if err != nil {
-		return err
+	// 每个库一个中继，名字各不相同（见 relayName）。同一订单的事件都在它所在的库里，
+	// 经过同一个中继、同一个消息 key 发到同一个分区，仍然有序。
+	relays := make([]*outbox.Relay, router.DBs())
+	kickers := make([]service.Kicker, router.DBs())
+	for i := range relays {
+		r, err := outbox.NewRelay(outbox.RelayConfig{
+			Name:     relayName(i),
+			DB:       dbs[i],
+			Sender:   producer,
+			Logger:   logger,
+			Interval: cfg.outboxInterval,
+			Guard:    lock.FailOpen(relayLeaders[i], logger),
+		})
+		if err != nil {
+			return fmt.Errorf("new outbox relay for db %d: %w", i, err)
+		}
+		relays[i], kickers[i] = r, r
 	}
 
-	svc := service.New(service.Deps{
-		Store:      store.New(db),
+	logger.Info("order read mode", "read_mode", cfg.readMode.String(), "replicas", st.HasReplicas())
+	svc, err := service.New(service.Deps{
+		Store:      st,
 		Gate:       gate,
 		Sender:     producer,
 		Inventory:  inventoryv1.NewInventoryServiceClient(conn),
 		IDs:        ids,
 		Logger:     logger,
 		OrderCache: orderCache,
+		// 标记放在闸门那个实例上（noeviction）：被淘汰的标记等于提前到期。
+		Marks: readmark.New(rdb, cfg.redisPrefix),
+		Cold:  cold,
 	}, service.Config{
 		PaymentTimeout:    cfg.paymentTimeout,
 		IdempotencyTTL:    cfg.idempotencyTTL,
 		OrderEventsTopic:  ordersTopic,
 		SubmitTopic:       submitTopic,
 		CloseDelayTopic:   closeTopic,
-		Relay:             relay,
+		Relays:            kickers,
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 		Backlog:           cfg.backlog,
+		ReadMode:          cfg.readMode,
+		ReadPinTTL:        cfg.readPinTTL,
+		ReadGTIDTTL:       cfg.readGTIDTTL,
+		ReadGTIDWait:      cfg.readGTIDWait,
 	})
+	if err != nil {
+		return err
+	}
 	cfg.sweeper.Guard = lock.FailOpen(sweeperLeader, logger)
 	cfg.reaper.Guard = lock.FailOpen(reaperLeader, logger)
 	sweeper, err := service.NewSweeper(svc, cfg.sweeper)
@@ -363,6 +530,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderPaymentEvents),
 		Topics: []string{paymentsTopic},
 		Logger: logger,
+		// 支付结果不能因为订单库抖了一下就进死信：钱已经收了，这条消息是订单变成已支付的唯一途径，
+		// 没有任何任务会重发它（设计文档 1b 的 5.4：长期 notified = 0 的支付单没有人扫）。
+		// 默认的 5 次重试合计只有约 1.5 秒，订单库的一次主从切换、扩容时被搬的 slot 的不可用窗口
+		// （ADR-0015，表被改名期间读写报“表不存在”）都比它长。所以普通错误无限重试，分区停在这里等库恢复；
+		// 业务上的异常由 handler 给出明确的处置，消息本身有问题的由 handler 标成 Permanent 直接进死信，
+		// 都不会走到这里的重试。代价是一条始终失败的消息会一直挡住它所在的分区，要靠积压告警发现（阶段 3）。
+		MaxAttempts: math.MaxInt,
 	}, svc.PaymentEventsHandler(service.DefaultEventTimeout))
 	if err != nil {
 		return err
@@ -410,13 +584,18 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	//     中途被打断会留下孤儿占用（只能等回收任务），所以让它们在 Redis 和生产者都还可用时走完。
 	//  3. 三个消费者：支付结果、延迟关单、落库。它们写 outbox，必须在中继之前停；
 	//     没处理完的消息不提交位点，下次启动（或别的副本）重新消费。
-	//  4. outbox 中继：排在所有会写 outbox 的组件之后，让最后写入的事件尽量在退出前发出；
+	//  4. 各库的 outbox 中继：排在所有会写 outbox 的组件之后，让最后写入的事件尽量在退出前发出；
 	//     没发出的也不会丢，下次启动时中继会先跑一轮。
 	//  5. 健康检查最后停。
 	// 生产者、Redis、数据库和库存的连接由 defer 在 app.Run 返回后关闭，此时已没有组件在用。
-	// 三把 leader 锁也在 app.Run 返回后释放（先于 Redis 连接关闭）：此时中继、sweeper、回收任务都已停下。
-	return app.Run(ctx, logger, httpServer, relay,
-		submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
+	// 全部 leader 锁（每个中继一把、sweeper、回收任务）也在 app.Run 返回后释放（先于 Redis 连接关闭）：
+	// 此时所有中继、sweeper、回收任务都已停下。
+	components := []app.Component{httpServer}
+	for _, r := range relays {
+		components = append(components, r)
+	}
+	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
+	return app.Run(ctx, logger, components...)
 }
 
 // openOrderCache 按配置创建订单查询缓存。ORDER_CACHE_TTL=0 时缓存为 nil（关闭）。
@@ -448,8 +627,8 @@ func openOrderCache(ctx context.Context, logger *slog.Logger, cfg config, rdb re
 	return c, closeFn, nil
 }
 
-// newLockers 创建两个 Locker：中继一个（TTL 短），其余周期任务共用一个。
-func newLockers(logger *slog.Logger, cfg config, rdb redis.Scripter) (*lock.Leader, *lock.Locker, error) {
+// newLockers 创建两个 Locker：各库的中继共用一个（TTL 短），其余周期任务共用一个。
+func newLockers(logger *slog.Logger, cfg config, rdb redis.Scripter) (*lock.Locker, *lock.Locker, error) {
 	relayLocker, err := lock.New(rdb, lock.Options{TTL: relayLockTTL, KeyPrefix: cfg.redisPrefix, Logger: logger})
 	if err != nil {
 		return nil, nil, fmt.Errorf("new relay locker: %w", err)
@@ -458,7 +637,7 @@ func newLockers(logger *slog.Logger, cfg config, rdb redis.Scripter) (*lock.Lead
 	if err != nil {
 		return nil, nil, fmt.Errorf("new task locker: %w", err)
 	}
-	return relayLocker.Leader(relayLockName), taskLocker, nil
+	return relayLocker, taskLocker, nil
 }
 
 // releaseLeaders 主动释放各 leader 锁。ctx 已结束（进程在退出），释放用独立的时限。

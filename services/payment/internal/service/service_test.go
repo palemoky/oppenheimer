@@ -13,15 +13,15 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/pkg/errx"
-	"github.com/palemoky/Oppenheimer/pkg/idgen"
-	"github.com/palemoky/Oppenheimer/pkg/testdb"
-	"github.com/palemoky/Oppenheimer/services/payment"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/service"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/store"
-	"github.com/palemoky/Oppenheimer/services/payment/internal/testkit"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
+	"github.com/palemoky/oppenheimer/pkg/testdb"
+	"github.com/palemoky/oppenheimer/services/payment"
+	"github.com/palemoky/oppenheimer/services/payment/internal/service"
+	"github.com/palemoky/oppenheimer/services/payment/internal/store"
+	"github.com/palemoky/oppenheimer/services/payment/internal/testkit"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/palemoky/Oppenheimer/pkg/logx"
+	"github.com/palemoky/oppenheimer/pkg/logx"
 )
 
 func TestNewWritesJSONWithService(t *testing.T) {

@@ -1,4 +1,4 @@
-module github.com/palemoky/Oppenheimer/pkg
+module github.com/palemoky/oppenheimer/pkg
 
 go 1.27
 

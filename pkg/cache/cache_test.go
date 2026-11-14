@@ -12,7 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	"github.com/palemoky/Oppenheimer/pkg/testredis"
+	"github.com/palemoky/oppenheimer/pkg/testredis"
 )
 
 type stringCodec struct{}

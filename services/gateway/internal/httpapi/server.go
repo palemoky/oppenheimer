@@ -9,10 +9,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	inventoryv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/inventory/v1"
-	orderv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/order/v1"
-	paymentv1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1"
-	"github.com/palemoky/Oppenheimer/services/gateway/internal/httpapi/oas"
+	inventoryv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/inventory/v1"
+	orderv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/order/v1"
+	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
+	paymentv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1"
+	"github.com/palemoky/oppenheimer/services/gateway/internal/httpapi/oas"
 )
 
 const (
@@ -24,9 +25,10 @@ const (
 
 // Deps 是 gateway 依赖的下游客户端。用接口注入，测试时换成假对象。
 type Deps struct {
-	Order     orderv1.OrderServiceClient
-	Payment   paymentv1.PaymentServiceClient
-	Inventory inventoryv1.InventoryServiceClient
+	Order      orderv1.OrderServiceClient
+	Payment    paymentv1.PaymentServiceClient
+	Inventory  inventoryv1.InventoryServiceClient
+	OrderIndex orderindexv1.OrderIndexServiceClient
 }
 
 // Config 是 HTTP 层的可调参数，零值取默认。

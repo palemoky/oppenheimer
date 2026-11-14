@@ -7,7 +7,7 @@
 package paymentv1
 
 import (
-	v1 "github.com/palemoky/Oppenheimer/api/gen/oppenheimer/common/v1"
+	v1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -466,7 +466,7 @@ const file_oppenheimer_payment_v1_payment_proto_rawDesc = "" +
 	"\rCreatePayment\x12,.oppenheimer.payment.v1.CreatePaymentRequest\x1a-.oppenheimer.payment.v1.CreatePaymentResponse\x12c\n" +
 	"\n" +
 	"GetPayment\x12).oppenheimer.payment.v1.GetPaymentRequest\x1a*.oppenheimer.payment.v1.GetPaymentResponseB\xee\x01\n" +
-	"\x1acom.oppenheimer.payment.v1B\fPaymentProtoP\x01ZHgithub.com/palemoky/Oppenheimer/api/gen/oppenheimer/payment/v1;paymentv1\xa2\x02\x03OPX\xaa\x02\x16Oppenheimer.Payment.V1\xca\x02\x16Oppenheimer\\Payment\\V1\xe2\x02\"Oppenheimer\\Payment\\V1\\GPBMetadata\xea\x02\x18Oppenheimer::Payment::V1b\x06proto3"
+	"\x1acom.oppenheimer.payment.v1B\fPaymentProtoP\x01ZHgithub.com/palemoky/oppenheimer/api/gen/oppenheimer/payment/v1;paymentv1\xa2\x02\x03OPX\xaa\x02\x16Oppenheimer.Payment.V1\xca\x02\x16Oppenheimer\\Payment\\V1\xe2\x02\"Oppenheimer\\Payment\\V1\\GPBMetadata\xea\x02\x18Oppenheimer::Payment::V1b\x06proto3"
 
 var (
 	file_oppenheimer_payment_v1_payment_proto_rawDescOnce sync.Once

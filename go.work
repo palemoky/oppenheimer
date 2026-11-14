@@ -3,9 +3,11 @@ go 1.27
 use (
 	./api
 	./pkg
+	./services/cdc
 	./services/gateway
 	./services/inventory
 	./services/order
+	./services/orderindex
 	./services/payment
 	./test/e2e
 	./test/load
