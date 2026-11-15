@@ -105,8 +105,15 @@ func loadConfig() (config, error) {
 	}
 
 	var err error
-	if cfg.workerID, err = strconv.ParseInt(cmp.Or(os.Getenv("WORKER_ID"), "0"), 10, 64); err != nil {
-		return config{}, fmt.Errorf("parse WORKER_ID: %w", err)
+	// 没设 WORKER_ID 就从 payment 的库里租一个节点号（ADR-0028），设了就固定用它（本机、测试脚本）。
+	cfg.workerID = idgen.Leased
+	if v := os.Getenv("WORKER_ID"); v != "" {
+		if cfg.workerID, err = strconv.ParseInt(v, 10, 64); err != nil {
+			return config{}, fmt.Errorf("parse WORKER_ID: %w", err)
+		}
+		if cfg.workerID < 0 || cfg.workerID > idgen.MaxWorkerID {
+			return config{}, fmt.Errorf("WORKER_ID must be in [0, %d], or unset to lease one", idgen.MaxWorkerID)
+		}
 	}
 	if cfg.outboxInterval, err = durationEnv("OUTBOX_INTERVAL"); err != nil {
 		return config{}, err
@@ -157,11 +164,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
-	ids, err := idgen.New(cfg.workerID)
-	if err != nil {
-		return fmt.Errorf("create id generator: %w", err)
-	}
-
 	db, err := mysqlx.Open(ctx, mysqlx.Config{DSN: cfg.mysqlDSN})
 	if err != nil {
 		return fmt.Errorf("open mysql: %w", err)
@@ -169,6 +171,20 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer db.Close()
 	if err := mysqlx.Migrate(ctx, db, payment.Migrations, payment.MigrationsDir); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+
+	// 支付单号的节点号。租约表在 payment 自己的库里（设计文档 2c 的 5.2）。
+	ids, idLease, err := idgen.Open(ctx, cfg.workerID, db, logger)
+	if err != nil {
+		return fmt.Errorf("open id generator: %w", err)
+	}
+	if idLease != nil {
+		// 正常退出时由 app.Run 停（让出节点号）；这里兜的是装配中途失败的情况。Stop 可以重复调用。
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			defer cancel()
+			_ = idLease.Stop(sctx)
+		}()
 	}
 
 	rctx, cancelRedis := context.WithTimeout(ctx, redisSetupTimeout)
@@ -287,8 +303,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 变成不可用，继续正常服务 DRAIN_DELAY 这么久，让负载均衡把流量挪走（本机默认 0）。然后
 	// 先停 gRPC 不再受理新支付，再停 processor（不再产生新事件），
 	// 再停消费者，然后停中继（它最后一轮会把 processor 刚写的事件发出去），健康检查最后停。
-	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay},
-		httpServer, relay, orderEvents, proc, grpcServer)
+	// 节点号的租约（有的话）紧跟在健康检查之后：gRPC 停了、不再发号之后才让出。
+	components := []app.Component{httpServer}
+	if idLease != nil {
+		components = append(components, idLease)
+	}
+	components = append(components, relay, orderEvents, proc, grpcServer)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, components...)
 }
 
 // newLeader 创建一把按 name 竞争的 leader 锁。
