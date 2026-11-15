@@ -1,0 +1,117 @@
+# 端到端测试的 Job（设计文档 2c 的 10.1）。模板：__IMAGE__、__LB_GATEWAY_IP__、__RUN_ID__、__ARGS__
+# 由 scripts/cluster/e2e.sh 填入（__ARGS__ 是 JSON 数组形式的一行，含 -test.v 和调用者给的额外参数）。
+# 镜像是 deploy/docker/e2e.Dockerfile：go test -c -race 的测试二进制加 archiver。
+#
+# 对应本机 scripts/e2e.sh 里 E2E_ 开头的变量，逐个对上：
+#   E2E_GATEWAY_URL        http://e2e.oppenheimer.test，经 hostAliases 指到入口的地址：流量从入口（Envoy Gateway）进，
+#                          不直连 gateway 的 Service
+#   E2E_*_DSN(S)           用 root 直连各库（本机也是 root）。root 的密码只在本命名空间的 Secret oppenheimer-e2e-root 里
+#   E2E_ORDER_REPLICA_DSNS 是 -replica Service，也就是 order 读的那个从库；主从延迟的用例在它上面停复制
+#   E2E_ARCHIVER_BIN       镜像里的 /app/archiver
+#   E2E_OTLP_ENDPOINT      接收端监听的地址（只用来 listen，所以是 0.0.0.0），服务经 e2e-otlp 这个 Service 连过来
+#   E2E_WAIT_READY         Job 先于服务启动（见 otlp-service.yaml），测试先等网关经入口就绪再开始（test/e2e/e2e_test.go）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e
+  labels:
+    app.kubernetes.io/name: e2e-test
+    app.kubernetes.io/part-of: oppenheimer
+    oppenheimer.test/run-id: "__RUN_ID__"
+spec:
+  # 测试失败不重跑：重跑会在已经被上一次改过的数据上再跑一遍，结果没有意义，也会盖住第一次的日志。
+  backoffLimit: 0
+  # 等服务就绪最多 15 分钟（E2E_WAIT_READY）加测试本身最多 15 分钟（-test.timeout，scripts/cluster/e2e.sh 给的），
+  # 再留 10 分钟。到了时限 Pod 被杀，Job 算失败。
+  activeDeadlineSeconds: 2400
+  # 跑完留一天，删命名空间时一起删；E2E_KEEP=1 保留现场时可以回头看。
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: e2e-test
+        app.kubernetes.io/part-of: oppenheimer
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # 和业务 Pod 一样不上控制面节点（deploy/charts/service 的 avoidControlPlane）：带 -race 的测试进程内存不小。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      # 入口的地址写进 /etc/hosts。集群里访问 LoadBalancer 的地址由 kube-proxy 在本节点上直接转给入口 Envoy 的
+      # Pod（不经过 MetalLB 的 ARP），但请求仍然经过入口的 Envoy 和 HTTPRoute，这是要测的那一段。
+      hostAliases:
+        - ip: "__LB_GATEWAY_IP__"
+          hostnames: [e2e.oppenheimer.test]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: e2e
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          args: __ARGS__
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+          # 被 $(...) 引用的变量要排在前面：先是 Secret 来的三个 root 密码，再是拼出来的 DSN。
+          env:
+            - name: MYSQL_ORDER_0_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-e2e-root, key: order-0-root-password}}
+            - name: MYSQL_ORDER_1_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-e2e-root, key: order-1-root-password}}
+            - name: MYSQL_MAIN_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-e2e-root, key: main-root-password}}
+            - name: E2E_GATEWAY_URL
+              value: http://e2e.oppenheimer.test
+            # 第一次部署要拉六个镜像、在空库上迁移，给足时间。
+            - name: E2E_WAIT_READY
+              value: 15m
+            # 和 order 的 PAYMENT_TIMEOUT 一致（deploy/cluster/services/e2e/order.yaml）。
+            - name: E2E_PAYMENT_TIMEOUT
+              value: 3s
+            - name: E2E_INVENTORY_DSN
+              value: "root:$(MYSQL_MAIN_ROOT_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_inventory_db"
+            - name: E2E_MERCHANT_INDEX_DSNS
+              value: "root:$(MYSQL_MAIN_ROOT_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_0,root:$(MYSQL_MAIN_ROOT_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_1"
+            - name: E2E_ORDER_DSNS
+              value: "root:$(MYSQL_ORDER_0_ROOT_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/e2e_order_db_0,root:$(MYSQL_ORDER_1_ROOT_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/e2e_order_db_1"
+            # 主从延迟用例：下标即分片号。主库读 gtid_executed，从库停复制、等追上；不带库名，只用管理语句。
+            - name: E2E_ORDER_PRIMARY_DSNS
+              value: "root:$(MYSQL_ORDER_0_ROOT_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/,root:$(MYSQL_ORDER_1_ROOT_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/"
+            - name: E2E_ORDER_REPLICA_DSNS
+              value: "root:$(MYSQL_ORDER_0_ROOT_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/,root:$(MYSQL_ORDER_1_ROOT_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/"
+            # 和 order 的 ORDER_READ_MODE、ORDER_READ_PIN_TTL 一致。
+            - name: E2E_ORDER_READ_MODE
+              value: gtid
+            - name: E2E_ORDER_READ_PIN_TTL
+              value: 1s
+            - name: E2E_ARCHIVE_DSN
+              value: "root:$(MYSQL_MAIN_ROOT_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_order_archive_db"
+            - name: E2E_ARCHIVER_BIN
+              value: /app/archiver
+            - name: E2E_OTLP_ENDPOINT
+              value: http://0.0.0.0:4317
+          resources:
+            requests: {cpu: 500m, memory: 256Mi}
+            # -race 的内存开销是普通的 5 到 10 倍。
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # t.TempDir 和 os.TempDir 要一个可写的地方。
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

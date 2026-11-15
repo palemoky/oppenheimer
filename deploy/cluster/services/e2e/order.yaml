@@ -1,0 +1,25 @@
+# order 在 e2e 那一套里的覆盖（叠在 ../order.yaml 和 common.yaml 之上）。
+# 2 个副本，让用例真的跨副本（下单落在一个副本、查询和支付回调落在另一个）。
+replicas: 2
+
+config:
+  # 和本机 scripts/e2e.sh 一致：读从库用 gtid 模式（覆盖最完整），标记时限 1 秒，主从延迟的用例不用等默认的 3 秒。
+  # 长期运行的那一套是默认的 primary 模式：gtid 模式用 app 账号读 @@global.gtid_executed、
+  # 在从库上 WAIT_FOR_EXECUTED_GTID_SET，这两样都不要额外的权限，但集群上是第一次这样跑。
+  ORDER_READ_MODE: gtid
+  ORDER_READ_PIN_TTL: 1s
+  # 缩短支付时限，让超时关单在几秒内测完（测试的 E2E_PAYMENT_TIMEOUT 要和它一致，见 deploy/cluster/e2e/test-job.yaml）。
+  PAYMENT_TIMEOUT: 3s
+  # sweeper 故意设得比测试的等待时间长：超时关单必须由延迟消息触发才能在时限内完成，
+  # 端到端测试覆盖的是延迟关单这条路径，而不是兜底的扫表。
+  SWEEP_INTERVAL: 1m
+
+# 列表整个替换：三条 DSN 重写，只改库名（e2e_ 前缀）。从库仍是共用的 -replica Service：主从延迟的用例会停它的
+# 复制线程，长期运行的那一套这几秒的展示读会退回主库（设计文档 10.1 接受了这一点）。
+expandEnv:
+  - name: MYSQL_DSNS
+    value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/e2e_order_db_1"
+  - name: MYSQL_REPLICA_DSNS
+    value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/e2e_order_db_1"
+  - name: ARCHIVE_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_order_archive_db"

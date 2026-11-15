@@ -56,6 +56,8 @@
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 | golang（构建镜像） | 1.27.4 | 稳定版 | 2026-11-15 | 服务镜像的构建阶段，Docker Hub 官方镜像 `golang`，1.27 系列最新补丁版本；https://hub.docker.com/_/golang |
 | distroless static（运行镜像） | static-debian13:nonroot@sha256:aafe9936…e3931 | 无版本号，按摘要固定 | 2026-11-15 | 基于 Debian 13（trixie），多架构清单的摘要；`gcr.io/distroless/static-debian13`，见 https://github.com/GoogleContainerTools/distroless |
+| distroless base（端到端测试的运行镜像） | base-debian13:nonroot@sha256:a08d9054…b0c5db | 无版本号，按摘要固定 | 2026-11-15 | `deploy/docker/e2e.Dockerfile`。带 `-race` 的测试二进制要 cgo、动态链接 glibc，static 镜像起不来，换成多了 glibc 的 base（仍然没有 shell）。摘要是 `gcr.io/distroless/base-debian13:nonroot` 当天的多架构清单（`docker buildx imagetools inspect` 从官方仓库读出），glibc 2.41（Debian 13），和构建阶段一致 |
+| gcc-x86-64-linux-gnu（交叉编译器） | 随 Debian 13 的源 | 不单独固定 | 2026-11-15 | `deploy/docker/e2e.Dockerfile` 的构建阶段在 arm64 的 MacBook 上 `apt-get install gcc-x86-64-linux-gnu libc6-dev-amd64-cross`，给 `-race` 交叉编译 amd64 的 cgo。版本跟着 `golang:1.27.4` 这个镜像的 Debian 13 源走（实测 glibc 2.41-12+deb13u4），只用于编译、不进运行镜像 |
 
 ## 本机 compose 的 MySQL 实例（2026-11-13）
 
@@ -87,6 +89,10 @@ CDC 伪装成从库读 binlog，要占用 server-id，不能和上表以及彼�
 | `order-1` | `mysql-order-1-replica` | 1021 |
 | `order-2` | `mysql-order-2-replica`（扩容后） | 1031 |
 | `order-3` | `mysql-order-3-replica`（扩容后） | 1041 |
+| `order-0`（集群上的 e2e 那一套） | `mysql-order-0-1`（和长期运行的那一套同一个从库） | 1012 |
+| `order-1`（集群上的 e2e 那一套） | `mysql-order-1-1`（同上） | 1022 |
+
+集群上 `oppenheimer-e2e` 命名空间里的 cdc（`deploy/cluster/services/e2e/cdc.yaml`）和长期运行的 cdc 读同一个从库，server-id 必须不同：同一个 server-id 的第二个 binlog 连接会把第一个踢掉。本机的 `make e2e` 连的是本机的 MySQL，仍用 1011、1021。
 
 CDC 的集成测试每个用例用一个 10 万以上的随机 server-id，避免并行的用例互相踢掉连接。
 

@@ -26,6 +26,7 @@ const (
 	gatewayEnv        = "E2E_GATEWAY_URL"
 	inventoryDSNEnv   = "E2E_INVENTORY_DSN"
 	paymentTimeoutEnv = "E2E_PAYMENT_TIMEOUT"
+	waitReadyEnv      = "E2E_WAIT_READY"
 
 	unitPrice = 1999
 )
@@ -84,12 +85,61 @@ func run(m *testing.M) int {
 		defer otlp.stop()
 	}
 
+	// 集群上（scripts/cluster/e2e.sh）测试 Job 先于各服务启动：接收端先监听，服务一起来就连得上，
+	// 不会因为连不上而退避到几十秒之后才重连，丢掉 trace_test.go 要断言的 span。所以要在这里等网关就绪。
+	// 本机的 make e2e 不设这个变量，行为不变。
+	if v := os.Getenv(waitReadyEnv); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parse %s: %v\n", waitReadyEnv, err)
+			return 1
+		}
+		if err := waitGatewayReady(d); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+
 	// 以时间为基数，重复运行时不会撞上之前的 SKU 和用户。
 	base := time.Now().UnixMilli() % 1_000_000_000 * 1000
 	nextSKU.Store(base)
 	nextUser.Store(base)
 
 	return m.Run()
+}
+
+// waitGatewayReady 轮询网关的 /readyz，直到连续 3 次 200 或超过 d。连续几次是因为入口刚挂上路由、
+// 第二个副本还没就绪时结果会来回变。
+func waitGatewayReady(d time.Duration) error {
+	deadline := time.Now().Add(d)
+	ok, last := 0, ""
+	for ok < 3 {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("gateway at %s not ready within %s (last: %s)", baseURL, d, last)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/readyz", nil)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("build readiness request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			ok, last = 0, err.Error()
+		} else {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				ok++
+			} else {
+				ok, last = 0, resp.Status
+			}
+		}
+		cancel()
+		time.Sleep(time.Second)
+	}
+	fmt.Printf("gateway at %s is ready\n", baseURL)
+	return nil
 }
 
 // ---------- 与网关交互 ----------

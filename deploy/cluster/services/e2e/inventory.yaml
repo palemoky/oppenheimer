@@ -1,0 +1,9 @@
+# inventory 在 e2e 那一套里的覆盖（叠在 ../inventory.yaml 和 common.yaml 之上）。
+config:
+  # 闸门对账缩短到 1 秒（本机 scripts/e2e.sh 的 GATE_RECONCILE_INTERVAL）。
+  GATE_RECONCILE_INTERVAL: 1s
+
+# 列表在 Helm 里是整个替换，不是合并：所以整条 DSN 重写一遍，只是库名带上 e2e_ 前缀（本机的 DB_PREFIX=e2e_）。
+expandEnv:
+  - name: MYSQL_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_inventory_db"

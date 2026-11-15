@@ -1,0 +1,6 @@
+# payment 在 e2e 那一套里的覆盖（叠在 ../payment.yaml 和 common.yaml 之上）。
+# 列表在 Helm 里是整个替换：整条 DSN 重写，只改库名（e2e_ 前缀）。不设 WORKER_ID，节点号照常从自己的库里租，
+# 租约表在 e2e_payment_db 里，和长期运行的那一套各租各的。
+expandEnv:
+  - name: MYSQL_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_payment_db"

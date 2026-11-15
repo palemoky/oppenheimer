@@ -34,7 +34,7 @@ export OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR  ?= cluster://172.30.0.31:6379,172.30
 
 .PHONY: help
 help: ## 显示可用目标
-	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ## ---------- 工具 ----------
 
@@ -280,6 +280,10 @@ deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部�
 	@tag="$$(scripts/cluster/images.sh tag)" && \
 	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
 	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)
+
+.PHONY: cluster-e2e
+cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
+	scripts/cluster/e2e.sh $(E2E_ARGS)
 
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute

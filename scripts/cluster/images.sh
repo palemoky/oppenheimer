@@ -7,6 +7,8 @@
 #   images.sh tag               只打印这次会用的 tag
 #
 # 不带服务名就是全部七个。镜像名 $REGISTRY_ADDR/oppenheimer/<服务>:<tag>。
+# 另有一个不在“全部”里的 e2e：端到端测试的镜像（deploy/docker/e2e.Dockerfile，带 -race 的测试二进制加 archiver），
+# 只有 scripts/cluster/e2e.sh 用，要显式写出来（images.sh all e2e）。
 # tag 是短提交号；工作区有未提交的改动时是 <短提交号>-dirty-<UTC 时间>，
 # 这样每次脏构建的 tag 都不同，集群不会因为 tag 没变而不拉新镜像。绝不用 latest。
 # 环境变量 IMAGE_TAG 可以覆盖 tag。
@@ -21,10 +23,12 @@ source "$HERE/cluster.env"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 ALL_SERVICES="gateway order inventory payment orderindex cdc recon"
+# 可以点名构建、但不在默认列表里的镜像。
+EXTRA_IMAGES="e2e"
 PLATFORM="linux/amd64"
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,14p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -51,24 +55,27 @@ check_services() {
   local s a ok
   for s in "$@"; do
     ok=0
-    for a in $ALL_SERVICES; do
+    for a in $ALL_SERVICES $EXTRA_IMAGES; do
       [[ "$s" == "$a" ]] && ok=1
     done
     if [[ $ok -eq 0 ]]; then
-      echo "unknown service: $s (valid: $ALL_SERVICES)" >&2
+      echo "unknown service: $s (valid: $ALL_SERVICES $EXTRA_IMAGES)" >&2
       exit 2
     fi
   done
 }
 
 do_build() { # tag 服务...
-  local tag="$1" s
+  local tag="$1" s dockerfile
   shift
   for s in "$@"; do
     echo "==> build $(image_name "$s" "$tag")"
+    dockerfile="$ROOT/deploy/docker/Dockerfile"
+    if [[ "$s" == e2e ]]; then dockerfile="$ROOT/deploy/docker/e2e.Dockerfile"; fi
     # --load：结果放进本机的镜像库，后面 push 和 inspect 都用得上。
+    # e2e.Dockerfile 不用 SERVICE 这个参数，传了也没有影响。
     docker buildx build --platform "$PLATFORM" --load \
-      -f "$ROOT/deploy/docker/Dockerfile" \
+      -f "$dockerfile" \
       --build-arg "SERVICE=$s" \
       -t "$(image_name "$s" "$tag")" \
       "$ROOT"

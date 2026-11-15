@@ -1,0 +1,19 @@
+# 端到端测试那一套（命名空间 oppenheimer-e2e，设计文档 2c 的 10.1）对六个服务共同的覆盖，
+# 叠在 deploy/cluster/services/<服务>.yaml 之上、e2e/<服务>.yaml 之下（scripts/cluster/services.sh e2e-up）。
+# 对应本机 scripts/e2e.sh 里对所有服务都 export 的那几个变量。
+#
+# 每次运行不同的 KAFKA_PREFIX、REDIS_PREFIX 不写在这里：由 services.sh 用 --set-string 按 E2E_RUN_ID 传入。
+# 数据库每次都重建，上一次留在 topic 和 Redis 里的东西对不上新的数据，不能让这次的进程读到。
+
+# 副本数固定，不要 HPA：用例的时序假设（同一用户的请求落到哪个副本无所谓，但副本数在跑的过程中变了，
+# 就多了一个“扩缩容期间的用例”这种不可复现的变量）。gateway 和 order 在自己的文件里改成 2。
+replicas: 1
+autoscaling: {enabled: false}
+
+config:
+  LOG_LEVEL: warn
+  # 链路导出到测试 Job 里的接收端（test/e2e/otlp_test.go），前面是 deploy/cluster/e2e/otlp-service.yaml 那个 Service。
+  # 短名字在本命名空间里解析，不写死命名空间。http:// 表示不用 TLS（和本机的写法一样）。
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://e2e-otlp:4317
+  # 批处理的发送间隔（毫秒），调小让 span 尽快到达，断言不用等久。
+  OTEL_BSP_SCHEDULE_DELAY: "200"

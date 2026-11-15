@@ -5,11 +5,19 @@
 #   services.sh status             Pod、Service、HTTPRoute 的状态
 #   services.sh render [服务]      只把渲染后的清单打印出来（helm template），不碰集群上的资源
 #   services.sh envoy-validate     只渲染并校验五个边车的配置（需要 docker）
+#   services.sh e2e-prepare        端到端测试那一套的准备：命名空间、Secret（含 root 密码）、OTLP 接收端的 Service
+#   services.sh e2e-up             e2e-prepare 之后把六个服务部署到 e2e 的命名空间（values 叠上 deploy/cluster/services/e2e/）
+#   services.sh e2e-down           删掉 e2e 的命名空间，再清理它留在中间件里的库、topic、消费者组和 Redis 键
+#   services.sh e2e-render [服务]   只渲染 e2e 那一套的清单
 #
 # 不带服务名就是六个，按依赖顺序：inventory、order、payment、orderindex、cdc、gateway。
 # 环境变量：
-#   IMAGE_TAG      deploy 必须设置（make deploy 会设好）：镜像的 tag。不猜，也不用 latest。
+#   IMAGE_TAG      deploy、e2e-up 必须设置（make deploy、make cluster-e2e 会设好）：镜像的 tag。不猜，也不用 latest。
 #   APP_NAMESPACE  部署到哪个命名空间，默认 oppenheimer。
+#   E2E_NAMESPACE  e2e 那一套的命名空间，默认 oppenheimer-e2e。
+#   E2E_RUN_ID     e2e-up 用它拼每次运行不同的 KAFKA_PREFIX（e2e-<号>.）和 REDIS_PREFIX（e2e-<号>:），
+#                  没设就用当前的 Unix 时间（scripts/cluster/e2e.sh 会设好）。
+# 端到端测试的完整流程（建库、部署、跑 Job、收日志）在 scripts/cluster/e2e.sh（make cluster-e2e）。
 #
 # 用 $KUBECONFIG_OUT 指向的 kubeconfig，不看当前的 context（这台机器上还有 OrbStack 的集群）。
 # 在 macOS 自带的 bash 3.2 上运行：不用关联数组、mapfile 这些 bash 4 的特性。
@@ -29,6 +37,13 @@ fi
 NS="${APP_NAMESPACE:-oppenheimer}"
 CHART="$ROOT/deploy/charts/service"
 VALUES="$ROOT/deploy/cluster/services"
+# e2e 那一套（设计文档 2c 的 10.1）：同一个 chart、同样的镜像，values 在 $VALUES/<服务>.yaml 之上再叠
+# $E2E_VALUES/common.yaml 和 $E2E_VALUES/<服务>.yaml。E2E_MODE=1 时 helm_args 带上这两层和每次运行的前缀。
+E2E_NS="${E2E_NAMESPACE:-oppenheimer-e2e}"
+E2E_VALUES="$VALUES/e2e"
+E2E_MANIFESTS="$ROOT/deploy/cluster/e2e"
+E2E_MODE=0
+E2E_ROOT_SECRET="oppenheimer-e2e-root"
 ENVOY_DIR="$ROOT/deploy/envoy"
 # 依赖顺序：被依赖的先部署。order 启动时要预热对 inventory 的调用，payment 调 order，gateway 调所有。
 SERVICES=(inventory order payment orderindex cdc gateway)
@@ -41,6 +56,9 @@ MYSQL_NS="mysql"
 # 要复制的 Secret：<mysql 命名空间里的 Secret>:<键名里的实例>
 MYSQL_SECRETS=(mysql-order-0-auth:order-0 mysql-order-1-auth:order-1 mysql-main-auth:main)
 MYSQL_SECRET_KEYS=(app-password cdc-password)
+# 测试 Job 自己要的 root 连接（停从库的复制线程、读 GTID、直接读各库、跑 archiver）。只复制到 e2e 的命名空间，
+# 长期运行的那一套不需要也不该有 root 的密码。
+E2E_ROOT_SECRET_KEYS=(root-password)
 
 TMP=""
 cleanup() {
@@ -49,7 +67,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  sed -n '2,15p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,23p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -136,6 +154,31 @@ helm_args() { # 服务 tag
   if [[ -f "$TMP/$s-envoy.yaml" ]]; then
     HELM_ARGS+=(--set-file "sidecar.config=$TMP/$s-envoy.yaml")
   fi
+  if [[ $E2E_MODE -eq 1 ]]; then
+    HELM_ARGS+=(-f "$E2E_VALUES/common.yaml")
+    if [[ -f "$E2E_VALUES/$s.yaml" ]]; then
+      HELM_ARGS+=(-f "$E2E_VALUES/$s.yaml")
+    fi
+    # 每次运行不同的前缀（本机 scripts/e2e.sh 的 KAFKA_PREFIX、REDIS_PREFIX）。六个服务都给：用不到的服务不读它。
+    # 值进 ConfigMap，变了校验和就变，重跑 e2e-up 会触发滚动。
+    HELM_ARGS+=(--set-string "config.KAFKA_PREFIX=e2e-$E2E_RUN_ID."
+      --set-string "config.REDIS_PREFIX=e2e-$E2E_RUN_ID:")
+  fi
+}
+
+# 切到 e2e 那一套：命名空间换掉（边车配置里下游的地址跟着换），helm_args 叠上 e2e 的 values。
+use_e2e() {
+  NS="$E2E_NS"
+  E2E_MODE=1
+  if [[ -z "${E2E_RUN_ID:-}" ]]; then
+    E2E_RUN_ID="$(date +%s)"
+  fi
+  case "$E2E_RUN_ID" in
+  *[!a-z0-9-]*)
+    echo "E2E_RUN_ID must be lowercase letters, digits and '-', got $E2E_RUN_ID" >&2
+    exit 2
+    ;;
+  esac
 }
 
 # 把 mysql 命名空间里三个实例的 app-password、cdc-password 复制成本命名空间的一个 Secret（Secret 不能跨命名空间引用）。
@@ -143,19 +186,21 @@ helm_args() { # 服务 tag
 # 清单经标准输入交给 kubectl，printf 是 shell 的内建命令，不起新进程。
 # 用 server-side apply：它不写 last-applied-configuration 注解，密码不会再存一份在注解里。
 # 每次都以源为准整份覆盖，源里的密码换了，重跑就同步过来。
-copy_secret() {
-  local spec src inst key val manifest
+# 参数：本命名空间里的 Secret 名，以及要复制的键（每个实例都复制这几个，键名前面加上实例）。
+copy_secret() { # secret 名 键...
+  local name="$1" spec src inst key val manifest
+  shift
   manifest="apiVersion: v1
 kind: Secret
 type: Opaque
 metadata:
-  name: $SECRET_NAME
+  name: $name
   namespace: $NS
 data:"
   for spec in "${MYSQL_SECRETS[@]}"; do
     src="${spec%%:*}"
     inst="${spec##*:}"
-    for key in "${MYSQL_SECRET_KEYS[@]}"; do
+    for key in "$@"; do
       val="$(kubectl -n "$MYSQL_NS" get secret "$src" -o go-template="{{index .data \"$key\"}}" 2>/dev/null)" || val=""
       if [[ -z "$val" || "$val" == "<no value>" ]]; then
         echo "secret $MYSQL_NS/$src has no key $key (is the mysql release deployed? make middleware-up)" >&2
@@ -166,19 +211,23 @@ data:"
     done
   done
   printf '%s\n' "$manifest" | kubectl apply --server-side --force-conflicts --field-manager=services-sh -f - >/dev/null
-  echo "    secret $NS/$SECRET_NAME synced from $MYSQL_NS"
+  echo "    secret $NS/$name synced from $MYSQL_NS"
 }
 
 cmd_deploy() { # [服务...]
-  local s list
   require_tag
-  list=()
-  while IFS= read -r s; do list+=("$s"); done < <(ordered "$@")
-
   echo "==> namespace $NS"
   ensure_namespace "$NS"
   echo "==> secret"
-  copy_secret
+  copy_secret "$SECRET_NAME" "${MYSQL_SECRET_KEYS[@]}"
+  deploy_releases "$@"
+}
+
+# 渲染并校验边车配置，按依赖顺序逐个 helm upgrade --install --wait，最后打印 Pod。deploy 和 e2e-up 共用。
+deploy_releases() { # [服务...]
+  local s list
+  list=()
+  while IFS= read -r s; do list+=("$s"); done < <(ordered "$@")
 
   echo "==> envoy configs"
   for s in "${list[@]}"; do
@@ -236,6 +285,49 @@ cmd_envoy_validate() {
   done
 }
 
+# ---------- 端到端测试那一套（设计文档 2c 的 10.1） ----------
+
+# 命名空间、两个 Secret、OTLP 接收端的 Service。测试 Job 要在服务之前建（见 deploy/cluster/e2e/otlp-service.yaml），
+# 它引用 root 的 Secret，所以这一步单独拿出来，scripts/cluster/e2e.sh 在建 Job 之前调用。可以重复执行。
+cmd_e2e_prepare() {
+  echo "==> namespace $NS"
+  ensure_namespace "$NS"
+  echo "==> secrets"
+  copy_secret "$SECRET_NAME" "${MYSQL_SECRET_KEYS[@]}"
+  copy_secret "$E2E_ROOT_SECRET" "${E2E_ROOT_SECRET_KEYS[@]}"
+  echo "==> otlp receiver service"
+  kubectl -n "$NS" apply -f "$E2E_MANIFESTS/otlp-service.yaml" >/dev/null
+  echo "    service $NS/e2e-otlp"
+}
+
+cmd_e2e_up() { # [服务...]
+  require_tag
+  cmd_e2e_prepare
+  echo "==> e2e run id $E2E_RUN_ID (KAFKA_PREFIX e2e-$E2E_RUN_ID., REDIS_PREFIX e2e-$E2E_RUN_ID:)"
+  deploy_releases "$@"
+}
+
+# 先删命名空间并等它删完（服务都停了，不再写库、不再占着消费者组），再清中间件里的东西。
+# 中间件的清理按 e2e- / e2e_ 前缀删，不区分运行号（scripts/cluster/e2e-lib.sh）。
+# 订单库的 DROP 会复制到共用的从库；e2e_* 库不在 2b 的 MySQL chart 的 databases 里，备份不会导它们。
+cmd_e2e_down() {
+  echo "==> namespace $NS"
+  if kubectl get namespace "$NS" >/dev/null 2>&1; then
+    kubectl delete namespace "$NS" --wait --timeout 5m >/dev/null
+    echo "    deleted"
+  else
+    echo "    not found"
+  fi
+  # shellcheck source=scripts/cluster/e2e-lib.sh
+  source "$HERE/e2e-lib.sh"
+  echo "==> mysql"
+  e2e_drop_dbs
+  echo "==> kafka"
+  e2e_clean_kafka
+  echo "==> redis"
+  e2e_clean_redis
+}
+
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
 shift
@@ -244,5 +336,21 @@ deploy) cmd_deploy "$@" ;;
 status) cmd_status ;;
 render) cmd_render "$@" ;;
 envoy-validate) cmd_envoy_validate ;;
+e2e-prepare)
+  use_e2e
+  cmd_e2e_prepare
+  ;;
+e2e-up)
+  use_e2e
+  cmd_e2e_up "$@"
+  ;;
+e2e-down)
+  use_e2e
+  cmd_e2e_down
+  ;;
+e2e-render)
+  use_e2e
+  cmd_render "$@"
+  ;;
 *) usage ;;
 esac
