@@ -17,6 +17,8 @@
 #   E2E_NAMESPACE  e2e 那一套的命名空间，默认 oppenheimer-e2e。
 #   E2E_RUN_ID     e2e-up 用它拼每次运行不同的 KAFKA_PREFIX（e2e-<号>.）和 REDIS_PREFIX（e2e-<号>:），
 #                  没设就用当前的 Unix 时间（scripts/cluster/e2e.sh 会设好）。
+#   E2E_OVERLAY_DIR e2e-up、e2e-render 在 e2e 那两层 values 之上再叠的一层（目录里的 common.yaml 和 <服务>.yaml），
+#                  scripts/cluster/chaos.sh 设成 deploy/cluster/services/chaos。没设就没有这一层。
 # 端到端测试的完整流程（建库、部署、跑 Job、收日志）在 scripts/cluster/e2e.sh（make cluster-e2e）。
 #
 # 用 $KUBECONFIG_OUT 指向的 kubeconfig，不看当前的 context（这台机器上还有 OrbStack 的集群）。
@@ -67,7 +69,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  sed -n '2,23p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,25p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -100,8 +102,10 @@ ordered() { # [服务...]
   done
 }
 
+# 已经存在就不动它。不用 create --dry-run | apply：e2e 的命名空间由 e2e-lib.sh 的 e2e_claim_ns 用 create 建
+#（带占用的标签），对它 apply 会报缺 last-applied 注解的警告。
 ensure_namespace() {
-  kubectl create namespace "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl get namespace "$1" >/dev/null 2>&1 || kubectl create namespace "$1" >/dev/null
 }
 
 require_tag() {
@@ -159,6 +163,16 @@ helm_args() { # 服务 tag
     if [[ -f "$E2E_VALUES/$s.yaml" ]]; then
       HELM_ARGS+=(-f "$E2E_VALUES/$s.yaml")
     fi
+    # 再叠一层（E2E_OVERLAY_DIR，scripts/cluster/chaos.sh 用 deploy/cluster/services/chaos）：同一套 e2e 环境
+    # 换一组配置，比如关限流、调短时限。没设就没有这一层。
+    if [[ -n "${E2E_OVERLAY_DIR:-}" ]]; then
+      if [[ -f "$E2E_OVERLAY_DIR/common.yaml" ]]; then
+        HELM_ARGS+=(-f "$E2E_OVERLAY_DIR/common.yaml")
+      fi
+      if [[ -f "$E2E_OVERLAY_DIR/$s.yaml" ]]; then
+        HELM_ARGS+=(-f "$E2E_OVERLAY_DIR/$s.yaml")
+      fi
+    fi
     # 每次运行不同的前缀（本机 scripts/e2e.sh 的 KAFKA_PREFIX、REDIS_PREFIX）。六个服务都给：用不到的服务不读它。
     # 值进 ConfigMap，变了校验和就变，重跑 e2e-up 会触发滚动。
     HELM_ARGS+=(--set-string "config.KAFKA_PREFIX=e2e-$E2E_RUN_ID."
@@ -179,6 +193,10 @@ use_e2e() {
     exit 2
     ;;
   esac
+  if [[ -n "${E2E_OVERLAY_DIR:-}" && ! -d "$E2E_OVERLAY_DIR" ]]; then
+    echo "E2E_OVERLAY_DIR $E2E_OVERLAY_DIR is not a directory" >&2
+    exit 2
+  fi
 }
 
 # 把 mysql 命名空间里三个实例的 app-password、cdc-password 复制成本命名空间的一个 Secret（Secret 不能跨命名空间引用）。

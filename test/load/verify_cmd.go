@@ -54,6 +54,34 @@ func (f *sourceFlags) register(fs *flag.FlagSet) {
 		"optional, comma-separated merchant index DB DSNs, the i-th is merchant_index_db_i; when empty verify check 20 is skipped")
 }
 
+// dsnEnv 是各 DSN 参数的环境变量。命令行上没给某个参数、对应的变量非空时，用变量的值。
+// 给集群上的 chaos（scripts/cluster/chaos.sh）用：DSN 里有密码，放在命令行上会出现在进程的参数里，
+// 放在 Pod 的环境变量里（来自 Secret）就不会。本机没人设这些变量，行为不变；命令行上给了的仍然优先。
+var dsnEnv = []struct{ flag, env string }{
+	{"inventory-dsn", "LOAD_INVENTORY_DSN"},
+	{"order-dsns", "LOAD_ORDER_DSNS"},
+	{"payment-dsn", "LOAD_PAYMENT_DSN"},
+	{"merchant-index-dsns", "LOAD_MERCHANT_INDEX_DSNS"},
+	{"archive-dsn", "LOAD_ARCHIVE_DSN"},
+}
+
+// applyEnv 在 fs.Parse 之后调用：把命令行上没给的 DSN 参数换成环境变量的值。fs 里没有注册的参数跳过。
+func applyEnv(fs *flag.FlagSet) error {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	for _, d := range dsnEnv {
+		v := os.Getenv(d.env)
+		if v == "" || set[d.flag] || fs.Lookup(d.flag) == nil {
+			continue
+		}
+		if err := fs.Set(d.flag, v); err != nil {
+			// 不把值带进错误里：它含密码。
+			return fmt.Errorf("apply %s to -%s failed", d.env, d.flag)
+		}
+	}
+	return nil
+}
+
 // open 连上全部数据源，返回的 close 关闭它们。
 func (f *sourceFlags) open(ctx context.Context) (verify.Sources, func(), error) {
 	var closers []func()
@@ -178,6 +206,19 @@ func parseFlags(fs *flag.FlagSet, args []string) (ok bool, code int) {
 	return true, 0
 }
 
+// parseSourceFlags 是 verify 和 wait-quiet 的 parseFlags：多一步 applyEnv。只给这两个命令用，
+// seed 那几个写库的命令不读这些环境变量。
+func parseSourceFlags(fs *flag.FlagSet, args []string) (ok bool, code int) {
+	if ok, code := parseFlags(fs, args); !ok {
+		return false, code
+	}
+	if err := applyEnv(fs); err != nil {
+		fmt.Fprintln(fs.Output(), err)
+		return false, 2
+	}
+	return true, 0
+}
+
 // ---------- verify ----------
 
 func verifyCmd(args []string, stdout, stderr io.Writer) int {
@@ -198,7 +239,7 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&initial, "initial", "", "initial stock of every sku, e.g. 1001=500,1002=500 (required)")
 	fs.StringVar(&invLog, "inventory-log", "", "inventory service log file, checked for gate corrections")
 	fs.DurationVar(&timeout, "timeout", 2*time.Minute, "overall timeout")
-	if ok, code := parseFlags(fs, args); !ok {
+	if ok, code := parseSourceFlags(fs, args); !ok {
 		return code
 	}
 	logger := newLogger(stderr)
@@ -340,7 +381,7 @@ func waitQuietCmd(args []string, stdout, stderr io.Writer) int {
 	sf.register(fs)
 	fs.DurationVar(&timeout, "timeout", 2*time.Minute, "give up after this long")
 	fs.DurationVar(&interval, "interval", time.Second, "probe interval")
-	if ok, code := parseFlags(fs, args); !ok {
+	if ok, code := parseSourceFlags(fs, args); !ok {
 		return code
 	}
 	logger := newLogger(stderr)

@@ -1,0 +1,15 @@
+# 删 Pod 对账测试（scripts/cluster/chaos.sh，make cluster-chaos）对六个服务共同的覆盖。
+# 叠在 e2e 那两层之上：deploy/cluster/services/<服务>.yaml、e2e/common.yaml、e2e/<服务>.yaml、本文件、chaos/<服务>.yaml
+#（services.sh 的 E2E_OVERLAY_DIR）。命名空间、库、前缀、入口的主机名都和 e2e 共用，这里只放 chaos 和 e2e 不同的地方，
+# 每一项对应本机 scripts/chaos.sh 里 export 的一个变量（本机是对所有服务都 export，这里只给读它的服务）。
+#
+# 副本数：gateway、order 在 e2e 那一层已经是 2；inventory、payment、orderindex 在各自的文件里改成 2；cdc 保持 1
+#（同一时刻只能有一个读 binlog 的实例）。HPA 在 e2e/common.yaml 里已经关掉：副本数在删 Pod 的过程中不能被 HPA 改。
+
+config:
+  # 本机 chaos 是 info（LOG_LEVEL 默认值）。e2e 那一层是 warn。info 的日志在失败时更有用；
+  # 库存服务日志里的闸门修正（verify 的第 19 条要找的）是 warn 和 error，两种级别下都在。
+  LOG_LEVEL: info
+  # 本机 chaos 不导出链路（脚本里 unset 了）。e2e 那一层把它指向测试 Job 里的接收端，chaos 的 Job 里没有接收端，
+  # 连不上的导出器只会不停重连、刷警告。空字符串就是“不导出”（pkg/otelx：没设或为空都不导出）。
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""

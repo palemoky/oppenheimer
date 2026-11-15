@@ -8,7 +8,8 @@
 #
 # 做的事，按顺序：
 #   1. 构建并推送六个服务和测试的镜像（同一个 tag，同 make deploy）。E2E_SKIP_IMAGES=1 跳过，这时必须给 IMAGE_TAG
-#   2. 上一次保留下来的 e2e 命名空间还在，就先 services.sh e2e-down
+#   2. 上一次保留下来的 e2e 命名空间还在，就先 services.sh e2e-down；再建命名空间并标成占用。
+#      命名空间正被另一次 e2e 或 chaos（scripts/cluster/chaos.sh，共用这个命名空间）占着就拒绝，退出码 3
 #   3. 拉起两个订单从库的复制，用 root 在各主库上重建 e2e_* 库并给 app、cdc 授权，等订单库复制到从库
 #   4. services.sh e2e-prepare（命名空间、Secret、OTLP 接收端的 Service），建测试 Job
 #   5. services.sh e2e-up 部署六个服务；Job 在这期间等网关经入口就绪（E2E_WAIT_READY）
@@ -111,22 +112,8 @@ job_result() {
   esac
 }
 
-# 失败时把现场收下来：每个 Pod 的日志（所有容器，含边车；重启过的再收上一次的）、Pod 列表、事件。
-collect_logs() {
-  local pod restarts
-  mkdir -p "$LOG_DIR"
-  echo "==> collecting logs into $LOG_DIR"
-  kubectl -n "$NS" get pods -o wide >"$LOG_DIR/pods.txt" 2>&1 || true
-  kubectl -n "$NS" get events --sort-by=.lastTimestamp >"$LOG_DIR/events.txt" 2>&1 || true
-  for pod in $(kubectl -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null || true); do
-    kubectl -n "$NS" logs "$pod" --all-containers --prefix --timestamps >"$LOG_DIR/$pod.log" 2>&1 || true
-    restarts="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.restartCount}{" "}{end}' 2>/dev/null || true)"
-    if [[ "$restarts" == *[1-9]* ]]; then
-      kubectl -n "$NS" logs "$pod" --all-containers --prefix --timestamps --previous >"$LOG_DIR/$pod.previous.log" 2>&1 || true
-    fi
-  done
-  echo "    $(command ls "$LOG_DIR" | wc -l | tr -d ' ') files"
-}
+# 失败时把现场收下来（e2e-lib.sh）。
+collect_logs() { e2e_collect_logs "$NS" "$LOG_DIR"; }
 
 finish() {
   local code=$?
@@ -138,6 +125,7 @@ finish() {
     collect_logs
   fi
   if [[ "${E2E_KEEP:-}" == 1 ]]; then
+    e2e_mark_kept "$NS"
     echo "==> E2E_KEEP=1: keeping namespace $NS and the e2e data in the middleware"
     echo "    clean up later with: scripts/cluster/services.sh e2e-down"
   else
@@ -151,6 +139,9 @@ finish() {
   fi
   exit "$code"
 }
+
+# 和 chaos 共用命名空间（e2e-lib.sh 的“命名空间的占用”）：正有一次在跑就拒绝。先查一次，免得白构建镜像。
+e2e_check_free "$NS" || exit 3
 
 # ---------- 1. 镜像 ----------
 if [[ "${E2E_SKIP_IMAGES:-}" == 1 ]]; then
@@ -168,11 +159,14 @@ export IMAGE_TAG
 echo "==> cluster e2e: run $E2E_RUN_ID, image tag $IMAGE_TAG, namespace $NS"
 
 # ---------- 2. 上一次留下的现场 ----------
-if kubectl get namespace "$NS" >/dev/null 2>&1; then
+if [[ -n "$(e2e_ns_state "$NS")" ]]; then
+  e2e_check_free "$NS" || exit 3
   echo "==> namespace $NS exists (kept by an earlier E2E_KEEP=1 run?); tearing it down first"
   "$HERE/services.sh" e2e-down
 fi
 if [[ -d "$LOG_DIR" ]]; then command rm -rf "$LOG_DIR"; fi
+# 建命名空间并标成 running。另一次运行恰好同时建了它就失败退出，不进下面的 trap（那会清掉别人的现场）。
+e2e_claim_ns "$NS" e2e "$E2E_RUN_ID" || exit 3
 
 # 从这里开始改了共用的中间件，退出时一定要收尾。
 trap finish EXIT

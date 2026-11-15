@@ -285,6 +285,10 @@ deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部�
 cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
 	scripts/cluster/e2e.sh $(E2E_ARGS)
 
+.PHONY: cluster-chaos
+cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
+	scripts/cluster/chaos.sh
+
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
 	scripts/cluster/services.sh status

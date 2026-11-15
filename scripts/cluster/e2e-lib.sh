@@ -180,3 +180,72 @@ e2e_clean_redis() {
     done
   done
 }
+
+# ---------- 命名空间的占用 ----------
+# e2e（scripts/cluster/e2e.sh）和删 Pod 对账（scripts/cluster/chaos.sh）共用一个命名空间、同一批 e2e_* 库、
+# 同一个入口主机名和同一组 cdc 的 server-id，所以不能同时跑。占用记在命名空间的两个标签上：
+#   oppenheimer.test/suite  e2e 或 chaos
+#   oppenheimer.test/state  running（正在跑）或 kept（E2E_KEEP=1 留下的现场）
+# 规则：命名空间是 running 就拒绝；是 kept 或者没有这两个标签（旧版本脚本留下的）就当作上一次的现场，先清掉再用。
+# 占用用 kubectl create 建命名空间：已经存在就失败，两个脚本同时开始时只有一个建得成。
+# 脚本被 kill -9 时来不及改标签，命名空间停在 running：确认没有在跑之后手工 scripts/cluster/services.sh e2e-down。
+E2E_SUITE_LABEL="oppenheimer.test/suite"
+E2E_STATE_LABEL="oppenheimer.test/state"
+
+# 命名空间的状态：不存在时什么都不输出，存在时输出 "<suite> <state>"，缺的标签是 "-"。
+e2e_ns_state() { # 命名空间
+  kubectl get namespace "$1" -o go-template="{{with .metadata.labels}}{{or (index . \"$E2E_SUITE_LABEL\") \"-\"}} {{or (index . \"$E2E_STATE_LABEL\") \"-\"}}{{else}}- -{{end}}" 2>/dev/null || true
+}
+
+# 命名空间正被一次运行占着就报错返回 1。
+e2e_check_free() { # 命名空间
+  local st
+  st="$(e2e_ns_state "$1")"
+  case "$st" in
+  *" running")
+    echo "namespace $1 is in use by a running ${st%% *} run (label $E2E_STATE_LABEL=running); e2e and chaos cannot run at the same time." >&2
+    echo "If nothing is running (the script was killed), clean up with: scripts/cluster/services.sh e2e-down" >&2
+    return 1
+    ;;
+  esac
+}
+
+# 建命名空间并标成 running。命名空间已经存在时失败（调用方先清掉上一次的现场）。
+# 调用方写成 e2e_claim_ns ... || exit：|| 左边的函数里 set -e 不起作用，所以失败要显式 return。
+e2e_claim_ns() { # 命名空间 suite 运行号
+  printf '%s\n' "apiVersion: v1
+kind: Namespace
+metadata:
+  name: $1
+  labels:
+    $E2E_SUITE_LABEL: $2
+    $E2E_STATE_LABEL: running
+    oppenheimer.test/run-id: \"$3\"" | kubectl create -f - >/dev/null || return 1
+  echo "    namespace $1 claimed for $2 (run $3)"
+}
+
+# E2E_KEEP=1 保留现场时调用：标成 kept，下一次运行会先清掉它。
+e2e_mark_kept() { # 命名空间
+  kubectl label namespace "$1" "$E2E_STATE_LABEL=kept" --overwrite >/dev/null 2>&1 ||
+    echo "    WARNING: could not label namespace $1 as kept" >&2
+}
+
+# 失败时把现场收下来：每个 Pod 的日志（所有容器，含边车；重启过的再收上一次的）、Pod 列表、事件。
+e2e_collect_logs() { # 命名空间 目录
+  local ns="$1" dir="$2" pod restarts c
+  mkdir -p "$dir"
+  echo "==> collecting logs into $dir"
+  kubectl -n "$ns" get pods -o wide >"$dir/pods.txt" 2>&1 || true
+  kubectl -n "$ns" get events --sort-by=.lastTimestamp >"$dir/events.txt" 2>&1 || true
+  for pod in $(kubectl -n "$ns" get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null || true); do
+    kubectl -n "$ns" logs "$pod" --all-containers --prefix --timestamps >"$dir/$pod.log" 2>&1 || true
+    restarts="$(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.restartCount}{" "}{end}' 2>/dev/null || true)"
+    if [[ "$restarts" == *[1-9]* ]]; then
+      # 逐个容器取：--all-containers 加 --previous 时，只要有一个容器没重启过（通常是边车）整条命令就报错。
+      for c in $(kubectl -n "$ns" get pod "$pod" -o jsonpath='{range .status.containerStatuses[?(@.restartCount>0)]}{.name}{" "}{end}{range .status.initContainerStatuses[?(@.restartCount>0)]}{.name}{" "}{end}' 2>/dev/null || true); do
+        kubectl -n "$ns" logs "$pod" -c "$c" --timestamps --previous >"$dir/$pod.$c.previous.log" 2>&1 || true
+      done
+    fi
+  done
+  echo "    $(command ls "$dir" | wc -l | tr -d ' ') files"
+}

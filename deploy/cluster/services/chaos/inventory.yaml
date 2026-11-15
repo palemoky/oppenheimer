@@ -1,0 +1,5 @@
+# inventory 在 chaos 那一套里的覆盖（叠在 e2e/inventory.yaml 之上）。
+replicas: 2
+config:
+  # 同本机 scripts/chaos.sh（e2e 那一层是 1s）。
+  GATE_RECONCILE_INTERVAL: 2s

@@ -1,0 +1,2 @@
+# payment 在 chaos 那一套里的覆盖（叠在 e2e/payment.yaml 之上）。节点号照常从 e2e_payment_db 里租（ADR-0028）。
+replicas: 2
