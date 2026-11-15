@@ -69,6 +69,13 @@ EOF
   for spec in "${NODES[@]}"; do
     hosts+="      $(cut -d: -f2 <<<"$spec") $(cut -d: -f1 <<<"$spec")"$'\n'
   done
+  # kernel.apparmor_restrict_unprivileged_unconfined=0：Ubuntu 26.04 默认是 1。开着的时候，k3s 的 runc 给容器
+  # 切换 AppArmor 配置时只能叠加不能替换，容器进程的标签变成 cri-containerd.apparmor.d//&unconfined，而
+  # containerd 的默认配置只允许向标签恰好是 cri-containerd.apparmor.d 的进程发信号，于是容器里的进程
+  # 连给自己发信号都被拒绝：官方的 MySQL 镜像起不来（gosu 空转、mysqld 初始化完不退出），所有 Go 程序的
+  # 抢占信号（SIGURG）被丢掉。2026-11-15 在一个节点上验证过：设成 0 之后标签恢复正常，拒绝记录消失
+  # （设计文档 2b 第 10 节的发现 1）。容器仍然受 cri-containerd.apparmor.d 约束，放宽的只是这一项系统级的限制。
+  # 文件在第一次开机时才写入，那时 systemd 已经加载过 sysctl，所以 runcmd 里再加载一次；之后每次开机自动生效。
   cat >"$tmp/user-data" <<EOF
 #cloud-config
 hostname: $name
@@ -90,8 +97,12 @@ write_files:
     append: true
     content: |
 $hosts
+  - path: /etc/sysctl.d/90-oppenheimer-apparmor.conf
+    content: |
+      kernel.apparmor_restrict_unprivileged_unconfined = 0
 runcmd:
   - systemctl enable --now qemu-guest-agent
+  - sysctl --system
 EOF
   # 按 MAC 认网卡，不依赖网卡在虚拟机里叫什么名字。
   # 不接受 IPv6 的路由通告：通告里带着一个 IPv6 的 DNS 服务器，它不经过 R2S 的代理，返回的是被污染的

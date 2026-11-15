@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mysql.name" . }}-config
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+data:
+  # 主容器、init 容器里的临时实例都用这一份（--defaults-extra-file），CLONE 要求两端的字符集等设置一致。
+  # 参数来自本机 compose；内存相关的按集群重新定（设计文档 2b 的 3.1），performance_schema 保持默认的开。
+  server.cnf: |
+    [mysqld]
+    # GTID 和 ROW 格式的 binlog 是主从复制和 CDC 的前提。
+    gtid-mode=ON
+    enforce-gtid-consistency=ON
+    binlog-row-image=FULL
+    # 每个 TABLE_MAP 事件带上列名，CDC 靠它得到产生日志时的列名（设计文档 1c 的 4.8）。从库的 binlog 由从库自己写，所以每个实例都要设。
+    binlog-row-metadata=FULL
+    character-set-server=utf8mb4
+    default-time-zone=+00:00
+    # 中继日志的文件名默认取主机名。Pod 名虽然稳定，但固定下来就不用再想这件事（本机踩过的 1872 错误）。
+    relay-log=relay-bin
+    # 从库崩溃或被杀之后，丢掉没应用完的中继日志，按自己的 gtid_executed 从主库重新拉。
+    # 中继日志不是和数据一起原子地落盘的，不开这个，被 kill -9 之后可能接着读一个写了一半的中继日志。
+    relay-log-recovery=ON
+    max-connections={{ .Values.mysqld.maxConnections }}
+    innodb-buffer-pool-size={{ .Values.mysqld.innodbBufferPoolSize }}
+    # 从库用 CLONE 从主库拉全量，两端都要加载这个插件。写在启动参数里，不用 INSTALL PLUGIN：
+    # 后者是写进系统表的状态，要想清楚它会不会被复制、被 CLONE 带走；启动参数每次都一样。
+    plugin-load-add=mysql_clone.so
+{{- range $path, $_ := .Files.Glob "files/*.sh" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}

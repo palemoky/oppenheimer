@@ -1,0 +1,82 @@
+# Sentinel 用 StatefulSet 加小数据卷，不用 emptyDir：
+# sentinel.conf 里记着当前主库、其他 Sentinel 和纪元，Pod 重建后要能接着用。
+# emptyDir 的话重建后只能靠别的 Sentinel 或 Redis 现状恢复（脚本里有这条退路，数据卷丢了也走它），
+# 但纪元和 myid 会丢，等于换了一个新 Sentinel。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-ha.sentinelName" . }}
+  labels: {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sentinel
+spec:
+  serviceName: {{ include "redis-ha.sentinelHeadless" . }}
+  replicas: {{ .Values.sentinel.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "redis-ha.sentinelSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "redis-ha.sentinelSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      affinity:
+        # 3 个分到 3 个节点（含控制面）：多数票 2/3，任何一个节点挂了还剩两个。
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "redis-ha.sentinelSelector" . | nindent 18 }}
+      containers:
+        - name: sentinel
+          image: {{ include "redis-ha.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/start-sentinel.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: SENTINEL_HEADLESS, value: {{ include "redis-ha.sentinelHeadless" . | quote }}}
+            - {name: SENTINEL_NAME, value: {{ include "redis-ha.sentinelName" . | quote }}}
+            - {name: REDIS_HEADLESS, value: {{ include "redis-ha.name" . | quote }}}
+            - {name: REDIS_NAME, value: {{ include "redis-ha.name" . | quote }}}
+            - {name: SUFFIX, value: {{ include "redis-ha.suffix" . | quote }}}
+            - {name: MASTER_NAME, value: {{ .Values.sentinel.masterName | quote }}}
+            - {name: QUORUM, value: {{ .Values.sentinel.quorum | quote }}}
+            - {name: DOWN_AFTER, value: {{ .Values.sentinel.downAfterMilliseconds | quote }}}
+            - {name: FAILOVER_TIMEOUT, value: {{ .Values.sentinel.failoverTimeout | quote }}}
+            - {name: PARALLEL_SYNCS, value: {{ .Values.sentinel.parallelSyncs | quote }}}
+            - {name: SENTINEL_REPLICAS, value: {{ .Values.sentinel.replicas | quote }}}
+            - {name: REDIS_REPLICAS, value: {{ .Values.redis.replicas | quote }}}
+          ports:
+            - {name: sentinel, containerPort: 26379}
+          startupProbe:
+            exec: {command: [redis-cli, -p, "26379", ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60   # 启动脚本最多等 DNS 和主库约 2 分钟
+          readinessProbe:
+            exec: {command: [redis-cli, -p, "26379", ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: [redis-cli, -p, "26379", ping]}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources: {{- toYaml .Values.sentinel.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scripts, mountPath: /scripts}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "redis-ha.name" . }}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.sentinel.storageClass }}
+        resources: {requests: {storage: {{ .Values.sentinel.storage }}}}

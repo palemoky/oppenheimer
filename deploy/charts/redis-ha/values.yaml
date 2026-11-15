@@ -1,0 +1,30 @@
+image:
+  repository: redis
+  tag: "8.10.3"
+  pullPolicy: IfNotPresent
+
+clusterDomain: cluster.local
+
+redis:
+  replicas: 2
+  # 库存等数据不能被淘汰，内存满时宁可写入报错。
+  maxmemory: 192mb
+  maxmemoryPolicy: noeviction
+  storage: 2Gi
+  storageClass: local-path
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 256Mi}
+
+sentinel:
+  replicas: 3
+  masterName: gate
+  quorum: 2
+  downAfterMilliseconds: 5000
+  failoverTimeout: 30000
+  parallelSyncs: 1
+  storage: 100Mi
+  storageClass: local-path
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 64Mi}

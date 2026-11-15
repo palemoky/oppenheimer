@@ -1,0 +1,19 @@
+# 订单分片 1（slot 1、3、5、7），一主一从。设计文档 2b 的 3.1。
+# 主库偏好 agent-2，和分片 0 的主库错开。
+replicas: 2
+primaryOrdinal: 0       # 切换后改这里再 helm upgrade（只改 -primary、-replica 两个 Service）
+priorityClassName: middleware
+serverIdBase: 21          # 和本机 compose 的 21、22 对应
+preferredNode: k3s-agent-2
+databases:
+  - order_db_1
+cdc:
+  enabled: true
+mysqld:
+  maxConnections: 200
+  innodbBufferPoolSize: 512M
+resources:
+  memory: 1Gi
+  cpu: 250m
+storage:
+  size: 20Gi

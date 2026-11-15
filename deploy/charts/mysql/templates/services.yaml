@@ -1,0 +1,68 @@
+{{- $name := include "mysql.name" . -}}
+{{- $replicas := int .Values.replicas -}}
+{{- $primary := int .Values.primaryOrdinal -}}
+{{- if or (lt $replicas 1) (gt $replicas 2) }}
+{{- fail "replicas must be 1 or 2: the -replica Service selects the single other ordinal by pod name" }}
+{{- end }}
+{{- if or (lt $primary 0) (ge $primary $replicas) }}
+{{- fail (printf "primaryOrdinal %d is out of range for replicas %d" $primary $replicas) }}
+{{- end }}
+# headless：给每个 Pod 稳定的名字 <release>-<序号>.<release>.<命名空间>.svc。从库找主库、CDC 找从库用它。
+# publishNotReadyAddresses：Pod 没就绪名字也能解析。复制线程断了的从库不就绪，但它找主库、
+# init 容器判断“别的 Pod 存不存在”都要靠这个名字。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mysql.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+# 服务写入连这个。按 Pod 名选，Pod 名由 StatefulSet 控制器打，Pod 重建之后还是它，不靠人工维护的标签。
+# 谁是主库由 values 的 primaryOrdinal 决定，在 git 里：切换的最后一步是改它再 helm upgrade，
+# 只改这个 Service，不重启任何 Pod（primaryOrdinal 不进 Pod 模板，也不进 ConfigMap）。
+#
+# 注意它只决定“经 Service 的写入去哪”，不改实例本身：切换之后旧主库回来时仍然是可写的（没有 super_read_only），
+# 只是 Service 不再指向它。直接连它的稳定名字仍然能写进去，造成分叉。middleware.sh 和 status.sh 会把
+# “可写但不是 primaryOrdinal”的实例报成异常，处理（设只读、重建复制或重新 CLONE）是人工的。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-primary
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "mysql.selectorLabels" . | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ printf "%s-%d" $name $primary }}
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+{{- if eq $replicas 2 }}
+---
+# 读从库连这个：选另一个序号。只支持 2 个副本（上面校验了）：Service 的 selector 只能写等于，
+# 写不出“除了主库以外的所有 Pod”；要支持更多从库得换成按标签选或自己维护 EndpointSlice。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-replica
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "mysql.selectorLabels" . | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ printf "%s-%d" $name (sub 1 $primary) }}
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+{{- end }}

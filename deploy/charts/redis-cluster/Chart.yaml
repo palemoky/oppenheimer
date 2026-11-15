@@ -1,0 +1,6 @@
+apiVersion: v2
+name: redis-cluster
+description: Redis Cluster 3 主 3 从，不持久化数据（缓存和限流用）
+type: application
+version: 0.1.0
+appVersion: "8.10.3"

@@ -1,0 +1,24 @@
+# 共享实例：inventory、payment、商家索引的两个库、订单冷库。单实例，是已知的单点（设计文档 2b 的 3.1）。
+# 库名和本机 Makefile 的 up-core 建的一致。
+replicas: 1
+primaryOrdinal: 0       # 单实例，只能是 0
+priorityClassName: middleware
+serverIdBase: 1           # 和本机 compose 的 mysql 一致
+preferredNode: ""         # 任一 agent
+databases:
+  - inventory_db
+  - payment_db
+  - merchant_index_db_0
+  - merchant_index_db_1
+  - order_archive_db
+cdc:
+  enabled: false
+mysqld:
+  # 本机的连接池合计已经是 164（compose 里的注释），给到 400 留出余量。
+  maxConnections: 400
+  innodbBufferPoolSize: 768M
+resources:
+  memory: 1536Mi
+  cpu: 250m
+storage:
+  size: 30Gi

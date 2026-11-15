@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-cluster.name" . }}
+  labels: {{- include "redis-cluster.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "redis-cluster.name" . }}
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "redis-cluster.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "redis-cluster.selector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      # 6 个分到三个节点各 2 个。只保证了节点均衡；“主库的从库不和它同节点”取决于组建时的配对，
+      # 见 bootstrap Job 的输出。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {{- include "redis-cluster.selector" . | nindent 14 }}
+      containers:
+        - name: redis
+          image: {{ include "redis-cluster.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/start.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HEADLESS, value: {{ include "redis-cluster.name" . | quote }}}
+            - {name: SUFFIX, value: {{ include "redis-cluster.suffix" . | quote }}}
+          ports:
+            - {name: redis, containerPort: 6379}
+            - {name: bus, containerPort: 16379}
+          startupProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scripts, mountPath: /scripts}
+            - {name: scripts, mountPath: /conf/redis.conf, subPath: redis.conf}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "redis-cluster.name" . }}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.storageClass }}
+        resources: {requests: {storage: {{ .Values.storage }}}}

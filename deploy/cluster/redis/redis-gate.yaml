@@ -1,0 +1,16 @@
+# release 名 redis-gate，命名空间 redis。库存闸门、分布式锁、读己之写标记。
+redis:
+  replicas: 2
+  maxmemory: 192mb
+  maxmemoryPolicy: noeviction
+  storage: 2Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 256Mi}
+sentinel:
+  replicas: 3
+  masterName: gate
+  quorum: 2
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 64Mi}

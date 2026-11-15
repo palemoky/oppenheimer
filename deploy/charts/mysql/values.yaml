@@ -1,0 +1,48 @@
+# 默认值。每个实例的差异写在 deploy/cluster/mysql/<release>.yaml。
+image: mysql:9.7.4
+
+# 2 是一主一从，1 是单实例。不支持更多（-replica Service 按 Pod 名选“另一个序号”，见 templates/services.yaml）。
+replicas: 2
+
+# 主库是哪个序号。-primary Service 按 Pod 名指向它，-replica 指向另一个。初始是 0。
+# 人工切换的最后一步是改这里再 helm upgrade：只改 Service，不重启 Pod。
+primaryOrdinal: 0
+
+# 有状态中间件的优先级（deploy/cluster/middleware/priorityclass.yaml，由 middleware.sh 先建好）。
+# 内存 requests 等于 limits 但 CPU 不设 limits，QoS 是 Burstable 而不是 Guaranteed，靠优先级排在业务服务之后被驱逐。
+priorityClassName: ""
+
+# server-id = serverIdBase + 序号，在容器启动时从 Pod 名算出来。各实例的基数不能重叠，
+# 也不能和 CDC 用的 server-id（docs/infra/versions.md 里登记的 1011、1021 等）冲突。
+serverIdBase: 11
+
+# 序号 0 第一次调度时偏好的节点（空表示不偏好）。只影响第一次：local-path 的卷建好之后 Pod 就固定在那个节点上。
+preferredNode: ""
+
+# 这个实例上要建的库。app 账号对它们有全部权限。
+databases: []
+
+# 是否建 cdc 账号。CDC 只读订单分片的 binlog，共享实例上不需要。
+cdc:
+  enabled: false
+
+mysqld:
+  maxConnections: 200
+  innodbBufferPoolSize: 512M
+
+resources:
+  memory: 1Gi
+  cpu: 250m
+
+storage:
+  storageClass: local-path
+  size: 20Gi
+
+clusterDomain: cluster.local
+
+# 建库建账号的 hook Job。只跑一个 mysql 客户端，给很小的内存就够。
+accountsJob:
+  memory: 128Mi
+  cpu: 50m
+  # 等主库可用的上限（秒）。第一次安装要拉镜像、初始化数据目录，给足时间。
+  waitSeconds: 900

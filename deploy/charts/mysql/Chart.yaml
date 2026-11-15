@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mysql
+description: 手写的 MySQL 主从（GTID 异步复制，从库用 CLONE 初始化），每个实例装一次。见 ADR-0027 和设计文档 2b 第 3 节。
+type: application
+version: 0.1.0
+appVersion: "9.7.4"

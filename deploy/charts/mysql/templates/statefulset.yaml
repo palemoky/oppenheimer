@@ -1,0 +1,163 @@
+{{- $name := include "mysql.name" . -}}
+{{- $mem := .Values.resources.memory -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ .Values.replicas }}
+  # OrderedReady：序号 1 要等序号 0 就绪才创建。按序号的节点偏好靠的就是这个先后（见下面的 affinity）。
+  # 代价：序号 0 不就绪时，序号 1 的 Pod 被删掉后不会重建，滚动更新也会停住。故障实验里要记得这一点。
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  # 卸载 release 或缩容都不删卷：卷就是数据，删它要人来做。
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      {{- include "mysql.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mysql.selectorLabels" . | nindent 8 }}
+      annotations:
+        # 脚本和参数改了要滚动重启才生效。
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # 不要把 primaryOrdinal 放进 Pod 模板（包括环境变量和注解）：改它只应该改 Service，不能滚动重启主从。
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: 120
+      # 以镜像里的 mysql 用户（999）运行，不用 root。
+      # 官方入口脚本以 root 启动时会用 gosu 切到 mysql 用户；在这个集群的节点上（内核 7.0）gosu 会一直占着
+      # CPU 空转、永远不往下走（2026-11-15 实测，原因没有查）。不是 root 时入口脚本跳过这一步。
+      # fsGroup 让卷对这个组可写；init 容器里的 chown 因此变成对自己的文件操作，不需要 root。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      affinity:
+        nodeAffinity:
+          {{- include "mysql.nodeAffinityRequired" . | nindent 10 }}
+          {{- with .Values.preferredNode }}
+          # Pod 模板对所有序号是同一份，偏好也对所有序号都写。能做到“只有序号 0 去这个节点”，是因为：
+          # 序号 0 先调度（OrderedReady），拿到偏好的节点；序号 1 被下面的反亲和排除在这个节点之外，只能去另一个。
+          # 之后 local-path 的卷把每个 Pod 钉在第一次的节点上，偏好不再起作用。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - {{ . | quote }}
+          {{- end }}
+        # 同一个实例的主从不能在同一个节点：节点挂了就同时丢了两份。
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mysql.selectorLabels" . | nindent 18 }}
+      initContainers:
+        - name: init-replica
+          image: {{ .Values.image }}
+          command: ["/scripts/init-replica.sh"]
+          env:
+            {{- include "mysql.peerEnv" . | nindent 12 }}
+            {{- include "mysql.secretEnv" . | nindent 12 }}
+          # 内存的 requests 等于 limits，和主容器一致（Pod 的 QoS 按所有容器算，init 容器也算在内）。
+          resources:
+            requests:
+              cpu: {{ .Values.resources.cpu }}
+              memory: {{ $mem }}
+            limits:
+              memory: {{ $mem }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: work
+              mountPath: /work
+            - name: config
+              mountPath: /etc/mysql-oppenheimer
+            - name: scripts
+              mountPath: /scripts
+      containers:
+        - name: mysql
+          image: {{ .Values.image }}
+          command: ["/scripts/run-mysqld.sh"]
+          env:
+            {{- include "mysql.peerEnv" . | nindent 12 }}
+            {{- include "mysql.secretEnv" . | nindent 12 }}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          # 内存 requests 等于 limits；CPU 只设 requests，不设 limits，避免被节流（设计文档 2b 的 6.1）。
+          resources:
+            requests:
+              cpu: {{ .Values.resources.cpu }}
+              memory: {{ $mem }}
+            limits:
+              memory: {{ $mem }}
+          # 崩溃恢复可能要几分钟，startup 最长给 10 分钟；它成功之前 liveness 不生效。
+          startupProbe:
+            exec:
+              command: ["/scripts/probe.sh", "startup"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["/scripts/probe.sh", "ready"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/scripts/probe.sh", "alive"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: config
+              mountPath: /etc/mysql-oppenheimer
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+            items:
+              - key: server.cnf
+                path: server.cnf
+        - name: scripts
+          configMap:
+            name: {{ $name }}-config
+            defaultMode: 0755
+            items:
+              {{- range $path, $_ := .Files.Glob "files/*.sh" }}
+              - key: {{ base $path }}
+                path: {{ base $path }}
+              {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "mysql.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storage.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

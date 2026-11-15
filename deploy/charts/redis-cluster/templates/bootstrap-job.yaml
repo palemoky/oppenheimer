@@ -1,0 +1,41 @@
+# 组建集群用 Helm 的 post-install/post-upgrade hook：helm install --wait 返回时集群已经好了，
+# 不需要主会话的脚本再协调。脚本可重复执行：集群已经好就什么都不做。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "redis-cluster.name" . }}-bootstrap
+  labels: {{- include "redis-cluster.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # 保留上一次的 Job 到下一次 hook 之前，方便 kubectl logs 看主从对应。
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels: {{- include "redis-cluster.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+      containers:
+        - name: bootstrap
+          image: {{ include "redis-cluster.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/bootstrap.sh"]
+          env:
+            - {name: NAME, value: {{ include "redis-cluster.name" . | quote }}}
+            - {name: HEADLESS, value: {{ include "redis-cluster.name" . | quote }}}
+            - {name: SUFFIX, value: {{ include "redis-cluster.suffix" . | quote }}}
+            - {name: REPLICAS, value: {{ .Values.replicas | quote }}}
+            - {name: REPLICAS_PER_MASTER, value: {{ .Values.replicasPerMaster | quote }}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "redis-cluster.name" . }}}
