@@ -30,6 +30,15 @@ x-envoy: &envoy
     retries: 30
     start_period: 2s
 
+x-redis-mode: &redis-mode
+  image: redis:8.10.3
+  profiles: ["redis-modes"]
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
 services:
   mysql:
     image: mysql:9.7.4
@@ -535,6 +544,162 @@ services:
       timeout: 3s
       retries: 30
       start_period: 20s
+
+  # ---------- profile redis-modes：Redis 的 Sentinel 和 Cluster 两种部署（make redis-modes-up） ----------
+  # 给 pkg/redisx 和 pkg/ratelimit 的可选集成测试用。Sentinel 和 Cluster 把节点自己的地址告诉客户端，
+  # 所以容器在自定义网络里用固定 IP，并让 Redis 通告这个 IP；OrbStack 下宿主机可以直接访问容器 IP。
+  # 不持久化，内存上限 64mb。
+  redis-s-master:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--replica-announce-ip", "172.30.0.11"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.11
+
+  redis-s-replica:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--replicaof", "172.30.0.11", "6379", "--replica-announce-ip", "172.30.0.12"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.12
+
+  redis-sentinel-1:
+    <<: *redis-mode
+    # Sentinel 会改写自己的配置文件，所以启动时生成到容器内可写的 /tmp，不挂载只读文件。
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        bind 0.0.0.0
+        protected-mode no
+        sentinel announce-ip 172.30.0.21
+        sentinel monitor gate 172.30.0.11 6379 2
+        sentinel down-after-milliseconds gate 2000
+        sentinel failover-timeout gate 10000
+        sentinel parallel-syncs gate 1
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      - redis-s-master
+      - redis-s-replica
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.21
+
+  redis-sentinel-2:
+    <<: *redis-mode
+    # Sentinel 会改写自己的配置文件，所以启动时生成到容器内可写的 /tmp，不挂载只读文件。
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        bind 0.0.0.0
+        protected-mode no
+        sentinel announce-ip 172.30.0.22
+        sentinel monitor gate 172.30.0.11 6379 2
+        sentinel down-after-milliseconds gate 2000
+        sentinel failover-timeout gate 10000
+        sentinel parallel-syncs gate 1
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      - redis-s-master
+      - redis-s-replica
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.22
+
+  redis-sentinel-3:
+    <<: *redis-mode
+    # Sentinel 会改写自己的配置文件，所以启动时生成到容器内可写的 /tmp，不挂载只读文件。
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        bind 0.0.0.0
+        protected-mode no
+        sentinel announce-ip 172.30.0.23
+        sentinel monitor gate 172.30.0.11 6379 2
+        sentinel down-after-milliseconds gate 2000
+        sentinel failover-timeout gate 10000
+        sentinel parallel-syncs gate 1
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      - redis-s-master
+      - redis-s-replica
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.23
+
+  redis-c1:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.31"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.31
+
+  redis-c2:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.32"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.32
+
+  redis-c3:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.33"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.33
+
+  redis-c4:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.34"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.34
+
+  redis-c5:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.35"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.35
+
+  redis-c6:
+    <<: *redis-mode
+    command: [redis-server, "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--protected-mode", "no", "--bind", "0.0.0.0", "--cluster-enabled", "yes", "--cluster-config-file", "/tmp/nodes.conf", "--cluster-node-timeout", "5000", "--cluster-announce-ip", "172.30.0.36"]
+    networks:
+      redis-modes:
+        ipv4_address: 172.30.0.36
+
+networks:
+  redis-modes:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   mysql-data:
