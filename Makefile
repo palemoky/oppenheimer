@@ -289,9 +289,21 @@ cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 
 cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
 	scripts/cluster/chaos.sh
 
+.PHONY: cluster-bench
+cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（732f9ab，各 1 副本）后 1b（设计副本数），共用 oppenheimer-e2e；BENCH_* 见脚本，结果在 tmp/cluster-bench/，E2E_KEEP=1 保留现场
+	scripts/cluster/bench.sh
+
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
 	scripts/cluster/services.sh status
+
+.PHONY: deploy-seed
+deploy-seed: ## 给集群上的 inventory 写入示例 SKU（1001 到 1003、2001，和探针用的 3001）；要在 make deploy 之后，可重复执行
+	scripts/cluster/seed.sh
+
+.PHONY: deploy-degrade
+deploy-degrade: ## 看或改集群上一个服务的降级开关（逐个 Pod）：make deploy-degrade ARGS="gateway" 或 ARGS="gateway stock_query off|auto"
+	scripts/cluster/degrade.sh $(ARGS)
 
 .PHONY: etcd-backup
 etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server 节点上的定时器每 12 小时做一次）；scripts/cluster/k3s.sh etcd-backup list 查看

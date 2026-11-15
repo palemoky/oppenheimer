@@ -1,0 +1,290 @@
+# 1a（提交 732f9ab）的四个服务在集群上的最小部署，只给吞吐对比用（scripts/cluster/bench.sh，设计文档 2c 的 10.3）。
+# 这是模板：前后带两个下划线的占位符（IMAGE_PREFIX、TAG、HOST、ORDER_DSN、ORDER_PASSWORD_VAR、ORDER_PASSWORD_KEY）由 bench.sh 填入，
+# 值都是脚本自己算出来的，不含密码（密码在 Secret oppenheimer-mysql 里，由 services.sh e2e-prepare 复制过来）。
+#
+# 为什么不用 deploy/charts/service：那个 chart 是按现在的服务写的，1a 对不上的地方有
+#   - 没有 /readyz，没有 DRAIN_DELAY（收到 SIGTERM 立刻停监听，没有摘流的等待）。探针三种都用 /healthz：
+#     1a 的 /healthz 在迁移完成、端口都绑好之后才开始应答（app.Run 之前先 Migrate、Listen），所以“应答了”就是“能用了”。
+#     压测期间不滚动、不删 Pod，缺优雅摘流不影响测量；收尾时直接删掉。
+#   - 没有边车：服务之间直连 ClusterIP Service（gRPC 明文，grpc.NewClient 默认的 dns 解析器、pick_first）。
+#     一个副本时 ClusterIP 和直连 Pod 没有区别；多副本时 HTTP/2 长连接会钉在一个 Pod 上（kube-proxy 只在建连时选一次），
+#     要 headless 加 round_robin，1a 的代码没配。这是 1a 只能 1 个副本的原因之一。
+#   - 节点号：1a 的 order、payment 从环境变量 WORKER_ID 读（默认 0），没有租约（ADR-0028 是后来的）。
+#     两个副本用同一个 WORKER_ID 会生成相同的订单号，这是只能 1 个副本的另一个原因。值和本机 scripts/bench.sh 一样：
+#     order 2、payment 3（inventory 不读 WORKER_ID）。
+#   - 订单库只有一个（bench1a_order_db，不分片），迁移在启动时自己跑（goose），所以 app 账号要建表的权限（bench.sh 给 ALL）。
+#   - 端口：HTTP 8080 到 8083、gRPC 9081 到 9083，同 1a 的默认值；这里还是显式写上 HTTP_ADDR、GRPC_ADDR。
+# 资源的 requests 和现在的 values（deploy/cluster/services/<服务>.yaml）一样，也不设 CPU 上限：两边的差别只在代码。
+# 不上控制面节点（同 chart 的 avoidControlPlane）。
+#
+# 名字都带 -1a 后缀，标签 app.kubernetes.io/part-of: oppenheimer-bench1a，bench.sh 按这个标签删。
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-1a
+  labels: {app.kubernetes.io/name: inventory-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  selector: {app.kubernetes.io/name: inventory-1a}
+  ports:
+    - {name: http, port: 8082, targetPort: http}
+    - {name: grpc, port: 9082, targetPort: grpc, appProtocol: kubernetes.io/h2c}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-1a
+  labels: {app.kubernetes.io/name: order-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  selector: {app.kubernetes.io/name: order-1a}
+  ports:
+    - {name: http, port: 8081, targetPort: http}
+    - {name: grpc, port: 9081, targetPort: grpc, appProtocol: kubernetes.io/h2c}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-1a
+  labels: {app.kubernetes.io/name: payment-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  selector: {app.kubernetes.io/name: payment-1a}
+  ports:
+    - {name: http, port: 8083, targetPort: http}
+    - {name: grpc, port: 9083, targetPort: grpc, appProtocol: kubernetes.io/h2c}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-1a
+  labels: {app.kubernetes.io/name: gateway-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  selector: {app.kubernetes.io/name: gateway-1a}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# 挂到同一个入口（envoy-gateway-system/public），和 1b 的 gateway 走同一条路径（发压 Pod -> 入口 Envoy -> gateway），
+# 主机名和 e2e 的 e2e.oppenheimer.test 分开。发压 Pod 用 hostAliases 把它指到入口的地址。
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gateway-1a
+  labels: {app.kubernetes.io/name: gateway-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: public, namespace: envoy-gateway-system}
+  hostnames: ["__HOST__"]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /}
+      backendRefs:
+        - {name: gateway-1a, port: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-1a
+  labels: {app.kubernetes.io/name: inventory-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: inventory-1a}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: inventory-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+    spec:
+      automountServiceAccountToken: false
+      # 环境变量里不要 Kubernetes 自动注入的 <SERVICE>_PORT 这一类（1a 不读，但少一个意外）。
+      enableServiceLinks: false
+      # app.DefaultStopTimeout 是 20 秒。
+      terminationGracePeriodSeconds: 25
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      containers:
+        - name: inventory
+          image: "__IMAGE_PREFIX__/inventory-1a:__TAG__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8082}
+            - {name: grpc, containerPort: 9082}
+          env:
+            - name: MYSQL_MAIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}
+            - {name: HTTP_ADDR, value: ":8082"}
+            - {name: GRPC_ADDR, value: ":9082"}
+            - {name: LOG_LEVEL, value: warn}
+            - {name: GOMEMLIMIT, value: 460MiB}
+            - name: MYSQL_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/bench1a_inventory_db"
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 2, failureThreshold: 90}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
+          resources:
+            requests: {cpu: 200m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-1a
+  labels: {app.kubernetes.io/name: order-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: order-1a}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: order-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 25
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      containers:
+        - name: order
+          image: "__IMAGE_PREFIX__/order-1a:__TAG__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8081}
+            - {name: grpc, containerPort: 9081}
+          env:
+            # 订单库在哪个实例由 BENCH_1A_ORDER_MYSQL 决定（默认 mysql-main，和另外两个库同一个实例）。
+            - name: __ORDER_PASSWORD_VAR__
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: __ORDER_PASSWORD_KEY__}}
+            - {name: HTTP_ADDR, value: ":8081"}
+            - {name: GRPC_ADDR, value: ":9081"}
+            - {name: LOG_LEVEL, value: warn}
+            - {name: GOMEMLIMIT, value: 690MiB}
+            - {name: WORKER_ID, value: "2"}
+            - {name: INVENTORY_ADDR, value: "inventory-1a:9082"}
+            # 压测期间不能有订单超时关单（同本机 bench）。
+            - {name: PAYMENT_TIMEOUT, value: 1h}
+            - name: MYSQL_DSN
+              value: "__ORDER_DSN__"
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 2, failureThreshold: 90}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
+          resources:
+            requests: {cpu: 300m, memory: 96Mi}
+            limits: {memory: 768Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-1a
+  labels: {app.kubernetes.io/name: payment-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: payment-1a}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: payment-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 25
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      containers:
+        - name: payment
+          image: "__IMAGE_PREFIX__/payment-1a:__TAG__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8083}
+            - {name: grpc, containerPort: 9083}
+          env:
+            - name: MYSQL_MAIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}
+            - {name: HTTP_ADDR, value: ":8083"}
+            - {name: GRPC_ADDR, value: ":9083"}
+            - {name: LOG_LEVEL, value: warn}
+            - {name: GOMEMLIMIT, value: 460MiB}
+            - {name: WORKER_ID, value: "3"}
+            - {name: ORDER_ADDR, value: "order-1a:9081"}
+            - name: MYSQL_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/bench1a_payment_db"
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 2, failureThreshold: 90}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-1a
+  labels: {app.kubernetes.io/name: gateway-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: gateway-1a}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: gateway-1a, app.kubernetes.io/part-of: oppenheimer-bench1a}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 25
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      containers:
+        - name: gateway
+          image: "__IMAGE_PREFIX__/gateway-1a:__TAG__"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: HTTP_ADDR, value: ":8080"}
+            - {name: LOG_LEVEL, value: warn}
+            - {name: GOMEMLIMIT, value: 460MiB}
+            # 1a 的 gateway 没有限流，也没有 TRUSTED_PROXIES。下游直连（见文件开头）。
+            - {name: ORDER_ADDR, value: "order-1a:9081"}
+            - {name: INVENTORY_ADDR, value: "inventory-1a:9082"}
+            - {name: PAYMENT_ADDR, value: "payment-1a:9083"}
+          startupProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 2, failureThreshold: 90}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          readinessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
+          resources:
+            requests: {cpu: 200m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}

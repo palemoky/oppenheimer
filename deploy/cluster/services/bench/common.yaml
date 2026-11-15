@@ -1,0 +1,17 @@
+# 吞吐对比（scripts/cluster/bench.sh，make cluster-bench）对六个服务共同的覆盖。叠在 e2e 那两层之上：
+# deploy/cluster/services/<服务>.yaml、e2e/common.yaml、e2e/<服务>.yaml、本目录的 common.yaml 和 <服务>.yaml
+#（services.sh 的 E2E_OVERLAY_DIR）。命名空间、e2e_* 库、前缀、入口的主机名都和 e2e 共用，这里只放 bench 不同的地方，
+# 每一项对照本机 scripts/bench.sh 里设的变量。
+#
+# 副本数：用长期运行那一套的设计值（gateway、order、inventory、payment、orderindex 各 2，cdc 1），HPA 关掉
+#（e2e/common.yaml 已经关了）：扩缩容在一轮里发生，这一轮的数字就说不清是几个副本量出来的。
+# gateway、order 在 e2e 那一层已经是 2；inventory、payment、orderindex 在各自的文件里改成 2。
+# 要和 1a 一样每个服务 1 个副本：BENCH_1B_REPLICAS=1，bench.sh 再叠一层 deploy/cluster/services/bench-single/。
+
+config:
+  # 同本机 bench（LOG_LEVEL=warn）。e2e 那一层已经是 warn，写在这里是为了不依赖它。
+  LOG_LEVEL: warn
+  # 不导出链路和指标。本机 bench 默认按 1% 采样导出到 otel-lgtm（有的话），集群上这一套没有接收端，
+  # e2e 那一层指向的 e2e-otlp 是 e2e 测试 Job 里的，bench 的 Job 里没有，连不上的导出器只会重连、刷警告。
+  # 1a 根本没有可观测的代码，关掉也让两边更可比（代价是 1b 的数字不含埋点的开销，见 bench.sh 开头）。
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""

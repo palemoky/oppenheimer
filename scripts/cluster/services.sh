@@ -19,6 +19,7 @@
 #                  没设就用当前的 Unix 时间（scripts/cluster/e2e.sh 会设好）。
 #   E2E_OVERLAY_DIR e2e-up、e2e-render 在 e2e 那两层 values 之上再叠的一层（目录里的 common.yaml 和 <服务>.yaml），
 #                  scripts/cluster/chaos.sh 设成 deploy/cluster/services/chaos。没设就没有这一层。
+#                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
 # 端到端测试的完整流程（建库、部署、跑 Job、收日志）在 scripts/cluster/e2e.sh（make cluster-e2e）。
 #
 # 用 $KUBECONFIG_OUT 指向的 kubeconfig，不看当前的 context（这台机器上还有 OrbStack 的集群）。
@@ -69,7 +70,7 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  sed -n '2,25p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,26p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -164,15 +165,19 @@ helm_args() { # 服务 tag
       HELM_ARGS+=(-f "$E2E_VALUES/$s.yaml")
     fi
     # 再叠一层（E2E_OVERLAY_DIR，scripts/cluster/chaos.sh 用 deploy/cluster/services/chaos）：同一套 e2e 环境
-    # 换一组配置，比如关限流、调短时限。没设就没有这一层。
-    if [[ -n "${E2E_OVERLAY_DIR:-}" ]]; then
-      if [[ -f "$E2E_OVERLAY_DIR/common.yaml" ]]; then
-        HELM_ARGS+=(-f "$E2E_OVERLAY_DIR/common.yaml")
+    # 换一组配置，比如关限流、调短时限。没设就没有这一层。可以用冒号隔开写几个目录（scripts/cluster/bench.sh
+    # 在 bench/ 之后再叠 bench-single/ 和临时生成的一层），按顺序叠，后面的覆盖前面的。
+    local d dirs
+    IFS=: read -r -a dirs <<<"${E2E_OVERLAY_DIR:-}"
+    for d in ${dirs[@]+"${dirs[@]}"}; do
+      [[ -n "$d" ]] || continue
+      if [[ -f "$d/common.yaml" ]]; then
+        HELM_ARGS+=(-f "$d/common.yaml")
       fi
-      if [[ -f "$E2E_OVERLAY_DIR/$s.yaml" ]]; then
-        HELM_ARGS+=(-f "$E2E_OVERLAY_DIR/$s.yaml")
+      if [[ -f "$d/$s.yaml" ]]; then
+        HELM_ARGS+=(-f "$d/$s.yaml")
       fi
-    fi
+    done
     # 每次运行不同的前缀（本机 scripts/e2e.sh 的 KAFKA_PREFIX、REDIS_PREFIX）。六个服务都给：用不到的服务不读它。
     # 值进 ConfigMap，变了校验和就变，重跑 e2e-up 会触发滚动。
     HELM_ARGS+=(--set-string "config.KAFKA_PREFIX=e2e-$E2E_RUN_ID."
@@ -193,10 +198,14 @@ use_e2e() {
     exit 2
     ;;
   esac
-  if [[ -n "${E2E_OVERLAY_DIR:-}" && ! -d "$E2E_OVERLAY_DIR" ]]; then
-    echo "E2E_OVERLAY_DIR $E2E_OVERLAY_DIR is not a directory" >&2
-    exit 2
-  fi
+  local d dirs
+  IFS=: read -r -a dirs <<<"${E2E_OVERLAY_DIR:-}"
+  for d in ${dirs[@]+"${dirs[@]}"}; do
+    if [[ -n "$d" && ! -d "$d" ]]; then
+      echo "E2E_OVERLAY_DIR: $d is not a directory" >&2
+      exit 2
+    fi
+  done
 }
 
 # 把 mysql 命名空间里三个实例的 app-password、cdc-password 复制成本命名空间的一个 Secret（Secret 不能跨命名空间引用）。

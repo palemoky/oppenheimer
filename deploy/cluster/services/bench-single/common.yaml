@@ -1,0 +1,5 @@
+# 吞吐对比里把 1b 也压成每个服务 1 个副本（BENCH_1B_REPLICAS=1，scripts/cluster/bench.sh），和 1a 对等。
+# 叠在 deploy/cluster/services/bench/ 之后（services.sh 的 E2E_OVERLAY_DIR 可以写多个目录，后面的覆盖前面的），
+# 所以这里的 replicas 盖过 bench/<服务>.yaml 和 e2e/<服务>.yaml 里的 2。cdc 本来就是 1。
+# 只改副本数：order 和 payment 的节点号是从库里租的，1 个副本照样能租到；PDB（maxUnavailable: 1）对 1 个副本不碍事。
+replicas: 1

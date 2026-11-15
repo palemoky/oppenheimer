@@ -1,0 +1,5 @@
+# gateway 在 bench 那一套里的覆盖（叠在 e2e/gateway.yaml 之上）。
+config:
+  # 限流整体关掉，同本机 scripts/bench.sh（RATE_LIMIT=off）：量的是下单和落库的吞吐，限流会把结果盖住，
+  # 看起来像“吞吐上不去”。1a 没有限流。e2e 那一层是开着的（ratelimit_test.go 要测它）。
+  RATE_LIMIT: "off"

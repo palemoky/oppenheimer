@@ -1,0 +1,14 @@
+# order 在 bench 那一套里的覆盖（叠在 e2e/order.yaml 之上）。
+config:
+  # 同本机 bench：支付时限设长，压测期间不会有订单超时关单（e2e 那一层是 3s）。
+  PAYMENT_TIMEOUT: 1h
+  # 同本机 bench：占用多久没被消费就回收。积压要排上几分钟时，默认的 1 分钟会把已受理的订单回收掉，
+  # 量到的落库吞吐就不是消费能力了。受理端的背压（ADMIT_MAX_QUEUE 默认 1 万、ADMIT_MAX_WAIT 默认取宽限的一半）照常开着，
+  # 和本机 bench 一样不改；要量“不设背压时受理能多快”，用 BENCH_1B_ADMIT_MAX_QUEUE=0（bench.sh 另叠一层）。
+  HOLD_REAP_GRACE: 1h
+  # e2e 那一层是 gtid（要测主从延迟）。bench 回到长期运行那一套的默认值 primary：本机 bench 没有从库，读的就是主库。
+  ORDER_READ_MODE: primary
+  # e2e 那一层把这两项调成测试用的值，这里设回服务的默认值（services/order：sweeper 30s、读主库的标记 3s），
+  # 让 bench 量到的是默认配置下的系统。
+  SWEEP_INTERVAL: 30s
+  ORDER_READ_PIN_TTL: 3s

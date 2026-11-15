@@ -1,0 +1,3 @@
+# payment 在 bench 那一套里的覆盖（叠在 e2e/payment.yaml 之上）。节点号照常从 e2e_payment_db 里租（ADR-0028）。
+# 下单压测不支付（-pay 0），payment 不在下单路径上，副本数只是和设计值保持一致。
+replicas: 2
