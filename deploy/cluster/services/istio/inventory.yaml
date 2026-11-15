@@ -1,0 +1,3 @@
+# inventory 在 istio 形态下的覆盖（设计文档 2d），叠在 ../inventory.yaml 之上、e2e 等叠加层之下（scripts/cluster/services.sh 的 MESH_ISTIO）。
+# 没有 gRPC 下游，只有入站（9082）过边车。
+mesh: istio

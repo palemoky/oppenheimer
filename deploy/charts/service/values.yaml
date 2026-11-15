@@ -57,14 +57,44 @@ pdb:
   enabled: true        # maxUnavailable: 1。cdc 只有一个实例，关掉
 
 # 普通 ClusterIP Service（<名字>），暴露服务的 HTTP 端口：给不经过边车的访问用（入口到 gateway、调试）。
+# grpcPort：ports.grpc 大于 0 时再暴露 gRPC 端口（端口名 grpc）。mesh: istio 时无条件有这个端口（调用方经它调用）；
+# mesh: envoy 时默认不开，迁移的准备阶段打开（scripts/cluster/services.sh 的 SERVICE_GRPC_PORT=1）：
+# 已经切到 Istio 的调用方连得到还没切的被调用方。
 service:
   enabled: true
+  grpcPort: false
 # headless Service（<名字>-headless），暴露边车的入站端口：调用方的边车 STRICT_DNS 解析它得到所有就绪的 Pod。
-# 只在边车开着时才有意义；没有入站监听的服务（gateway）自己关掉。
+# 只在手写边车开着时才有意义（mesh: istio 时不渲染）；没有入站监听的服务（gateway）自己关掉。
 headless:
   enabled: true
 
-# Envoy 边车（原生 sidecar：initContainers 里 restartPolicy: Always），设计文档 6.1。
+# 服务之间的 gRPC 走哪种边车（设计文档 2d）：
+#   envoy  chart 里手写的 Envoy 边车（下面的 sidecar、headless），迁移前的现状
+#   istio  Istio 自动注入的边车：不渲染手写边车的任何东西，Pod 上打注入标签，每个服务一个 ServiceAccount，
+#          Service 上暴露 gRPC 端口。流量规则在 deploy/cluster/mesh/（services.sh 先于 release 应用）
+# 迁移时逐个服务切（scripts/cluster/services.sh 的 MESH_ISTIO），两种形态在同一个命名空间里共存。
+mesh: envoy
+
+# 只在 mesh: istio 时起作用。
+istio:
+  # 注入边车。只有服务之间的 gRPC 要过边车：有 gRPC 入站的服务（ports.grpc > 0）和只有出站的 gateway 注入，
+  # 没有任何 gRPC 的 cdc 关掉（它的 values 叠加层里设 false）。关掉时 Pod 上显式写 inject: "false"。
+  inject: true
+  # 不过边车的出站端口：MySQL、Redis、Redis Cluster 总线、Sentinel、Kafka。它们不是 HTTP/gRPC，
+  # 边车除了多一跳什么也不做；Redis Cluster、Kafka 还会按节点地址直连，经边车只会多出一层要排查的东西。
+  excludeOutboundPorts: "3306,6379,16379,26379,9092"
+  # 边车的资源。默认不设，用网格的全局默认值（deploy/cluster/istio/：requests 50m / 64Mi，上限 192Mi）。
+  # 设了哪一项才渲染哪一项的注解：cpu -> proxyCPU，memory -> proxyMemory，memoryLimit -> proxyMemoryLimit（如 "256Mi"）。
+  proxy:
+    cpu: ""
+    memory: ""
+    memoryLimit: ""
+
+# Pod 模板上额外的注解，原样加在 chart 自己的注解之后。默认没有。
+# 现在只有故障注入（deploy/cluster/services/fault/gateway.yaml）用它打开边车的统计项（proxy.istio.io/config）。
+podAnnotations: {}
+
+# Envoy 边车（原生 sidecar：initContainers 里 restartPolicy: Always），设计文档 6.1。mesh: istio 时不起作用。
 sidecar:
   enabled: true
   image: envoyproxy/envoy:v1.40.2

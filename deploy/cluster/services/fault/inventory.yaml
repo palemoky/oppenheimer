@@ -1,0 +1,3 @@
+# inventory 在 fault 那一套里的覆盖（叠在 e2e/inventory.yaml 之上）。
+# 2 个副本：场景 B' 只挂住其中一个，看另一个接走全部流量；e2e 那一层是 1。
+replicas: 2

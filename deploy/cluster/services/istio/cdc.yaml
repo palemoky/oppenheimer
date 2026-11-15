@@ -1,0 +1,6 @@
+# cdc 在 istio 形态下的覆盖（设计文档 2d），叠在 ../cdc.yaml 之上（scripts/cluster/services.sh 的 MESH_ISTIO）。
+# 没有任何 gRPC（出站只有 MySQL 和 Kafka，都在 istio.excludeOutboundPorts 里），不注入边车：Pod 上是 inject: "false"。
+# 仍然切到 istio 形态，是为了和别的服务一样有自己的 ServiceAccount、不再依赖手写边车的那套 values。
+mesh: istio
+istio:
+  inject: false

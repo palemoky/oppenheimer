@@ -28,13 +28,50 @@ spec:
       labels:
         {{- include "service.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: oppenheimer
+        {{- if include "service.istio" . }}
+        # 按 Pod 选择注入（命名空间不打 istio-injection 标签）：同一个命名空间里的测试 Job、还没切过来的服务不受影响。
+        # 不注入的（cdc）显式写 "false"。
+        sidecar.istio.io/inject: {{ ternary "true" "false" (not (empty (include "service.istioInject" .))) | quote }}
+        {{- end }}
       annotations:
         # 配置或边车配置变了，Pod 模板就变，helm upgrade 触发滚动更新（环境变量只在启动时读）。
         checksum/config: {{ toYaml .Values.config | sha256sum }}
-        {{- if .Values.sidecar.enabled }}
+        {{- if include "service.envoySidecar" . }}
         checksum/sidecar: {{ .Values.sidecar.config | sha256sum }}
         {{- end }}
+        {{- if include "service.istioInject" . }}
+        # 入站只接管 gRPC 端口；HTTP 端口（探针、gateway 对外的 8080）不过边车。没有 gRPC 的（gateway）写空字符串：
+        # 不接管任何入站端口（不写这个注解的默认值是 "*"，全部接管）。
+        traffic.sidecar.istio.io/includeInboundPorts: {{ ternary (toString (int .Values.ports.grpc)) "" (gt (int .Values.ports.grpc) 0) | quote }}
+        # 探针不改写。Istio 默认把 HTTP 探针改成先打边车的 15020、由它转给应用，那是为“应用端口被边车接管、
+        # kubelet 没有证书连不进来”准备的；这里 HTTP 端口不过边车，kubelet 直接探应用，少依赖一个进程。
+        sidecar.istio.io/rewriteAppHTTPProbers: "false"
+        # 中间件（MySQL、Redis、Sentinel、Kafka）的出站不过边车。
+        traffic.sidecar.istio.io/excludeOutboundPorts: {{ .Values.istio.excludeOutboundPorts | quote }}
+        {{- with .Values.istio.proxy.cpu }}
+        sidecar.istio.io/proxyCPU: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.istio.proxy.memory }}
+        sidecar.istio.io/proxyMemory: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.istio.proxy.memoryLimit }}
+        sidecar.istio.io/proxyMemoryLimit: {{ . | quote }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      {{- if include "service.istio" . }}
+      # 每个服务一个 ServiceAccount：Istio 的工作负载身份（SPIFFE ID）由它来，后面的 mTLS、AuthorizationPolicy 按它认人。
+      # 下面的 automountServiceAccountToken: false 照旧：Istio 的边车用自己的投射卷（istio-token），不受它影响。
+      serviceAccountName: {{ $name }}
+      {{- else }}
+      # 手写边车形态用命名空间的 default，而且要显式写出来：从 Istio 形态退回来时，如果只是不写这个字段，
+      # Kubernetes 会保留旧值（Pod 模板里还有一个已废弃的同义字段 serviceAccount，删掉 serviceAccountName 时它不跟着清），
+      # 而那个 ServiceAccount 已经被 Helm 删了，新的 Pod 建不出来，滚动卡在一半（2d 演练回退时遇到的）。
+      serviceAccountName: default
+      {{- end }}
       # 服务不调 Kubernetes API，不挂令牌。
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -68,7 +105,7 @@ spec:
             matchLabels:
               {{- include "service.selectorLabels" . | nindent 14 }}
       {{- end }}
-      {{- if .Values.sidecar.enabled }}
+      {{- if include "service.envoySidecar" . }}
       # 原生 sidecar：边车先起来并就绪，服务才启动；服务容器全部退出之后才停边车（设计文档 6.1）。
       initContainers:
         - name: envoy
@@ -209,7 +246,7 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
-        {{- if .Values.sidecar.enabled }}
+        {{- if include "service.envoySidecar" . }}
         - name: envoy-config
           configMap:
             name: {{ $name }}-envoy

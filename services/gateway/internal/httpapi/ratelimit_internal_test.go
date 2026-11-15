@@ -1,6 +1,9 @@
 package httpapi
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"net/http"
 	"net/netip"
 	"os"
@@ -475,5 +478,113 @@ func TestParseTrustedProxies(t *testing.T) {
 		if _, err := ParseTrustedProxies(bad); err == nil {
 			t.Errorf("ParseTrustedProxies(%q) succeeded, want error", bad)
 		}
+	}
+}
+
+// meshRoute 是 Istio VirtualService 里 spec.http 的一条路由（只取这里要核对的字段）。
+type meshRoute struct {
+	Name  string `yaml:"name"`
+	Match []struct {
+		SourceLabels map[string]string `yaml:"sourceLabels"`
+	} `yaml:"match"`
+	Timeout string `yaml:"timeout"`
+	Retries *struct {
+		Attempts *int `yaml:"attempts"`
+	} `yaml:"retries"`
+}
+
+// meshRoutes 读 deploy/cluster/mesh/<callee>.yaml（多文档），返回其中唯一一个 VirtualService 的路由列表。
+func meshRoutes(t *testing.T, path string) []meshRoute {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read mesh config: %v", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	var routes []meshRoute
+	found := 0
+	for {
+		var doc struct {
+			Kind string `yaml:"kind"`
+			Spec struct {
+				HTTP []meshRoute `yaml:"http"`
+			} `yaml:"spec"`
+		}
+		if err := dec.Decode(&doc); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		if doc.Kind == "VirtualService" {
+			found++
+			routes = doc.Spec.HTTP
+		}
+	}
+	if found != 1 {
+		t.Fatalf("%s: found %d VirtualService documents, want exactly 1", path, found)
+	}
+	return routes
+}
+
+// checkMeshRoute 断言一条路由有 timeout（可选地等于 want）并且显式写了 retries.attempts: 0。
+func checkMeshRoute(t *testing.T, path string, r meshRoute, want time.Duration) {
+	t.Helper()
+	d, err := time.ParseDuration(r.Timeout)
+	switch {
+	case r.Timeout == "":
+		t.Errorf("%s: route %q has no timeout; without it a slow downstream is never ejected by the sidecar", path, r.Name)
+	case err != nil:
+		t.Errorf("%s: route %q timeout %q: %v", path, r.Name, r.Timeout, err)
+	case want != 0 && d != want:
+		t.Errorf("%s: route %q timeout = %v, hop budget in Go = %v; they must match", path, r.Name, d, want)
+	}
+	if r.Retries == nil || r.Retries.Attempts == nil {
+		t.Errorf("%s: route %q has no retries.attempts; Istio retries unavailable errors twice by default, "+
+			"and a synchronous call chain must not retry (a non-idempotent write would run more than once)", path, r.Name)
+	} else if *r.Retries.Attempts != 0 {
+		t.Errorf("%s: route %q retries.attempts = %d, want 0; a synchronous call chain must not retry "+
+			"(a non-idempotent write would run more than once)", path, r.Name, *r.Retries.Attempts)
+	}
+}
+
+// meshEdgeRoute 找出 sourceLabels 的 app.kubernetes.io/name 等于 caller 的那条路由。
+func meshEdgeRoute(t *testing.T, path string, routes []meshRoute, caller string) (meshRoute, bool) {
+	t.Helper()
+	for _, r := range routes {
+		for _, m := range r.Match {
+			if m.SourceLabels["app.kubernetes.io/name"] == caller {
+				return r, true
+			}
+		}
+	}
+	t.Errorf("%s: no route matches sourceLabels app.kubernetes.io/name=%s; %s would fall through to the catch-all route "+
+		"(or have no timeout at all without a VirtualService), so a slow downstream is never ejected", path, caller, caller)
+	return meshRoute{}, false
+}
+
+// TestHopTimeoutMatchesMesh：gateway 到四个下游的 VirtualService 路由都存在，timeout 等于 DownstreamHopBudget、不重试；
+// 并且每个文件里的每条路由都有 timeout 和 retries.attempts: 0，没有 match 的兜底路由在最后
+// （Istio 取第一条匹配的，兜底放前面会吃掉后面所有的路由）。
+func TestHopTimeoutMatchesMesh(t *testing.T) {
+	for _, callee := range []string{"order", "inventory", "payment", "orderindex"} {
+		t.Run(callee, func(t *testing.T) {
+			path := "../../../../deploy/cluster/mesh/" + callee + ".yaml"
+			routes := meshRoutes(t, path)
+			if len(routes) == 0 {
+				t.Fatalf("%s: VirtualService has no http routes", path)
+			}
+			if r, ok := meshEdgeRoute(t, path, routes, "gateway"); ok {
+				checkMeshRoute(t, path, r, DownstreamHopBudget)
+			}
+			for _, r := range routes {
+				checkMeshRoute(t, path, r, 0)
+			}
+			for i, r := range routes {
+				if last := i == len(routes)-1; last == (len(r.Match) > 0) {
+					t.Errorf("%s: route %q (index %d of %d): only the last route may have no match; "+
+						"Istio takes the first matching route, so a catch-all before the others swallows them", path, r.Name, i, len(routes))
+				}
+			}
+		})
 	}
 }

@@ -1,0 +1,10 @@
+# gateway 在 istio 形态下的覆盖（设计文档 2d），叠在 ../gateway.yaml 之上、e2e 等叠加层之下（scripts/cluster/services.sh 的 MESH_ISTIO）。
+# 没有 gRPC 入站，但四个出站要过边车，所以照样注入（istio.inject 默认 true）；入站一个端口都不接管（chart 按 ports.grpc 为 0 处理）。
+mesh: istio
+
+config:
+  # 下游连 Service 名加 gRPC 端口：出站被自己的边车截获，按 deploy/cluster/mesh/ 的规则路由、限流、摘除。
+  ORDER_ADDR: order:9081
+  INVENTORY_ADDR: inventory:9082
+  PAYMENT_ADDR: payment:9083
+  ORDERINDEX_ADDR: orderindex:9084

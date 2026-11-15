@@ -14,8 +14,17 @@ spec:
     - name: http
       port: {{ .Values.ports.http }}
       targetPort: http
+    {{- if and (gt (int .Values.ports.grpc) 0) (or (include "service.istio" .) .Values.service.grpcPort) }}
+    # 端口名必须是 grpc（或以 grpc- 开头）：Istio 靠端口名和 appProtocol 认协议。认不出来会被当成 TCP，
+    # 按连接而不是按请求负载均衡（一条 HTTP/2 连接上的请求全落到一个 Pod），超时、重试、摘除这些 HTTP 层的规则
+    # 也全部不生效，而且不报任何错。
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: {{ .Values.ports.grpc }}
+      appProtocol: grpc
+    {{- end }}
 {{- end }}
-{{- if and .Values.sidecar.enabled .Values.headless.enabled }}
+{{- if and (include "service.envoySidecar" .) .Values.headless.enabled }}
 ---
 # headless Service：DNS 返回所有就绪 Pod 的地址，调用方的边车用 STRICT_DNS 把每个地址当一个上游，按请求轮流
 # （设计文档 6.2）。暴露的是边车的入站端口，不是服务自己的 gRPC 端口：调用要经过被调用方的边车。

@@ -851,7 +851,8 @@ setup_1b() {
   printf '%s\n' "INSERT INTO e2e_inventory_db.sku_stock (sku_id, name, unit_price, available) VALUES $SKU_VALUES;" |
     e2e_root_sql "$POD_MAIN"
   log "1b: skus $SKU_LIST, stock $STOCK each"
-  run_phase warmup-gate "$OUT" 120 load warmup -inventory-addr inventory-headless:15001 -skus "$SKU_LIST" \
+  # 直连 inventory 的地址随它的形态（MESH_ISTIO）变，e2e-lib.sh 的 e2e_inventory_addr。
+  run_phase warmup-gate "$OUT" 120 load warmup -inventory-addr "$(e2e_inventory_addr)" -skus "$SKU_LIST" \
     -redis-addr "sentinel://gate@redis-gate-sentinel.redis.svc:26379" -redis-prefix "e2e-$RUN_ID:"
   [[ "$PHASE_CODE" == 0 ]] || die 1 "load warmup failed (see $OUT/warmup-gate.err)"
   wait_ingress_ready "$HOST_1B" /readyz

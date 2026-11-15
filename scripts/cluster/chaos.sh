@@ -99,8 +99,9 @@ KAFKA_BROKERS="kafka-kafka-bootstrap.kafka.svc:9092"
 KAFKA_PREFIX="e2e-$E2E_RUN_ID."
 REDIS_PREFIX="e2e-$E2E_RUN_ID:"
 GATEWAY_URL="http://e2e.oppenheimer.test"
-# warmup 直接调 inventory 的 gRPC：经它的 headless Service 到边车的入站端口（和别的服务的边车调它的路径一样）。
-INVENTORY_ADDR="inventory-headless:15001"
+# warmup 直接调 inventory 的 gRPC：手写边车形态下经它的 headless Service 到边车的入站端口（和别的服务的边车调它的路径一样），
+# Istio 形态（MESH_ISTIO 含 inventory）下是普通 Service 的 gRPC 端口（e2e-lib.sh 的 e2e_inventory_addr）。
+INVENTORY_ADDR="$(e2e_inventory_addr)"
 
 LOG_DIR="$ROOT/tmp/cluster-chaos-logs/$E2E_RUN_ID"
 EVENTS="$LOG_DIR/chaos-events.log"

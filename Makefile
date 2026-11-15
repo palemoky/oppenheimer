@@ -301,6 +301,10 @@ cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 
 cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
 	scripts/cluster/chaos.sh
 
+.PHONY: cluster-fault
+cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、并发上限、超时和不重试；和 cluster-e2e 共用 oppenheimer-e2e；FAULT_SCENARIOS、E2E_KEEP 见脚本
+	scripts/cluster/fault.sh
+
 .PHONY: cluster-bench
 cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（732f9ab，各 1 副本）后 1b（设计副本数），共用 oppenheimer-e2e；BENCH_* 见脚本，结果在 tmp/cluster-bench/，E2E_KEEP=1 保留现场
 	scripts/cluster/bench.sh
