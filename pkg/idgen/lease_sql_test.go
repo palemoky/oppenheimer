@@ -122,17 +122,22 @@ func TestSQLLeaseTakeoverAfterExpiry(t *testing.T) {
 	owners := map[int64]string{}
 	for i := range idgen.MaxWorkerID + 1 {
 		owner := fmt.Sprintf("old-%d", i)
-		id, _, err := store.Acquire(ctx, owner, ttl)
+		// 先用长租期占满：占满全部节点号要几十条语句，慢的机器上会超过 ttl，
+		// 用短租期的话最早的几个在下面的检查之前就过期了（CI 上出现过）。
+		id, _, err := store.Acquire(ctx, owner, time.Minute)
 		if err != nil {
 			t.Fatalf("acquire #%d: %v", i, err)
 		}
 		owners[id] = owner
-		if held, err := store.Extend(ctx, id, owner, ttl, 1000+id); err != nil || !held {
-			t.Fatalf("Extend = %v, %v", held, err)
-		}
 	}
 	if _, _, err := store.Acquire(ctx, "new", time.Minute); !errors.Is(err, idgen.ErrNoWorkerID) {
 		t.Fatalf("acquire before expiry: err = %v, want ErrNoWorkerID", err)
+	}
+	// 再把每个租约改成短租期并登记上界，下面等它们全部过期。
+	for id, owner := range owners {
+		if held, err := store.Extend(ctx, id, owner, ttl, 1000+id); err != nil || !held {
+			t.Fatalf("Extend = %v, %v", held, err)
+		}
 	}
 	time.Sleep(ttl + 100*time.Millisecond)
 
