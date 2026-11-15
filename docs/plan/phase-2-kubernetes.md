@@ -37,7 +37,7 @@
 ## 2c 服务上集群
 
 - [x] 设计文档 [design/2c-services.md](../design/2c-services.md)，主人已确认（2026-11-15）
-- [x] 节点号在多副本下的分配：没设 `WORKER_ID` 时从本服务的 MySQL 租（ADR-0028，`pkg/idgen` 的租约；本机 `make lint test e2e` 通过，集群上还没有跑过）
+- [x] 节点号在多副本下的分配：没设 `WORKER_ID` 时从本服务的 MySQL 租（ADR-0028，`pkg/idgen` 的租约；本机 `make lint test e2e` 通过；集群上四个 Pod 各租到不同的号，滚动时新旧各占一个。租约所在的库不可用时受理被拒绝再恢复、`kill -9` 之后 30 秒才能被租走，这两种没有在集群上验证）
 - [x] 多阶段 Dockerfile，构建 `linux/amd64` 镜像（`deploy/docker/Dockerfile`、`make images`；七个镜像已推到集群仓库并在节点上跑过）
 - [x] 一个公共 chart 加每个服务一份 values（`deploy/charts/service`、`deploy/cluster/services/`）；六个服务已部署，从入口走通下单到支付到商家索引的整条链路
 - [x] 探针：startup、liveness、readiness，与优雅启停配合（`DRAIN_DELAY` 15 秒，按实测的端点传播时间定的：最长 9.5 秒）
@@ -47,11 +47,11 @@
 - [ ] HPA：基于自定义指标（QPS），挪到阶段 3a，等有了 Prometheus
 - [x] 滚动发布策略，验证发布过程零报错：六个服务整体滚动两次共 28500 个请求 0 失败，`DRAIN_DELAY=0` 的对照每删一个 Pod 失败 15 个左右（`scripts/cluster/probe.py`）
 - [x] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决：直连 ClusterIP 时 gateway 的请求全部落在一个 inventory Pod 上，经边车时两个 Pod 各一半（设计文档 2c 第 13 节）
-- [ ] 在集群上重做 1b 的吞吐对比（`scripts/bench.sh`，1a 与 1b 各一遍），给出“下单吞吐相对 1a 是否有数量级提升”的结论。本机的测量疑似受 OrbStack 端口转发丢包干扰（约 23% 的提交卡在 200 毫秒，正好是 TCP 最小重传超时），见 1b 设计文档 7.3.4
+- [x] 在集群上重做 1b 的吞吐对比（`make cluster-bench`）：**没有数量级的提升**。1a 下单约 400 单/秒；1b 落库约 200 单/秒（1a 的一半），受理在默认背压下约 365 单/秒（被压回落库速度加一个队列的量），关掉背压约 1900 到 2500 单/秒（1a 的 5 到 6 倍，受集群大小限制）。短板是落库，原因没有查，留给阶段 3（设计文档 2c 第 13 节的第七步）
 - [x] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：**结论是不做**。滚动 payment 时每个分区只停 0.5 到 3.2 秒；franz-go 的静态成员关闭时不离组，Deployment 的新 Pod 又是新名字，用了反而要等会话超时（设计文档 2c 第 13 节的第七步，ADR-0007 的补充）
 - [x] 阶段 1 的端到端测试在集群上通过：`make cluster-e2e`，19 个用例，流量经入口的 Envoy（设计文档 2c 第 13 节的第五步）。一致性测试见下一条
 - [x] 一致性测试在集群上通过：`make cluster-chaos`，压测期间每 5 秒随机删一个业务 Pod，静止后 `verify` 和 `recon` 无差异；正常删除（23 个 Pod，客户端 0 个 5xx）和强制删除（22 个 Pod，29 个 5xx）各通过一次。查出并修掉 `kafkax` 启动时查死信 topic 的缺陷（三个 broker 才出现）
-- [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；还差示例 SKU 的脚本和“从空集群重建一遍”的验收。Argo CD 在 2d
+- [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；示例 SKU 的脚本（`make deploy-seed`）和降级开关的脚本（`make deploy-degrade`）已有；还差“从空集群重建一遍”的验收。Argo CD 在 2d
 
 ## 2d 生态组件巡礼（按需）
 
@@ -92,6 +92,7 @@ Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调
 - 两个 CDC 实例读同一个 MySQL 为什么 server id 必须不同。
 - 新建的 Kafka topic 为什么“建成功了却查不到”：每个 broker 的元数据缓存各自异步更新，单 broker 的环境测不出来。
 - 一致性测试的判定标准为什么是“数据对得上”而不是“零报错”；正常删除和强制删除在客户端看到的差别来自哪里。
+- 异步削峰到底提升了什么：受理和落库是两个数；背压把持续过载时的受理压回落库速度，“快”只在突发时成立；压测时怎么认出自己量到的是保护机制的上限而不是系统的能力。
 - 做对照实验：没有“去掉保护就失败”的对照，零失败说明不了保护起了作用；对照改过的配置要先恢复干净。
 
 2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：
