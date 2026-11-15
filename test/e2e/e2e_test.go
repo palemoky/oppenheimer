@@ -241,9 +241,24 @@ func waitLanded(t testing.TB, userID int64, id string) order {
 	return o
 }
 
+// getOrder 查订单。带 Retry-After 的 503 按接口的约定处理：稍后再试，最多等 10 秒。
+//
+// 这个 503 在一切正常时也会出现：订单还没落库、查询又没占到读闸门占用的名额（READ_GATE_MAX_CONCURRENCY）时，
+// 服务说不清订单的状态，答的是 STOCK_GATE_UNAVAILABLE 加 Retry-After，而不是猜一个 404。并行的用例一起轮询
+// 就可能碰上（CI 上出现过，PROGRESS 的 2026-11-15）。正确的客户端应当重试，这里照做；
+// 不看 Retry-After 的秒数（固定 5 秒，是给真实客户端的），隔 100 毫秒再问。别的非 200 仍然立刻失败。
 func getOrder(t testing.TB, userID int64, orderID string) order {
 	t.Helper()
-	r := mustCall(t, http.MethodGet, "/api/v1/orders/"+orderID, userID, "", nil)
+	deadline := time.Now().Add(10 * time.Second)
+	var r response
+	for {
+		r = mustCall(t, http.MethodGet, "/api/v1/orders/"+orderID, userID, "", nil)
+		retryable := r.status == http.StatusServiceUnavailable && r.header.Get("Retry-After") != ""
+		if !retryable || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if r.status != http.StatusOK {
 		t.Fatalf("get order %s: status %d: %s", orderID, r.status, r.body)
 	}
