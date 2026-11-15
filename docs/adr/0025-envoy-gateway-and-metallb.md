@@ -1,6 +1,6 @@
 # ADR-0025：集群入口用 Envoy Gateway 加 MetalLB，不用 ingress-nginx 和 k3s 自带的入口
 
-- 状态：已采纳（实测细节待 2a 补充）
+- 状态：已采纳
 - 日期：2026-11-15
 
 ## 背景
@@ -42,3 +42,14 @@
 ## 版本
 
 查证于 2026-11-15，引入时登记到 `docs/infra/versions.md`：Envoy Gateway v1.10.0（2026-11-06 发布），MetalLB v0.16.2。Gateway API 用 Envoy Gateway v1.10 的兼容性表里写的 v1.6.1（它支持 Kubernetes v1.34 到 v1.37），不用上游最新的 v1.7.0。Envoy Gateway 的每个版本只支持特定范围的 Gateway API 和 Kubernetes 版本，安装前要对照它的兼容性表。
+
+## 2a 的实测（2026-11-15）
+
+细节在设计文档 [2a-cluster.md](../design/2a-cluster.md) 的第 11、12 节。
+
+- 内存：Envoy Gateway 的控制器 41 Mi，Envoy 38 Mi；MetalLB 的控制器 35 Mi，三个 speaker 各约 22 Mi。合计不到 200 Mi。
+- MetalLB 的 chart 默认还会装 BGP 用的 frr-k8s（每个节点约 60 Mi），二层模式用不到，已用 `frrk8s.enabled=false` 关掉。
+- **Gateway API 的 CRD 实际用的是 k3s 自带的 v1.6.3（标准通道），不是上面写的 v1.6.1。** k3s v1.37 自己装这套 CRD；Envoy Gateway 的 chart 带的是实验通道的，装上去会被 Gateway API 的准入策略拒绝。所以只装 Envoy Gateway 自己的 CRD。后果：Gateway API 的版本跟着 k3s 走，升级 k3s 时要对照 Envoy Gateway 的兼容性表；实验通道才有的资源用不了。
+- 入口的 Service 用 `externalTrafficPolicy: Local`，后端看到的 `X-Forwarded-For` 是真实的客户端地址。
+- 入口地址在节点故障时的漂移时间没有量（阶段 4）。
+

@@ -16,7 +16,8 @@
 - [x] 存储：本地盘用 local-path，备份与共享数据用 NAS 的 NFS
 - [x] 入口与负载均衡：Envoy Gateway（Gateway API）加 MetalLB，禁用 k3s 自带的 Traefik 和 ServiceLB（ADR-0025）
 - [x] 建集群与重建集群的步骤脚本化（`make cluster-up`，重建演练 5 分 28 秒）
-- [ ] 2a 收尾：重启宿主机后集群自己恢复（要先和主人说）；etcd 的 fsync 延迟偏高，2b 上中间件后复查（设计文档 2a 第 12 节）
+- [x] 重启宿主机后集群自己恢复（104 秒）
+- [ ] etcd 的 fsync 延迟偏高，2b 上中间件后复查（设计文档 2a 第 12 节）
 
 ## 2b 中间件上集群
 
