@@ -26,7 +26,7 @@
 # 做的事，按顺序（同 scripts/cluster/chaos.sh，没有测试 Job：请求都从 MacBook 经入口发）：
 #   1. 构建并推送六个服务的镜像（E2E_SKIP_IMAGES=1 跳过，这时必须给 IMAGE_TAG）
 #   2. 占用命名空间 oppenheimer-e2e（和 e2e、chaos 共用，规则见 e2e-lib.sh 的“命名空间的占用”）
-#   3. 建 e2e_* 库并授权；services.sh e2e-up 部署六个服务，固定 MESH_ISTIO=all，values 在 e2e 那两层上
+#   3. 建 e2e_* 库并授权；services.sh e2e-up 部署六个服务，values 在 e2e 那两层上
 #      再叠 deploy/cluster/services/fault/（关限流、gateway 和 inventory 各 2 个副本、打开边车的统计项）
 #   4. 灌 SKU 3001（库存很大），等网关经入口就绪
 #   5. 依次跑场景；结束时（无论成败）先把挂住的进程全部 SIGCONT，失败时收日志，再 e2e-down（E2E_KEEP=1 保留现场）
@@ -80,8 +80,6 @@ source "$HERE/e2e-lib.sh"
 
 NS="${E2E_NAMESPACE:-oppenheimer-e2e}"
 export E2E_NAMESPACE="$NS"
-# 这个脚本验证的就是 Istio 的边车：六个服务全部 Istio 形态（services.sh 读它）。
-export MESH_ISTIO=all
 export E2E_OVERLAY_DIR="$ROOT/deploy/cluster/services/fault"
 IMAGES="gateway order inventory payment orderindex cdc"
 SKIP_DEPLOY="${FAULT_SKIP_DEPLOY:-0}"

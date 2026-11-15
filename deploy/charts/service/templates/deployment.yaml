@@ -28,17 +28,12 @@ spec:
       labels:
         {{- include "service.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: oppenheimer
-        {{- if include "service.istio" . }}
-        # 按 Pod 选择注入（命名空间不打 istio-injection 标签）：同一个命名空间里的测试 Job、还没切过来的服务不受影响。
+        # 按 Pod 选择注入（命名空间不打 istio-injection 标签）：同一个命名空间里的测试 Job 不受影响。
         # 不注入的（cdc）显式写 "false"。
         sidecar.istio.io/inject: {{ ternary "true" "false" (not (empty (include "service.istioInject" .))) | quote }}
-        {{- end }}
       annotations:
-        # 配置或边车配置变了，Pod 模板就变，helm upgrade 触发滚动更新（环境变量只在启动时读）。
+        # 配置变了，Pod 模板就变，helm upgrade 触发滚动更新（环境变量只在启动时读）。
         checksum/config: {{ toYaml .Values.config | sha256sum }}
-        {{- if include "service.envoySidecar" . }}
-        checksum/sidecar: {{ .Values.sidecar.config | sha256sum }}
-        {{- end }}
         {{- if include "service.istioInject" . }}
         # 入站只接管 gRPC 端口；HTTP 端口（探针、gateway 对外的 8080）不过边车。没有 gRPC 的（gateway）写空字符串：
         # 不接管任何入站端口（不写这个注解的默认值是 "*"，全部接管）。
@@ -62,16 +57,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      {{- if include "service.istio" . }}
       # 每个服务一个 ServiceAccount：Istio 的工作负载身份（SPIFFE ID）由它来，后面的 mTLS、AuthorizationPolicy 按它认人。
       # 下面的 automountServiceAccountToken: false 照旧：Istio 的边车用自己的投射卷（istio-token），不受它影响。
       serviceAccountName: {{ $name }}
-      {{- else }}
-      # 手写边车形态用命名空间的 default，而且要显式写出来：从 Istio 形态退回来时，如果只是不写这个字段，
-      # Kubernetes 会保留旧值（Pod 模板里还有一个已废弃的同义字段 serviceAccount，删掉 serviceAccountName 时它不跟着清），
-      # 而那个 ServiceAccount 已经被 Helm 删了，新的 Pod 建不出来，滚动卡在一半（2d 演练回退时遇到的）。
-      serviceAccountName: default
-      {{- end }}
       # 服务不调 Kubernetes API，不挂令牌。
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
@@ -104,67 +92,6 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "service.selectorLabels" . | nindent 14 }}
-      {{- end }}
-      {{- if include "service.envoySidecar" . }}
-      # 原生 sidecar：边车先起来并就绪，服务才启动；服务容器全部退出之后才停边车（设计文档 6.1）。
-      initContainers:
-        - name: envoy
-          image: {{ .Values.sidecar.image }}
-          restartPolicy: Always
-          args:
-            - -c
-            - /etc/envoy/envoy.yaml
-            - --log-level
-            - warn
-            - --service-cluster
-            - {{ $name }}
-            - --service-node
-            - envoy-{{ $name }}
-          ports:
-            - name: inbound
-              containerPort: {{ .Values.sidecar.inboundPort }}
-            - name: envoy-admin
-              containerPort: {{ .Values.sidecar.adminPort }}
-          startupProbe:
-            httpGet:
-              path: /ready
-              port: envoy-admin
-            # Envoy 要等出站集群的第一次 DNS 解析完成才就绪；下游的 headless Service 还不存在时可能要等一阵。
-            periodSeconds: 2
-            failureThreshold: 90
-          # 存活只看进程能不能应答。/ready 在启动和排空时是 503，不能拿来重启。
-          livenessProbe:
-            httpGet:
-              path: /server_info
-              port: envoy-admin
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: envoy-admin
-            periodSeconds: 3
-            timeoutSeconds: 2
-            failureThreshold: 2
-          resources:
-            requests:
-              cpu: {{ .Values.sidecar.resources.cpu }}
-              memory: {{ .Values.sidecar.resources.memoryRequestMi }}Mi
-            limits:
-              memory: {{ .Values.sidecar.resources.memoryLimitMi }}Mi
-          securityContext:
-            # Envoy 的镜像默认以 root 启动再降到 envoy（101）；这里直接以 101 运行，才能满足 runAsNonRoot。
-            runAsUser: 101
-            runAsGroup: 101
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
-          volumeMounts:
-            - name: envoy-config
-              mountPath: /etc/envoy
-              readOnly: true
       {{- end }}
       containers:
         - name: {{ $name }}
@@ -246,8 +173,3 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
-        {{- if include "service.envoySidecar" . }}
-        - name: envoy-config
-          configMap:
-            name: {{ $name }}-envoy
-        {{- end }}

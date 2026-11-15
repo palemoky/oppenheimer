@@ -288,7 +288,7 @@ images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓�
 	scripts/cluster/images.sh all $(IMAGE_SERVICES)
 
 .PHONY: deploy
-deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up（MESH_ISTIO= 退回手写的边车）；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
+deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
 	@tag="$$(scripts/cluster/images.sh tag)" && \
 	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
 	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)

@@ -18,33 +18,11 @@ E2E_MAIN_DBS="e2e_inventory_db e2e_payment_db e2e_merchant_index_db_0 e2e_mercha
 # 订单分片：release 序号 i 上是 e2e_order_db_i。
 E2E_ORDER_SHARDS="0 1"
 
-# 某个服务是不是 Istio 形态（设计文档 2d；services.sh 开头的 MESH_ISTIO）：没设是 all（见下），显式的空是全部用手写的 Envoy 边车，
-# all 是全部用 Istio，否则是空格分隔的服务名。services.sh 选 values，chaos.sh、bench.sh 选直连 inventory 的地址，
-# 三处用同一个判断。服务名的合法性由 services.sh 检查。
-# 默认是 all：长期运行的那一套在 2026-11-16 已经全部切到 Istio，默认还是手写边车的话，一次普通的 make deploy
-# 就会把它们全部退回去。没设才用默认值；显式设成空（MESH_ISTIO= make deploy）才是全部手写边车。
-export MESH_ISTIO="${MESH_ISTIO-all}"
-mesh_istio() { # 服务
-  case "${MESH_ISTIO:-}" in
-  "") return 1 ;;
-  all) return 0 ;;
-  esac
-  case " $MESH_ISTIO " in
-  *" $1 "*) return 0 ;;
-  esac
-  return 1
-}
-
-# 测试 Pod（不注入边车）直连 inventory 的 gRPC 的地址：手写边车形态下经 headless Service 到它边车的入站端口
-#（和别的服务的边车调它的路径一样）；Istio 形态下是普通 Service 的 gRPC 端口，请求由 inventory 自己的边车接管入站。
-# 9082 是 deploy/cluster/services/inventory.yaml 的 ports.grpc。
-e2e_inventory_addr() {
-  if mesh_istio inventory; then
-    echo "inventory:9082"
-  else
-    echo "inventory-headless:15001"
-  fi
-}
+# 测试的发压 Pod 直连 inventory 的 gRPC 的地址（chaos.sh、bench.sh 的 warmup 预热闸门用）：普通 Service 的 gRPC 端口。
+# 发压 Pod 也在网格里（注入边车，身份是 ServiceAccount load，deploy/cluster/e2e/mesh-load.yaml 单独放行它调 inventory），
+# 请求经自己的边车出站、由 inventory 的边车接管入站。9082 是 deploy/cluster/services/inventory.yaml 的 ports.grpc。
+# shellcheck disable=SC2034 # 由 source 它的脚本使用
+E2E_INVENTORY_ADDR="inventory:9082"
 
 # 某个 release 当前作为主库或从库的 Pod：以 -primary、-replica 两个 Service 实际选中的 Pod 名为准
 # （和 middleware.sh 的 mysql_check 同样的办法），不假设序号。

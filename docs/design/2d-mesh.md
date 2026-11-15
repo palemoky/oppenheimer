@@ -91,7 +91,7 @@ istiod ×1（istio-system）：把 Service、端点和下面的资源翻译成 E
 - Helm 装 `base`（CRD）和 `istiod` 两个 chart，版本固定，登记到 `versions.md`。不装 Istio 自己的入口网关（入口仍是 Envoy Gateway，ADR-0025）。新脚本 `scripts/cluster/mesh.sh`，`make mesh-up`，可重复执行，放进一键部署的顺序里（`middleware-up` 之后、`deploy` 之前：webhook 要先于业务 Pod 存在）。
 - istiod 1 个副本、关掉它自己的 HPA，requests 改小（第 6 节），和业务服务一样避开 server 节点。**istiod 挂了会怎样**要实测并写进笔记：已经在跑的边车用最后一份配置继续工作，但端点的变化推不下去，新 Pod 注入不了（webhook 的失败策略决定是创建失败还是不带边车起来）。
 - 重定向规则用默认的 init 容器（`istio-init`），不装 Istio CNI 的 DaemonSet（多三个常驻 Pod）。先在一个临时 Pod 上验证 nf_tables 后端和 AppArmor 下规则写得进去；写不进去再试 `nativeNftables`，再不行才换 CNI 插件。
-- 注入按命名空间打标签（`istio-injection=enabled`）：`oppenheimer` 和 `oppenheimer-e2e`。cdc 在 Pod 上标 `sidecar.istio.io/inject: "false"`。e2e 的测试 Job、压测 Job 也不注入（它们模拟的是集群外的客户端，走入口）。
+- 注入按命名空间打标签（`istio-injection=enabled`）：`oppenheimer` 和 `oppenheimer-e2e`。cdc 在 Pod 上标 `sidecar.istio.io/inject: "false"`。e2e 的测试 Job、压测 Job 也不注入（它们模拟的是集群外的客户端，走入口）。**实现时改了两处**：注入改成按 Pod 的标签（`sidecar.istio.io/inject: "true"`），命名空间不打标签，逐个服务迁移才做得到；删 Pod 测试和压测的 Job 后来也注入了，因为严格模式下它们的 warmup 连不进 inventory（第 10 节的第二到四步、第八步）。
 
 ### 3.3 chart 的改动
 
@@ -100,7 +100,7 @@ istiod ×1（istio-system）：把 Service、端点和下面的资源翻译成 E
 - 每个服务一个 ServiceAccount。
 - Pod 模板的注解：入站只接管 gRPC 端口，出站排除中间件的端口，边车的 requests 和 limits。
 - 下游地址从 `127.0.0.1:151xx` 改成 `<服务>:<gRPC 端口>`（同命名空间的短名字，两套命名空间不用区分）。
-- `DRAIN_DELAY` 先不动（15 秒）。端点改成经 xDS 推送之后传播应当比 DNS 快得多，按 2c 第四步同样的办法重新量，有了数再决定要不要降。
+- `DRAIN_DELAY` 先不动（15 秒）。端点改成经 xDS 推送之后传播应当比 DNS 快得多，按 2c 第四步同样的办法重新量，有了数再决定要不要降。（量了之后降到 5 秒，第 10 节的第七步。）
 
 ### 3.4 1d 的每一条怎么写
 
@@ -120,7 +120,7 @@ istiod ×1（istio-system）：把 Service、端点和下面的资源翻译成 E
 ```yaml
 trafficPolicy:
   connectionPool:
-    http: {http2MaxRequests: 128, http1MaxPendingRequests: 128, maxRetries: 0}
+    http: {http2MaxRequests: 128, http1MaxPendingRequests: 128}   # 草稿里还有 maxRetries: 0，实测不起作用，去掉了（第 10 节第一步）
   outlierDetection:
     consecutive5xxErrors: 5
     interval: 1s
@@ -133,7 +133,7 @@ trafficPolicy:
 
 入站：每个被调用的服务一个 `Sidecar` 资源，`inboundConnectionPool` 里 `http2MaxRequests` 写 1024（order）或 512。同一个资源里把 `egress` 的可见范围收到本命名空间加 `istio-system`：默认每个边车会拿到全网格所有 Service 的配置（包括中间件那些 headless Service 的每一个 Pod），内存随集群里的服务数增长，这是 Istio 在大集群里最常见的资源问题，这里顺手做对。
 
-mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间 `PeerAuthentication` 用默认的 `PERMISSIVE`（明文和 mTLS 都收，第 7 节的不停机切换依赖它）；全部切完后对 gRPC 端口改成 `STRICT`，再加 `AuthorizationPolicy`：order 的 gRPC 只允许 gateway 和 payment 的身份调，inventory 只允许 gateway 和 order，以此类推。
+mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间 `PeerAuthentication` 用默认的 `PERMISSIVE`（明文和 mTLS 都收，第 7 节的不停机切换依赖它）；全部切完后改成 `STRICT`（实现是命名空间级的一条：它只对被边车接管的端口起作用，而接管的只有 gRPC 端口，效果相同），再加 `AuthorizationPolicy`：order 的 gRPC 只允许 gateway 和 payment 的身份调，inventory 只允许 gateway 和 order，以此类推。
 
 ### 3.5 资源放在哪
 
@@ -293,7 +293,7 @@ mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间
 
 两个 gateway 各有各的统计，第 1 轮每个摊到 4 个，不够 5 次，所以第 2 轮才摘除。**和 1d 的结论一致：`maxGrpcTimeout` 没有妨碍路由超时计入摘除。**
 
-**一个和 1d 不一样、还没有查清的现象：超时的请求里有一部分是 504。** 1d 里边车超时调用方看到的一律是 `UNAVAILABLE`（503），504 只在边车不在时出现。推断（没有证实）：Istio 的出站边车会把剩余时间经请求头传给下游，被调用方的入站边车也按它计时，两边差不多同时到期；入站那边先到时返回的是 `DEADLINE_EXCEEDED`，gateway 映射成 504。对保护没有影响（摘除照常发生），但“503 表示边车超时、504 表示边车不在”这条 1d 的判断方法在集群上不成立了。第五步查。
+**一个和 1d 不一样、还没有查清的现象：超时的请求里有一部分是 504。** 1d 里边车超时调用方看到的一律是 `UNAVAILABLE`（503），504 只在边车不在时出现。推断（没有证实）：Istio 的出站边车会把剩余时间经请求头传给下游，被调用方的入站边车也按它计时，两边差不多同时到期；入站那边先到时返回的是 `DEADLINE_EXCEEDED`，gateway 映射成 504。对保护没有影响（摘除照常发生），但“503 表示边车超时、504 表示边车不在”这条 1d 的判断方法在集群上不成立了。第五步查到了支持这个推断的统计（见第五步的发现三）。
 
 **`istioctl analyze` 查出的问题**：`VirtualService` 的 `destination` 没写端口，Service 有 HTTP 和 gRPC 两个端口时有歧义（IST0112）。已补上端口。连带的一个要知道的后果写在清单的注释里：路由不按端口匹配，网格里的 Pod 访问别的服务的 HTTP 端口也会被送到 gRPC 端口；服务之间没有这样的调用。剩下一条提示：e2e 的 OTLP 接收端的端口名 `otlp-grpc` 不符合 Istio 的命名约定，被当成 TCP 透传，链路的用例通过，没有改。
 
@@ -366,6 +366,8 @@ mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间
 
 **切完之后把默认形态改成了 Istio**：没设 `MESH_ISTIO` 时是 `all`（原来是全部手写边车）。不改的话，一次普通的 `make deploy` 会把十个 Pod 全部退回去。显式设成空（`MESH_ISTIO= make deploy`）才是手写边车。控制面不在时部署脚本直接报错，提示先 `make mesh-up`。默认形态渲染出来的东西和集群上正在跑的没有差异（`kubectl diff` 为空）。
 
+**后来（第九步）开关删掉了**：chart 的 `mesh`、手写边车的模板、`deploy/cluster/services/istio/` 和脚本的 `MESH_ISTIO`、`SERVICE_GRPC_PORT` 都没有了，集群上只有 Istio 一种形态。上面写到这些名字的地方是当时的做法；要回到手写边车只能从 git 历史里恢复（提交 `35efd5d` 及之前）。
+
 ### 第八步：mTLS 严格模式和按身份的访问控制（2026-11-16）
 
 `deploy/cluster/mesh/security/policies.yaml`（Fable 写）：一条命名空间级的 `PeerAuthentication`（`STRICT`），每个被调用方一条 `AuthorizationPolicy`，只允许它的调用方的身份（order 允许 gateway 和 payment，inventory 允许 gateway 和 order，payment、orderindex 只允许 gateway）。它们只管被边车接管的端口，也就是 gRPC 端口；探针和 gateway 对外的 HTTP 端口不受影响。
@@ -393,14 +395,15 @@ mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间
 - **内存**：十个边车平均 32 Mi，最大 34 Mi；istiod 76 Mi。比手写的边车每个多约 15 Mi，合计约 150 Mi，加 istiod 共 230 Mi 左右。requests（边车 64 Mi、istiod 256 Mi）可以各降一半，没有改。
 - **滚动发布零报错**：迁移本身就是七次滚动，0 失败。
 
-- **端点传播时间，`DRAIN_DELAY` 从 15 秒降到 5 秒。** 探针开着，删一个 Pod，看它的日志里最后一个请求离它收到 SIGTERM 有多远。inventory 3 次、gateway 3 次、order 2 次：最后一个请求都落在 SIGTERM 之前 0.5 秒到之后 0.2 秒之间（探针每 0.5 秒发一批，所以分辨率就是 0.5 秒）。2c 里调用方的边车靠 DNS 发现端点，量到的是 1.7 到 9.5 秒。现在端点的变化由 istiod 经 EDS 推给每个边车，入口那一侧本来就是 Envoy Gateway 的 xDS。`DRAIN_DELAY` 改成 5 秒（chart 的默认值，仍然是实测的十倍），之后带着探针做了一次部署、一次全部重启、四次删 Pod：9570 个请求 0 失败。这一次没有再做 `DRAIN_DELAY=0` 的对照（2c 做过：每删一个 Pod 失败约 15 个）。**退回手写边车时要改回 15 秒。**
+- **端点传播时间，`DRAIN_DELAY` 从 15 秒降到 5 秒。** 探针开着，删一个 Pod，看它的日志里最后一个请求离它收到 SIGTERM 有多远。inventory 3 次、gateway 3 次、order 2 次：最后一个请求都落在 SIGTERM 之前 0.5 秒到之后 0.2 秒之间（探针每 0.5 秒发一批，所以分辨率就是 0.5 秒）。2c 里调用方的边车靠 DNS 发现端点，量到的是 1.7 到 9.5 秒。现在端点的变化由 istiod 经 EDS 推给每个边车，入口那一侧本来就是 Envoy Gateway 的 xDS。`DRAIN_DELAY` 改成 5 秒（chart 的默认值；量到的传播时间不超过 0.5 秒，留了十倍的余量），之后带着探针做了一次部署、一次全部重启、四次删 Pod：9570 个请求 0 失败。这一次没有再做 `DRAIN_DELAY=0` 的对照（2c 做过：每删一个 Pod 失败约 15 个）。**退回手写边车时要改回 15 秒。**
 
 **没有做的**：HPA 的扩容点没有重量（边车的 CPU requests 从 20m 变成 50m）；经边车和直连的延迟对比没有做。
 
 ## 11. 还没做的
 
 - 第七步剩下的两项（上面）：HPA 的扩容点、延迟对比；边车和 istiod 的 requests 可以各降一半。
-- 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；从空集群重建验证一键部署（顺序里多了 `make mesh-up`；要删虚拟机，先问主人）；ADR-0020 的补充；笔记。
+- 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；从空集群重建验证一键部署（顺序里多了 `make mesh-up`；要删虚拟机，先问主人）；笔记已写（`docs/notes/2d-mesh.md`），ADR-0020 的补充已写。
+- 第 4 节计划的两个对照没有做：`maxEjectionPercent` 用默认值时不摘除、路由不写 `timeout` 时慢下游不摘除。做了的对照只有“把重试打开”（场景 F）和“检查间隔改成 3 秒”。这两条在 1d 的手写边车上证过，Istio 下只确认了生成出来的配置是对的。
 - 摘除晚 0.5 到 1 秒生效的原因没有直接证实（用 EnvoyFilter 把 `update_merge_window` 设成 0 再量）。
 - 强制删 Pod 时客户端的 5xx 比 2c 多（133 对 29），两次删到的服务不同，没有做可比的对照。场景 C 表明被删的 Pod 是毫秒级失败，摘除时间也不累加，所以大概率只是这次 order 被删得多；没有证实。
 - `e2e` 的 OTLP 接收端的端口名不符合 Istio 的约定（被当成 TCP 透传）；`e2e_inventory_addr` 里 inventory 的端口是写死的。

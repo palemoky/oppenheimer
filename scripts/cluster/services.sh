@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 在 MacBook 上给集群部署六个业务服务（设计文档 2c 第 11 节）。
 #
-#   services.sh deploy [服务...]   复制 Secret、渲染并校验边车配置、helm upgrade --install --wait，最后打印各 Pod 的状态
+#   services.sh deploy [服务...]   复制 Secret、应用 Istio 的流量规则、helm upgrade --install --wait、应用 mTLS 和访问控制，
+#                                  最后打印各 Pod 的状态
 #   services.sh status             Pod、Service、HTTPRoute 的状态
 #   services.sh render [服务]      只把渲染后的清单打印出来（helm template），不碰集群上的资源
-#   services.sh envoy-validate     只渲染并校验五个边车的配置（需要 docker）
 #   services.sh e2e-prepare        端到端测试那一套的准备：命名空间、Secret（含 root 密码）、OTLP 接收端的 Service
 #   services.sh e2e-up             e2e-prepare 之后把六个服务部署到 e2e 的命名空间（values 叠上 deploy/cluster/services/e2e/）
 #   services.sh e2e-down           删掉 e2e 的命名空间，再清理它留在中间件里的库、topic、消费者组和 Redis 键
@@ -20,14 +20,9 @@
 #   E2E_OVERLAY_DIR e2e-up、e2e-render 在 e2e 那两层 values 之上再叠的一层（目录里的 common.yaml 和 <服务>.yaml），
 #                  scripts/cluster/chaos.sh 设成 deploy/cluster/services/chaos。没设就没有这一层。
 #                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
-#   MESH_ISTIO     哪些服务用 Istio 的边车（设计文档 2d，chart 的 mesh: istio）。没设时是 all（默认）；显式设成空是全部用手写的 Envoy 边车；
-#                  all 是全部用 Istio；或者空格分隔的服务名，只有这些用 Istio（逐个服务迁移的中间态）。
-#                  Istio 形态的服务不渲染边车配置，values 在基础那一层之后叠 deploy/cluster/services/istio/<服务>.yaml
-#                  （在 e2e 等叠加层之前）。非空时 deploy、e2e-up 在部署任何 release 之前先对目标命名空间
-#                  kubectl apply deploy/cluster/mesh/（流量规则先于 Pod 存在）。chaos.sh、bench.sh 也读它。
-#   SERVICE_GRPC_PORT  设成 1：仍是手写边车形态的服务也在 Service 上暴露 gRPC 端口（service.grpcPort=true）。
-#                  迁移的准备阶段用：已经切到 Istio 的调用方经 <服务>:<gRPC 端口> 才连得到还没切的被调用方。
-#                  MESH_ISTIO 非空时不用设，自动打开。
+# 服务之间走 Istio 的边车（设计文档 2d）：deploy、e2e-up 要求 istiod 已经装好（make mesh-up），在部署任何 release
+# 之前对目标命名空间 kubectl apply deploy/cluster/mesh/（流量规则先于 Pod 存在），全部滚动完之后再应用
+# deploy/cluster/mesh/security/（mTLS 严格模式和按身份的访问控制）。
 # 端到端测试的完整流程（建库、部署、跑 Job、收日志）在 scripts/cluster/e2e.sh（make cluster-e2e）。
 #
 # 用 $KUBECONFIG_OUT 指向的 kubeconfig，不看当前的 context（这台机器上还有 OrbStack 的集群）。
@@ -38,7 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=scripts/cluster/cluster.env
 source "$HERE/cluster.env"
 ROOT="$(cd "$HERE/../.." && pwd)"
-# mesh_istio（MESH_ISTIO 的判断，和 chaos.sh、bench.sh 共用）在这里。其余是 e2e 用的函数，只定义不执行。
+# e2e 用的函数，只定义不执行。
 # shellcheck source=scripts/cluster/e2e-lib.sh
 source "$HERE/e2e-lib.sh"
 
@@ -58,16 +53,12 @@ E2E_VALUES="$VALUES/e2e"
 E2E_MANIFESTS="$ROOT/deploy/cluster/e2e"
 E2E_MODE=0
 E2E_ROOT_SECRET="oppenheimer-e2e-root"
-ENVOY_DIR="$ROOT/deploy/envoy"
-# Istio 形态（MESH_ISTIO）：每个服务一层 values（叠在基础那一层之后），和对整个命名空间的流量规则。
-ISTIO_VALUES="$VALUES/istio"
+# Istio 的流量规则（对整个命名空间）和 mTLS、访问控制。
 MESH_RULES="$ROOT/deploy/cluster/mesh"
 MESH_SECURITY="$MESH_RULES/security/policies.yaml"
 E2E_MESH_LOAD="$E2E_MANIFESTS/mesh-load.yaml"
 # 依赖顺序：被依赖的先部署。order 启动时要预热对 inventory 的调用，payment 调 order，gateway 调所有。
 SERVICES=(inventory order payment orderindex cdc gateway)
-# Envoy 的版本和 Makefile 的 envoy-validate、chart 里的边车镜像一致。
-ENVOY_IMAGE="envoyproxy/envoy:v1.40.2"
 
 # 应用用的 Secret（本命名空间里），键名带上实例。chart 的 secretName 默认值是同一个名字。
 SECRET_NAME="oppenheimer-mysql"
@@ -79,14 +70,8 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 # 长期运行的那一套不需要也不该有 root 的密码。
 E2E_ROOT_SECRET_KEYS=(root-password)
 
-TMP=""
-cleanup() {
-  if [[ -n "$TMP" ]]; then command rm -rf "$TMP"; fi
-}
-trap cleanup EXIT
-
 usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,29p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -132,119 +117,39 @@ require_tag() {
   fi
 }
 
-# 边车配置：deploy/envoy/<服务>.yaml 是唯一的来源，这里替换两处地址再交给 chart（设计文档 6.3）：
-#   host.docker.internal           -> 127.0.0.1（同一个 Pod 里）
-#   address: envoy-<服务>,          -> <服务>-headless.<命名空间>.svc.cluster.local（作为上游地址出现的地方）
-render_envoy() { # 服务 输出文件
-  sed -E \
-    -e 's/host\.docker\.internal/127.0.0.1/g' \
-    -e "s/address: envoy-([a-z]+),/address: \\1-headless.${NS}.svc.cluster.local,/g" \
-    "$ENVOY_DIR/$1.yaml" >"$2"
-}
-
-# 和 make envoy-validate 同样的办法：Envoy 自己的校验模式，输出里有以 "' OK" 结尾的一行才算通过。
-# 不用 grep -q：pipefail 下提前退出的 grep 会让上游 SIGPIPE，误判失败。
-validate_envoy() { # 文件
-  local out code=0
-  out="$(docker run --rm -v "$1:/etc/envoy/envoy.yaml:ro" "$ENVOY_IMAGE" --mode validate -c /etc/envoy/envoy.yaml 2>&1)" || code=$?
-  # "' OK" 那一行后面还有别的日志，所以要么在行尾、要么后面跟换行。
-  if [[ $code -eq 0 && ("$out" == *"' OK" || "$out" == *"' OK"$'\n'*) ]]; then
-    return 0
-  fi
-  printf 'validation failed (docker exit %s), full output:\n%s\n' "$code" "$out" >&2
-  return 1
-}
-
-# MESH_ISTIO、SERVICE_GRPC_PORT 写错了就别往下走：拼错的服务名会被悄悄当成手写边车形态。
-check_mesh_env() {
-  local s
-  case "${SERVICE_GRPC_PORT:-}" in
-  "" | 0 | 1) ;;
-  *)
-    echo "SERVICE_GRPC_PORT must be empty, 0 or 1, got $SERVICE_GRPC_PORT" >&2
-    exit 2
-    ;;
-  esac
-  [[ -n "${MESH_ISTIO:-}" && "$MESH_ISTIO" != all ]] || return 0
-  for s in $MESH_ISTIO; do
-    check_services "$s"
-  done
-}
-
 # Istio 的流量规则（超时、并发上限、摘除，deploy/cluster/mesh/）对目标命名空间应用，在部署任何 release 之前：
 # 规则后建的话，新 Pod 起来的头几秒拿到的是默认行为（没有超时）。规则对没注入的 Pod 不起作用，先建无害。
 # 规则里的 host 都是短名字，所以同一份文件对长期运行和 e2e 两个命名空间各 apply 一次。
 apply_mesh_rules() {
-  [[ -n "${MESH_ISTIO:-}" ]] || return 0
-  echo "==> istio traffic rules (MESH_ISTIO=$MESH_ISTIO)"
-  # Istio 形态的 Pod 靠 istiod 的 webhook 注入边车；控制面不在的话 Pod 建不出来（webhook 的失败策略是 Fail），
+  echo "==> istio traffic rules"
+  # Pod 靠 istiod 的 webhook 注入边车；控制面不在的话 Pod 建不出来（webhook 的失败策略是 Fail），
   # 规则的 CRD 也不存在。在这里说清楚，比 kubectl apply 报“no matches for kind”好懂。
   if ! kubectl -n istio-system get deploy istiod >/dev/null 2>&1; then
-    echo "istiod is not installed; run make mesh-up first (or set MESH_ISTIO= to deploy with the hand-written Envoy sidecars)" >&2
+    echo "istiod is not installed; run make mesh-up first" >&2
     exit 1
   fi
+  # -f 一个目录不递归：security/ 子目录有意不被带上，那里的文件要先替换 __NS__（apply_mesh_security）。
   kubectl apply -n "$NS" -f "$MESH_RULES/" >/dev/null
   echo "    $MESH_RULES applied to $NS"
 }
 
-ensure_tmp() {
-  if [[ -z "$TMP" ]]; then TMP="$(mktemp -d)"; fi
-}
-
-# mTLS 严格模式和按身份的访问控制（deploy/cluster/mesh/security/）。在 release 部署完之后调用。
-# 只有全部服务都是 Istio 形态才应用：还有手写边车的 Pod 时，它们的明文请求会被拒绝。不是 all 的时候反过来把它们删掉，
-# 这样“从 all 退回某个中间态”的第一步就是放开，退回才不会断流（策略不存在时删除是空操作；连 CRD 都没有时也忽略）。
+# mTLS 严格模式和按身份的访问控制（deploy/cluster/mesh/security/）。在 release 全部滚动完之后调用。
 # 文件里的 __NS__ 换成目标命名空间。e2e 的命名空间多一份：测试的发压 Pod 的身份和它调 inventory 的许可。
 apply_mesh_security() {
   local f files=("$MESH_SECURITY")
   if [[ $E2E_MODE -eq 1 ]]; then files+=("$E2E_MESH_LOAD"); fi
-  if [[ "${MESH_ISTIO:-}" == all ]]; then
-    echo "==> istio mTLS (STRICT) and authorization policies"
-    # 这次只部署了一部分服务、命名空间里还有手写边车的 Pod（initContainer 叫 envoy）时不收紧。
-    if kubectl -n "$NS" get pods -o jsonpath='{range .items[*]}{.spec.initContainers[*].name}{"\n"}{end}' | grep -qw envoy; then
-      echo "    skipped: $NS still has pods with the hand-written sidecar; deploy the remaining services first" >&2
-      return 0
-    fi
-    for f in "${files[@]}"; do
-      sed "s/__NS__/$NS/g" "$f" | kubectl apply -n "$NS" -f - >/dev/null
-    done
-    echo "    applied to $NS"
-  else
-    # 只删策略；ServiceAccount load 留着（发压 Job 引用它）。
-    kubectl -n "$NS" delete peerauthentication.security.istio.io,authorizationpolicy.security.istio.io --all \
-      --ignore-not-found >/dev/null 2>&1 || true
-  fi
+  echo "==> istio mTLS (STRICT) and authorization policies"
+  for f in "${files[@]}"; do
+    sed "s/__NS__/$NS/g" "$f" | kubectl apply -n "$NS" -f - >/dev/null
+  done
+  echo "    applied to $NS"
 }
 
-# 渲染某个服务的边车配置到临时目录；没有边车（deploy/envoy 下没有它的文件，比如 cdc）或者这个服务是
-# Istio 形态（MESH_ISTIO）就什么都不做。成功后 $TMP/<服务>-envoy.yaml 存在。
-prepare_sidecar() { # 服务
-  [[ -f "$ENVOY_DIR/$1.yaml" ]] || return 0
-  if mesh_istio "$1"; then return 0; fi
-  ensure_tmp
-  render_envoy "$1" "$TMP/$1-envoy.yaml"
-}
-
-# 所有 helm 子命令共用的参数：values、镜像、边车配置。
-# Istio 形态的服务：基础 values 之后紧跟 istio/<服务>.yaml（e2e 等叠加层还在它后面，可以覆盖它），不传边车配置。
-# 手写边车形态的服务：SERVICE_GRPC_PORT=1 时 Service 上也暴露 gRPC 端口（Istio 形态的本来就有）。
+# 所有 helm 子命令共用的参数：values、镜像。
 helm_args() { # 服务 tag
   local s="$1" tag="$2"
   HELM_ARGS=(-n "$NS" -f "$VALUES/$s.yaml")
-  if mesh_istio "$s"; then
-    HELM_ARGS+=(-f "$ISTIO_VALUES/$s.yaml")
-  fi
   HELM_ARGS+=(--set "image.repository=$REGISTRY_ADDR/oppenheimer/$s" --set "image.tag=$tag")
-  if ! mesh_istio "$s"; then
-    if [[ -f "$TMP/$s-envoy.yaml" ]]; then
-      HELM_ARGS+=(--set-file "sidecar.config=$TMP/$s-envoy.yaml")
-    fi
-    # 只要有服务已经是 Istio 形态，就不看 SERVICE_GRPC_PORT、一律打开：漏设的话这次 upgrade 会把还没切的
-    # 被调用方的 gRPC 端口删掉，已经切过去的调用方立刻连不上。
-    if [[ "${SERVICE_GRPC_PORT:-}" == 1 || -n "${MESH_ISTIO:-}" ]]; then
-      HELM_ARGS+=(--set service.grpcPort=true)
-    fi
-  fi
   if [[ $E2E_MODE -eq 1 ]]; then
     HELM_ARGS+=(-f "$E2E_VALUES/common.yaml")
     if [[ -f "$E2E_VALUES/$s.yaml" ]]; then
@@ -271,7 +176,7 @@ helm_args() { # 服务 tag
   fi
 }
 
-# 切到 e2e 那一套：命名空间换掉（边车配置里下游的地址跟着换），helm_args 叠上 e2e 的 values。
+# 切到 e2e 那一套：命名空间换掉，helm_args 叠上 e2e 的 values。
 use_e2e() {
   NS="$E2E_NS"
   E2E_MODE=1
@@ -336,27 +241,14 @@ cmd_deploy() { # [服务...]
   deploy_releases "$@"
 }
 
-# 渲染并校验边车配置，按依赖顺序逐个 helm upgrade --install --wait，最后打印 Pod。deploy 和 e2e-up 共用。
+# 先应用流量规则，按依赖顺序逐个 helm upgrade --install --wait，滚动完再应用 mTLS 和访问控制，最后打印 Pod。
+# deploy 和 e2e-up 共用。
 deploy_releases() { # [服务...]
   local s list
   list=()
   while IFS= read -r s; do list+=("$s"); done < <(ordered "$@")
 
-  echo "==> envoy configs"
-  for s in "${list[@]}"; do
-    prepare_sidecar "$s"
-    if [[ -f "$TMP/$s-envoy.yaml" ]]; then
-      validate_envoy "$TMP/$s-envoy.yaml" || {
-        echo "envoy config of $s did not validate" >&2
-        return 1
-      }
-      echo "    $s: ok"
-    fi
-  done
-
   apply_mesh_rules
-  # 不是全部 Istio 形态时，先放开（删掉严格模式和访问控制）再滚动；是的话，滚动完再收紧。
-  if [[ "${MESH_ISTIO:-}" != all ]]; then apply_mesh_security; fi
 
   for s in "${list[@]}"; do
     echo "==> $s (image tag $IMAGE_TAG)"
@@ -364,7 +256,7 @@ deploy_releases() { # [服务...]
     helm upgrade --install "$s" "$CHART" "${HELM_ARGS[@]}" --wait --timeout 10m >/dev/null
   done
 
-  if [[ "${MESH_ISTIO:-}" == all ]]; then apply_mesh_security; fi
+  apply_mesh_security
 
   echo "==> pods"
   kubectl -n "$NS" get pods -o wide
@@ -385,22 +277,10 @@ cmd_render() { # [服务]
   list=()
   while IFS= read -r s; do list+=("$s"); done < <(ordered "$@")
   for s in "${list[@]}"; do
-    prepare_sidecar "$s"
     helm_args "$s" "$tag"
     echo "---"
     echo "# service: $s"
     helm template "$s" "$CHART" "${HELM_ARGS[@]}"
-  done
-}
-
-cmd_envoy_validate() {
-  local s
-  for s in "${SERVICES[@]}"; do
-    prepare_sidecar "$s"
-    if [[ -f "$TMP/$s-envoy.yaml" ]]; then
-      validate_envoy "$TMP/$s-envoy.yaml"
-      echo "$s: ok"
-    fi
   done
 }
 
@@ -449,12 +329,10 @@ cmd_e2e_down() {
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
 shift
-check_mesh_env
 case "$cmd" in
 deploy) cmd_deploy "$@" ;;
 status) cmd_status ;;
 render) cmd_render "$@" ;;
-envoy-validate) cmd_envoy_validate ;;
 e2e-prepare)
   use_e2e
   cmd_e2e_prepare

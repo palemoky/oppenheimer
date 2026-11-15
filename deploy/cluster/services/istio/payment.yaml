@@ -1,6 +1,0 @@
-# payment 在 istio 形态下的覆盖（设计文档 2d），叠在 ../payment.yaml 之上、e2e 等叠加层之下（scripts/cluster/services.sh 的 MESH_ISTIO）。
-mesh: istio
-
-config:
-  # 连 Service 名加 gRPC 端口，出站被自己的边车截获（规则在 deploy/cluster/mesh/order.yaml）。
-  ORDER_ADDR: order:9081

@@ -1,7 +1,7 @@
 # 服务之间的 mTLS 严格模式和按身份的访问控制（设计文档 2d 的 3.4、第 2 节第 8 项，ADR-0029）。
 # 模板：__NS__ 由 scripts/cluster/services.sh 换成目标命名空间（身份里带命名空间，所以不能像流量规则那样
-# 两个命名空间共用同一份文字）。只在全部服务都是 Istio 形态时应用，并且在 release 部署完之后：
-# 还有手写边车的 Pod 时，它们发的是明文、没有身份，会被下面两样东西拒绝。
+# 两个命名空间共用同一份文字）。在 release 部署完之后应用：没有边车的 Pod 发的是明文、没有身份，
+# 会被下面两样东西拒绝，所以要等新的 Pod 都带着边车起来。
 #
 # 这两样只管被边车接管的端口，也就是各服务的 gRPC 端口。HTTP 端口（探针、gateway 对外的 8080）不过边车，不受影响。
 #
@@ -9,7 +9,7 @@
 # spiffe://cluster.local/ns/<命名空间>/sa/<服务名>。被调用方的边车在 mTLS 握手时验证这张证书，
 # AuthorizationPolicy 的 principals 比的就是它（写的时候不带 spiffe:// 前缀）。
 ---
-# 只收 mTLS。默认的 PERMISSIVE 是明文和 mTLS 都收（迁移期间靠它）；全部进了网格之后收紧：
+# 只收 mTLS。默认的 PERMISSIVE 是明文和 mTLS 都收（从手写边车迁过来的那段时间靠的是它，设计文档 2d 第 7 节）；全部进了网格之后收紧：
 # 没有边车的 Pod（没有证书）连不进任何服务的 gRPC 端口。
 apiVersion: security.istio.io/v1
 kind: PeerAuthentication

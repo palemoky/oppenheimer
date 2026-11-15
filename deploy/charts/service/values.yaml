@@ -23,7 +23,6 @@ minReadySeconds: 5
 # 要大于 DRAIN_DELAY 加停止时限（20 秒）加边车退出的时间（设计文档 8.1）。不用 preStop。
 terminationGracePeriodSeconds: 45
 # 5 秒：Istio 下端点的变化经 xDS 推送，实测 Pod 收到 SIGTERM 之后 0.5 秒内就不再有新请求进来（设计文档 2d 第 10 节）。
-# 手写边车靠 DNS 时最长要 9.5 秒，那时是 15 秒；MESH_ISTIO= 退回手写边车时要改回 15s。
 drainDelay: 5s
 
 # 服务容器监听的端口。chart 把它们同时渲染成 HTTP_ADDR、GRPC_ADDR（监听所有地址，探针才连得到）。
@@ -58,26 +57,13 @@ spread: true
 pdb:
   enabled: true        # maxUnavailable: 1。cdc 只有一个实例，关掉
 
-# 普通 ClusterIP Service（<名字>），暴露服务的 HTTP 端口：给不经过边车的访问用（入口到 gateway、调试）。
-# grpcPort：ports.grpc 大于 0 时再暴露 gRPC 端口（端口名 grpc）。mesh: istio 时无条件有这个端口（调用方经它调用）；
-# mesh: envoy 时默认不开，迁移的准备阶段打开（scripts/cluster/services.sh 的 SERVICE_GRPC_PORT=1）：
-# 已经切到 Istio 的调用方连得到还没切的被调用方。
+# 普通 ClusterIP Service（<名字>），暴露服务的 HTTP 端口（入口到 gateway、调试，不经过边车），
+# ports.grpc 大于 0 时再暴露 gRPC 端口（端口名 grpc）：服务之间经它调用，出站被调用方自己的边车截获。
 service:
   enabled: true
-  grpcPort: false
-# headless Service（<名字>-headless），暴露边车的入站端口：调用方的边车 STRICT_DNS 解析它得到所有就绪的 Pod。
-# 只在手写边车开着时才有意义（mesh: istio 时不渲染）；没有入站监听的服务（gateway）自己关掉。
-headless:
-  enabled: true
 
-# 服务之间的 gRPC 走哪种边车（设计文档 2d）：
-#   envoy  chart 里手写的 Envoy 边车（下面的 sidecar、headless），迁移前的现状
-#   istio  Istio 自动注入的边车：不渲染手写边车的任何东西，Pod 上打注入标签，每个服务一个 ServiceAccount，
-#          Service 上暴露 gRPC 端口。流量规则在 deploy/cluster/mesh/（services.sh 先于 release 应用）
-# 迁移时逐个服务切（scripts/cluster/services.sh 的 MESH_ISTIO），两种形态在同一个命名空间里共存。
-mesh: envoy
-
-# 只在 mesh: istio 时起作用。
+# 服务之间的 gRPC 走 Istio 自动注入的边车（设计文档 2d）：Pod 上打注入标签，每个服务一个 ServiceAccount。
+# 流量规则在 deploy/cluster/mesh/（services.sh 先于 release 应用）。
 istio:
   # 注入边车。只有服务之间的 gRPC 要过边车：有 gRPC 入站的服务（ports.grpc > 0）和只有出站的 gateway 注入，
   # 没有任何 gRPC 的 cdc 关掉（它的 values 叠加层里设 false）。关掉时 Pod 上显式写 inject: "false"。
@@ -95,19 +81,6 @@ istio:
 # Pod 模板上额外的注解，原样加在 chart 自己的注解之后。默认没有。
 # 现在只有故障注入（deploy/cluster/services/fault/gateway.yaml）用它打开边车的统计项（proxy.istio.io/config）。
 podAnnotations: {}
-
-# Envoy 边车（原生 sidecar：initContainers 里 restartPolicy: Always），设计文档 6.1。mesh: istio 时不起作用。
-sidecar:
-  enabled: true
-  image: envoyproxy/envoy:v1.40.2
-  # 配置内容（Envoy 的 yaml）。由部署脚本用 --set-file 传入渲染过的 deploy/envoy/<服务>.yaml，不在 chart 里另存一份。
-  config: ""
-  inboundPort: 15001
-  adminPort: 9901
-  resources:
-    cpu: 20m
-    memoryRequestMi: 32
-    memoryLimitMi: 192
 
 # 对外路由，挂到入口的 Gateway（2a）。只有 gateway 开。
 route:

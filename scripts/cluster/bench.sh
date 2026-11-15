@@ -39,7 +39,7 @@
 #   - 数据库：1a 的三个库默认都在 mysql-main 一个实例上（同本机 bench 只有一个 MySQL），1b 的订单在两个分片实例上，
 #     库存和支付在 mysql-main。BENCH_1A_ORDER_MYSQL=order-0 把 1a 的订单库放到 mysql-order-0 上（库存仍在 mysql-main），
 #     这样 1a 也用上两个实例，单看“架构”而不是“实例数”。
-#   - 1b 多了边车（每个 Pod 一个 Envoy）、Kafka、Redis；1b 不导出链路（OTEL_EXPORTER_OTLP_ENDPOINT 为空），1a 没有埋点。
+#   - 1b 多了 Istio 的边车（除 cdc 外每个 Pod 一个，服务之间 mTLS）、Kafka、Redis；1b 不导出链路（OTEL_EXPORTER_OTLP_ENDPOINT 为空），1a 没有埋点。
 #   - 1b 是当前分支的代码（含 1c 的分片、1d 的保护、2c 的改动），不是 1b 刚做完时的代码：比的是“1a 对现在”。
 #
 # ---------- 发压模式（BENCH_MODE） ----------
@@ -851,8 +851,8 @@ setup_1b() {
   printf '%s\n' "INSERT INTO e2e_inventory_db.sku_stock (sku_id, name, unit_price, available) VALUES $SKU_VALUES;" |
     e2e_root_sql "$POD_MAIN"
   log "1b: skus $SKU_LIST, stock $STOCK each"
-  # 直连 inventory 的地址随它的形态（MESH_ISTIO）变，e2e-lib.sh 的 e2e_inventory_addr。
-  run_phase warmup-gate "$OUT" 120 load warmup -inventory-addr "$(e2e_inventory_addr)" -skus "$SKU_LIST" \
+  # 直连 inventory 的 gRPC（e2e-lib.sh 的 E2E_INVENTORY_ADDR）。
+  run_phase warmup-gate "$OUT" 120 load warmup -inventory-addr "$E2E_INVENTORY_ADDR" -skus "$SKU_LIST" \
     -redis-addr "sentinel://gate@redis-gate-sentinel.redis.svc:26379" -redis-prefix "e2e-$RUN_ID:"
   [[ "$PHASE_CODE" == 0 ]] || die 1 "load warmup failed (see $OUT/warmup-gate.err)"
   wait_ingress_ready "$HOST_1B" /readyz
@@ -944,7 +944,7 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.ca
   echo "replicas: 1a 1 per service (inventory, order, payment, gateway); 1b $REPLICAS_1B per service (gateway, order, inventory, payment, orderindex), cdc 1, no HPA"
   echo "1a databases: inventory and payment on mysql-main, order on $(order_1a_release); 1b: order on mysql-order-0/1 (2 shards), inventory and payment on mysql-main"
   echo "1b admission backlog limit: ${ADMIT_MAX_QUEUE:-service default (10000)}; rate limit off; PAYMENT_TIMEOUT 1h; HOLD_REAP_GRACE 1h; tracing off"
-  echo "1b has an Envoy sidecar per pod, Kafka and Redis; 1a calls services directly over ClusterIP"
+  echo "1b has an Istio sidecar per pod (except cdc) with mTLS between services, Kafka and Redis; 1a calls services directly over ClusterIP"
   echo "the long-running set in namespace oppenheimer shares MySQL, Kafka, Redis and the ingress"
   echo "nodes (vCPU):"
   sed 's/^/  /' "$OUT/nodes-capacity.txt"
