@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **当前阶段**：2d（服务之间的流量治理迁到 Istio）进行中：九步里做完了第一到六步和第八步，**六个服务已经不停机地切到 Istio**；剩第七步的重量和第九步的收尾（见“2d 做到哪”）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-15 从空虚拟机重建过一次，六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
+- **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完了，等主人看 PR。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出）。改动都已提交，**没有推送，还没有开 PR**。工作区是干净的。
 - **最后更新**：2026-11-16
 
@@ -73,31 +73,34 @@
 
 ### 2d 做到哪（2026-11-16）
 
-**PR #11（2c）已合并**（合并提交 `d36449f`）。分支 `phase-2d` 从合并后的 `main` 开出，已提交，**没有推送，还没有开 PR**（主人说全部做完再一起推送、开 PR）。
+**2d 必做的部分做完了**：服务之间的流量治理从手写的 Envoy 边车迁到了 Istio。设计文档 [design/2d-mesh.md](design/2d-mesh.md)（主人确认了第 2 节的八项，都按建议；九步的结果和量到的数在第 10 节，没做的在第 11 节），决定在 ADR-0029，笔记 [notes/2d-mesh.md](notes/2d-mesh.md)，面试考点已补进阶段计划。分支 `phase-2d`，PR 见“当前状态”。
 
-设计文档 [design/2d-mesh.md](design/2d-mesh.md)，主人确认了第 2 节的八项（都按建议），决定在 ADR-0029。实现顺序在设计第 8 节（九步），每一步的结果和量到的数在第 10 节，没做的在第 11 节。
+**集群现状（2026-11-16 从空虚拟机重建之后）**：全新的集群，一键部署的顺序是 `make cluster-up && make middleware-up && make mesh-up && make deploy && make deploy-seed`（`make mesh-check` 可以在 `mesh-up` 之后验证注入）。
 
-**集群现状：六个服务已经全部在 Istio 上**（命名空间 `oppenheimer`，镜像 tag `c54615c`）。istiod 1.32.0 在 `istio-system`（1 个副本）；五个有 gRPC 的服务各带一个注入的 `istio-proxy`（按 Pod 的标签注入，命名空间没有打标签），cdc 不注入；mTLS 是严格模式，每个被调用方有一条按身份的 `AuthorizationPolicy`。手写边车的 headless Service 和 ConfigMap 已经没有了。**`make deploy` 的默认形态现在是 Istio**（`MESH_ISTIO` 没设时是 `all`；`MESH_ISTIO= make deploy` 才退回手写边车，退之前读设计第 10 节第六步）。
+- istiod 1.32.0 在 `istio-system`（1 个副本，在 agent 节点上）。chart 和 istioctl 来自 GitHub 的发布包，`scripts/cluster/mesh.sh fetch` 放在 `./bin/istio-1.32.0/`；排查用 `scripts/cluster/mesh.sh istioctl proxy-config ...`。
+- 六个服务在命名空间 `oppenheimer`，镜像 tag 是重建时的提交号。五个有 gRPC 的服务各带一个注入的 `istio-proxy`（按 Pod 的标签 `sidecar.istio.io/inject` 注入，命名空间不打标签），cdc 不注入。入站只接管 gRPC 端口，到 MySQL、Redis、Kafka 的出站不过边车。
+- 流量规则在 `deploy/cluster/mesh/`（每条调用边的超时、不重试、并发上限、摘除；`make deploy` 先于 release 应用），mTLS 严格模式和按身份的访问控制在 `deploy/cluster/mesh/security/policies.yaml`（release 滚动完之后应用）。
+- `DRAIN_DELAY` 是 5 秒（2c 是 15 秒）。
+- **手写边车的形态已经从 chart 和集群脚本里删掉**，集群上只有 Istio 一种形态；本机 compose 和 CI 仍然用 `deploy/envoy/` 的手写边车。同一跳的超时写在三处（Go 的常量、`deploy/envoy/`、`deploy/cluster/mesh/`），有测试核对。
+- 库里只有示例 SKU 和验收时探针下的几百单；MySQL 的密码是新生成的；主库都是序号 0；新集群还没有做过手工备份。
 
-做完的（设计第 8 节的第一到六步、第八步，第七步的一部分）：
+**验证过的**：`make cluster-e2e`（19 个用例）、`make cluster-chaos`（正常删除、强制删除、严格模式下各一次）、`make cluster-fault`（八个场景，含“把重试打开”的对照）、不停机切换（e2e 上来回演练十次滚动 0 失败；长期运行的那一套七次部署 18770 个请求 0 失败）、访问控制的反向验证、从空集群重建。本机全量 `make lint test e2e` 通过。
 
-- 第一步：`make mesh-up`、`make mesh-status`、`make mesh-check`（`scripts/cluster/mesh.sh`，values 在 `deploy/cluster/istio/istiod.yaml`）。chart 不在官方 Helm 仓库里，`mesh.sh fetch` 从 GitHub 的发布包取到 `./bin/istio-1.32.0/`（里面有 istioctl：`scripts/cluster/mesh.sh istioctl ...`）。
-- 第二步：chart 的 `mesh: envoy | istio`（Opus）；每条调用边的 `VirtualService`、`DestinationRule` 和每个服务的 `Sidecar` 在 `deploy/cluster/mesh/`（Fable）；各服务 Istio 形态下的 values 在 `deploy/cluster/services/istio/`。
-- 第三步：三个 Go 测试核对代码常量、`deploy/envoy/`、`deploy/cluster/mesh/` 三处超时一致、不重试（Sonnet）。
-- 第四步：`make cluster-e2e` 19 个用例通过；`make cluster-chaos` 正常删除、强制删除、严格模式下各通过一次。
-- 第五步：`make cluster-fault`（`scripts/cluster/fault.sh`，Opus 写）八个场景通过，数值和 1d 对得上。三个发现（设计第 10 节）：摘除晚 0.5 到 1 秒生效（也解释了 1d 里那个没有解释的现象）；摘除时间在间隔几秒的重复故障下不累加（不需要 EnvoyFilter）；超时的请求有一部分是 504（被调用方的入站边车也在计时）。
-- 第六步：先在 e2e 上来回演练（十次滚动 0 失败），再切长期运行的那一套（七次部署，探针 18770 个请求 0 失败）。演练抓到回退时才出现的缺陷（Pod 模板残留的 ServiceAccount），已修。
-- 第八步：`deploy/cluster/mesh/security/policies.yaml`（模板，`__NS__`），部署脚本在全部是 Istio 形态、滚动完之后应用。删 Pod 测试和压测的 Job 进了网格（ServiceAccount `load`，e2e 命名空间里单独放行）。反向验证过：名单外的身份 403，没有边车的 Pod 连接被重置。
-- 第七步做了的：负载均衡（两个副本各一半）、内存（边车平均 32 Mi，istiod 76 Mi）。端点传播时间重量了：Pod 收到 SIGTERM 后 0.5 秒内就不再有新请求（2c 是 1.7 到 9.5 秒），**`DRAIN_DELAY` 从 15 秒降到 5 秒**（chart 的默认值；已部署，之后的滚动和删 Pod 9570 个请求 0 失败；退回手写边车时要改回 15 秒）。
+**这个阶段的几个发现**（细节在设计第 10 节）：
 
-本机 `make lint`（gateway、order、payment 三个模块）0 issues，`make test` 这三个模块通过，`make envoy-validate` 通过。**全量的 `make lint test` 和本机 `make e2e` 这一轮没有跑**（Go 只改了三个测试文件；本机的 e2e 走手写边车，没有动过它的配置）。推送之前跑一遍。
+- Istio 默认对 `UNAVAILABLE` 重试 2 次，必须显式关；关没关掉要有“打开时”的对照才说明得了。
+- 摘除在触发之后 0.5 到 1 秒才生效（也解释了 1d 里那个没有解释的现象）；原因和 Envoy 的 `update_merge_window` 吻合，没有直接证实。
+- 摘除时间在间隔几秒的重复故障下不累加，不需要 EnvoyFilter。
+- 边车超时时调用方看到的可能是 503 也可能是 504（被调用方的入站边车也在计时）：1d 的“503 是边车超时、504 是边车不在”在集群上不成立了。
+- 回退路径上有只在退回时出现的缺陷（Pod 模板残留的 ServiceAccount），演练时发现并修掉；随后整条回退路径随手写边车的分支一起删了。
+- 重建时 `make cluster-up` 因为经代理的下载断了三次，重跑才完成：脚本里的下载没有重试。
 
 **下一步，新会话从这里开始：**
 
-1. **2d 剩下的**（设计第 11 节）：
-   - 第七步剩下的：HPA 的扩容点重量（边车的 CPU requests 变了）；经边车和直连的延迟对比；边车和 istiod 的 requests 各降一半。
-   - 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；**从空集群重建验证一键部署**（顺序是 `make cluster-up && make middleware-up && make mesh-up && make deploy && make deploy-seed`；要删三台虚拟机，**先问主人**）；2d 的笔记（派 Sonnet，材料是设计第 1、3、10 节和 ADR-0029；面试考点已经补进阶段计划）。
-   - 然后跑全量 `make lint test e2e`，推送，开 PR（CI 派 Haiku 看）。
+1. 请主人看 2d 的 PR，决定合并。2d 其余几项（Argo CD、cert-manager、灰度发布）这次不做（ADR-0029 第 8 项）；阶段 2 到此可以收尾，下一个是阶段 3（可观测，需要 Mac mini，先提醒主人开机）。
+   - 2d 留下、适合在阶段 3 压测时一起做的：HPA 的扩容点重量（边车的 CPU requests 从 20m 变成 50m）；经边车和直连的延迟对比；边车和 istiod 的内存 requests 各降一半（实际 32 Mi、66 到 76 Mi）；接监控时定 Istio 边车保留哪些统计项、要不要开访问日志。
+   - 适合放进阶段 4 的：istiod 不在时的行为（已有的边车继续工作、新 Pod 建不出来，没有实测）；入站并发上限没有压到过；设计第 4 节计划的两个对照没有做。
+   - 小的欠账：一键部署里经代理的下载没有重试；e2e 的 OTLP 接收端端口名不符合 Istio 的约定；server 节点的内存偏高（重建后 73%），来源没有查。
 2. **阶段 3 压测之前要处理的**（都是 2c 发现、没有修的）：
    - 1b 在集群上的落库只有约 200 单/秒，是本机的四分之一左右，原因没有查（线索：最忙的是订单库 0 的从库，约 1 核）。
    - 扩容时新 order Pod 一就绪就有十几个 503（推断是冷连接池，Fable 改）。

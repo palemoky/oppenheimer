@@ -59,7 +59,7 @@
 - [ ] cert-manager：证书
 - [ ] Argo CD：GitOps
 - [ ] 灰度发布：Argo Rollouts 或 Ingress 金丝雀
-- [ ] 服务网格：把服务之间手写的 Envoy 边车迁到 Istio，熔断、并发上限、路由超时逐项对照 1d 的实测重新验证（设计文档 [2d-mesh.md](../design/2d-mesh.md)，ADR-0029；主人 2026-11-15 定的，不是“按需”）。**已做完**：Istio 1.32.0 边车模式，六个服务不停机地切了过去（探针 18770 个请求 0 失败）；`make cluster-fault` 八个场景通过，数值和 1d 对得上；`make cluster-e2e`、`make cluster-chaos` 通过；mTLS 严格模式加按身份的访问控制。**还差**：端点传播时间和 `DRAIN_DELAY`、HPA 扩容点、延迟对比没有重量；chart 里手写边车的分支还没删；没有从空集群重建验证过（设计第 11 节）
+- [x] 服务网格：把服务之间手写的 Envoy 边车迁到 Istio（设计文档 [2d-mesh.md](../design/2d-mesh.md)，ADR-0029，笔记 [2d-mesh.md](../notes/2d-mesh.md)；主人 2026-11-15 定的，不是“按需”）。Istio 1.32.0 边车模式，六个服务不停机地切了过去（探针 18770 个请求 0 失败）；`make cluster-fault` 八个场景通过，数值和 1d 对得上；`make cluster-e2e`、`make cluster-chaos` 通过；`DRAIN_DELAY` 从 15 秒降到 5 秒；chart 里手写边车的分支已删；从空集群重建验证过（`make cluster-up && make middleware-up && make mesh-up && make deploy && make deploy-seed`）。没有重量的：HPA 的扩容点、经边车和直连的延迟（挪到阶段 3 压测时一起量）
 - [x] 服务之间的访问控制：用网格的 mTLS 严格模式加 `AuthorizationPolicy` 做了（按身份，只管 gRPC 端口），代替了 NetworkPolicy 那一条想防的大部分；gateway 的 HTTP 入口仍然没有限制
 
 ## 验收标准

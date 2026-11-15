@@ -399,14 +399,35 @@ mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间
 
 **没有做的**：HPA 的扩容点没有重量（边车的 CPU requests 从 20m 变成 50m）；经边车和直连的延迟对比没有做。
 
+### 第九步：删掉手写边车的分支，从空集群重建（2026-11-16）
+
+**删分支**（Opus，主人确认现在删）：chart 的 `mesh`、`sidecar`、`headless`、`service.grpcPort` 和对应的模板，`deploy/cluster/services/istio/`（并进了各服务的基础 values），脚本的 `MESH_ISTIO`、`SERVICE_GRPC_PORT`、渲染和校验手写边车配置的函数。27 个文件，减 419 行、加 78 行。判据：六个服务和 e2e 的五种叠加组合，删之前和删之后的渲染结果去掉注释行后逐字节相同；对集群上正在跑的那一套 `kubectl diff` 为空。本机 compose 和 CI 用的 `deploy/envoy/`、`make envoy-validate`、`make fault` 都没有动。
+
+**从空集群重建**（主人确认后做的）：删掉三台虚拟机，然后 `make cluster-up`、`make middleware-up`、`make mesh-up`、`make mesh-check`、`make deploy`、`make deploy-seed`。
+
+| 步骤 | 耗时 |
+|---|---|
+| 删三台虚拟机 | 3 秒 |
+| `make cluster-up` | **跑了四次才完成**，前三次分别在 114 秒、37 秒、194 秒处失败 |
+| `make middleware-up` | 8 分 49 秒 |
+| `make mesh-up` | 41 秒 |
+| `make mesh-check` | 36 秒 |
+| `make deploy` | 1 分 51 秒 |
+| `make deploy-seed` | 不到 1 秒 |
+
+- 验收：11 个业务 Pod 全部就绪（10 个带 `istio-proxy`），严格模式和四条访问控制策略都在，整个集群没有一个容器重启过；探针 30 秒 1380 个请求 0 失败；`make cluster-e2e` 19 个用例通过。本机 `make lint`（11 个模块 0 issues）、`make test`、`make e2e`（19 个用例）通过。
+- **`cluster-up` 的三次失败都是经代理的下载断了**，和网格无关：两次是节点上下载 k3s 的校验文件（`Download failed`），一次是 Helm 从 Docker Hub 取 Envoy Gateway 的 chart（`EOF`）。每一步都可以重复执行，重跑就接着做；但“一条命令从头跑到尾”这次没有做到。脚本里这几处下载没有重试，是可以补的（k3s 的安装脚本和 `helm upgrade --install` 外面各包一层有上限的重试）。没有改。
+- 这次的连续脚本在 `cluster-up` 失败之后没有停下来（写法的问题），所以中间件、Istio 和业务服务是在入口还没装上的情况下装好的，入口最后补上。顺带说明这几样之间没有安装顺序上的依赖（HTTPRoute 用的 CRD 是 k3s 自带的）。
+- 重建之后 server 节点的内存是 73%，agent 是 36% 到 38%。2c 重建后轻载时 server 是 48%。网格没有任何东西在 server 上（istiod 在 agent 上，66 Mi），多出来的没有查。
+
 ## 11. 还没做的
 
 - 第七步剩下的两项（上面）：HPA 的扩容点、延迟对比；边车和 istiod 的 requests 可以各降一半。
-- 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；从空集群重建验证一键部署（顺序里多了 `make mesh-up`；要删虚拟机，先问主人）；笔记已写（`docs/notes/2d-mesh.md`），ADR-0020 的补充已写。
+- 一键部署里几处经代理的下载没有重试（第九步）。
 - 第 4 节计划的两个对照没有做：`maxEjectionPercent` 用默认值时不摘除、路由不写 `timeout` 时慢下游不摘除。做了的对照只有“把重试打开”（场景 F）和“检查间隔改成 3 秒”。这两条在 1d 的手写边车上证过，Istio 下只确认了生成出来的配置是对的。
 - 摘除晚 0.5 到 1 秒生效的原因没有直接证实（用 EnvoyFilter 把 `update_merge_window` 设成 0 再量）。
 - 强制删 Pod 时客户端的 5xx 比 2c 多（133 对 29），两次删到的服务不同，没有做可比的对照。场景 C 表明被删的 Pod 是毫秒级失败，摘除时间也不累加，所以大概率只是这次 order 被删得多；没有证实。
 - `e2e` 的 OTLP 接收端的端口名不符合 Istio 的约定（被当成 TCP 透传）；`e2e_inventory_addr` 里 inventory 的端口是写死的。
 - 手写边车的入站上限在 Istio 下换成了 `Sidecar` 的 `inboundConnectionPool`，配置确认下发了（上限 1024），**没有压到上限验证过**。
 - istiod 不在时的行为（已有的边车继续工作、新 Pod 建不出来）没有实测，放进阶段 4。
-- server 节点的内存在这一天的测试之后是 76%（重建后轻载时 48%）；网格没有任何东西在它上面，来源没有查。
+- server 节点的内存偏高（重建后 73%，2c 重建后是 48%）；网格没有任何东西在它上面，来源没有查。阶段 3 装监控之前要弄清。
