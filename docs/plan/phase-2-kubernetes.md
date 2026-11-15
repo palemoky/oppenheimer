@@ -21,14 +21,15 @@
 
 ## 2b 中间件上集群
 
-- [ ] MySQL：2 分片 × 一主一从（对比 Operator 与 StatefulSet 手写，选一种并写 ADR）
-- [ ] Redis Cluster：3 主 3 从
-- [ ] Kafka：Strimzi Operator，KRaft 模式 3 broker
+- [x] 节点的 AppArmor 拦掉容器内的信号：`vm.sh` 里关掉 `apparmor_restrict_unprivileged_unconfined`，重建集群（设计文档 2b 第 10 节的发现 1）
+- [x] MySQL：2 分片 × 一主一从加一个共享实例，手写 StatefulSet（ADR-0027，设计文档 [2b-middleware.md](../design/2b-middleware.md)）
+- [x] Redis：闸门和锁用一主一从加 Sentinel，缓存和限流用 Redis Cluster 3 主 3 从；`pkg/redisx` 支持三种模式，`pkg/ratelimit` 适配 Cluster
+- [x] Kafka：Strimzi Operator，KRaft 模式 3 broker（Kafka 4.3.2，Strimzi 还不支持 4.4）
 - [ ] 各中间件的资源限额、反亲和、PDB、持久化
 - [ ] 入口的 Envoy 改成 2 个副本并分散到两个节点（阶段 4 之前）
 - [ ] MySQL 定时备份到 NAS，并演练一次恢复
 - [ ] etcd 快照定时存到 NAS，并演练一次从快照恢复（ADR-0026）
-- [ ] 中间件部署完、灌数据之前量各节点的内存，改定 CNI 用 flannel 还是 Cilium（ADR-0026）
+- [x] 中间件部署完、灌数据之前量各节点的内存，改定 CNI：保留 flannel（ADR-0026）
 
 ## 2c 服务上集群
 

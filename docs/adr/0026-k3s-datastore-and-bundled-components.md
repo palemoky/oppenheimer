@@ -1,6 +1,6 @@
 # ADR-0026：k3s 用内嵌 etcd；自带组件里保留 flannel、CoreDNS、local-path，禁用 Traefik 和 ServiceLB
 
-- 状态：已采纳（CNI 一项是暂定，见“后果”）
+- 状态：已采纳（CNI 已在 2b 改定为 flannel，见末尾）
 - 日期：2026-11-15
 
 ## 背景
@@ -58,4 +58,10 @@ flannel 配上 k3s 内嵌的策略控制器已经能执行 NetworkPolicy，2d �
 - server 上 k3s 进程（apiserver、etcd、调度器等都在里面）占 638 MiB。空集群三个节点合计约 3.1 GiB，这是 CNI 决定的第一份输入。
 - 重启宿主机后单成员的 etcd 自己恢复，集群 104 秒后全部就绪。
 - flannel 的 MTU 和跨节点吞吐没有量。
+
+## CNI 改定：保留 flannel（2026-11-15，阶段 2b）
+
+按“后果”一节的约定，中间件第一次部署完、灌数据之前量了内存（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节）。三个节点可分配合计约 24 Gi，空集群加全部中间件的 requests 已经承诺出去 13.1 Gi，剩约 10.9 Gi。还没上的监控、业务服务、Chaos Mesh 的预算合计 9 GB，放进去之后剩约 1.9 Gi。Cilium 估计多用 1 到 1.5 GB（仍然是公开资料的粗估），装上之后基本没有余量，agent-2 已经承诺了 62%。
+
+决定保留 flannel。放弃的是用 eBPF 取代 kube-proxy、Hubble 的按连接可观测，以及它和阶段 9 的衔接；NetworkPolicy 不受影响（k3s 内嵌的策略控制器）。重新评估的条件：宿主机加内存，或者监控的实际占用明显低于预算。
 

@@ -52,4 +52,5 @@
 | [0023](0023-instrumentation.md) | 埋点：链路过 outbox 靠表里的一列，异步一跳以父子为主，指标走 OTLP | 已采纳 |
 | [0024](0024-tempo-for-traces.md) | 链路后端用 Grafana Tempo，不部署 SkyWalking（修改 ADR-0004） | 已采纳 |
 | [0025](0025-envoy-gateway-and-metallb.md) | 集群入口用 Envoy Gateway 加 MetalLB，不用 ingress-nginx 和 k3s 自带的入口 | 已采纳 |
-| [0026](0026-k3s-datastore-and-bundled-components.md) | k3s 用内嵌 etcd；保留 flannel（暂定）、CoreDNS、local-path，禁用 Traefik 和 ServiceLB | 已采纳，CNI 暂定 |
+| [0026](0026-k3s-datastore-and-bundled-components.md) | k3s 用内嵌 etcd；保留 flannel（暂定）、CoreDNS、local-path，禁用 Traefik 和 ServiceLB | 已采纳 |
+| [0027](0027-mysql-statefulset-not-operator.md) | 集群上的 MySQL 用手写的 StatefulSet，不用 Operator | 已采纳 |
