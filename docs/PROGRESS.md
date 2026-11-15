@@ -4,9 +4,60 @@
 
 ## 当前状态
 
-- **当前阶段**：1d（限流、熔断、降级与对账）。步骤一到四已推送（PR #7，HEAD `219da67`），CI 25 项全部通过；步骤五（对账）已分 4 个提交推送（`c8e8c9c` 到 `b09a74e`），另有一个修 CI 脚本的提交（`1ac7c1c`）和增量对账的两个提交（到 `4e0f4ca`），CI 27 项全部通过；步骤六（埋点）已分 6 个提交推送（`7826840` 到 `493e983`），CI 27 项全部通过；1d 的六步都做完了。1c 五步全部完成并已合并进 `main`
-- **当前分支**：`phase-1-wrapup`（从 `main` 开出，已推送并开 draft PR #8，CI 27 项全部通过）。1d 的 PR #7 已于 2026-11-14 合并进 `main`（合并提交 `d04e118`）
+- **当前阶段**：2a（集群搭建）完成，集群在运行；下一步是 2b（中间件上集群）。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
+- **当前分支**：`phase-2a`（从 `main` 开出）。宿主机和虚拟机的准备已提交在本地（两个提交，脚本和文档），**没有推送**。2a 的全部工作已提交在本地（主人 2026-11-15 要求提交；脚本和清单、设计文档、面试笔记各一个提交），**没有推送**（主人没有要求推送）。
 - **最后更新**：2026-11-15
+
+### 2a 做到哪（2026-11-15）
+
+已完成：
+
+- 摸清了三台设备的现状，地址规划写进了 `scripts/cluster/cluster.env` 和 [infra/hardware.md](infra/hardware.md) 的“网络”。
+- 宿主机（`ssh ubt`，xinyu 已有免密 sudo）装好了 KVM 和 libvirt（qemu 10.2.1、libvirt 12.0.0、virtinst、cloud-image-utils、nfs-common），xinyu 已加进 `libvirt`、`kvm` 组。
+- `scripts/cluster/host-setup.sh`（装包、建网桥 `br0`、登记 libvirt 网络 `host-bridge`、停掉默认的 NAT 网络）和 `on-host.sh`（从 MacBook 把脚本推到宿主机执行）已跑通，重复运行没有变化。宿主机的有线网卡现在接在 `br0` 上，地址是静态的（写在 `/etc/netplan/10-cluster-bridge.yaml`），默认路由走 `br0`；Wi-Fi 没有动，`ssh ubt` 仍然走它。
+- Ubuntu 26.04 的 cloud image 已下到宿主机的 `/var/lib/libvirt/images/base/`，SHA256 核对过。
+- 换盘方案写在 `tmp/disk-migration.md`（本地文档，不入库）。
+
+- 宿主机整机备份在 NAS 的 `/volume1/homes/me/backups/ubt-20261115/`（2026-11-15）：`metadata.tar`（分区表、LVM 元数据、fstab、启动项、软件包清单）和 `rootfs.tar.zst`（`/`、`/boot`、`/boot/efi`，16.8 GB，两端 SHA256 一致；没有做过恢复演练）。
+- **网线拔掉时宿主机从 IPv4 连不上的问题已修**：`br0` 是静态地址，没有载波时路由还在而且比 Wi-Fi 的优先。修法是 `ignore_routes_with_linkdown=1`（已写进 `host-setup.sh`）。再遇到 IPv4 连不上时可以走 Wi-Fi 网卡的 IPv6 链路本地地址（在 MacBook 上 `ping6 ff02::1%en0` 找邻居）。
+- 板载网口确认是硬件坏了（只通告千兆时链路起不来，别的电脑接同一个路由器口是千兆）。主人已把网线拔掉，现在只走 Wi-Fi；长期方案是加一块 PCIe 网卡，显示器（U2723QX）的 USB 网口可以临时顶替。**网线没插时 `host-setup.sh` 会因为没有链路而退出**（`ALLOW_NO_LINK=1` 可以跳过）。
+- 换盘定了走方案 A（没有硬盘盒）：主人拔 Windows 盘装 1TB，主会话经 ssh 做迁移，主人再换回。
+
+- **换盘（方案 A）的软件步骤已做完并重启验证过**（2026-11-15）：1TB 分成 EFI 1G、`/boot` 2G、LVM 928G；根分区用 `pvmove` 在线搬到新盘，旧盘已移出卷组；`/boot`、EFI 复制过去，`/etc/fstab` 换了两个 UUID（原件在 `/etc/fstab.before-migration`）；GRUB 装到新盘，主板启动项 `Boot0001` 指向新盘的 EFI 分区。卷组里还有约 698G 没分配。250GB 的旧盘按主人要求已清空（分区表和签名都抹掉，整盘 discard），指向它的启动项已删。虚拟机磁盘的卷已建：`/dev/ubuntu-vg/vmpool`，600G，ext4，挂在 `/var/lib/libvirt/images`（fstab 里带 `nofail`），cloud image 已挪进去并重新核对过；卷组还剩约 98G 没分配。**剩下的**：主人关机拔掉 250GB、把 Windows 盘装回 `M2_1`，开机后主会话确认启动顺序和 Windows 的启动项。
+- `br0` 在 netplan 里加了 `optional: true`：没插网线时开机不再等 2 分钟（等待期间 ssh 会以 pam_nologin 拒绝登录）。
+
+- **换盘全部完成**：Windows 盘已装回 `M2_1`，开机自动进 Ubuntu，启动顺序是 Ubuntu、Windows Boot Manager（Windows 没有实际启动验证过）。
+- **三台虚拟机已建好**（`scripts/cluster/vm.sh`，经 `scripts/cluster/on-host.sh vm.sh create` 调用；规格和地址见 [infra/hardware.md](infra/hardware.md)）。从 MacBook 用 `ubuntu` 用户直接 ssh 到节点地址能登录；三台都能经 R2S 访问 GitHub、Docker Hub、get.k3s.io，互相按名字能 ping 通。还没有装 k3s。
+
+- **2a 的集群已建成并做过一次完整的重建演练**（2026-11-15）。设计文档 [design/2a-cluster.md](design/2a-cluster.md)（主人确认了第 2 节的六项，都按建议），实现中的七个发现在第 11 节，结果和实测的数在第 12 节。现状：
+  - k3s v1.37.2+k3s1，1 server 加 2 agent，内嵌 etcd，flannel；MetalLB（二层模式）；镜像仓库（集群里，数据在 NAS 的 `/volume1/k8s/registry`，明文 HTTP）；Envoy Gateway v1.10.0，`Gateway` 叫 `public`，在 `envoy-gateway-system`，监听 80。固定地址见 hardware.md 的“网络”和 `cluster.env`。
+  - 用法：`make cluster-up`（从空宿主机到可用集群，可重复执行，重建实测 5 分 28 秒）、`make cluster-status`、`make cluster-smoke`。kubeconfig 在 `~/.kube/oppenheimer.yaml`，**不在默认的 `~/.kube/config` 里**，手工操作要 `export KUBECONFIG=~/.kube/oppenheimer.yaml`。删虚拟机是 `scripts/cluster/on-host.sh vm.sh destroy <名字...>`。
+  - NAS 的共享文件夹 `k8s` 主人已建好（NFS 权限按设计文档 6.2），NAS 不需要 root。子目录要直接挂载，并且建好后要 `chmod` 一次（设计文档第 11 节的发现 2）。
+  - 宿主机加了 `br_netfilter` 的 udev 规则（`host-setup.sh`），做过实验。
+  - 仓库里留着一个测试镜像 `test/busybox:1.37.0`，可以不管。
+
+停在哪、在等什么：
+
+1. 2a 没有在等的事。重启宿主机的检查已做（2026-11-15）：不做任何操作，104 秒后集群全部恢复。宿主机上有主人自己的一个 traefik 容器，以后重启宿主机前仍然先说一声。
+2. **PCIe 网卡还没装，有线仍是 100 Mbit/s**。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。
+3. 出网的白名单由主人管，**不要去改 R2S**。R2S 经路由通告下发的 IPv6 DNS 不走代理、返回被污染的地址，节点一侧已经绕开（`accept-ra: false`）；局域网里其他在白名单内的设备可能有同样的问题，已告诉主人。
+
+下一步：
+
+1. 主人要求时推送 `phase-2a` 并开 PR。仓库是公开的：PROGRESS 里的地址主人已要求去掉；`hardware.md`、`cluster.env`、设计文档里仍有局域网的地址规划（脚本要用），推送前和主人确认一次。
+2. 2b 的设计文档（`docs/design/2b-middleware.md`）：MySQL 用 Operator 还是手写 StatefulSet（要写 ADR）、Redis Cluster、Strimzi；中间件用节点亲和放在两个 agent 上，server 只放轻负载；数据用 local-path，备份走 NFS。
+3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
+4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
+5. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
+
+2a 用到的版本都已登记到 `versions.md`。已查证、还没有用到的：Cilium v1.20.4。
+
+主人已定的（2026-11-15；前三项已写成 ADR-0025、ADR-0026）：
+
+- **入口控制器用 Envoy Gateway**（查到的最新版 v1.10.0，Gateway API 按它的兼容性表用 v1.6.1），取代已停止维护的 ingress-nginx；负载均衡用 MetalLB（地址池见 hardware.md）。k3s 自带的 Traefik 和 ServiceLB 要禁用（`--disable=traefik --disable=servicelb`）。
+- **k3s 的数据存储用内嵌 etcd**（server 加 `--cluster-init`）。
+- **CNI 由主会话按内存决定**：先用自带的 flannel，**2b 的中间件第一次部署完、量过内存之后、灌数据之前**回来改定（ADR-0026 的后果一节），够再换 Cilium（查到的最新版 v1.20.4）。换 CNI 等于重建集群。
+- **换盘要同时保留 Windows 和 Ubuntu**（已按方案 A 做完，见上）。
 
 ## 上次做到哪
 
@@ -175,16 +226,16 @@
 
 ## 阻塞项与待确认
 
-- 无。阶段 1 只需要 MacBook，其他设备不用开机。
+- 见“当前状态”里的“停在哪、在等什么”：千兆网卡。
 
 ## 设备状态（上次已知）
 
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 关机，阶段 2 开始需要 |
+| Ubuntu 3900X | 开机（2026-11-15），k3s 集群在运行，Ubuntu 26.04.1，有线接在网桥 `br0` 上（百兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 关机，阶段 3 开始需要 |
-| DS218+ | 关机，阶段 2 开始需要 |
+| DS218+ | 开机（2026-11-15） |
 
 ## 计划变更记录
 
@@ -232,6 +283,7 @@
 | 2026-11-15 | 链路后端从 SkyWalking 换成 Grafana Tempo，不部署 SkyWalking | 本机已经在用 Tempo；三种信号统一成 PromQL、LogQL、TraceQL，Agent 只对接一套；省约 3 GB 内存；去掉 ADR-0004 的待验证项。见 ADR-0024，主人提出并确认 |
 | 2026-11-15 | 阶段 5 增加“封闭式判断交给决策模型（Gemini Decision 1）”的对比实验，挂在模型分层下面；3d 和阶段 4 不接，主循环保持 Claude | 它只做是否、多选、打分，不能做主循环；适合判分、裁剪工具输出、告警分诊，接不接由评测数据决定。主人提出并确认 |
 | 2026-11-15 | 诊断 Agent 的 Kubernetes 只读工具从阶段 5 提前到 3d，pprof 工具提前到阶段 4（Go 代码缺陷实验之前） | 阶段 4 的 Pod 和节点类故障、Go 缺陷类故障没有这两个工具基本诊断不了，运行记录也就没有评测价值。主人提出并确认 |
+| 2026-11-15 | 2a 的入口控制器不再考虑 ingress-nginx；虚拟机等宿主机换上 1TB 的盘再建 | ingress-nginx 已于 2026 年 3 月停止维护；现有系统盘只剩 170 GB，放不下原规划的 360 GB，主人不想先建小规格再重建 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
@@ -325,3 +377,25 @@
 教训：性能对比的基线要先确认它自己没有被写慢（全量归并的第一版发了 2.9 万条大多读不到行的语句）；量之前先想清楚自变量是什么（这次是“差异落在多少个节点里”，不是“差异有多少行”）。
 
 教训：给“什么算成功”下定义要想反例。落库健康第一版把“消息处理完了”当成功，而依赖坏着时被 sweeper 置为失败的订单也会“处理完”。
+
+### 2026-11-15
+
+阶段 2a 开工。摸清三台设备的现状后发现四件和计划不符的事：宿主机只连着 Wi-Fi；系统盘只剩 170 GB；R2S 的代理有白名单；ingress-nginx 已停止维护。主人插了网线、开了免密 sudo、给 NAS 加了公钥，决定换上 1TB 的盘再建虚拟机，并定了 Envoy Gateway、内嵌 etcd、CNI 按内存决定（ADR-0025、ADR-0026）。
+
+同日做了：宿主机装 KVM 和 libvirt、建网桥（`host-setup.sh`）；整机备份到 NAS；换盘（方案 A：`pvmove` 在线迁移根分区，复制 `/boot` 和 EFI，重装 GRUB，中间重启验证，旧盘清空）；建 600G 的 `vmpool` 卷；写 `vm.sh` 并建好三台虚拟机。
+
+同日新开一个会话：把上面的工作分两个提交存在本地（没有推送），写了 2a 的设计文档草稿。写之前对三台设备做了只读的探测并核对了版本，查出两处和之前记录不符的：Envoy Gateway v1.10 配的 Gateway API 是 v1.6.1；NAS 的 NFS 服务本来就开着。还没有装 k3s。
+
+主人确认设计并建好 NAS 的共享文件夹之后，同一个会话里把 2a 做完：装 k3s、MetalLB、仓库、Envoy Gateway，最后删掉三台虚拟机用 `make cluster-up` 重建了一遍。`k3s.sh` 派给 Sonnet 写，其余清单和脚本很小，主会话直接写了；集群上的执行都是主会话做的。
+
+教训：一项检查“通过了”要问它是不是碰巧通过。建虚拟机时验证过节点能访问镜像源，装 k3s 时却拉不到镜像：两个 DNS 上游一好一坏，第一次恰好用的是好的那个。有多个上游、多个副本、多条路径时，要逐个验证，不能只看整体的一次结果。
+
+教训：Helm chart 的默认值要先 `helm show values` 看一遍再写 values。MetalLB 这次按记忆关了一个已经弃用的开关，真正的开关是另一个，结果多装了一套用不到的组件。
+
+教训：本机的 `rm` 是 `trash`，不认 `-f`。在 `&&` 串起来的命令里它失败会让后面的步骤全部跳过；脚本和一次性命令里用 `command rm`。
+
+教训：静态地址的网桥在没有载波时地址和路由都还在，而且比备用网卡的路由优先。说“留了一条备用通道”之前要想清楚主通道以各种方式坏掉时内核会怎么选路；这次是拔网线后整台机器从 IPv4 连不上，靠 IPv6 的链路本地地址才进去修。
+
+教训：`set -o pipefail` 下不要写 `命令 | grep -q`，grep 匹配到就退出，前面的命令收到 SIGPIPE，整条管道算失败。这次让“停掉默认网络”那一步悄悄没有执行。
+
+教训：链路只协商到百兆时，让网卡只通告千兆是个决定性的测试：起不来就是物理层少了线对，不用再猜驱动和设置。

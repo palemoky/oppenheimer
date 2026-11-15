@@ -6,14 +6,18 @@
 
 ## 2a 集群搭建
 
-- [ ] Ubuntu 上用 KVM 创建 3 台虚拟机，资源分配写入 `docs/infra/hardware.md`
-- [ ] 安装 k3s：1 server + 2 agent（见 ADR-0001）
-- [ ] MacBook 配置 kubeconfig，能远程操作集群
-- [ ] 镜像仓库：自建 registry（数据放 NAS），集群配置拉取
-- [ ] 镜像拉取代理经 R2S，验证常用镜像源可用
-- [ ] 存储：本地盘用 local-path，备份与共享数据用 NAS 的 NFS
-- [ ] Ingress 与负载均衡：ingress-nginx + MetalLB（或 k3s 自带方案，选定后写 ADR）
-- [ ] 建集群与重建集群的步骤脚本化
+- [x] 宿主机准备：装 KVM 和 libvirt，有线网卡接到网桥 `br0`（`scripts/cluster/host-setup.sh`）；换上 1TB 的盘放虚拟机磁盘
+- [x] 设计文档 [design/2a-cluster.md](../design/2a-cluster.md)，主人已确认
+- [x] Ubuntu 上用 KVM 创建 3 台虚拟机（`scripts/cluster/vm.sh`），资源分配写入 `docs/infra/hardware.md`
+- [x] 安装 k3s：1 server + 2 agent，内嵌 etcd，CNI 先用 flannel（见 ADR-0001、ADR-0026）
+- [x] MacBook 配置 kubeconfig，能远程操作集群
+- [x] 镜像仓库：自建 registry（数据放 NAS），集群配置拉取
+- [x] 镜像拉取代理经 R2S，验证常用镜像源可用
+- [x] 存储：本地盘用 local-path，备份与共享数据用 NAS 的 NFS
+- [x] 入口与负载均衡：Envoy Gateway（Gateway API）加 MetalLB，禁用 k3s 自带的 Traefik 和 ServiceLB（ADR-0025）
+- [x] 建集群与重建集群的步骤脚本化（`make cluster-up`，重建演练 5 分 28 秒）
+- [x] 重启宿主机后集群自己恢复（104 秒）
+- [ ] etcd 的 fsync 延迟偏高，2b 上中间件后复查（设计文档 2a 第 12 节）
 
 ## 2b 中间件上集群
 
@@ -21,7 +25,10 @@
 - [ ] Redis Cluster：3 主 3 从
 - [ ] Kafka：Strimzi Operator，KRaft 模式 3 broker
 - [ ] 各中间件的资源限额、反亲和、PDB、持久化
+- [ ] 入口的 Envoy 改成 2 个副本并分散到两个节点（阶段 4 之前）
 - [ ] MySQL 定时备份到 NAS，并演练一次恢复
+- [ ] etcd 快照定时存到 NAS，并演练一次从快照恢复（ADR-0026）
+- [ ] 中间件部署完、灌数据之前量各节点的内存，改定 CNI 用 flannel 还是 Cilium（ADR-0026）
 
 ## 2c 服务上集群
 
@@ -54,3 +61,15 @@
 ## 面试考点
 
 Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调度（亲和、污点、优先级）；requests 与 limits 对调度和 OOM 的影响；StatefulSet 与 Deployment 的区别；Operator 模式；HPA 工作原理；滚动发布如何做到零中断；gRPC 负载均衡；etcd 与控制面组件职责。
+
+2a 补充（设计文档 [2a-cluster.md](../design/2a-cluster.md)）：
+
+- 节点的可分配量怎么算（总量减 `system-reserved`、`kube-reserved`、驱逐阈值），不留预留会怎样。
+- Gateway API 的三层资源各管什么，和 Ingress 的区别；ingress-nginx 为什么退役。
+- MetalLB 二层模式的原理（ARP 应答、免费 ARP 接管），为什么说它是故障切换而不是负载均衡。
+- `externalTrafficPolicy` 的 `Cluster` 和 `Local`：源地址保留、多一跳、对负载均衡器的影响。
+- local-path 的 PV 为什么带节点亲和，`WaitForFirstConsumer` 解决什么问题。
+- 数据库的数据为什么不放 NFS；NFS 的 squash（root 映射）是什么。
+- 镜像仓库放在它所服务的集群里有什么循环依赖，节点上的镜像缓存起什么作用。
+- 虚拟机桥接网络里 `br_netfilter` 的作用：为什么 Kubernetes 节点需要它，为什么宿主机上加载它会让虚拟机断网。
+- k3s 和 kubeadm 搭出来的集群差在哪（单进程、内嵌组件、数据存储可选）。

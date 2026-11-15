@@ -236,3 +236,21 @@ ps: ## 查看本地依赖的状态
 .PHONY: logs
 logs: ## 跟踪本地依赖的日志
 	$(COMPOSE) logs -f --tail=100
+
+# 集群（阶段 2，设计文档 docs/design/2a-cluster.md）。地址和版本在 scripts/cluster/cluster.env。
+# 删除虚拟机不做成目标：要显式运行 scripts/cluster/on-host.sh vm.sh destroy <名字>。
+.PHONY: cluster-up
+cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s、取 kubeconfig、装 MetalLB、仓库、Envoy Gateway；每一步可重复执行
+	scripts/cluster/on-host.sh vm.sh create
+	scripts/cluster/k3s.sh prepare
+	scripts/cluster/k3s.sh install
+	scripts/cluster/k3s.sh kubeconfig
+	scripts/cluster/addons.sh all
+
+.PHONY: cluster-status
+cluster-status: ## 查看各节点的 k3s 状态和集群里的 Pod
+	scripts/cluster/k3s.sh status
+
+.PHONY: cluster-smoke
+cluster-smoke: ## 入口的通路检查：经 MetalLB 和 Envoy Gateway 访问一个临时的回显服务
+	scripts/cluster/addons.sh smoke

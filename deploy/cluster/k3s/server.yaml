@@ -1,0 +1,12 @@
+# 模板：scripts/cluster/k3s.sh 把占位符替换后渲染到节点的 /etc/rancher/k3s/config.yaml。
+# k3s 的所有选项都在这个文件里，安装命令行不带其他参数。设计见 docs/design/2a-cluster.md 3.2。
+cluster-init: true            # 内嵌 etcd（ADR-0026）
+disable: [traefik, servicelb] # 换成 Envoy Gateway 和 MetalLB（ADR-0025）
+node-ip: __NODE_IP__          # 节点还有 IPv6 地址，写明用哪个
+tls-san: [__NODE_IP__, __NODE_NAME__]
+write-kubeconfig-mode: "0600"
+etcd-expose-metrics: true     # 阶段 3 要抓 etcd 的指标，现在不开以后要重启控制面
+kubelet-arg:
+  - system-reserved=cpu=200m,memory=400Mi
+  - kube-reserved=cpu=300m,memory=800Mi
+  - eviction-hard=memory.available<200Mi,nodefs.available<5%,imagefs.available<5%

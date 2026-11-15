@@ -1,0 +1,6 @@
+# 模板：渲染到节点的 /etc/rancher/k3s/registries.yaml，让 containerd 从集群内的镜像仓库拉镜像。
+# 必须写 http://：不写的话 containerd 默认用 HTTPS，而仓库是明文 HTTP。
+# 这个文件只在 k3s 启动时读，改了要重启 k3s（k3s.sh 检测到变化会自动重启）。
+mirrors:
+  "__REGISTRY_ADDR__":
+    endpoint: ["http://__REGISTRY_ADDR__"]

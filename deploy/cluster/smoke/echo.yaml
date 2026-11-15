@@ -1,0 +1,56 @@
+# 入口的通路检查：一个会把请求头原样返回的小服务（podinfo 的 /headers）和一条路由。
+# scripts/cluster/addons.sh smoke 部署它、从 MacBook 访问入口地址、再删掉。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smoke
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: smoke
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: echo }
+  template:
+    metadata:
+      labels: { app: echo }
+    spec:
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.9.0
+          ports:
+            - containerPort: 9898
+          readinessProbe:
+            httpGet: { path: /readyz, port: 9898 }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: smoke
+spec:
+  selector: { app: echo }
+  ports:
+    - port: 80
+      targetPort: 9898
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: echo
+  namespace: smoke
+spec:
+  parentRefs:
+    - name: public
+      namespace: envoy-gateway-system
+  hostnames: ["smoke.oppenheimer.test"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 80

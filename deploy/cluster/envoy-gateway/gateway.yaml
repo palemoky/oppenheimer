@@ -1,0 +1,56 @@
+# 对外入口。模板：__LB_GATEWAY_IP__ 由 scripts/cluster/addons.sh 从 cluster.env 填入。
+# 设计见 docs/design/2a-cluster.md 第 7 节、ADR-0025。
+#
+# EnvoyProxy：定制 Envoy Gateway 为 Gateway 创建的数据面（一个 Envoy 的 Deployment 和一个 Service）。
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: public
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        replicas: 1
+        container:
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      envoyService:
+        type: LoadBalancer
+        # Local：只转给本节点上的 Envoy，不改源地址，Envoy 看到的是真实的客户端地址（gateway 的按 IP
+        # 限流要用）。代价是 MetalLB 只让有就绪的 Envoy 的节点持有这个地址。
+        externalTrafficPolicy: Local
+        annotations:
+          metallb.io/loadBalancerIPs: "__LB_GATEWAY_IP__"
+---
+# GatewayClass：这一类入口由哪个控制器实现，用哪份参数。
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: public
+    namespace: envoy-gateway-system
+---
+# Gateway：要一个入口，监听 80。Envoy Gateway 看到它才创建 Envoy。443 在 2d 有了证书之后加。
+# 路由（HTTPRoute）由各个服务在自己的命名空间里声明，所以允许所有命名空间挂上来。
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: envoy-gateway-system
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
