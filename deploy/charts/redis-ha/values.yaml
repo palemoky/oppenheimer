@@ -28,3 +28,6 @@ sentinel:
   resources:
     requests: {cpu: 20m, memory: 64Mi}
     limits: {memory: 64Mi}
+
+# PriorityClass 的名字，空表示不设。集群上用 middleware（由 middleware.sh 先建好）。
+priorityClassName: ""

@@ -1,4 +1,5 @@
 # release 名 redis-cache，命名空间 redis。查询缓存和 gateway 限流的桶。
+priorityClassName: middleware
 replicas: 6
 replicasPerMaster: 1
 maxmemory: 128mb

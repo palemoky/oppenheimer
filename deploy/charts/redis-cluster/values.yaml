@@ -19,3 +19,6 @@ storageClass: local-path
 resources:
   requests: {cpu: 50m, memory: 192Mi}
   limits: {memory: 192Mi}
+
+# PriorityClass 的名字，空表示不设。集群上用 middleware（由 middleware.sh 先建好）。
+priorityClassName: ""

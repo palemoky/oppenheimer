@@ -14,7 +14,13 @@ spec:
   activeDeadlineSeconds: 900
   template:
     metadata:
-      labels: {{- include "redis-cluster.labels" . | nindent 8 }}
+      # Pod 不能带 Redis 那一套标签（app.kubernetes.io/name: redis-cluster 加 instance）：PDB 和 headless Service
+      # 都按它们选 Pod。这个 Job 的 Pod 做完之后还留着，原来它被 PDB 选中，PDB 要算“应该有几个 Pod”时
+      # 去问它的控制器（Job）要副本数，Job 没有 scale 子资源，于是 PDB 一直是 SyncFailed、
+      # 允许的中断数是 0：排空任何一个有 Redis 的节点都会被卡住（2026-11-15 发现，设计文档 2b 发现 16）。
+      labels:
+        app.kubernetes.io/name: redis-cluster-bootstrap
+        app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       restartPolicy: Never
       securityContext:

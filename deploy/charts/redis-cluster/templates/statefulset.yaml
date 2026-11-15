@@ -15,6 +15,11 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      # 有状态中间件的优先级（deploy/cluster/middleware/priorityclass.yaml）：QoS 是 Burstable，
+      # 靠它在节点内存紧张时排在业务服务之后被驱逐。
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       securityContext:
         runAsUser: 999
         runAsGroup: 999

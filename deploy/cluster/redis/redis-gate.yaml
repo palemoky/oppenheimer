@@ -1,4 +1,5 @@
 # release 名 redis-gate，命名空间 redis。库存闸门、分布式锁、读己之写标记。
+priorityClassName: middleware
 redis:
   replicas: 2
   maxmemory: 192mb
