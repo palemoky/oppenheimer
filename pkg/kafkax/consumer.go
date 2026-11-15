@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -269,27 +270,49 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 	return c, nil
 }
 
+// dlqCheckWait 是启动时等死信 topic 在元数据里出现的上限。
+const dlqCheckWait = 10 * time.Second
+
 // checkDLQTopics 确认每个死信 topic 存在。broker 关闭了自动建 topic，
 // 死信 topic 不存在时消息进不了死信，分区会一直卡在死信重试上，所以在启动时就报错。
+//
+// “查不到”要等一会儿再下结论：topic 刚由 EnsureTopics 建好时，每个 broker 的元数据缓存是各自异步更新的。
+// EnsureTopics 等到的是它问的那个 broker 看得见，而这里是另一个客户端，可能问到另一个还没更新的 broker。
+// 单 broker 的环境（本机、CI）里不会出现；三个 broker 的集群上，服务因此在启动时退出过（设计文档 2c 第 13 节）。
 func (c *Consumer) checkDLQTopics(ctx context.Context) error {
 	names := make([]string, len(c.cfg.Topics))
 	for i, t := range c.cfg.Topics {
 		names[i] = t + c.cfg.DLQSuffix
 	}
-	details, err := kadm.NewClient(c.client).ListTopics(ctx, names...)
-	if err != nil {
-		return fmt.Errorf("kafkax: list dlq topics: %w", err)
-	}
-	for _, name := range names {
-		d, ok := details[name]
-		if !ok {
-			return fmt.Errorf("kafkax: dlq topic %s does not exist", name)
+	adm := kadm.NewClient(c.client)
+	deadline := time.Now().Add(dlqCheckWait)
+	for {
+		details, err := adm.ListTopics(ctx, names...)
+		if err != nil {
+			return fmt.Errorf("kafkax: list dlq topics: %w", err)
 		}
-		if d.Err != nil {
-			return fmt.Errorf("kafkax: dlq topic %s: %w", name, d.Err)
+		missing := ""
+		for _, name := range names {
+			d, ok := details[name]
+			switch {
+			case !ok, errors.Is(d.Err, kerr.UnknownTopicOrPartition):
+				missing = name
+			case d.Err != nil:
+				return fmt.Errorf("kafkax: dlq topic %s: %w", name, d.Err)
+			}
+		}
+		if missing == "" {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("kafkax: dlq topic %s does not exist", missing)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("kafkax: dlq topic %s: %w", missing, ctx.Err())
+		case <-time.After(topicPollInterval):
 		}
 	}
-	return nil
 }
 
 // Name 实现 app.Component。
