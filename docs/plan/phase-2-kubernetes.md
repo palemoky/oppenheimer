@@ -6,13 +6,14 @@
 
 ## 2a 集群搭建
 
-- [ ] Ubuntu 上用 KVM 创建 3 台虚拟机，资源分配写入 `docs/infra/hardware.md`
-- [ ] 安装 k3s：1 server + 2 agent（见 ADR-0001）
+- [x] 宿主机准备：装 KVM 和 libvirt，有线网卡接到网桥 `br0`（`scripts/cluster/host-setup.sh`）；换上 1TB 的盘放虚拟机磁盘
+- [x] Ubuntu 上用 KVM 创建 3 台虚拟机（`scripts/cluster/vm.sh`），资源分配写入 `docs/infra/hardware.md`
+- [ ] 安装 k3s：1 server + 2 agent，内嵌 etcd，CNI 先用 flannel（见 ADR-0001、ADR-0026）
 - [ ] MacBook 配置 kubeconfig，能远程操作集群
 - [ ] 镜像仓库：自建 registry（数据放 NAS），集群配置拉取
 - [ ] 镜像拉取代理经 R2S，验证常用镜像源可用
 - [ ] 存储：本地盘用 local-path，备份与共享数据用 NAS 的 NFS
-- [ ] Ingress 与负载均衡：ingress-nginx + MetalLB（或 k3s 自带方案，选定后写 ADR）
+- [ ] 入口与负载均衡：Envoy Gateway（Gateway API）加 MetalLB，禁用 k3s 自带的 Traefik 和 ServiceLB（ADR-0025）
 - [ ] 建集群与重建集群的步骤脚本化
 
 ## 2b 中间件上集群
@@ -22,6 +23,8 @@
 - [ ] Kafka：Strimzi Operator，KRaft 模式 3 broker
 - [ ] 各中间件的资源限额、反亲和、PDB、持久化
 - [ ] MySQL 定时备份到 NAS，并演练一次恢复
+- [ ] etcd 快照定时存到 NAS，并演练一次从快照恢复（ADR-0026）
+- [ ] 中间件部署完、灌数据之前量各节点的内存，改定 CNI 用 flannel 还是 Cilium（ADR-0026）
 
 ## 2c 服务上集群
 
