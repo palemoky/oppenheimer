@@ -40,12 +40,12 @@
 - [x] 节点号在多副本下的分配：没设 `WORKER_ID` 时从本服务的 MySQL 租（ADR-0028，`pkg/idgen` 的租约；本机 `make lint test e2e` 通过，集群上还没有跑过）
 - [x] 多阶段 Dockerfile，构建 `linux/amd64` 镜像（`deploy/docker/Dockerfile`、`make images`；七个镜像已推到集群仓库并在节点上跑过）
 - [x] 一个公共 chart 加每个服务一份 values（`deploy/charts/service`、`deploy/cluster/services/`）；六个服务已部署，从入口走通下单到支付到商家索引的整条链路
-- [ ] 探针：startup、liveness、readiness，与优雅启停配合
+- [x] 探针：startup、liveness、readiness，与优雅启停配合（`DRAIN_DELAY` 15 秒，按实测的端点传播时间定的：最长 9.5 秒）
 - [x] 配置与密钥：ConfigMap 经 `envFrom`，密码从 Secret 取并用变量展开拼 DSN，配置变了靠校验和注解触发滚动（设计文档 2c 的 7.2）
-- [ ] 资源 requests 与 limits、QoS 等级：已按设计的估计值写进 values，**还没有对着 `kubectl top` 的实际用量校一遍**
+- [x] 资源 requests 与 limits、QoS 等级（Burstable）；requests 已按轻载下 `kubectl top` 的实际用量调低，阶段 3 压测时再校
 - [ ] HPA：基于 CPU（gateway、order）。基于自定义指标（QPS）的挪到阶段 3a，等有了 Prometheus
-- [ ] 滚动发布策略，验证发布过程零报错
-- [ ] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决
+- [x] 滚动发布策略，验证发布过程零报错：六个服务整体滚动两次共 28500 个请求 0 失败，`DRAIN_DELAY=0` 的对照每删一个 Pod 失败 15 个左右（`scripts/cluster/probe.py`）
+- [x] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决：直连 ClusterIP 时 gateway 的请求全部落在一个 inventory Pod 上，经边车时两个 Pod 各一半（设计文档 2c 第 13 节）
 - [ ] 在集群上重做 1b 的吞吐对比（`scripts/bench.sh`，1a 与 1b 各一遍），给出“下单吞吐相对 1a 是否有数量级提升”的结论。本机的测量疑似受 OrbStack 端口转发丢包干扰（约 23% 的提交卡在 200 毫秒，正好是 TCP 最小重传超时），见 1b 设计文档 7.3.4
 - [ ] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：重启的实例直接接回原来的分区，不触发重平衡
 - [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；还差示例 SKU 的脚本和“从空集群重建一遍”的验收。Argo CD 在 2d
@@ -68,6 +68,20 @@
 ## 面试考点
 
 Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调度（亲和、污点、优先级）；requests 与 limits 对调度和 OOM 的影响；StatefulSet 与 Deployment 的区别；Operator 模式；HPA 工作原理；滚动发布如何做到零中断；gRPC 负载均衡；etcd 与控制面组件职责。
+
+2c 补充（设计文档 [2c-services.md](../design/2c-services.md)，ADR-0028）：
+
+- 雪花算法的节点号在多副本下怎么分配；为什么“持有者在本地判断租约有效”不够（时钟、进程停顿），怎么用“每一任一段互不重叠的区间”把对时钟的依赖去掉；这和 fencing token 是什么关系。
+- 为什么不用 StatefulSet 的序号当节点号：它的“同一身份最多一个”在节点失联时的代价。
+- Pod 被删时 SIGTERM 和“从端点里摘掉”是同时开始的；摘流的等待该多长、怎么量；为什么不用 `preStop` 里 sleep。
+- 原生 sidecar（`initContainers` 加 `restartPolicy: Always`）解决的启动和停止顺序问题。
+- gRPC 长连接在 ClusterIP 后面为什么不均衡，三种解法（客户端按请求均衡、中间放七层代理、服务网格）；headless Service 是什么。
+- 端点的变化经 DNS 传到调用方要多久，和经 xDS 下发比差在哪。
+- `maxSurge`、`maxUnavailable`、`minReadySeconds`、PDB 各管什么；滚动发布期间新旧版本共存对接口和表结构的要求。
+- 环境变量形式的配置为什么改了 ConfigMap 不生效，校验和注解的做法。
+- requests 和 limits 怎么定，`GOMEMLIMIT` 为什么要设，CPU 为什么不设 limits。
+- 多阶段构建、交叉编译对模拟、distroless 的取舍、tag 为什么不能重用。
+- 做对照实验：没有“去掉保护就失败”的对照，零失败说明不了保护起了作用；对照改过的配置要先恢复干净。
 
 2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：
 
