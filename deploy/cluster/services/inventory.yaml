@@ -1,0 +1,18 @@
+# inventory 服务（设计文档 2c）。release 名 inventory，命名空间 oppenheimer。
+# 镜像的仓库和 tag 由 scripts/cluster/services.sh 传入。边车配置来自 deploy/envoy/inventory.yaml。
+replicas: 1   # 2c 第二步：先 1 个副本跑通，多副本等节点号的租约做完（设计文档第 5 节）
+ports: {http: 8082, grpc: 9082}
+resources: {cpu: 200m, memoryRequestMi: 128, memoryLimitMi: 512}
+sidecar: {enabled: true}
+
+config:
+  KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
+  REDIS_ADDR: sentinel://gate@redis-gate-sentinel.redis.svc:26379
+  CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
+
+# inventory 的库在共享实例 mysql-main 上，用 app 账号。
+secretEnv:
+  - {name: MYSQL_MAIN_PASSWORD, key: main-app-password}
+expandEnv:
+  - name: MYSQL_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/inventory_db"

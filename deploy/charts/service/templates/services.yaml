@@ -1,0 +1,36 @@
+{{- $name := include "service.name" . -}}
+{{- if .Values.service.enabled }}
+# 普通的 ClusterIP Service：给不经过边车的访问用（入口到 gateway、调试）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "service.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+{{- end }}
+{{- if and .Values.sidecar.enabled .Values.headless.enabled }}
+---
+# headless Service：DNS 返回所有就绪 Pod 的地址，调用方的边车用 STRICT_DNS 把每个地址当一个上游，按请求轮流
+# （设计文档 6.2）。暴露的是边车的入站端口，不是服务自己的 gRPC 端口：调用要经过被调用方的边车。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "service.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: inbound
+      port: {{ .Values.sidecar.inboundPort }}
+      targetPort: inbound
+{{- end }}

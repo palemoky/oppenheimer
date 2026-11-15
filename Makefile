@@ -271,6 +271,20 @@ cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s�
 middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Cluster）、Kafka（Strimzi）、MySQL（两个分片加共享实例）；可重复执行
 	scripts/cluster/middleware.sh all
 
+.PHONY: images
+images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓库，tag 是提交号（有未提交改动时带 -dirty-时间）；make images IMAGE_SERVICES="order gateway" 只做部分
+	scripts/cluster/images.sh all $(IMAGE_SERVICES)
+
+.PHONY: deploy
+deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
+	@tag="$$(scripts/cluster/images.sh tag)" && \
+	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
+	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)
+
+.PHONY: deploy-status
+deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
+	scripts/cluster/services.sh status
+
 .PHONY: etcd-backup
 etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server 节点上的定时器每 12 小时做一次）；scripts/cluster/k3s.sh etcd-backup list 查看
 	scripts/cluster/k3s.sh etcd-backup run

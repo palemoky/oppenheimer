@@ -1,0 +1,19 @@
+# payment 服务（设计文档 2c）。release 名 payment。边车配置来自 deploy/envoy/payment.yaml。
+replicas: 2   # 节点号各自从库里租（ADR-0028）
+ports: {http: 8083, grpc: 9083}
+resources: {cpu: 100m, memoryRequestMi: 128, memoryLimitMi: 512}
+sidecar: {enabled: true}
+
+config:
+  KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
+  REDIS_ADDR: sentinel://gate@redis-gate-sentinel.redis.svc:26379
+  CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
+  # 调 order 经自己边车的出站端口（本机同样是 15281）。
+  ORDER_ADDR: 127.0.0.1:15281
+
+secretEnv:
+  - {name: MYSQL_MAIN_PASSWORD, key: main-app-password}
+expandEnv:
+  - name: MYSQL_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/payment_db"
+  # 不设 WORKER_ID：节点号启动时从自己的库里租（ADR-0028），每个副本各一个。

@@ -1,0 +1,25 @@
+# cdc 服务（设计文档 2c）：从订单从库读 binlog，写 Kafka。没有 gRPC，没有边车，没有 Service。
+# 同一时刻只能有一个实例读 binlog：Recreate（先停旧的再起新的），不要 PDB。
+replicas: 1
+strategy: Recreate
+ports: {http: 8085, grpc: 0}
+resources: {cpu: 100m, memoryRequestMi: 128, memoryLimitMi: 512}
+sidecar: {enabled: false}
+service: {enabled: false}
+pdb: {enabled: false}
+
+config:
+  KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
+  CDC_SOURCE_NAMES: order-0,order-1
+  # server-id 登记在 docs/infra/versions.md。
+  CDC_SERVER_IDS: "1011,1021"
+
+# 源是从库 Pod 的稳定名字，不是 -replica Service：它要认准一个实例的 binlog 位点。
+# 名字里的序号（-1）和各实例的 primaryOrdinal 绑着：主从切换之后要跟着改（切换手册里的“CDC 换源”）。
+# 用 cdc 账号。
+secretEnv:
+  - {name: MYSQL_ORDER_0_CDC_PASSWORD, key: order-0-cdc-password}
+  - {name: MYSQL_ORDER_1_CDC_PASSWORD, key: order-1-cdc-password}
+expandEnv:
+  - name: CDC_SOURCE_DSNS
+    value: "cdc:$(MYSQL_ORDER_0_CDC_PASSWORD)@tcp(mysql-order-0-1.mysql-order-0.mysql.svc:3306)/order_db_0,cdc:$(MYSQL_ORDER_1_CDC_PASSWORD)@tcp(mysql-order-1-1.mysql-order-1.mysql.svc:3306)/order_db_1"
