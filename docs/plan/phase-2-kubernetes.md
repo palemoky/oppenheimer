@@ -49,7 +49,8 @@
 - [x] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决：直连 ClusterIP 时 gateway 的请求全部落在一个 inventory Pod 上，经边车时两个 Pod 各一半（设计文档 2c 第 13 节）
 - [ ] 在集群上重做 1b 的吞吐对比（`scripts/bench.sh`，1a 与 1b 各一遍），给出“下单吞吐相对 1a 是否有数量级提升”的结论。本机的测量疑似受 OrbStack 端口转发丢包干扰（约 23% 的提交卡在 200 毫秒，正好是 TCP 最小重传超时），见 1b 设计文档 7.3.4
 - [x] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：**结论是不做**。滚动 payment 时每个分区只停 0.5 到 3.2 秒；franz-go 的静态成员关闭时不离组，Deployment 的新 Pod 又是新名字，用了反而要等会话超时（设计文档 2c 第 13 节的第七步，ADR-0007 的补充）
-- [x] 阶段 1 的端到端测试在集群上通过：`make cluster-e2e`，19 个用例，流量经入口的 Envoy（设计文档 2c 第 13 节的第五步）。一致性测试（删 Pod 后对账）还没有做
+- [x] 阶段 1 的端到端测试在集群上通过：`make cluster-e2e`，19 个用例，流量经入口的 Envoy（设计文档 2c 第 13 节的第五步）。一致性测试见下一条
+- [x] 一致性测试在集群上通过：`make cluster-chaos`，压测期间每 5 秒随机删一个业务 Pod，静止后 `verify` 和 `recon` 无差异；正常删除（23 个 Pod，客户端 0 个 5xx）和强制删除（22 个 Pod，29 个 5xx）各通过一次。查出并修掉 `kafkax` 启动时查死信 topic 的缺陷（三个 broker 才出现）
 - [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；还差示例 SKU 的脚本和“从空集群重建一遍”的验收。Argo CD 在 2d
 
 ## 2d 生态组件巡礼（按需）
@@ -89,6 +90,8 @@ Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调
 - 带 `-race` 的测试二进制为什么不能放进 static 镜像，交叉编译 cgo 要什么。
 - 集群里的 Pod 访问 LoadBalancer 的地址走的是哪条路（kube-proxy 就地转发，不经过外部的负载均衡器）。
 - 两个 CDC 实例读同一个 MySQL 为什么 server id 必须不同。
+- 新建的 Kafka topic 为什么“建成功了却查不到”：每个 broker 的元数据缓存各自异步更新，单 broker 的环境测不出来。
+- 一致性测试的判定标准为什么是“数据对得上”而不是“零报错”；正常删除和强制删除在客户端看到的差别来自哪里。
 - 做对照实验：没有“去掉保护就失败”的对照，零失败说明不了保护起了作用；对照改过的配置要先恢复干净。
 
 2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：

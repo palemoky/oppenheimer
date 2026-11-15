@@ -53,13 +53,19 @@
 - **扩容时新的 order Pod 一就绪就出错**：约 810 请求/秒时，第 3 个 order Pod 就绪后的 20 秒里有 14 个查订单返回 `503 STOCK_GATE_UNAVAILABLE`。推断是新 Pod 到闸门 Redis 的连接池是冷的，撞上读闸门的 300 毫秒时限（只有时间上的吻合）。可选的修法：就绪前预热连接池（go-redis 的 `MinIdleConns`），或在调用方边车上开 Envoy 的慢启动。属于 order 的代码，由 Fable 改。
 - 缩容时相隔 15 秒被删的两个 order Pod：前一个交出的分区被分给了后一个（它正在摘流），这些分区挪了两次。代价是多停一两秒，没有处理。
 
+**第五步的后一半也做完了（2026-11-15）**：`make cluster-chaos`，压测期间随机删 Pod，静止后 `verify` 和 `recon` 无差异。正常删除和强制删除（`CHAOS_FORCE=1`）各通过一次，四次运行的数据都对得上（设计第 13 节的表）。它和 e2e 共用命名空间 `oppenheimer-e2e`，靠标签互斥；日志在 `tmp/cluster-chaos-logs/<运行号>/`。
+
+- **它查出一个真缺陷，已修**：`pkg/kafkax` 的消费者启动时查死信 topic，可能问到元数据还没更新的 broker，服务启动时退出再被重启（只有多 broker 才出现）。`checkDLQTopics` 现在最多等 10 秒。`pkg` 的 lint 和测试通过。**长期运行的那一套还是旧镜像，没有重新部署**（第八步从空集群重建时会带上）。
+- 一次没有解释的重启：某次运行里一个 inventory 容器启动阶段重启过一次（用的是修过的镜像），日志没留下，之后两次没有再出现。
+- PR #11（draft）已开；CI 第一次失败 1 项（`pkg/idgen` 的 `TestSQLLeaseTakeoverAfterExpiry`，测试用 300 毫秒的租期占满 64 个号，CI 上慢，最早的在断言前就过期了；改成先用长租期占满），第二次（`aa94c07`）27 项全部通过。
+
 **下一步，新会话从这里开始：**
 
-1. 第五步的后一半：最小的“压测期间随机删 Pod，静止后 verify 和 recon 通过”（`make cluster-chaos`）。**已派给 Opus 子 Agent 写（只写不执行），见本节末尾的状态。**
-2. 第七步的后一半：吞吐对比（设计 10.3；`test/load` 的镜像由上一条带出来，1a 的二进制要从 1a 的提交构建，先看 `scripts/bench.sh` 的 `BENCH_ARCH=1a` 需要什么）。
-3. 第八步收尾：示例 SKU 的脚本、`scripts/cluster/degrade.sh`、从空集群重建一遍的验收、灌数据后重量 MySQL 恢复耗时、切换手册里两步的验证、笔记（2c 的笔记还没有写，派 Sonnet）。
-4. 第四步里没做的：强制删除和直接杀进程两种没有摘流的退出（`cluster-chaos` 的强删开关可以覆盖前一种）；探针不发支付请求；租约所在的库不可用时受理被拒绝再恢复（集群上）。
-5. 提交前跑一遍 `make lint test`（这个会话的 Go 改动只有 `test/e2e/e2e_test.go`，`make lint MODULES=$PWD/test/e2e` 0 issues，本机 `make e2e` 没有重跑）。提交和推送等主人说。
+1. 第七步的后一半：吞吐对比（`make cluster-bench`）。**已派给 Opus 子 Agent 写（只写不执行）**：1a 的四个镜像从提交 `732f9ab` 构建，单独的最小清单（1a 没有 `/readyz`、边车、Kafka、Redis），1b 复用 e2e 那一套加一层 bench 的 values。交付后主会话验收并在集群上执行，结果记进设计第 13 节和阶段计划。如果新会话接手时工作区里有 `scripts/cluster/bench.sh`、`deploy/cluster/bench/` 而设计文档里没有结果，说明还没执行过。
+2. 第八步收尾：示例 SKU 的脚本、`scripts/cluster/degrade.sh`、从空集群重建一遍的验收（破坏性操作，**先向主人确认**）、灌数据后重量 MySQL 恢复耗时、切换手册里两步的验证、2c 的笔记（派 Sonnet）。
+3. 扩容时新 order Pod 的冷连接池（见上，Fable 改）。
+4. 第四步里没做的：在节点上直接杀进程；探针不发支付请求；租约所在的库不可用时受理被拒绝再恢复（集群上）。强制删除已由 `cluster-chaos` 覆盖。
+5. 提交和推送等主人说（主人 2026-11-15 说过“先提交推送，然后做接下来的三点”，那之后的改动按同一个意思提交并推送到了 PR #11，见 git log）。
 
 ### 2a 做到哪（2026-11-15）
 
