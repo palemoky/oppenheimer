@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：2a（集群搭建），刚开工。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
-- **当前分支**：`phase-2a`（从 `main` 开出）。宿主机和虚拟机的准备已提交在本地（`1c4f6e9` 脚本、`4f1e468` 文档），**没有推送**。2a 的设计文档和它带来的文档改动**没有提交**。
+- **当前阶段**：2a（集群搭建）基本完成，集群在运行；下一步是 2b（中间件上集群）。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
+- **当前分支**：`phase-2a`（从 `main` 开出）。宿主机和虚拟机的准备已提交在本地（两个提交，脚本和文档），**没有推送**。之后的全部改动**没有提交**（主人没有要求）：2a 的设计文档、`scripts/cluster/` 的 `k3s.sh`、`addons.sh` 和三个旧脚本的修改、`deploy/cluster/`、Makefile、四份文档。
 - **最后更新**：2026-11-15
 
 ### 2a 做到哪（2026-11-15）
@@ -29,20 +29,28 @@
 - **换盘全部完成**：Windows 盘已装回 `M2_1`，开机自动进 Ubuntu，启动顺序是 Ubuntu、Windows Boot Manager（Windows 没有实际启动验证过）。
 - **三台虚拟机已建好**（`scripts/cluster/vm.sh`，经 `scripts/cluster/on-host.sh vm.sh create` 调用；规格和地址见 [infra/hardware.md](infra/hardware.md)）。从 MacBook 用 `ubuntu` 用户直接 ssh 到节点地址能登录；三台都能经 R2S 访问 GitHub、Docker Hub、get.k3s.io，互相按名字能 ping 通。还没有装 k3s。
 
+- **2a 的集群已建成并做过一次完整的重建演练**（2026-11-15）。设计文档 [design/2a-cluster.md](design/2a-cluster.md)（主人确认了第 2 节的六项，都按建议），实现中的七个发现在第 11 节，结果和实测的数在第 12 节。现状：
+  - k3s v1.37.2+k3s1，1 server 加 2 agent，内嵌 etcd，flannel；MetalLB（二层模式）；镜像仓库（集群里，数据在 NAS 的 `/volume1/k8s/registry`，明文 HTTP）；Envoy Gateway v1.10.0，`Gateway` 叫 `public`，在 `envoy-gateway-system`，监听 80。固定地址见 hardware.md 的“网络”和 `cluster.env`。
+  - 用法：`make cluster-up`（从空宿主机到可用集群，可重复执行，重建实测 5 分 28 秒）、`make cluster-status`、`make cluster-smoke`。kubeconfig 在 `~/.kube/oppenheimer.yaml`，**不在默认的 `~/.kube/config` 里**，手工操作要 `export KUBECONFIG=~/.kube/oppenheimer.yaml`。删虚拟机是 `scripts/cluster/on-host.sh vm.sh destroy <名字...>`。
+  - NAS 的共享文件夹 `k8s` 主人已建好（NFS 权限按设计文档 6.2），NAS 不需要 root。子目录要直接挂载，并且建好后要 `chmod` 一次（设计文档第 11 节的发现 2）。
+  - 宿主机加了 `br_netfilter` 的 udev 规则（`host-setup.sh`），做过实验。
+  - 仓库里留着一个测试镜像 `test/busybox:1.37.0`，可以不管。
+
 停在哪、在等什么：
 
-1. **2a 的设计文档 [design/2a-cluster.md](design/2a-cluster.md) 主人已确认**（2026-11-15，第 2 节的六项都按建议）：仓库放集群里、不装 NFS 动态供给、server 不加污点、仓库明文不设登录、kubeconfig 单独存放、2a 结束前做一次删虚拟机的重建演练（动手前仍要再说一声）。
-2. **NAS 的共享文件夹 `k8s` 主人已建好**（NFS 权限按设计文档 6.2）。NAS 不再需要 root 或 sudo。
-3. **PCIe 网卡还没装，有线仍是 100 Mbit/s**（2026-11-15 再次确认）。主人决定不等它，先往下做。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。网桥的 MAC 会跟着新网卡变，虚拟机不受影响（它们各有固定的 MAC）。阶段 3 压测之前要解决。
-4. 出网的白名单由主人管，**不要去改 R2S**：宿主机的有线地址和节点地址段已放行（地址和原理见 hardware.md 的“网络”）。
+1. **2a 剩一项收尾**：重启宿主机、确认集群自己恢复。宿主机上有主人自己的容器（一个 traefik），重启前要先说。
+2. **PCIe 网卡还没装，有线仍是 100 Mbit/s**。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。
+3. 出网的白名单由主人管，**不要去改 R2S**。R2S 经路由通告下发的 IPv6 DNS 不走代理、返回被污染的地址，节点一侧已经绕开（`accept-ra: false`）；局域网里其他在白名单内的设备可能有同样的问题，已告诉主人。
 
-下一步（主人确认设计之后，按设计文档第 10 节的顺序）：
+下一步：
 
-1. 步骤一：给 `host-setup.sh` 加 `br_netfilter` 的 udev 规则并做一次实验（设计文档 3.5）；写 `scripts/cluster/k3s.sh` 和 `deploy/cluster/k3s/` 下的配置；装 k3s（v1.37.2+k3s1）；取 kubeconfig 到 `~/.kube/oppenheimer.yaml`。MacBook 的 kubectl 是 v1.37.2，helm 是 v4.3.2。
-2. 装好后先做设计文档 3.4 的验证：虚拟机的 DNS 上游里有一个 IPv6 地址 `fd82:1609:af3::1`，不知道是谁，可能让 Pod 解析到真实地址而绕开代理。
-3. 然后依次是公共镜像拉取验证、MetalLB（固定地址的分配见设计文档第 5 节）、NFS 和仓库、Envoy Gateway、一键脚本和重建演练。每一步的检查和要量的数在设计文档第 9 节。
+1. 主人看过之后提交 2a 的改动（还没有要求提交）。
+2. 2b 的设计文档（`docs/design/2b-middleware.md`）：MySQL 用 Operator 还是手写 StatefulSet（要写 ADR）、Redis Cluster、Strimzi；中间件用节点亲和放在两个 agent 上，server 只放轻负载；数据用 local-path，备份走 NFS。
+3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
+4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
+5. 写 2a 的面试笔记（`docs/notes/`，派 Sonnet），考点已经在阶段计划里。
 
-已查证、还没有登记到 `versions.md` 的版本（引入时登记）：k3s 稳定通道 v1.37.2+k3s1；Envoy Gateway v1.10.0 配 Gateway API v1.6.1（不是上游最新的 v1.7.0，ADR-0025 已改）；MetalLB v0.16.2；Ubuntu 26.04 的 cloud image（`ubuntu-26.04-server-cloudimg-amd64.img`）；distribution（registry）v3.1.2。
+2a 用到的版本都已登记到 `versions.md`。已查证、还没有用到的：Cilium v1.20.4。
 
 主人已定的（2026-11-15；前三项已写成 ADR-0025、ADR-0026）：
 
@@ -218,14 +226,14 @@
 
 ## 阻塞项与待确认
 
-- 见“当前状态”里的“停在哪、在等什么”：2a 设计的六项确认、NAS 的共享文件夹、千兆网卡。
+- 见“当前状态”里的“停在哪、在等什么”：重启宿主机的检查、千兆网卡。
 
 ## 设备状态（上次已知）
 
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 开机（2026-11-15），Ubuntu 26.04.1，有线接在网桥 `br0` 上（百兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
+| Ubuntu 3900X | 开机（2026-11-15），k3s 集群在运行，Ubuntu 26.04.1，有线接在网桥 `br0` 上（百兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 关机，阶段 3 开始需要 |
 | DS218+ | 开机（2026-11-15） |
 
@@ -377,6 +385,14 @@
 同日做了：宿主机装 KVM 和 libvirt、建网桥（`host-setup.sh`）；整机备份到 NAS；换盘（方案 A：`pvmove` 在线迁移根分区，复制 `/boot` 和 EFI，重装 GRUB，中间重启验证，旧盘清空）；建 600G 的 `vmpool` 卷；写 `vm.sh` 并建好三台虚拟机。
 
 同日新开一个会话：把上面的工作分两个提交存在本地（没有推送），写了 2a 的设计文档草稿。写之前对三台设备做了只读的探测并核对了版本，查出两处和之前记录不符的：Envoy Gateway v1.10 配的 Gateway API 是 v1.6.1；NAS 的 NFS 服务本来就开着。还没有装 k3s。
+
+主人确认设计并建好 NAS 的共享文件夹之后，同一个会话里把 2a 做完：装 k3s、MetalLB、仓库、Envoy Gateway，最后删掉三台虚拟机用 `make cluster-up` 重建了一遍。`k3s.sh` 派给 Sonnet 写，其余清单和脚本很小，主会话直接写了；集群上的执行都是主会话做的。
+
+教训：一项检查“通过了”要问它是不是碰巧通过。建虚拟机时验证过节点能访问镜像源，装 k3s 时却拉不到镜像：两个 DNS 上游一好一坏，第一次恰好用的是好的那个。有多个上游、多个副本、多条路径时，要逐个验证，不能只看整体的一次结果。
+
+教训：Helm chart 的默认值要先 `helm show values` 看一遍再写 values。MetalLB 这次按记忆关了一个已经弃用的开关，真正的开关是另一个，结果多装了一套用不到的组件。
+
+教训：本机的 `rm` 是 `trash`，不认 `-f`。在 `&&` 串起来的命令里它失败会让后面的步骤全部跳过；脚本和一次性命令里用 `command rm`。
 
 教训：静态地址的网桥在没有载波时地址和路由都还在，而且比备用网卡的路由优先。说“留了一条备用通道”之前要想清楚主通道以各种方式坏掉时内核会怎么选路；这次是拔网线后整台机器从 IPv4 连不上，靠 IPv6 的链路本地地址才进去修。
 

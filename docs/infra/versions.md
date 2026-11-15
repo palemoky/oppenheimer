@@ -44,6 +44,13 @@
 | otel contrib：runtime | v0.72.0 | 稳定版 | 2026-11-14 | `go.opentelemetry.io/contrib/instrumentation/runtime`，Go 运行时指标（GC、goroutine 等） |
 | redis/go-redis/extra/redisotel | v9.23.0 | 稳定版 | 2026-11-14 | `github.com/redis/go-redis/extra/redisotel/v9`，Redis 调用的链路和指标，版本与 go-redis 一致 |
 | XSAM/otelsql | v0.44.0 | 稳定版 | 2026-11-14 | `github.com/XSAM/otelsql`，`database/sql` 的链路和指标（MySQL） |
+| Ubuntu（集群节点） | 26.04.1 LTS | LTS | 2026-11-15 | cloud image `ubuntu-26.04-server-cloudimg-amd64.img`，内核 7.0；宿主机也是 26.04 |
+| k3s | v1.37.2+k3s1 | 稳定版 | 2026-11-15 | 稳定通道当天的版本（`update.k3s.io`）；版本写在 `scripts/cluster/cluster.env`，不走通道。自带 containerd 2.3.7、Gateway API 的 CRD v1.6.3（标准通道） |
+| MetalLB | v0.16.2 | 稳定版 | 2026-11-15 | Helm chart 0.16.2，只用二层模式，`frrk8s.enabled=false`（ADR-0025） |
+| Envoy Gateway | v1.10.0 | 稳定版 | 2026-11-15 | chart `oci://docker.io/envoyproxy/gateway-helm`。兼容性表：Envoy v1.40.x、Gateway API v1.6.1、Kubernetes v1.34 到 v1.37，支持到 2027-05-05。实际用的 Gateway API CRD 是 k3s 自带的 v1.6.3（设计文档 2a 第 11 节） |
+| distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
+| podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
+| kubectl / helm（MacBook） | v1.37.2 / v4.3.2 | 稳定版 | 2026-11-15 | Homebrew 安装 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
 
 ## 本机 compose 的 MySQL 实例（2026-11-13）
@@ -107,9 +114,7 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 
 | 组件 | 阶段 | 是否有 LTS |
 |---|---|---|
-| Ubuntu（虚拟机镜像） | 2 | 有 |
-| k3s / Kubernetes | 2 | 无，选当前受支持的最新小版本 |
-| Strimzi、MySQL Operator、Helm | 2 | 无 |
+| Strimzi、MySQL Operator | 2 | 无 |
 | OpenTelemetry Collector 与 Go SDK | 1d / 3 | 无 |
 | Prometheus | 3 | 有 |
 | Grafana、Loki、Alertmanager | 3 | 无 |
