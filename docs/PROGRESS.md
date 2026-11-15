@@ -48,10 +48,10 @@
    - **集群在 2026-11-15 重建过一次**（主人确认）。原因是节点上的 AppArmor 拦掉了容器里进程之间的全部信号：官方的 MySQL 镜像起不来，所有 Go 程序的抢占信号被拒绝。根因是 Ubuntu 26.04 默认的 `kernel.apparmor_restrict_unprivileged_unconfined=1`，主人在一个节点上手工验证后同意写进 `vm.sh` 的 cloud-init 并重建。重建后三个节点没有任何信号被拒绝的记录。
    - 现在集群上有：两套 Redis（`redis-gate` 主从加 Sentinel、`redis-cache` Cluster）、Strimzi 1.3.1 加 Kafka 4.3.2（3 个 broker）、MySQL 9.7.4（`mysql-order-0`、`mysql-order-1` 各一主一从，`mysql-main` 单实例）。`make cluster-up` 之后 `make middleware-up`（或 `scripts/cluster/middleware.sh redis|kafka|mysql`），都可重复执行。MySQL 的密码是脚本在集群里随机生成的 Secret（`<release>-auth`），重建后会变。
    - MySQL 的主从由 values 里的 `primaryOrdinal` 决定（不是 Pod 的标签，发现 2）；`middleware.sh mysql` 最后只读地核对实际状态，不一致时非零退出。
-   - Go 代码：`pkg/redisx` 三种模式（地址写法 `sentinel://gate@...`、`cluster://...`）、`pkg/ratelimit` 在 Cluster 下按桶调用（ADR-0019 的补充）、调用方改成 `redis.UniversalClient`、`kafkax` 建 topic 的副本数用 broker 的默认值。受影响的五个模块 `make lint` 0 issues、`make test` 通过（`kafkax` 的改动之后只重跑了 `pkg`）；`make e2e` 没有跑。
+   - Go 代码：`pkg/redisx` 三种模式（地址写法 `sentinel://gate@...`、`cluster://...`）、`pkg/ratelimit` 在 Cluster 下按桶调用（ADR-0019 的补充）、调用方改成 `redis.UniversalClient`、`kafkax` 建 topic 的副本数用 broker 的默认值。全部 11 个模块 `make lint` 0 issues、`make build` 通过；`pkg`、四个服务和 `test/load` 的 `make test` 通过；`make e2e` 通过（都是 2026-11-15）。第一次推送时漏改了 `test/load`（它也用旧的客户端类型），CI 有 3 项编译失败，已修。
    - CNI 已改定为保留 flannel（ADR-0026 末尾）。
    - 本机：OrbStack 配了 `insecure-registries`，可以直接 `docker push 192.168.50.50:5000/...`；多了一个可选的测试环境 `make redis-modes-up`（11 个容器，现在在运行，不用时 `make redis-modes-down`）。
-2. 2b 剩下的（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册；跑一次 `make e2e`。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
+2. 2b 剩下的（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
 3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
 4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
 5. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
@@ -400,6 +400,8 @@
 教训：Helm chart 的默认值要先 `helm show values` 看一遍再写 values。MetalLB 这次按记忆关了一个已经弃用的开关，真正的开关是另一个，结果多装了一套用不到的组件。
 
 教训：本机的 `rm` 是 `trash`，不认 `-f`。在 `&&` 串起来的命令里它失败会让后面的步骤全部跳过；脚本和一次性命令里用 `command rm`。
+
+教训：改公共库的类型之后要对**全部**模块跑 `make lint` 和 `make build`，不能只跑自己想到的那几个。这次按“谁在用 `*redis.Client`”搜了 `pkg` 和 `services`，漏了 `test/load`，推送后 CI 才发现。
 
 教训：新环境装完要看内核日志，不能只看功能。2a 里所有 Go 程序的抢占信号一直在被 AppArmor 拒绝，但什么都“正常”，直到 2b 碰上一个靠信号退出的程序（mysqld）才暴露。排查的顺序是：先用不带任何自定义配置的官方镜像复现，排除自己写的 chart；再逐个去掉可疑的保护层（这里是 AppArmor）；确认之后去内核日志里找具体被拒绝的操作。
 
