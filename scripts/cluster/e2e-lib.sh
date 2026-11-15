@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # 集群上端到端测试（设计文档 2c 的 10.1）对共用中间件的操作：建库授权、恢复从库复制、清理 e2e 留下的东西。
-# 被 scripts/cluster/e2e.sh 和 services.sh 的 e2e-down 引用，不单独运行。调用方已经 source 过 cluster.env、
-# 设好了 KUBECONFIG。
+# 被 scripts/cluster/e2e.sh、chaos.sh、bench.sh 和 services.sh 引用，不单独运行（source 时只定义变量和函数）。
+# 调用方已经 source 过 cluster.env、设好了 KUBECONFIG。
 #
 # e2e 那一套和长期运行的那一套共用 MySQL、Kafka、Redis，靠名字隔离（和本机的做法一样）：
 #   MySQL  e2e_ 前缀的库，建在三个实例的主库上（从库靠复制）
@@ -17,6 +17,12 @@ E2E_MYSQL_NS="mysql"
 E2E_MAIN_DBS="e2e_inventory_db e2e_payment_db e2e_merchant_index_db_0 e2e_merchant_index_db_1 e2e_order_archive_db"
 # 订单分片：release 序号 i 上是 e2e_order_db_i。
 E2E_ORDER_SHARDS="0 1"
+
+# 测试的发压 Pod 直连 inventory 的 gRPC 的地址（chaos.sh、bench.sh 的 warmup 预热闸门用）：普通 Service 的 gRPC 端口。
+# 发压 Pod 也在网格里（注入边车，身份是 ServiceAccount load，deploy/cluster/e2e/mesh-load.yaml 单独放行它调 inventory），
+# 请求经自己的边车出站、由 inventory 的边车接管入站。9082 是 deploy/cluster/services/inventory.yaml 的 ports.grpc。
+# shellcheck disable=SC2034 # 由 source 它的脚本使用
+E2E_INVENTORY_ADDR="inventory:9082"
 
 # 某个 release 当前作为主库或从库的 Pod：以 -primary、-replica 两个 Service 实际选中的 Pod 名为准
 # （和 middleware.sh 的 mysql_check 同样的办法），不假设序号。
@@ -228,6 +234,15 @@ metadata:
 e2e_mark_kept() { # 命名空间
   kubectl label namespace "$1" "$E2E_STATE_LABEL=kept" --overwrite >/dev/null 2>&1 ||
     echo "    WARNING: could not label namespace $1 as kept" >&2
+}
+
+# 复用上一次 E2E_KEEP=1 留下的现场（scripts/cluster/fault.sh 的 FAULT_SKIP_DEPLOY=1）时调用：标回 running，
+# 这期间别的 e2e、chaos 会被拒绝，而不是把它当成旧现场清掉。失败时 return 1，由调用方决定是否继续。
+e2e_mark_running() { # 命名空间
+  kubectl label namespace "$1" "$E2E_STATE_LABEL=running" --overwrite >/dev/null 2>&1 || {
+    echo "    WARNING: could not label namespace $1 as running" >&2
+    return 1
+  }
 }
 
 # 失败时把现场收下来：每个 Pod 的日志（所有容器，含边车；重启过的再收上一次的）、Pod 列表、事件。

@@ -1,0 +1,75 @@
+# 注入检查：一个服务端（podinfo）和一个客户端（busybox），放在打了注入标签的临时命名空间 mesh-check 里。
+# 验证的是这批节点上注入能不能用（设计文档 2d 第 8 节的第一步）：init 容器写得进重定向规则（iptables 是
+# nf_tables 后端，节点有 AppArmor），边车是原生 sidecar，Pod 的安全设置和业务服务相同时边车照样拿得到证书。
+# 用法见 scripts/cluster/mesh.sh check。
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+spec:
+  selector: {app: server}
+  ports:
+    - {name: http, port: 9898, targetPort: 9898}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: server}
+  template:
+    metadata:
+      labels: {app: server}
+    spec:
+      # 和 deploy/charts/service 的 Pod 相同的几项：要验证的正是它们和注入能不能共存。
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.9.0
+          ports: [{containerPort: 9898}]
+          readinessProbe:
+            httpGet: {path: /readyz, port: 9898}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: client}
+  template:
+    metadata:
+      labels: {app: client}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: client
+          image: 192.168.50.50:5000/test/busybox:1.37.0
+          command: [sleep, "86400"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}

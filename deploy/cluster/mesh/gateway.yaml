@@ -1,0 +1,14 @@
+# gateway 自己的边车（设计文档 2d 的 3.4）。gateway 没有 gRPC 入站：它的 HTTP 端口不过边车
+# （入口的 Envoy 直接连 8080，见 ADR-0029 的第 4 项），所以这里只有出站的可见范围。
+# 调到四个下游的规则在各个下游的文件里（order.yaml 等）。
+#   - egress：只下发本命名空间和 istio-system 的服务。不写的话每个边车会拿到全网格所有 Service 的配置
+#     （包括中间件那些 headless Service 的每一个 Pod），内存随集群里的服务数增长。
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: gateway
+spec:
+  workloadSelector:
+    labels: {app.kubernetes.io/name: gateway}
+  egress:
+    - hosts: ["./*", "istio-system/*"]

@@ -1,0 +1,11 @@
+# 集群上的故障注入（scripts/cluster/fault.sh，make cluster-fault）对六个服务共同的覆盖。
+# 叠在 e2e 那两层之上：deploy/cluster/services/<服务>.yaml、e2e/common.yaml、e2e/<服务>.yaml、本文件、
+# fault/<服务>.yaml（services.sh 的 E2E_OVERLAY_DIR）。
+# 命名空间、库、前缀、入口的主机名都和 e2e 共用，这里只放 fault 和 e2e 不同的地方。
+# HPA 在 e2e/common.yaml 里已经关掉：挂住 inventory 期间 CPU 会变，副本数不能被 HPA 改。
+
+config:
+  # 失败时日志更有用（e2e 那一层是 warn）。
+  LOG_LEVEL: info
+  # 同 chaos：e2e 那一层指向测试 Job 里的接收端，这里没有那个 Job，连不上的导出器只会不停重连、刷警告。
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""

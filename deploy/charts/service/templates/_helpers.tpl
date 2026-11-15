@@ -16,7 +16,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- end -}}
 
-{{/* 边车开着才有边车配置；开着但没给配置时渲染失败，不要起一个空配置的 Envoy。 */}}
-{{- define "service.sidecarConfig" -}}
-{{- required "sidecar.config is empty: pass the rendered deploy/envoy/<service>.yaml with --set-file (scripts/cluster/services.sh does), or set sidecar.enabled=false" .Values.sidecar.config -}}
+{{/* Istio 的边车要注入：istio.inject。 */}}
+{{- define "service.istioInject" -}}
+{{- if .Values.istio.inject }}true{{ end -}}
 {{- end -}}

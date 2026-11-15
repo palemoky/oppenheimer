@@ -22,7 +22,8 @@ strategy: RollingUpdate
 minReadySeconds: 5
 # 要大于 DRAIN_DELAY 加停止时限（20 秒）加边车退出的时间（设计文档 8.1）。不用 preStop。
 terminationGracePeriodSeconds: 45
-drainDelay: 15s
+# 5 秒：Istio 下端点的变化经 xDS 推送，实测 Pod 收到 SIGTERM 之后 0.5 秒内就不再有新请求进来（设计文档 2d 第 10 节）。
+drainDelay: 5s
 
 # 服务容器监听的端口。chart 把它们同时渲染成 HTTP_ADDR、GRPC_ADDR（监听所有地址，探针才连得到）。
 # grpc 为 0 表示没有 gRPC（gateway 的 HTTP 是对外的，cdc 没有 gRPC）。
@@ -56,26 +57,30 @@ spread: true
 pdb:
   enabled: true        # maxUnavailable: 1。cdc 只有一个实例，关掉
 
-# 普通 ClusterIP Service（<名字>），暴露服务的 HTTP 端口：给不经过边车的访问用（入口到 gateway、调试）。
+# 普通 ClusterIP Service（<名字>），暴露服务的 HTTP 端口（入口到 gateway、调试，不经过边车），
+# ports.grpc 大于 0 时再暴露 gRPC 端口（端口名 grpc）：服务之间经它调用，出站被调用方自己的边车截获。
 service:
   enabled: true
-# headless Service（<名字>-headless），暴露边车的入站端口：调用方的边车 STRICT_DNS 解析它得到所有就绪的 Pod。
-# 只在边车开着时才有意义；没有入站监听的服务（gateway）自己关掉。
-headless:
-  enabled: true
 
-# Envoy 边车（原生 sidecar：initContainers 里 restartPolicy: Always），设计文档 6.1。
-sidecar:
-  enabled: true
-  image: envoyproxy/envoy:v1.40.2
-  # 配置内容（Envoy 的 yaml）。由部署脚本用 --set-file 传入渲染过的 deploy/envoy/<服务>.yaml，不在 chart 里另存一份。
-  config: ""
-  inboundPort: 15001
-  adminPort: 9901
-  resources:
-    cpu: 20m
-    memoryRequestMi: 32
-    memoryLimitMi: 192
+# 服务之间的 gRPC 走 Istio 自动注入的边车（设计文档 2d）：Pod 上打注入标签，每个服务一个 ServiceAccount。
+# 流量规则在 deploy/cluster/mesh/（services.sh 先于 release 应用）。
+istio:
+  # 注入边车。只有服务之间的 gRPC 要过边车：有 gRPC 入站的服务（ports.grpc > 0）和只有出站的 gateway 注入，
+  # 没有任何 gRPC 的 cdc 关掉（它的 values 叠加层里设 false）。关掉时 Pod 上显式写 inject: "false"。
+  inject: true
+  # 不过边车的出站端口：MySQL、Redis、Redis Cluster 总线、Sentinel、Kafka。它们不是 HTTP/gRPC，
+  # 边车除了多一跳什么也不做；Redis Cluster、Kafka 还会按节点地址直连，经边车只会多出一层要排查的东西。
+  excludeOutboundPorts: "3306,6379,16379,26379,9092"
+  # 边车的资源。默认不设，用网格的全局默认值（deploy/cluster/istio/：requests 50m / 64Mi，上限 192Mi）。
+  # 设了哪一项才渲染哪一项的注解：cpu -> proxyCPU，memory -> proxyMemory，memoryLimit -> proxyMemoryLimit（如 "256Mi"）。
+  proxy:
+    cpu: ""
+    memory: ""
+    memoryLimit: ""
+
+# Pod 模板上额外的注解，原样加在 chart 自己的注解之后。默认没有。
+# 现在只有故障注入（deploy/cluster/services/fault/gateway.yaml）用它打开边车的统计项（proxy.istio.io/config）。
+podAnnotations: {}
 
 # 对外路由，挂到入口的 Gateway（2a）。只有 gateway 开。
 route:

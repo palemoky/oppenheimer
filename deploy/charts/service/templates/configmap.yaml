@@ -13,16 +13,3 @@ data:
   {{- if not .Values.config }}
   {}
   {{- end }}
----
-{{- if .Values.sidecar.enabled }}
-# Envoy 边车的配置。内容来自 deploy/envoy/<服务>.yaml（部署脚本替换了两处主机名）。
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "service.name" . }}-envoy
-  labels:
-    {{- include "service.labels" . | nindent 4 }}
-data:
-  envoy.yaml: |
-    {{- include "service.sidecarConfig" . | nindent 4 }}
-{{- end }}

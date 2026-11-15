@@ -1,15 +1,14 @@
-# order 服务（设计文档 2c）。release 名 order。边车配置来自 deploy/envoy/order.yaml。
+# order 服务（设计文档 2c）。release 名 order。
 replicas: 2   # 节点号各自从库里租（ADR-0028）
 ports: {http: 8081, grpc: 9081}
 resources: {cpu: 300m, memoryRequestMi: 96, memoryLimitMi: 768}
-sidecar: {enabled: true}
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
   REDIS_ADDR: sentinel://gate@redis-gate-sentinel.redis.svc:26379
   CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
-  # 调 inventory 经自己边车的出站端口（本机同样是 15182）。
-  INVENTORY_ADDR: 127.0.0.1:15182
+  # 连 Service 名加 gRPC 端口，出站被自己的边车截获（规则在 deploy/cluster/mesh/inventory.yaml）。
+  INVENTORY_ADDR: inventory:9082
 
 # 两个订单分片各有主库和从库（MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应）；冷库在共享实例上。
 secretEnv:

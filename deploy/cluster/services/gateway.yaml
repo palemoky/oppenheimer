@@ -1,19 +1,18 @@
-# gateway 服务（设计文档 2c）。release 名 gateway。边车配置来自 deploy/envoy/gateway.yaml。
-# gateway 的 HTTP 入站不经过边车（入口的 Envoy 直接连 8080），边车只管四个出站，所以没有 headless Service。
+# gateway 服务（设计文档 2c）。release 名 gateway。
+# gateway 的 HTTP 入站不经过边车（入口的 Envoy 直接连 8080）。没有 gRPC 入站，但四个出站要过边车，所以照样注入
+# （istio.inject 默认 true）；入站一个端口都不接管（chart 按 ports.grpc 为 0 处理）。
 # 管理端口（降级开关，ADMIN_ADDR 的默认值 127.0.0.1:8089）不设：它没有鉴权，只在 Pod 内的回环上监听，
 # 用 kubectl port-forward 访问。探针打的是对外的 8080（/healthz、/readyz 在对外端口的 mux 上）。
 replicas: 2
 ports: {http: 8080, grpc: 0}
 resources: {cpu: 200m, memoryRequestMi: 64, memoryLimitMi: 512}
-sidecar: {enabled: true}
-headless: {enabled: false}
 
 config:
-  # 四个下游经自己边车的出站端口（和本机一致）。
-  ORDER_ADDR: 127.0.0.1:15081
-  INVENTORY_ADDR: 127.0.0.1:15082
-  PAYMENT_ADDR: 127.0.0.1:15083
-  ORDERINDEX_ADDR: 127.0.0.1:15084
+  # 下游连 Service 名加 gRPC 端口：出站被自己的边车截获，按 deploy/cluster/mesh/ 的规则路由、限流、摘除。
+  ORDER_ADDR: order:9081
+  INVENTORY_ADDR: inventory:9082
+  PAYMENT_ADDR: payment:9083
+  ORDERINDEX_ADDR: orderindex:9084
   RATE_LIMIT_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
   # 入口的 Envoy 会在 X-Forwarded-For 里追加客户端地址。入口 Pod 的地址不固定，先信整个 Pod 网段；
   # 任何 Pod 都能伪造这个头的问题留给 2d 的 NetworkPolicy（设计文档 7.5）。

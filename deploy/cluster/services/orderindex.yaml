@@ -1,8 +1,7 @@
-# orderindex 服务（设计文档 2c）。release 名 orderindex。边车配置来自 deploy/envoy/orderindex.yaml。
+# orderindex 服务（设计文档 2c）。release 名 orderindex。没有 gRPC 下游，只有入站（9084）过边车。
 replicas: 2
 ports: {http: 8084, grpc: 9084}
 resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
-sidecar: {enabled: true}
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092

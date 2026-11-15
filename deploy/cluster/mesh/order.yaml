@@ -1,0 +1,111 @@
+# 调到 order 的流量在网格里的规则（设计文档 2d 的 3.4，ADR-0029），和 order 自己的边车的设置。
+# 对两个命名空间各 kubectl apply -n 一次（scripts/cluster/services.sh），所以 host 都写短名字。
+# 数值和本机手写的边车（deploy/envoy/）是同一套，来源是设计文档 1d 的 5.5；Go 的测试核对这里的超时、
+# deploy/envoy/ 里的超时和代码里的常量三处一致（TestHopTimeoutMatches* 一类）。改数时三处一起改。
+#
+# 规则都作用在调用方的边车上：每个调用方对 order 各有各的超时、并发额度和摘除统计。
+# 超时和重试。路由按调用方匹配（sourceLabels），从上到下第一条匹配的生效。
+#   - timeout 是这一跳的预算，也是慢下游能被摘除的唯一途径（1d 的坑 2）。进程里的时限比它长
+#     grpcx.SidecarMargin：边车必须先超时。
+#   - retries.attempts: 0：同步调用链上不重试。Istio 的默认是对 unavailable 等条件重试 2 次，
+#     网格的默认配置里已经关了（deploy/cluster/istio/istiod.yaml），这里每条路由再写一遍，不依赖那个默认。
+#   - destination 要写端口：Service 上有 HTTP 和 gRPC 两个端口，不写的话 istioctl analyze 报 IST0112（有歧义）。
+#     路由本身不按端口匹配，所以网格里的 Pod 访问 order 的 HTTP 端口也会被送到 gRPC 端口。服务之间没有这样的调用
+#     （探针来自 kubelet，不在网格里）；调试时要访问 HTTP 端口用 kubectl port-forward。
+#   - 最后一条没有 match 的是兜底：以后多了一个调用方而忘了在这里加路由时，它拿到的是最紧的预算和不重试，
+#     而不是“没有超时”。
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: order
+spec:
+  hosts: [order]
+  http:
+    - name: from-gateway
+      match:
+        - sourceLabels: {app.kubernetes.io/name: gateway}
+      route:
+        - destination: {host: order, port: {number: 9081}}
+      timeout: 3s
+      retries: {attempts: 0}
+    - name: from-payment
+      match:
+        - sourceLabels: {app.kubernetes.io/name: payment}
+      route:
+        - destination: {host: order, port: {number: 9081}}
+      timeout: 1s
+      retries: {attempts: 0}
+    - name: from-anyone-else
+      route:
+        - destination: {host: order, port: {number: 9081}}
+      timeout: 1s
+      retries: {attempts: 0}
+---
+# 并发上限和摘除。workloadSelector 选的是调用方的 Pod：这条规则只下发给它的边车。
+#   - http2MaxRequests：这个调用方的每个 Pod 对 order 同时在途的请求数，超过的立刻返回 UNAVAILABLE。
+#     http1MaxPendingRequests 名字里带 http1，实际对 HTTP/2 也生效（等连接的排队上限）。
+#   - 不写 maxRetries：Istio 把 0 当成没写（生成出来是 2^32-1）。重试是在路由上关的。
+#   - 连续 5 次 5xx（下游报错、连不上、路由超时的 504 都算）摘除这个 Pod 5 秒。摘除时间随被摘除的次数
+#     加长（5、10、15 秒…），DestinationRule 没有封顶的字段（ADR-0029 的第 5 项）。
+#   - maxEjectionPercent: 100：默认 10%，两个副本的 10% 是 0 个，摘除不生效（1d 的坑 1）。
+#   - minHealthPercent、splitExternalLocalOriginErrors 用默认值（0、false），正是要的（坑 1 的后一半、坑 3），
+#     写出来防止以后有人改。
+#   - 关掉就近优先：配了 outlierDetection 就会启用它，节点没有区域标签时没有效果，但不依赖这一点。
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: gateway-to-order
+spec:
+  host: order
+  workloadSelector:
+    matchLabels: {app.kubernetes.io/name: gateway}
+  trafficPolicy:
+    connectionPool:
+      http: {http2MaxRequests: 512, http1MaxPendingRequests: 512}
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 1s
+      baseEjectionTime: 5s
+      maxEjectionPercent: 100
+      minHealthPercent: 0
+      splitExternalLocalOriginErrors: false
+    loadBalancer:
+      localityLbSetting: {enabled: false}
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: payment-to-order
+spec:
+  host: order
+  workloadSelector:
+    matchLabels: {app.kubernetes.io/name: payment}
+  trafficPolicy:
+    connectionPool:
+      http: {http2MaxRequests: 128, http1MaxPendingRequests: 128}
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 1s
+      baseEjectionTime: 5s
+      maxEjectionPercent: 100
+      minHealthPercent: 0
+      splitExternalLocalOriginErrors: false
+    loadBalancer:
+      localityLbSetting: {enabled: false}
+---
+# order 自己的边车。一个工作负载只能有一个 Sidecar 资源，入站和出站的设置都在这里。
+#   - inboundConnectionPool：order 的每个 Pod 总共同时处理多少 gRPC 请求，不管来自谁（它对自己的保护）。
+#     比任何一个调用方的出站额度都大，正常情况下先触发的是调用方那一侧的上限。
+#   - egress：只下发本命名空间和 istio-system 的服务。不写的话每个边车会拿到全网格所有 Service 的配置
+#     （包括中间件那些 headless Service 的每一个 Pod），内存随集群里的服务数增长。
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: order
+spec:
+  workloadSelector:
+    labels: {app.kubernetes.io/name: order}
+  inboundConnectionPool:
+    http: {http2MaxRequests: 1024, http1MaxPendingRequests: 1024}
+  egress:
+    - hosts: ["./*", "istio-system/*"]

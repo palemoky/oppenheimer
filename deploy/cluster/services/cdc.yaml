@@ -1,12 +1,14 @@
-# cdc 服务（设计文档 2c）：从订单从库读 binlog，写 Kafka。没有 gRPC，没有边车，没有 Service。
+# cdc 服务（设计文档 2c）：从订单从库读 binlog，写 Kafka。没有 gRPC，没有 Service。
 # 同一时刻只能有一个实例读 binlog：Recreate（先停旧的再起新的），不要 PDB。
 replicas: 1
 strategy: Recreate
 ports: {http: 8085, grpc: 0}
 resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
-sidecar: {enabled: false}
 service: {enabled: false}
 pdb: {enabled: false}
+# 没有任何 gRPC（出站只有 MySQL 和 Kafka，都在 istio.excludeOutboundPorts 里），不注入边车：Pod 上是 inject: "false"。
+# 照样有自己的 ServiceAccount（chart 无条件建）。
+istio: {inject: false}
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092

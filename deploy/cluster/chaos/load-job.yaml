@@ -32,8 +32,18 @@ spec:
       labels:
         app.kubernetes.io/name: chaos-load
         app.kubernetes.io/part-of: oppenheimer
+        # 进网格（设计文档 2d 第 10 节的第八步）：warmup 直接调 inventory 的 gRPC，严格模式下没有证书连不进去。
+        # 身份是 ServiceAccount load，由 deploy/cluster/e2e/mesh-load.yaml 放行。集群上没有 Istio 时这个标签没有作用。
+        sidecar.istio.io/inject: "true"
+      annotations:
+        # 没有入站。出站只让到集群内服务的那一部分过边车：中间件的端口排除（和业务服务一样），
+        # 入口的地址也排除，发压的请求不能多过一层代理，否则量到的延迟里有它。
+        traffic.sidecar.istio.io/includeInboundPorts: ""
+        traffic.sidecar.istio.io/excludeOutboundPorts: "3306,6379,16379,26379,9092"
+        traffic.sidecar.istio.io/excludeOutboundIPRanges: "__LB_GATEWAY_IP__/32"
     spec:
       restartPolicy: Never
+      serviceAccountName: load
       automountServiceAccountToken: false
       # sleep 是 1 号进程，不处理 SIGTERM，删的时候只能等到优雅期满；它没有要收尾的东西。
       terminationGracePeriodSeconds: 1

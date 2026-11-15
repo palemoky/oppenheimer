@@ -162,8 +162,14 @@ func TestCommandWithoutParentProducesNoSpan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if after := len(spans.Ended()); after != before {
-		t.Errorf("%d spans were recorded for commands without a parent span, want 0", after-before)
+	if ended := spans.Ended(); len(ended) != before {
+		t.Errorf("%d spans were recorded for commands without a parent span, want 0", len(ended)-before)
+		// 这个用例在 CI 上偶发失败过一次（多出 2 个 span，2026-11-16，PR #12，本机没有复现）。记录器是进程级的，
+		// 多出来的也可能是别的用例留下、这时候才结束的 span：把它们是谁、父 span 是谁打出来，下次能直接判断。
+		for _, sp := range ended[before:] {
+			t.Logf("extra span %q kind=%s trace=%s parent=%s remote_parent=%t attrs=%v", sp.Name(), sp.SpanKind(),
+				sp.SpanContext().TraceID(), sp.Parent().SpanID(), sp.Parent().IsRemote(), sp.Attributes())
+		}
 	}
 }
 

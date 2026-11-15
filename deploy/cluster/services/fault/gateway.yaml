@@ -1,0 +1,22 @@
+# gateway 在 fault 那一套里的覆盖（叠在 e2e/gateway.yaml 之上）。
+# 2 个副本（e2e 那一层已经是 2，这里再写一遍，因为场景 D 的断言“在途不超过 2×128”依赖它）。
+replicas: 2
+
+config:
+  # 限流整体关掉，同 chaos 和本机 scripts/fault.sh：场景里从 MacBook 一个地址用少数几个用户高频请求，
+  # 不关会先被限流（429）拦住，验证不到边车。
+  RATE_LIMIT: "off"
+
+# 打开边车上 gateway -> inventory 这一条边的统计项。Istio 默认只保留一小部分统计（cluster_manager、server 等），
+# 集群级的 upstream_rq_total、upstream_rq_retry、溢出、摘除这些都不在里面。场景 D、F 要读它们。
+# 两条正则：
+#   cluster.outbound|9082||inventory.<命名空间>.svc.cluster.local.*   边车到 inventory 的上游请求、重试、溢出、摘除
+#   http.outbound_0.0.0.0_9082.*                                     gateway 进程交给边车的请求（出站监听的 HCM）
+# 第二条写得宽一点（outbound_ 和 9082 之间任意），不依赖 Istio 给出站监听起的统计前缀的确切写法。
+# 只匹配这一条边，统计项的数量很小，不影响边车的内存。
+podAnnotations:
+  proxy.istio.io/config: |
+    proxyStatsMatcher:
+      inclusionRegexps:
+        - 'cluster\.outbound\|9082\|\|inventory\..*'
+        - 'http\.outbound_.*9082.*'
