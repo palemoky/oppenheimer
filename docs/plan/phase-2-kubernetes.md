@@ -43,11 +43,13 @@
 - [x] 探针：startup、liveness、readiness，与优雅启停配合（`DRAIN_DELAY` 15 秒，按实测的端点传播时间定的：最长 9.5 秒）
 - [x] 配置与密钥：ConfigMap 经 `envFrom`，密码从 Secret 取并用变量展开拼 DSN，配置变了靠校验和注解触发滚动（设计文档 2c 的 7.2）
 - [x] 资源 requests 与 limits、QoS 等级（Burstable）；requests 已按轻载下 `kubectl top` 的实际用量调低，阶段 3 压测时再校
-- [ ] HPA：基于 CPU（gateway、order）。基于自定义指标（QPS）的挪到阶段 3a，等有了 Prometheus
+- [x] HPA：基于 CPU（gateway、order，2 到 4 个副本，目标 70%）。约 810 请求/秒时两个服务都从 2 扩到 4，新 Pod 约 5 秒就绪并均分到流量；从发压到第一次扩容约 55 秒，主要是指标的滞后（设计文档 2c 第 13 节的第六步）。扩容瞬间有 14 个查订单的 503 没有修
+- [ ] HPA：基于自定义指标（QPS），挪到阶段 3a，等有了 Prometheus
 - [x] 滚动发布策略，验证发布过程零报错：六个服务整体滚动两次共 28500 个请求 0 失败，`DRAIN_DELAY=0` 的对照每删一个 Pod 失败 15 个左右（`scripts/cluster/probe.py`）
 - [x] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决：直连 ClusterIP 时 gateway 的请求全部落在一个 inventory Pod 上，经边车时两个 Pod 各一半（设计文档 2c 第 13 节）
 - [ ] 在集群上重做 1b 的吞吐对比（`scripts/bench.sh`，1a 与 1b 各一遍），给出“下单吞吐相对 1a 是否有数量级提升”的结论。本机的测量疑似受 OrbStack 端口转发丢包干扰（约 23% 的提交卡在 200 毫秒，正好是 TCP 最小重传超时），见 1b 设计文档 7.3.4
-- [ ] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：重启的实例直接接回原来的分区，不触发重平衡
+- [x] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：**结论是不做**。滚动 payment 时每个分区只停 0.5 到 3.2 秒；franz-go 的静态成员关闭时不离组，Deployment 的新 Pod 又是新名字，用了反而要等会话超时（设计文档 2c 第 13 节的第七步，ADR-0007 的补充）
+- [x] 阶段 1 的端到端测试在集群上通过：`make cluster-e2e`，19 个用例，流量经入口的 Envoy（设计文档 2c 第 13 节的第五步）。一致性测试（删 Pod 后对账）还没有做
 - [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；还差示例 SKU 的脚本和“从空集群重建一遍”的验收。Argo CD 在 2d
 
 ## 2d 生态组件巡礼（按需）
@@ -81,6 +83,12 @@ Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调
 - 环境变量形式的配置为什么改了 ConfigMap 不生效，校验和注解的做法。
 - requests 和 limits 怎么定，`GOMEMLIMIT` 为什么要设，CPU 为什么不设 limits。
 - 多阶段构建、交叉编译对模拟、distroless 的取舍、tag 为什么不能重用。
+- HPA 的算式和它看到的是什么：利用率对 requests 算、按整个 Pod（边车也在内）、指标滞后近一分钟所以是分几步扩上去的；为什么开了 HPA 就不能在 Deployment 里写 `replicas`，去掉这个字段的那一次发布会发生什么；缩容的稳定窗口。
+- 扩出来的新 Pod 一就绪就拿到满额流量：冷连接池、没有慢启动；预热和 Envoy 慢启动各解决什么。
+- 滚动发布时一个 Kafka 分区会停多久，由什么决定（增量再平衡只挪要挪的分区；成员主动离组后其他成员要到下一次心跳才知道）；静态成员帮得上和帮倒忙的情形。
+- 带 `-race` 的测试二进制为什么不能放进 static 镜像，交叉编译 cgo 要什么。
+- 集群里的 Pod 访问 LoadBalancer 的地址走的是哪条路（kube-proxy 就地转发，不经过外部的负载均衡器）。
+- 两个 CDC 实例读同一个 MySQL 为什么 server id 必须不同。
 - 做对照实验：没有“去掉保护就失败”的对照，零失败说明不了保护起了作用；对照改过的配置要先恢复干净。
 
 2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：
