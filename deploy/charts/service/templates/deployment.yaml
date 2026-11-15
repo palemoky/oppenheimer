@@ -7,7 +7,9 @@ metadata:
   labels:
     {{- include "service.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicas }}
+  {{- end }}
   # 刚就绪就崩的 Pod 不算可用（设计文档 8.2）。
   minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
@@ -54,7 +56,7 @@ spec:
                   - key: node-role.kubernetes.io/control-plane
                     operator: DoesNotExist
       {{- end }}
-      {{- if and .Values.spread (gt (int .Values.replicas) 1) }}
+      {{- if and .Values.spread (or .Values.autoscaling.enabled (gt (int .Values.replicas) 1)) }}
       # 同一个服务的副本尽量分到不同节点。是软约束（ScheduleAnyway）：能放的只有两个工作节点，
       # 滚动时多开的那个 Pod 必然和某个旧 Pod 同节点，硬约束会让它一直 Pending、滚动卡住。
       # 代价是不保证分散：一个节点不可用时两个副本可能都挤在另一个上，恢复后也不会自己挪回去。

@@ -24,3 +24,7 @@ expandEnv:
   - name: ARCHIVE_DSN
     value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"
   # 不设 WORKER_ID：节点号启动时从自己的库里租（ADR-0028），每个副本各一个。
+
+# 按 CPU 伸缩，2 到 4 个副本（设计文档 2c 第 9 节）。上面的 replicas 不再起作用。
+# CPU 对 order 只是个凑合的信号：落库卡在下游时 CPU 是低的，不会扩。
+autoscaling: {enabled: true}

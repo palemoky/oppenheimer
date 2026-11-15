@@ -1,0 +1,28 @@
+{{- if .Values.autoscaling.enabled }}
+# 按 CPU 的水平伸缩（设计文档 2c 第 9 节）。只有 gateway 和 order 开。
+# 期望副本数 = ceil(当前副本数 × 当前利用率 ÷ 目标利用率)，偏差在 10% 以内不动。
+# 利用率 = Pod 里所有容器的 CPU 用量之和 ÷ 所有容器的 CPU requests 之和（边车也算在内），
+# 所以 requests 写错了这个数就失真。用量来自 metrics-server，有十几秒到一分钟的滞后。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "service.name" . }}
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "service.name" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilization }}
+  # behavior 不写，用默认值：扩容不设稳定窗口（每 15 秒最多翻倍或加 4 个，取大的），
+  # 缩容取过去 5 分钟里算出的最大期望值，避免负载抖动时来回伸缩。
+{{- end }}

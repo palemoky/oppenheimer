@@ -23,3 +23,6 @@ route:
   enabled: true
   hostnames: [api.oppenheimer.test]
   parentRef: {name: public, namespace: envoy-gateway-system}
+
+# 按 CPU 伸缩，2 到 4 个副本（设计文档 2c 第 9 节）。上面的 replicas 不再起作用。
+autoscaling: {enabled: true}
