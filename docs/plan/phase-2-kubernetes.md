@@ -36,17 +36,19 @@
 
 ## 2c 服务上集群
 
-- [ ] 多阶段 Dockerfile，构建 `linux/amd64` 镜像
-- [ ] 每个服务一个 Helm chart（或一个公共 chart 加 values）
+- [x] 设计文档 [design/2c-services.md](../design/2c-services.md)，主人已确认（2026-11-15）
+- [x] 节点号在多副本下的分配：没设 `WORKER_ID` 时从本服务的 MySQL 租（ADR-0028，`pkg/idgen` 的租约；本机 `make lint test e2e` 通过，集群上还没有跑过）
+- [x] 多阶段 Dockerfile，构建 `linux/amd64` 镜像（`deploy/docker/Dockerfile`、`make images`；七个镜像已推到集群仓库并在节点上跑过）
+- [x] 一个公共 chart 加每个服务一份 values（`deploy/charts/service`、`deploy/cluster/services/`）；六个服务已部署，从入口走通下单到支付到商家索引的整条链路
 - [ ] 探针：startup、liveness、readiness，与优雅启停配合
-- [ ] 配置与密钥：ConfigMap、Secret，配置变更如何生效
-- [ ] 资源 requests 与 limits、QoS 等级
-- [ ] HPA：基于 CPU，之后基于自定义指标（QPS）
+- [x] 配置与密钥：ConfigMap 经 `envFrom`，密码从 Secret 取并用变量展开拼 DSN，配置变了靠校验和注解触发滚动（设计文档 2c 的 7.2）
+- [ ] 资源 requests 与 limits、QoS 等级：已按设计的估计值写进 values，**还没有对着 `kubectl top` 的实际用量校一遍**
+- [ ] HPA：基于 CPU（gateway、order）。基于自定义指标（QPS）的挪到阶段 3a，等有了 Prometheus
 - [ ] 滚动发布策略，验证发布过程零报错
 - [ ] gRPC 在 K8s 里的负载均衡问题（长连接不均衡）及解决
 - [ ] 在集群上重做 1b 的吞吐对比（`scripts/bench.sh`，1a 与 1b 各一遍），给出“下单吞吐相对 1a 是否有数量级提升”的结论。本机的测量疑似受 OrbStack 端口转发丢包干扰（约 23% 的提交卡在 200 毫秒，正好是 TCP 最小重传超时），见 1b 设计文档 7.3.4
 - [ ] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：重启的实例直接接回原来的分区，不触发重平衡
-- [ ] 一键部署：`make deploy` 或 Argo CD（可选）
+- [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；还差示例 SKU 的脚本和“从空集群重建一遍”的验收。Argo CD 在 2d
 
 ## 2d 生态组件巡礼（按需）
 
@@ -54,6 +56,7 @@
 - [ ] cert-manager：证书
 - [ ] Argo CD：GitOps
 - [ ] 灰度发布：Argo Rollouts 或 Ingress 金丝雀
+- [ ] 服务网格：把服务之间手写的 Envoy 边车迁到 Istio，熔断、并发上限、路由超时逐项对照 1d 的实测重新验证（设计文档 2c 的 6.5；主人 2026-11-15 定的，不是“按需”）
 
 ## 验收标准
 

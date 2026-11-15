@@ -54,3 +54,4 @@
 | [0025](0025-envoy-gateway-and-metallb.md) | 集群入口用 Envoy Gateway 加 MetalLB，不用 ingress-nginx 和 k3s 自带的入口 | 已采纳 |
 | [0026](0026-k3s-datastore-and-bundled-components.md) | k3s 用内嵌 etcd；保留 flannel（暂定）、CoreDNS、local-path，禁用 Traefik 和 ServiceLB | 已采纳 |
 | [0027](0027-mysql-statefulset-not-operator.md) | 集群上的 MySQL 用手写的 StatefulSet，不用 Operator | 已采纳 |
+| [0028](0028-worker-id-lease.md) | 发号器的节点号从 MySQL 租，唯一性靠互不重叠的时间区间 | 已采纳 |

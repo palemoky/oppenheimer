@@ -21,6 +21,7 @@
 - [ ] 指标、日志、链路通过 trace id 互相跳转
 - [ ] Grafana 大盘：业务总览、单服务、中间件、集群资源
 - [ ] 监控数据保留策略与资源占用评估（内存紧张，见 hardware.md）
+- [ ] 按 QPS 的 HPA（gateway、order）：prometheus-adapter 或 KEDA 提供自定义指标（从 2c 挪过来的，设计文档 2c 第 9 节）
 
 ## 3b 压测
 
