@@ -3,7 +3,7 @@
 replicas: 1
 strategy: Recreate
 ports: {http: 8085, grpc: 0}
-resources: {cpu: 100m, memoryRequestMi: 128, memoryLimitMi: 512}
+resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
 sidecar: {enabled: false}
 service: {enabled: false}
 pdb: {enabled: false}

@@ -43,12 +43,25 @@ spec:
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      {{- if .Values.avoidControlPlane }}
+      # 不上控制面节点：它只有 6 GB，上面有 etcd、一个 Kafka broker 和两个 Redis，业务 Pod 再落上去内存用到过 86%
+      #（设计文档 2c 第 13 节）。etcd 所在的节点被挤爆比两个副本偶尔同节点严重得多。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      {{- end }}
       {{- if and .Values.spread (gt (int .Values.replicas) 1) }}
-      # 用分布约束而不是“必须不同节点”的反亲和：滚动时多出来的那个 Pod 可以落到第三个节点，不会卡住。
+      # 同一个服务的副本尽量分到不同节点。是软约束（ScheduleAnyway）：能放的只有两个工作节点，
+      # 滚动时多开的那个 Pod 必然和某个旧 Pod 同节点，硬约束会让它一直 Pending、滚动卡住。
+      # 代价是不保证分散：一个节点不可用时两个副本可能都挤在另一个上，恢复后也不会自己挪回去。
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
+          whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
               {{- include "service.selectorLabels" . | nindent 14 }}

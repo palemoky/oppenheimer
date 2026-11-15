@@ -1,7 +1,7 @@
 # payment 服务（设计文档 2c）。release 名 payment。边车配置来自 deploy/envoy/payment.yaml。
 replicas: 2   # 节点号各自从库里租（ADR-0028）
 ports: {http: 8083, grpc: 9083}
-resources: {cpu: 100m, memoryRequestMi: 128, memoryLimitMi: 512}
+resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
 sidecar: {enabled: true}
 
 config:

@@ -41,6 +41,8 @@ secretEnv: []          # - {name: MYSQL_ORDER_0_PASSWORD, key: order-0-app-passw
 expandEnv: []          # - {name: MYSQL_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(...)/db"}
 
 # 同一个服务的副本分散到不同节点（和入口 Envoy 同样的写法：滚动时多出来的那个可以落到第三个节点）。
+# 不调度到控制面节点（见 deployment.yaml 里的说明）。
+avoidControlPlane: true
 spread: true
 
 pdb:
@@ -64,7 +66,7 @@ sidecar:
   adminPort: 9901
   resources:
     cpu: 20m
-    memoryRequestMi: 48
+    memoryRequestMi: 32
     memoryLimitMi: 192
 
 # 对外路由，挂到入口的 Gateway（2a）。只有 gateway 开。

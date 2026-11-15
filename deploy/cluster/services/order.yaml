@@ -1,7 +1,7 @@
 # order 服务（设计文档 2c）。release 名 order。边车配置来自 deploy/envoy/order.yaml。
 replicas: 2   # 节点号各自从库里租（ADR-0028）
 ports: {http: 8081, grpc: 9081}
-resources: {cpu: 300m, memoryRequestMi: 192, memoryLimitMi: 768}
+resources: {cpu: 300m, memoryRequestMi: 96, memoryLimitMi: 768}
 sidecar: {enabled: true}
 
 config:

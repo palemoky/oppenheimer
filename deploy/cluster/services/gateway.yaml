@@ -2,9 +2,9 @@
 # gateway 的 HTTP 入站不经过边车（入口的 Envoy 直接连 8080），边车只管四个出站，所以没有 headless Service。
 # 管理端口（降级开关，ADMIN_ADDR 的默认值 127.0.0.1:8089）不设：它没有鉴权，只在 Pod 内的回环上监听，
 # 用 kubectl port-forward 访问。探针打的是对外的 8080（/healthz、/readyz 在对外端口的 mux 上）。
-replicas: 1   # 2c 第二步：先 1 个副本，设计值是 2（HPA 2 到 4）
+replicas: 2
 ports: {http: 8080, grpc: 0}
-resources: {cpu: 200m, memoryRequestMi: 128, memoryLimitMi: 512}
+resources: {cpu: 200m, memoryRequestMi: 64, memoryLimitMi: 512}
 sidecar: {enabled: true}
 headless: {enabled: false}
 

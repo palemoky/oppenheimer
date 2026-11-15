@@ -1,8 +1,8 @@
 # inventory 服务（设计文档 2c）。release 名 inventory，命名空间 oppenheimer。
 # 镜像的仓库和 tag 由 scripts/cluster/services.sh 传入。边车配置来自 deploy/envoy/inventory.yaml。
-replicas: 1   # 2c 第二步：先 1 个副本跑通，多副本等节点号的租约做完（设计文档第 5 节）
+replicas: 2
 ports: {http: 8082, grpc: 9082}
-resources: {cpu: 200m, memoryRequestMi: 128, memoryLimitMi: 512}
+resources: {cpu: 200m, memoryRequestMi: 64, memoryLimitMi: 512}
 sidecar: {enabled: true}
 
 config:
