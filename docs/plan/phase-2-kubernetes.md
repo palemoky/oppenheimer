@@ -30,8 +30,8 @@
 - [x] MySQL 定时备份到 NAS，并演练一次恢复（`make middleware-backup`、`make mysql-restore-drill`；数据量是假的，2c 灌数据后重量恢复耗时）
 - [x] MySQL 主从切换手册（[infra/mysql-switchover.md](../infra/mysql-switchover.md)），计划内切换演练过两趟；主库故障的切换留到阶段 4
 - [x] etcd 快照定时存到 NAS（server 节点上的 systemd 定时器，连同 token）
-- [ ] 演练一次从 etcd 快照恢复（ADR-0026；会重置控制面，动手前和主人说）
-- [ ] 重启宿主机后全部中间件自己恢复（重启前和主人说）
+- [x] 演练一次从 etcd 快照恢复：用 NAS 上的副本原地恢复，控制面中断 8 秒，工作负载不受影响（设计文档 2b 第 10 节的发现 17）；换机器恢复没有演练
+- [x] 重启宿主机后全部中间件自己恢复（240 秒内，没有人工干预，发现 18）
 - [x] 中间件部署完、灌数据之前量各节点的内存，改定 CNI：保留 flannel（ADR-0026）
 
 ## 2c 服务上集群
@@ -78,6 +78,7 @@ Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调
 - 切换之后旧主库回来为什么危险（脑裂），怎么让它起来就是只读的（`SET PERSIST`）。
 - Redis Cluster 的主从为什么可能落在同一个节点（`--cluster create` 只按地址避让），`CLUSTER REPLICATE` 和主从切换的区别。
 - MetalLB 二层模式下两个入口副本是主备不是分摊；`externalTrafficPolicy: Local` 的影响。
+- 从 etcd 快照恢复之后，快照之后才建的对象和它们正在跑的 Pod 会怎样；控制面停了的时候已经在跑的 Pod 为什么不受影响。
 - PDB 的 `maxUnavailable` 怎么算出“应该有几个 Pod”（经控制器的 scale 子资源），选中了一个 Job 的 Pod 会怎样。
 - Job 的终态条件（`Complete`、`Failed`，以及 1.31 起的 `SuccessCriteriaMet`、`FailureTarget`）。
 - 客户端怎么对待带 `Retry-After` 的 503。

@@ -338,6 +338,23 @@ apparmor="DENIED" operation="signal" profile="cri-containerd.apparmor.d" comm="g
 
 教训：PDB、Service、NetworkPolicy 都按标签选 Pod，一次性的 Job 和 hook 的 Pod 不能沿用被它们选中的那套标签。检查 PDB 要看 `ALLOWED DISRUPTIONS` 和它的状态，不是看它存不存在。
 
+**17. etcd 的恢复演练（7.2 的后一半，主人确认后做）。** 步骤先对照了 k3s 的文档（单 server：停 k3s，带 `--cluster-reset --cluster-reset-restore-path` 运行一次，再正常启动）。做法：
+
+1. 建命名空间 `etcd-drill` 和记号 `before-snapshot`；记下全部 39 个 Pod 的名字和重启次数、Secret 的个数、一个 MySQL Secret 的 `resourceVersion`。
+2. `make etcd-backup`（拍快照并同步到 NAS）。之后再建一个记号 `after-snapshot`。
+3. 在 server 上：挂载 NAS，校验快照副本的 SHA-256，确认 NAS 上的 token 和本机的一样，**把 NAS 上的那一份复制回来用它恢复**（演练的是“备份能用”，不是“本地的快照能用”）；`systemctl stop k3s`；`k3s server --cluster-reset --cluster-reset-restore-path=<副本>`；`systemctl start k3s`。
+
+结果：从停 k3s 到 API 重新可用 8 秒（恢复本身 3 秒，快照 20 MB）。`after-snapshot` 不见了，`before-snapshot` 还在；39 个 Pod 的名字和重启次数和快照前完全一样；Secret 的个数和那个 `resourceVersion` 没有变；两个 agent 没有重启、自己接了回来；之后 MySQL 的主从核对、Redis 的两套、Kafka、入口的通路检查、七个 PDB 都正常。旧的数据库被 k3s 挪到了 `server/db/etcd-old-<时间>`，确认无误后删了。
+
+要讲得清楚的两点：
+
+- **恢复的只是“集群认为应该有什么”，不是工作负载的数据。** 这次停控制面的 8 秒里，所有 Pod 照常在跑（kubelet 和容器不依赖 API 才能继续运行），MySQL 里的数据一行没动。反过来，快照之后才建的对象在恢复后就不存在了：如果那是一个 Deployment，它的 Pod 还在节点上跑着，但控制面已经不认识它，kubelet 会把这些“没有主”的容器清掉。这次的记号是 ConfigMap，看不到这一层；快照和现状差得越多，恢复之后的“回退”越多（比如 Secret 被轮换过、PVC 是快照之后建的）。
+- **单 server 的恢复是原地的，token 没有用上**；换一台机器恢复才需要它（发现 11）。那种情况（server 的虚拟机整个没了）没有演练，`make cluster-up` 现在也不会从快照恢复，只会建一个新的空集群。
+
+**18. 重启宿主机后全部中间件自己恢复（主人确认后做）。** 直接 `systemctl reboot`，不做任何别的操作。API 在第 32 秒断开，第 172 秒恢复；第 240 秒检查时三个节点 Ready、39 个 Pod 全部就绪（每个各重启一次），没有人工干预。逐项核对：MySQL 三个实例主从关系和重启前一样、复制线程在跑、`mysql-order-1` 主从都是 1490 行；Redis Cluster `cluster_state:ok`、主从配对没有变；Redis 主从经 Sentinel 切了一次（主库从 `redis-gate-1` 变成 `redis-gate-0`），复制正常；Kafka `Ready`、没有落后的副本；入口的通路检查通过；七个 PDB 正常；etcd 快照的定时器在；重启后手工触发的一次 MySQL 备份成功；内核日志里没有信号被拒绝的记录。2a 的空集群是 104 秒，多出来的时间没有拆开量（从 API 恢复到所有中间件就绪的确切时刻没有记到：API 一回来看到的 Pod 状态还是重启前的旧值，第一版的计时因此不可信，只能说不超过 240 秒）。
+
+主人的 traefik 容器也自己起来了。
+
 ### 量到的数（全部中间件在运行，空载）
 
 | 节点 | 内存（`free` 的 used） | 2a 结束时 | Pod 的内存 requests 合计（占可分配的比例） |
@@ -354,8 +371,7 @@ etcd 的 fsync（重建之后）：52% 在 2 毫秒以内，71% 在 8 毫秒以�
 
 ### 还没做的
 
-- **etcd 的恢复演练**（7.2 的后一半）。快照的同步已经有了（发现 11）；演练会重置控制面，等主人点头。
-- 重启宿主机后全部中间件自己恢复的检查（重启前要和主人说一声）。
+- server 的虚拟机整个没了、换一台机器从 NAS 上的快照加 token 恢复，没有演练；`make cluster-up` 不会从快照恢复（发现 17）。
 - “停掉两个 broker 时写入被拒绝”（阶段 4 用 Chaos Mesh）。
 - 主库故障时的切换没有演练（手册第二节，阶段 4）。
 - 备份脚本和 MySQL 共用一个 ConfigMap，改它会滚动重启 MySQL（发现 14）。

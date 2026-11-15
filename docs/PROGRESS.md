@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：2b（中间件上集群）接近完成：中间件、备份、MySQL 的恢复演练和切换演练都做了，**只剩 etcd 的恢复演练和重启宿主机的检查，两项都要先和主人说**。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
-- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。draft PR #10 的 HEAD 是 `a3df8d1`（CI 27 项全部通过）。**2026-11-15 第二个会话的改动都在工作区里，没有提交**（主人没有要求提交）：见下面“下一步”的第 2 条。
+- **当前阶段**：2b（中间件上集群）的任务全部做完，剩收尾（补笔记、推送、等 CI、PR #10 转正）。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
+- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。draft PR #10 在远端的 HEAD 是 `a3df8d1`。**本地比远端多 6 个提交，没有推送**（`203a840` 到最后一个文档提交；主人 2026-11-15 说“先提交”，没有说推送）。提交前 `make lint test` 通过（11 个模块 0 issues，55 个包），`make e2e` 通过。
 - **最后更新**：2026-11-15
 
 ### 2a 做到哪（2026-11-15）
@@ -59,11 +59,12 @@
    - 入口的 Envoy 改成 2 个副本加 PDB（`deploy/cluster/envoy-gateway/gateway.yaml`），现在在 k3s-server 和 k3s-agent-1 上。
    - e2e 的偶发失败已修：`test/e2e/e2e_test.go` 的 `getOrder` 对带 `Retry-After` 的 503 重试（最多 10 秒）。本机 `make e2e` 通过，`make lint MODULES=$PWD/test/e2e` 0 issues。没有改服务。
    - 这一轮没有跑全量的 `make lint test`（Go 代码只改了 e2e 的一个函数）；脚本过了 shellcheck，chart 过了 `helm lint`。提交前按 AGENTS.md 跑一遍。
-3. **下一步，都要先和主人说一声再动手**：
-   - **etcd 的恢复演练**（设计文档 2b 的 7.2）：`make etcd-backup` 拍快照，建一个做记号的资源，在 server 上停 k3s、`k3s server --cluster-reset --cluster-reset-restore-path=<快照>`、再启动，确认记号不见了、快照之前的东西（节点、中间件的 Pod、Secret）都在，agent 自己接回来。动手前先在 k3s 的文档里核对 v1.37 的恢复步骤（单 server、agent 要不要重启），不凭记忆。最坏情况是 `make cluster-up` 加 `make middleware-up` 重来（约 20 分钟；MySQL 的密码会变，NAS 上的备份还在）。
-   - **重启宿主机后全部中间件自己恢复的检查**。宿主机上有主人自己的 traefik 容器。
-   - 做完这两项，把结果写进设计文档 2b 第 10 节和阶段计划，2b 就可以收尾：让 Sonnet 补 `docs/notes/2b-middleware.md`（备份、切换、发现 10 到 16；考点已经在阶段计划的“2b 补充”里），提交、推送、等 CI（派 Haiku），把 PR #10 转成正式的。
-4. 2b 留下、不在这个阶段做的（设计文档第 10 节“还没做的”）：备份失败没有告警（阶段 3）；备份脚本和 MySQL 共用 ConfigMap，改它会滚动重启 MySQL；主库故障时的切换和“停掉两个 broker”（阶段 4）；恢复耗时要在 2c 灌数据后重量；有流量时的恢复比对要用对账工具（2c）。没有查到的：Oracle MySQL Operator 的最新版本。
+3. **etcd 的恢复演练和重启宿主机的检查都做了**（主人 2026-11-15 确认后做的，设计文档 2b 第 10 节的发现 17、18）：用 NAS 上的快照副本原地恢复，控制面中断 8 秒，快照之后的记号消失、之前的对象和所有 Pod 原样；重启宿主机后 240 秒内全部中间件自己恢复。演练的痕迹已清理（命名空间 `etcd-drill`、server 上的 `etcd-old-*`）。重启之后 Redis 主从的主库是 `redis-gate-0`。
+   **新会话从这里开始，2b 的收尾**：
+   - 让 Sonnet 补 `docs/notes/2b-middleware.md`：备份、恢复演练、切换、发现 10 到 18（考点已经在阶段计划的“2b 补充”里）。主会话抽查。
+   - 问主人要不要推送；推送后等 CI 派 Haiku（`gh pr checks 10 --watch`），通过后把 PR #10 转成正式的，合并由主人定。
+   - 然后进 2c，先写设计文档（要定的事在下面第 6 条）。
+4. 2b 留下、不在这个阶段做的（设计文档第 10 节“还没做的”）：换一台机器从快照加 token 恢复 etcd 没有演练；server 节点的内核日志里有少量 `profile="who"` 读 `/etc/passwd` 被 AppArmor 拒绝的记录（和信号无关，来源没有查）；备份失败没有告警（阶段 3）；备份脚本和 MySQL 共用 ConfigMap，改它会滚动重启 MySQL；主库故障时的切换和“停掉两个 broker”（阶段 4）；恢复耗时要在 2c 灌数据后重量；有流量时的恢复比对要用对账工具（2c）。没有查到的：Oracle MySQL Operator 的最新版本。
 5. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；CNI 已定为 flannel；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。入口多了一个 Envoy 副本（requests 128 Mi）。
 6. 2c 要定的：服务的镜像怎么构建和推送（MacBook 已经可以直接 `docker push` 到集群的仓库）；各服务连中间件的地址（Redis 用 `sentinel://`、`cluster://` 的写法，MySQL 连 `<release>-primary`、`<release>-replica` 两个 Service，Kafka 连 `kafka-kafka-bootstrap.kafka.svc:9092`）。
 7. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
