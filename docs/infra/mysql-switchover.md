@@ -83,6 +83,8 @@ START REPLICA;
 SQL'
 ```
 
+这一步放在改 Service 之前：改了之后 `-replica` 就指向旧主库，它得已经在复制，读从库的请求才不会落到一个停在旧状态的实例上（只读又没配复制的实例不就绪，那样 `-replica` 会没有端点）。
+
 参数和 `files/init-replica.sh` 里新建从库时用的一样。`SOURCE_AUTO_POSITION = 1` 让它按自己的 `gtid_executed` 去要缺的事务：第 3 步确认过两边一致，所以这里什么都不用补。
 
 **6. 改 Service 的指向。** 把 `deploy/cluster/mysql/$R.yaml` 里的 `primaryOrdinal` 改成 `NEW`，然后：
@@ -119,11 +121,18 @@ echo "SELECT CONCAT('KILL ', id, ';') FROM information_schema.processlist WHERE 
 - 节点失联：`kubectl cordon` 那个节点，Pod 回不来。
 - 能连上旧主库的话走第一节，不走这里。
 
-**2. 看从库收到了多少。** 从库的 IO 线程已经断了，让 SQL 线程把收到的中继日志应用完：
+**2. 让从库把已经收到的事务应用完，再看它有多少。** 从库的 IO 线程已经断了，但它收到的事务不一定都应用了：收到的在中继日志里（`Retrieved_Gtid_Set`），应用了的才进 `gtid_executed`。这时提升会把“已经到了从库、只是还没应用”的事务也丢掉。等到前者被后者包含：
 
 ```sh
-echo "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status; SELECT REPLACE(@@global.gtid_executed, '\n', '')" | q $NEW
+q $NEW <<'SQL'
+SELECT GTID_SUBSET(RECEIVED_TRANSACTION_SET, @@global.gtid_executed) AS applied_all,
+       (SELECT SERVICE_STATE FROM performance_schema.replication_applier_status) AS sql_thread
+FROM performance_schema.replication_connection_status;
+SELECT REPLACE(@@global.gtid_executed, '\n', '');
+SQL
 ```
+
+`applied_all` 是 1 才往下做；是 0 就等（SQL 线程要是 `ON` 的；它停了先看 `Last_SQL_Error`）。不要在这之前执行 `STOP REPLICA`。
 
 记下这个 `gtid_executed`。主库上提交过、这里没有的事务，从这一刻起就是“可能丢了”的：服务收到过成功的答复，数据却不在新主库上。对订单库来说是“已受理并落库的订单不见了”，之后要靠对账（`recon`）和上游的重试找回来，这是异步复制的代价（要不丢就得半同步，见 ADR-0027 放弃了什么）。
 
