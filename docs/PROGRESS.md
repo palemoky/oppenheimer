@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：2b（中间件上集群）进行中：三种中间件已部署并验证，剩备份、恢复演练和收尾。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
-- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。2b 已推送，draft PR #10，HEAD `993c5c6` 之后还有一个只改 PROGRESS 的提交。CI 27 项全部通过（2026-11-15；最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 52 秒、`test (./pkg)` 3 分 24 秒，没有明显变慢的 job）。工作区是干净的。
+- **当前阶段**：2b（中间件上集群）接近完成：中间件、备份、MySQL 的恢复演练和切换演练都做了，**只剩 etcd 的恢复演练和重启宿主机的检查，两项都要先和主人说**。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
+- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。draft PR #10 的 HEAD 是 `a3df8d1`（CI 27 项全部通过）。**2026-11-15 第二个会话的改动都在工作区里，没有提交**（主人没有要求提交）：见下面“下一步”的第 2 条。
 - **最后更新**：2026-11-15
 
 ### 2a 做到哪（2026-11-15）
@@ -44,17 +44,27 @@
 
 下一步：
 
-1. **2b 的中间件已全部部署并验证，剩备份、演练和收尾。** 分支 `phase-2b`。PR #9（2a）已合并进 `main`（2026-11-15）；2b 到目前为止的改动已分提交推送，在 draft PR 里（见“当前状态”）。设计文档 [design/2b-middleware.md](design/2b-middleware.md)，实现中的九个发现、量到的数和“还没做的”都在它的第 10 节。
+1. **2b 的中间件已全部部署并验证（第一个会话）。** 分支 `phase-2b`。PR #9（2a）已合并进 `main`（2026-11-15）；2b 到目前为止的改动已分提交推送，在 draft PR 里（见“当前状态”）。设计文档 [design/2b-middleware.md](design/2b-middleware.md)，实现中的九个发现、量到的数和“还没做的”都在它的第 10 节。
    - **集群在 2026-11-15 重建过一次**（主人确认）。原因是节点上的 AppArmor 拦掉了容器里进程之间的全部信号：官方的 MySQL 镜像起不来，所有 Go 程序的抢占信号被拒绝。根因是 Ubuntu 26.04 默认的 `kernel.apparmor_restrict_unprivileged_unconfined=1`，主人在一个节点上手工验证后同意写进 `vm.sh` 的 cloud-init 并重建。重建后三个节点没有任何信号被拒绝的记录。
    - 现在集群上有：两套 Redis（`redis-gate` 主从加 Sentinel、`redis-cache` Cluster）、Strimzi 1.3.1 加 Kafka 4.3.2（3 个 broker）、MySQL 9.7.4（`mysql-order-0`、`mysql-order-1` 各一主一从，`mysql-main` 单实例）。`make cluster-up` 之后 `make middleware-up`（或 `scripts/cluster/middleware.sh redis|kafka|mysql`），都可重复执行。MySQL 的密码是脚本在集群里随机生成的 Secret（`<release>-auth`），重建后会变。
    - MySQL 的主从由 values 里的 `primaryOrdinal` 决定（不是 Pod 的标签，发现 2）；`middleware.sh mysql` 最后只读地核对实际状态，不一致时非零退出。
    - Go 代码：`pkg/redisx` 三种模式（地址写法 `sentinel://gate@...`、`cluster://...`）、`pkg/ratelimit` 在 Cluster 下按桶调用（ADR-0019 的补充）、调用方改成 `redis.UniversalClient`、`kafkax` 建 topic 的副本数用 broker 的默认值。全部 11 个模块 `make lint` 0 issues、`make build` 通过；`pkg`、四个服务和 `test/load` 的 `make test` 通过；`make e2e` 通过（都是 2026-11-15）。第一次推送时漏改了 `test/load`（它也用旧的客户端类型），CI 有 3 项编译失败，已修。
    - CNI 已改定为保留 flannel（ADR-0026 末尾）。
    - 本机：OrbStack 配了 `insecure-registries`，可以直接 `docker push 192.168.50.50:5000/...`；多了一个可选的测试环境 `make redis-modes-up`（11 个容器，现在在运行，不用时 `make redis-modes-down`）。
-2. **新会话从这里开始：etcd 的恢复演练**（设计文档 2b 的 7.2；主人 2026-11-15 说在新会话里做）。它会把控制面重置到快照时的状态，最坏情况是 `make cluster-up` 加 `make middleware-up` 重来（约 20 分钟）；主人确认过要做，动手前仍然说一声。演练之前先把 etcd 快照同步到 NAS 的定时器做出来。
-3. **e2e 在 CI 上偶发失败过一次，原因查到了，没有修**（PR #10，`993c5c6` 的第一次运行；重跑通过）。`TestCancelReturnsStockOnce` 轮询订单是否落库时收到 503 `STOCK_GATE_UNAVAILABLE`。order 的日志里没有任何闸门或熔断的报错，所以走的是 `errReadBusy`：展示读读闸门占用的并发名额（`READ_GATE_MAX_CONCURRENCY`，默认 16，阶段 1 收尾时加的）满了，而订单还没落库，服务按设计回“说不清状态”的 503（`services/order/internal/service/service.go` 里 `errHoldPending` 那一段，这种情况有意不记日志）。用例的 `getOrder` 把任何非 200 当成致命错误（`test/e2e/e2e_test.go`）。和这次的 Redis 客户端改动无关。两种修法：轮询里把这个 503 当成“还没好，继续等”；或者 e2e 里把名额调大。涉及读路径的降级语义，先想清楚客户端该怎么对待这个 503 再改。
-4. 2b 剩下的其他项（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
-5. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；CNI 已定为 flannel；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
+2. **2026-11-15 第二个会话做完的（都没有提交）**，细节在设计文档 2b 第 10 节的发现 10 到 16：
+   - etcd 快照同步到 NAS：server 节点上的 systemd 定时器（`scripts/cluster/k3s.sh etcd-backup install|run|list`，模板在 `deploy/cluster/k3s/etcd-snapshot-sync.*`，已进 `make cluster-up`；`make etcd-backup` 立刻拍一份）。连 server 的 token 一起备份。NAS 上现在有一份按需快照。
+   - MySQL 备份：chart 里的 CronJob（三个实例每天 19:00、19:30、20:00 UTC）、`backup` 账号、NFS 的 PV 和 PVC；`make middleware-backup`、`make mysql-restore-drill RELEASE=<实例>`。三个实例的恢复演练都通过（各 1000 行记号数据，表叫 `drill_marker`，留在库里没有删；`mysql-order-1` 里还有 490 行切换探针写的）。Sonnet 写，主会话读过 diff 并在集群上执行，修了一个等 Job 完成的判断。
+   - MySQL 切换手册 `docs/infra/mysql-switchover.md`，计划内切换在 `mysql-order-1` 上演练了两趟（切过去再切回来），写入各中断约 5 秒，490 次确认的写入没有丢。现在主库都是序号 0，values 没有改动。
+   - 两个 Redis 的 chart 加了 `priorityClassName`。顺带发现并修掉两个问题：`redis-cache` 有一对主从在同一个节点（新脚本 `scripts/cluster/redis-cache-pairing.sh check|fix`，`middleware.sh redis` 结尾会调）；`redis-cache` 的 PDB 因为选中了 hook Job 的 Pod 一直允许 0 个中断（Job 的 Pod 换了标签）。
+   - 入口的 Envoy 改成 2 个副本加 PDB（`deploy/cluster/envoy-gateway/gateway.yaml`），现在在 k3s-server 和 k3s-agent-1 上。
+   - e2e 的偶发失败已修：`test/e2e/e2e_test.go` 的 `getOrder` 对带 `Retry-After` 的 503 重试（最多 10 秒）。本机 `make e2e` 通过，`make lint MODULES=$PWD/test/e2e` 0 issues。没有改服务。
+   - 这一轮没有跑全量的 `make lint test`（Go 代码只改了 e2e 的一个函数）；脚本过了 shellcheck，chart 过了 `helm lint`。提交前按 AGENTS.md 跑一遍。
+3. **下一步，都要先和主人说一声再动手**：
+   - **etcd 的恢复演练**（设计文档 2b 的 7.2）：`make etcd-backup` 拍快照，建一个做记号的资源，在 server 上停 k3s、`k3s server --cluster-reset --cluster-reset-restore-path=<快照>`、再启动，确认记号不见了、快照之前的东西（节点、中间件的 Pod、Secret）都在，agent 自己接回来。动手前先在 k3s 的文档里核对 v1.37 的恢复步骤（单 server、agent 要不要重启），不凭记忆。最坏情况是 `make cluster-up` 加 `make middleware-up` 重来（约 20 分钟；MySQL 的密码会变，NAS 上的备份还在）。
+   - **重启宿主机后全部中间件自己恢复的检查**。宿主机上有主人自己的 traefik 容器。
+   - 做完这两项，把结果写进设计文档 2b 第 10 节和阶段计划，2b 就可以收尾：让 Sonnet 补 `docs/notes/2b-middleware.md`（备份、切换、发现 10 到 16；考点已经在阶段计划的“2b 补充”里），提交、推送、等 CI（派 Haiku），把 PR #10 转成正式的。
+4. 2b 留下、不在这个阶段做的（设计文档第 10 节“还没做的”）：备份失败没有告警（阶段 3）；备份脚本和 MySQL 共用 ConfigMap，改它会滚动重启 MySQL；主库故障时的切换和“停掉两个 broker”（阶段 4）；恢复耗时要在 2c 灌数据后重量；有流量时的恢复比对要用对账工具（2c）。没有查到的：Oracle MySQL Operator 的最新版本。
+5. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；CNI 已定为 flannel；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。入口多了一个 Envoy 副本（requests 128 Mi）。
 6. 2c 要定的：服务的镜像怎么构建和推送（MacBook 已经可以直接 `docker push` 到集群的仓库）；各服务连中间件的地址（Redis 用 `sentinel://`、`cluster://` 的写法，MySQL 连 `<release>-primary`、`<release>-replica` 两个 Service，Kafka 连 `kafka-kafka-bootstrap.kafka.svc:9092`）。
 7. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
 

@@ -17,7 +17,7 @@
 - [x] 入口与负载均衡：Envoy Gateway（Gateway API）加 MetalLB，禁用 k3s 自带的 Traefik 和 ServiceLB（ADR-0025）
 - [x] 建集群与重建集群的步骤脚本化（`make cluster-up`，重建演练 5 分 28 秒）
 - [x] 重启宿主机后集群自己恢复（104 秒）
-- [ ] etcd 的 fsync 延迟偏高，2b 上中间件后复查（设计文档 2a 第 12 节）
+- [x] etcd 的 fsync 延迟偏高，2b 上中间件后复查：没有变差，p99 仍高于 10 毫秒的参考线，原因没有查（设计文档 2b 第 10 节“量到的数”）
 
 ## 2b 中间件上集群
 
@@ -25,10 +25,13 @@
 - [x] MySQL：2 分片 × 一主一从加一个共享实例，手写 StatefulSet（ADR-0027，设计文档 [2b-middleware.md](../design/2b-middleware.md)）
 - [x] Redis：闸门和锁用一主一从加 Sentinel，缓存和限流用 Redis Cluster 3 主 3 从；`pkg/redisx` 支持三种模式，`pkg/ratelimit` 适配 Cluster
 - [x] Kafka：Strimzi Operator，KRaft 模式 3 broker（Kafka 4.3.2，Strimzi 还不支持 4.4）
-- [ ] 各中间件的资源限额、反亲和、PDB、持久化
-- [ ] 入口的 Envoy 改成 2 个副本并分散到两个节点（阶段 4 之前）
-- [ ] MySQL 定时备份到 NAS，并演练一次恢复
-- [ ] etcd 快照定时存到 NAS，并演练一次从快照恢复（ADR-0026）
+- [x] 各中间件的资源限额、反亲和、PDB、持久化、PriorityClass；Redis Cluster 的主从配对由脚本核对并修正（设计文档 2b 第 10 节的发现 10）
+- [x] 入口的 Envoy 改成 2 个副本并分散到两个节点，加 PDB
+- [x] MySQL 定时备份到 NAS，并演练一次恢复（`make middleware-backup`、`make mysql-restore-drill`；数据量是假的，2c 灌数据后重量恢复耗时）
+- [x] MySQL 主从切换手册（[infra/mysql-switchover.md](../infra/mysql-switchover.md)），计划内切换演练过两趟；主库故障的切换留到阶段 4
+- [x] etcd 快照定时存到 NAS（server 节点上的 systemd 定时器，连同 token）
+- [ ] 演练一次从 etcd 快照恢复（ADR-0026；会重置控制面，动手前和主人说）
+- [ ] 重启宿主机后全部中间件自己恢复（重启前和主人说）
 - [x] 中间件部署完、灌数据之前量各节点的内存，改定 CNI：保留 flannel（ADR-0026）
 
 ## 2c 服务上集群
@@ -62,6 +65,22 @@
 ## 面试考点
 
 Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调度（亲和、污点、优先级）；requests 与 limits 对调度和 OOM 的影响；StatefulSet 与 Deployment 的区别；Operator 模式；HPA 工作原理；滚动发布如何做到零中断；gRPC 负载均衡；etcd 与控制面组件职责。
+
+2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：
+
+- `mysqldump --single-transaction` 靠什么得到一致的备份，为什么还要短暂的全局读锁；只有逻辑备份、没有 binlog 归档时能恢复到哪个时刻。
+- `--source-data` 和 `--dump-replica` 的区别；GTID 下恢复出来的实例靠什么续接复制（`GTID_PURGED`）。
+- 备份账号的最小权限怎么定；缺权限时 mysqldump 会悄悄少导东西，怎么发现。
+- 怎么保证“半截的备份不被当成备份”（临时名字、校验、改名）；为什么先写新的再删旧的。
+- 备份不演练恢复等于没有备份：演练比对什么，有写入时为什么比不了。
+- etcd 快照为什么要连 token 一起备份；为什么这个任务放在节点上而不是做成 CronJob；NFS 的 hard 和 soft 各适合什么。
+- 主从切换的顺序为什么是“旧主只读、等追平、提升、改指向”；Service 改了指向为什么已有的连接不跟着走；异步复制下主库故障会丢什么、怎么知道丢了哪些（`GTID_SUBTRACT`）。
+- 切换之后旧主库回来为什么危险（脑裂），怎么让它起来就是只读的（`SET PERSIST`）。
+- Redis Cluster 的主从为什么可能落在同一个节点（`--cluster create` 只按地址避让），`CLUSTER REPLICATE` 和主从切换的区别。
+- MetalLB 二层模式下两个入口副本是主备不是分摊；`externalTrafficPolicy: Local` 的影响。
+- PDB 的 `maxUnavailable` 怎么算出“应该有几个 Pod”（经控制器的 scale 子资源），选中了一个 Job 的 Pod 会怎样。
+- Job 的终态条件（`Complete`、`Failed`，以及 1.31 起的 `SuccessCriteriaMet`、`FailureTarget`）。
+- 客户端怎么对待带 `Retry-After` 的 503。
 
 2a 补充（设计文档 [2a-cluster.md](../design/2a-cluster.md)）：
 

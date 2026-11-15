@@ -197,7 +197,7 @@ MySQL 的 root 密码、各服务的账号、复制账号、CDC 账号都存成 
 
 ### 7.1 MySQL
 
-- 每个实例一个 CronJob，每天一次，从**从库**做 `mysqldump --single-transaction --source-data`（`mysql-main` 没有从库，从它自己做），压缩后写到 NAS 的 `/volume1/k8s/backup/mysql/<实例>/<日期>/`，保留 7 份。
+- 每个实例一个 CronJob，每天一次（三个实例错开），从**从库**做 `mysqldump --single-transaction --source-data=2 --set-gtid-purged=ON`（`mysql-main` 没有从库，从它自己做），用 zstd 压缩后写到 NAS 的 `/volume1/k8s/backup/mysql/<实例>/<UTC 时间戳>/`，保留 7 份。实现和实测见第 10 节的发现 14。
 - 逻辑备份的含义要讲得出来：`--single-transaction` 靠 InnoDB 的一致性快照，不锁表；它记下的 GTID 位置加上之后的 binlog 才能恢复到任意时刻，而 binlog 现在没有单独归档，所以**能恢复到的是备份的时刻，之后的数据会丢**。按时间点恢复不在 2b 做。
 - 恢复演练：起一个临时的 MySQL，把一个分片最近的备份灌进去，用 1d 的对账工具（`recon`）和线上的从库比。不碰线上的实例，不是破坏性操作。演练在 2c 灌过数据之后才有意义，2b 先用少量手工写入的数据走通流程。
 
@@ -289,6 +289,55 @@ apparmor="DENIED" operation="signal" profile="cri-containerd.apparmor.d" comm="g
 
 **9. 建 topic 的副本数。** `kafkax.EnsureTopics` 原来在没指定副本数时写死成 1。改成交给 broker 的默认值（`default.replication.factor`）：本机的单个 broker 是 1，集群上是 3。副本数是部署环境的属性，服务的代码不用知道。
 
+**10. Redis Cluster 的主从配对在重建之后有一对落在了同一个节点。** 给两个 Redis 加 `priorityClassName` 时顺手核对，发现 `redis-cache-0` 和它的从库 `redis-cache-4` 都在 k3s-agent-1 上：那个节点一挂，这三分之一的槽没有副本可以顶上。原因是配对由 `redis-cli --cluster create` 决定，它按地址避开“同一台主机”，而 Pod 的地址各不相同，它不知道哪两个 Pod 在同一个节点；Pod 落在哪个节点由调度器定。发现 5 里说的“恰好都不在同一个节点”是重建之前那一次的运气，`middleware.sh` 当时只把配对打印出来，没有人去对照节点。
+
+改法：`scripts/cluster/redis-cache-pairing.sh`（`check`、`fix`），`middleware.sh redis` 结尾调用 `fix`。它取每个 Pod 所在的节点和 `cluster nodes` 的主从关系，有同节点的主从时找一个改动最少的配对，用 `CLUSTER REPLICATE` 把从库改挂过去（只动从库，不动槽；从库重新全量同步，对缓存没有影响）。这次改了两个从库，之后 `--cluster check` 通过。**没有自动处理的**：两个主库落在同一个节点（要做主从切换），脚本只报异常并以非零退出；这种情况下那个节点一挂就少两个主库，剩下一个凑不出多数票，整个集群不能自动切换。
+
+教训和发现 2 是同一类：一条性质（“主从不同节点”）如果是靠碰运气成立的，就要有东西去核对它，只打印不核对等于没有。
+
+**11. etcd 的快照同步到 NAS（7.2 的前一半）。** server 节点上一个 systemd 定时器（每天 00:20、12:20，在 k3s 自己的快照之后 20 分钟）运行 `/usr/local/sbin/etcd-snapshot-sync`：临时挂载 NAS 的 `backup/etcd`，把本地快照目录里的文件复制过去（先写临时名字，读回来比对 SHA-256 再改名），NAS 上保留 14 份。模板在 `deploy/cluster/k3s/etcd-snapshot-sync.*`，由 `scripts/cluster/k3s.sh etcd-backup install` 安装，已加进 `make cluster-up`；`make etcd-backup` 立刻拍一份并同步。三个决定：
+
+- **放在节点上而不是做成集群里的 CronJob**：它备份的是控制面，控制面坏了的时候它也得能跑。
+- **NFS 用 soft 挂载加短超时**，和别处的 hard 相反：NAS 不在时要的是这一次失败、下一次再试，不是永远挂住。soft 的风险（写到一半返回错误）由“临时名字加校验再改名”兜住。
+- **token 和快照一起备份**（`/var/lib/rancher/k3s/server/token`）。k3s 把引导数据（各个 CA 的私钥等）用 token 加密后存在 etcd 里，换一台机器恢复时没有同一个 token，快照读得出来、集群起不来。快照里本来就有全部的 Secret（没有开静态加密），所以把 token 放在旁边没有扩大暴露面；NAS 上的目录属于 root、权限 700。
+
+实测：一份快照 20 MB，拍加复制约 2 秒。本地一份快照都没有时脚本以失败退出（定时器在跑而 NAS 上永远是空的，要显出来）。
+
+**12. 入口的 Envoy 改成 2 个副本。** `EnvoyProxy` 里 `replicas: 2`、按节点的分布约束、`envoyPDB`（`maxUnavailable: 1`）。两个副本现在在 k3s-server 和 k3s-agent-1 上，通路检查通过。要讲得清楚的一点：这不是负载分摊，MetalLB 二层模式加 `externalTrafficPolicy: Local`，流量同一时刻只进一个节点上的那一个 Envoy，另一个是备用的；节点挂了之后地址被另一个节点接管，接管要多久留到阶段 4 量。
+
+**13. e2e 偶发失败的修法。** `TestCancelReturnsStockOnce` 在 CI 上失败过一次：轮询订单时收到 503 `STOCK_GATE_UNAVAILABLE`（订单还没落库，展示读又没占到读闸门占用的名额）。这个 503 是服务有意的答复（说不清状态时不猜 404），带 `Retry-After`，所以该改的是客户端：e2e 的 `getOrder` 对带 `Retry-After` 的 503 重试，最多 10 秒；别的非 200 仍然立刻失败。没有调大名额：那只是让测试碰不到这条路径。
+
+**14. MySQL 的备份和恢复演练（7.1）。** chart 里加了 CronJob（`backup.enabled`）和脚本 `files/backup.sh`，子 Agent（Sonnet）写、主会话读过 diff 后在集群上执行。要点：
+
+- **专门的 `backup` 账号，不用 root。** 权限是在 9.7.4 上逐个去掉试出来的：全局 `FLUSH_TABLES`（`--single-transaction` 对齐位点时要 `FLUSH TABLES WITH READ LOCK`，比 `RELOAD` 窄）、`REPLICATION CLIENT`（读位点和复制状态）、`SHOW_ROUTINE`；每个业务库 `SELECT, SHOW VIEW, TRIGGER, EVENT`。**缺 `SHOW_ROUTINE` 或 `TRIGGER` 时 dump 照常成功，只是存储过程、触发器悄悄不在里面**，所以演练脚本会比对这几类对象的个数。Secret 里多了 `backup-password`，`middleware.sh` 现在会给已存在的 Secret 补缺的键（服务端 apply，不留 last-applied 注解）。
+- **位点用 `--source-data=2`，不用 `--dump-replica`。** 后者会先停从库的 SQL 线程（备份期间从库越落越后，CDC 跟着停），还要 `REPLICATION_SLAVE_ADMIN`。复制是 GTID 自动定位，续接靠 dump 开头的 `GTID_PURGED`，文件加位点只是给人看的记录。
+- **只导业务库**，不导系统库（账号由 accounts hook 重建）。9.x 的 mysqldump 默认还会去读数据脱敏策略的系统表，备份账号没有权限，加了 `--skip-masking-policies`。
+- **半截的备份不会被当成备份**：写到 `.tmp-<时间戳>`，整份解压一遍确认最后一行是 `-- Dump completed`、取出 GTID、算好 SHA-256 之后才改名。新的一份成功之后才删旧的，只删符合时间戳命名的目录。
+- **从库上备份前先确认它确实是从库、复制在跑**：切换之后 `-replica` 可能指向别的东西，复制断了的从库备出来的是旧数据却不报错。
+- 存储：一个 NFS 的 PV 加 PVC（`deploy/cluster/mysql/backup-pv.yaml`，RWX），三个 CronJob 共用，各写各的子目录。没有用 `subPath`：它的目录由 kubelet 以 root 建，以 999 运行的 Pod 写不进去。代价是三个 Job 互相看得到对方的目录，靠脚本约束而不是权限。
+- **代价**：`backup.sh` 放在 `files/` 里，进了和 MySQL 共用的 ConfigMap，所以这次部署让三个实例（含主库）滚动重启了一次；以后改备份脚本也会。要避免得给备份单独一个 ConfigMap，现在没有做。
+
+用法：`make middleware-backup`（立刻跑一次，可带 `RELEASE=`）、`make mysql-restore-drill RELEASE=mysql-order-0`。
+
+实测（每个实例写了 1000 行记号数据）：三个实例手工备份一共 10 秒，每份约 4.5 KB。恢复演练（`scripts/cluster/mysql-restore-drill.sh`）：起一个临时的 MySQL Pod（数据在 emptyDir，只读挂备份），校验 SHA-256，灌入最新的一份，核对 `gtid_executed` 和备份记录一致，再逐表和线上从库比行数和 `CHECKSUM TABLE`。三个实例都通过。演练中间碰到一次“不一致”：当时切换演练的写入探针还在往线上写，恢复出来 1295 行、线上 1328 行，探针结束后重新备份再比就一致了。这就是 7.1 说的“能恢复到的是备份的时刻”，也说明这个比对只能在没有写入时用；有流量时要按备份的 GTID 用对账工具比，是 2c 的事。数据量是假的，恢复耗时（不到 1 秒）没有参考价值，2c 灌过数据之后要重量一次。
+
+实现时的一个坑：手工触发的命令第一版一直等到超时，而备份 3 秒就做完了。Kubernetes 1.31 起 Job 成功时有**两个**为真的条件（`SuccessCriteriaMet`、`Complete`），脚本把所有为真的条件拼起来和 `Complete` 比，永远不相等。子 Agent 在本机没有集群可测，这一段是到集群上才跑出来的。
+
+**15. 计划内的主从切换演练。** 按新写的手册 [infra/mysql-switchover.md](../infra/mysql-switchover.md) 在 `mysql-order-1` 上切了两趟（0 到 1，再切回 0），期间一个探针每 0.5 秒经 `-primary` Service 新建连接写一行：
+
+| | 写入失败的时间 | 失败的次数 |
+|---|---|---|
+| 第一趟（主库 0 → 1） | 09:40:26.1 到 09:40:30.8，约 5.2 秒 | 10 |
+| 第二趟（主库 1 → 0） | 09:41:08.4 到 09:41:13.1，约 5.2 秒 | 10 |
+
+两趟一共 490 次写入得到了成功的答复，结束后主从都是 1490 行（1000 行记号加 490），没有丢也没有多。旧主库设成只读之后就绪探针让 `-primary` 没有端点，新的连接直接失败，没有一次写到错的实例上。这 5 秒是把各步骤连成脚本执行的结果，其中大部分花在 `helm upgrade` 上（`middleware.sh mysql` 按顺序处理三个实例，`mysql-order-1` 排第二）；人照着手册一步步敲会更久。`helm upgrade` 没有重启任何 Pod。演练完主库回到序号 0，values 没有留下改动。
+
+没有验证的：服务的连接池碰到 1290 和断连之后自己恢复（手册第 7 步，2c）；CDC 换源（2c）；主库故障时的切换（手册第二节，阶段 4）。
+
+**16. Redis Cluster 的 PDB 一直是坏的，允许的中断数是 0。** 核对各组件的 PDB 时发现的。组建集群的 hook Job 的 Pod 带着和 Redis 一样的标签，做完之后还留着（有意保留，方便看日志），被 PDB 的选择器选中。PDB 用 `maxUnavailable` 时要知道“应该有几个 Pod”，办法是找到每个 Pod 的控制器、读它的 scale 子资源；Job 没有这个子资源，于是 PDB 报 `SyncFailed`（`jobs.batch does not implement the scale subresource`），允许的中断数停在 0。后果是 `kubectl drain` 任何一个有 `redis-cache` 的节点都会卡住，而三个节点上都有。从部署那一刻起就是这样，之前的验证只看了“PDB 建出来了”。改法：Job 的 Pod 换一套自己的标签。改完之后七个 PDB 允许的中断数都是 1。
+
+教训：PDB、Service、NetworkPolicy 都按标签选 Pod，一次性的 Job 和 hook 的 Pod 不能沿用被它们选中的那套标签。检查 PDB 要看 `ALLOWED DISRUPTIONS` 和它的状态，不是看它存不存在。
+
 ### 量到的数（全部中间件在运行，空载）
 
 | 节点 | 内存（`free` 的 used） | 2a 结束时 | Pod 的内存 requests 合计（占可分配的比例） |
@@ -305,12 +354,13 @@ etcd 的 fsync（重建之后）：52% 在 2 毫秒以内，71% 在 8 毫秒以�
 
 ### 还没做的
 
-- 两个 Redis 的 chart 还没有加 `priorityClassName`。
-- 备份（MySQL 的 CronJob、etcd 快照同步到 NAS）和两次恢复演练（第 7 节）。
-- 重启宿主机后全部中间件自己恢复的检查。
-- “停掉两个 broker 时写入被拒绝”。
-- 切换手册（发现 2 里的两个顺序问题）还没有写。
-- 笔记。
+- **etcd 的恢复演练**（7.2 的后一半）。快照的同步已经有了（发现 11）；演练会重置控制面，等主人点头。
+- 重启宿主机后全部中间件自己恢复的检查（重启前要和主人说一声）。
+- “停掉两个 broker 时写入被拒绝”（阶段 4 用 Chaos Mesh）。
+- 主库故障时的切换没有演练（手册第二节，阶段 4）。
+- 备份脚本和 MySQL 共用一个 ConfigMap，改它会滚动重启 MySQL（发现 14）。
+- 备份失败没有告警：失败的 Job 留在记录里，要有人去看。阶段 3 接监控时加（`kube_job_status_failed`，以及“最近一份备份有多旧”）。
+- 笔记要补备份、切换和发现 10 到 15。
 
 ## 11. 不在 2b 做的
 
