@@ -1,0 +1,28 @@
+# 普通环境变量，envFrom 注入。环境变量只在进程启动时读：改了这里不会自己生效，
+# 靠 Deployment 上的校验和注解让 helm upgrade 触发滚动（设计文档 7.2）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "service.name" . }}
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.config }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+  {{- if not .Values.config }}
+  {}
+  {{- end }}
+---
+{{- if .Values.sidecar.enabled }}
+# Envoy 边车的配置。内容来自 deploy/envoy/<服务>.yaml（部署脚本替换了两处主机名）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "service.name" . }}-envoy
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+data:
+  envoy.yaml: |
+    {{- include "service.sidecarConfig" . | nindent 4 }}
+{{- end }}

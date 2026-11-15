@@ -34,7 +34,7 @@ export OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR  ?= cluster://172.30.0.31:6379,172.30
 
 .PHONY: help
 help: ## 显示可用目标
-	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ## ---------- 工具 ----------
 
@@ -270,6 +270,40 @@ cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s�
 .PHONY: middleware-up
 middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Cluster）、Kafka（Strimzi）、MySQL（两个分片加共享实例）；可重复执行
 	scripts/cluster/middleware.sh all
+
+.PHONY: images
+images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓库，tag 是提交号（有未提交改动时带 -dirty-时间）；make images IMAGE_SERVICES="order gateway" 只做部分
+	scripts/cluster/images.sh all $(IMAGE_SERVICES)
+
+.PHONY: deploy
+deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
+	@tag="$$(scripts/cluster/images.sh tag)" && \
+	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
+	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)
+
+.PHONY: cluster-e2e
+cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
+	scripts/cluster/e2e.sh $(E2E_ARGS)
+
+.PHONY: cluster-chaos
+cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
+	scripts/cluster/chaos.sh
+
+.PHONY: cluster-bench
+cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（732f9ab，各 1 副本）后 1b（设计副本数），共用 oppenheimer-e2e；BENCH_* 见脚本，结果在 tmp/cluster-bench/，E2E_KEEP=1 保留现场
+	scripts/cluster/bench.sh
+
+.PHONY: deploy-status
+deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
+	scripts/cluster/services.sh status
+
+.PHONY: deploy-seed
+deploy-seed: ## 给集群上的 inventory 写入示例 SKU（1001 到 1003、2001，和探针用的 3001）；要在 make deploy 之后，可重复执行
+	scripts/cluster/seed.sh
+
+.PHONY: deploy-degrade
+deploy-degrade: ## 看或改集群上一个服务的降级开关（逐个 Pod）：make deploy-degrade ARGS="gateway" 或 ARGS="gateway stock_query off|auto"
+	scripts/cluster/degrade.sh $(ARGS)
 
 .PHONY: etcd-backup
 etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server 节点上的定时器每 12 小时做一次）；scripts/cluster/k3s.sh etcd-backup list 查看

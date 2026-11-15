@@ -1,0 +1,28 @@
+# gateway 服务（设计文档 2c）。release 名 gateway。边车配置来自 deploy/envoy/gateway.yaml。
+# gateway 的 HTTP 入站不经过边车（入口的 Envoy 直接连 8080），边车只管四个出站，所以没有 headless Service。
+# 管理端口（降级开关，ADMIN_ADDR 的默认值 127.0.0.1:8089）不设：它没有鉴权，只在 Pod 内的回环上监听，
+# 用 kubectl port-forward 访问。探针打的是对外的 8080（/healthz、/readyz 在对外端口的 mux 上）。
+replicas: 2
+ports: {http: 8080, grpc: 0}
+resources: {cpu: 200m, memoryRequestMi: 64, memoryLimitMi: 512}
+sidecar: {enabled: true}
+headless: {enabled: false}
+
+config:
+  # 四个下游经自己边车的出站端口（和本机一致）。
+  ORDER_ADDR: 127.0.0.1:15081
+  INVENTORY_ADDR: 127.0.0.1:15082
+  PAYMENT_ADDR: 127.0.0.1:15083
+  ORDERINDEX_ADDR: 127.0.0.1:15084
+  RATE_LIMIT_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
+  # 入口的 Envoy 会在 X-Forwarded-For 里追加客户端地址。入口 Pod 的地址不固定，先信整个 Pod 网段；
+  # 任何 Pod 都能伪造这个头的问题留给 2d 的 NetworkPolicy（设计文档 7.5）。
+  TRUSTED_PROXIES: 10.42.0.0/16
+
+route:
+  enabled: true
+  hostnames: [api.oppenheimer.test]
+  parentRef: {name: public, namespace: envoy-gateway-system}
+
+# 按 CPU 伸缩，2 到 4 个副本（设计文档 2c 第 9 节）。上面的 replicas 不再起作用。
+autoscaling: {enabled: true}

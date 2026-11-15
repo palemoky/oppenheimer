@@ -1,0 +1,12 @@
+# cdc 在 e2e 那一套里的覆盖（叠在 ../cdc.yaml 和 common.yaml 之上）。
+config:
+  # server-id 不能和长期运行的那一套的 1011、1021 相同：两套读的是同一个从库，同一个 server-id 的第二个
+  # binlog 连接会把第一个踢掉（MySQL 按 server-id 认从库），两边就轮流断线。登记在 docs/infra/versions.md。
+  CDC_SERVER_IDS: "1012,1022"
+
+# 位点存在带 KAFKA_PREFIX 的 topic 里（每次运行不同），所以每次都从空位点开始，先做全量再接 binlog。
+# 源和长期运行的那一套一样是从库 Pod 的稳定名字，只改库名：流水线只认 DSN 里的库（schema），
+# 同一个从库的 binlog 里长期运行那一套的 order_db_N 的事件会被跳过。
+expandEnv:
+  - name: CDC_SOURCE_DSNS
+    value: "cdc:$(MYSQL_ORDER_0_CDC_PASSWORD)@tcp(mysql-order-0-1.mysql-order-0.mysql.svc:3306)/e2e_order_db_0,cdc:$(MYSQL_ORDER_1_CDC_PASSWORD)@tcp(mysql-order-1-1.mysql-order-1.mysql.svc:3306)/e2e_order_db_1"

@@ -1,0 +1,6 @@
+# inventory 在 bench 那一套里的覆盖（叠在 e2e/inventory.yaml 之上）。
+replicas: 2
+config:
+  # e2e 那一层是 1s（测试要快）；设回服务的默认值 5s（services/inventory/internal/reconcile），
+  # 对账每一轮都读库和 Redis，1 秒一次是额外的负载。
+  GATE_RECONCILE_INTERVAL: 5s

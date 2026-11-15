@@ -10,6 +10,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/breaker"
 	"github.com/palemoky/oppenheimer/pkg/degrade"
 	"github.com/palemoky/oppenheimer/pkg/errx"
+	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/stockgate"
 )
@@ -519,5 +520,31 @@ func TestAdmissionStatus(t *testing.T) {
 	svc.gateBreaker.Report(false)
 	if v := view(); !v.Degraded {
 		t.Fatalf("with the gate breaker open: %+v, want degraded", v)
+	}
+}
+
+// expiredIDs 模拟节点号的租约续不上（ADR-0028）。
+type expiredIDs struct{}
+
+func (expiredIDs) Next(int64) (int64, error) { return 0, idgen.ErrLeaseExpired }
+
+// 节点号的租约过期时受理按降级拒绝（FAILED_PRECONDITION 加原因码，不是 INTERNAL，免得调用方的边车把 order 摘掉），
+// 而且什么都没有发生：没有占用，没有消息。
+func TestSubmitRejectedWhenIDLeaseExpired(t *testing.T) {
+	e := newEnvWith(t, envOptions{ids: expiredIDs{}})
+	_, err := e.svc.SubmitOrder(t.Context(), submitReq(1, "lease-expired", items(skuA, 1)))
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderLandingUnavailable)
+	if !errx.IsDegraded(err) {
+		t.Errorf("err = %v, want a degraded error", err)
+	}
+	if n := e.sender.sendCount(); n != 0 {
+		t.Errorf("%d messages sent for a rejected order", n)
+	}
+	holds, err := e.gate.HoldsBefore(t.Context(), time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holds) != 0 {
+		t.Errorf("holds %v left behind by a rejected order", holds)
 	}
 }

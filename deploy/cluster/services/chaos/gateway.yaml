@@ -1,0 +1,5 @@
+# gateway 在 chaos 那一套里的覆盖（叠在 e2e/gateway.yaml 之上）。
+config:
+  # 限流整体关掉，同本机 scripts/chaos.sh（RATE_LIMIT=off）：这里验证的是删 Pod 之后的数据一致性，
+  # 被限流的请求（429）只会让重试和账本的判断变复杂。e2e 那一层是开着的（ratelimit_test.go 要测它）。
+  RATE_LIMIT: "off"

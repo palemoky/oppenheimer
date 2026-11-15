@@ -1,0 +1,18 @@
+# 测试 Job 里的 OTLP 接收端（test/e2e/otlp_test.go）前面的 Service：各服务的 OTEL_EXPORTER_OTLP_ENDPOINT
+# 是 http://e2e-otlp:4317（deploy/cluster/services/e2e/common.yaml）。按标签选 Job 的 Pod，Job 没起来时没有端点，
+# 服务的导出器连不上只丢那一批。scripts/cluster/e2e.sh 先建 Job 再部署服务，所以正常情况下服务一起来就连得上。
+# 命名空间由 kubectl -n 指定（scripts/cluster/services.sh e2e-prepare）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-otlp
+  labels:
+    app.kubernetes.io/name: e2e-test
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  selector:
+    app.kubernetes.io/name: e2e-test
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc

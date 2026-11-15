@@ -1,0 +1,12 @@
+# bench1a.Dockerfile 的构建上下文（732f9ab 的 worktree）只放构建用得到的东西。
+# 不能排掉：go.work（含 go.work.sum）、api/、pkg/、services/、test/（go.work 列了 test/e2e）。
+# worktree 根目录的 .git 是一个指向主仓库的文件，排掉。
+.git
+.github
+bin/
+tmp/
+docs/
+deploy/
+scripts/
+*.md
+.DS_Store

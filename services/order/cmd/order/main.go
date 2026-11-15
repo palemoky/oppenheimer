@@ -308,11 +308,13 @@ func loadConfig() (config, error) {
 	if cfg.outboxInterval, err = envDuration("OUTBOX_INTERVAL", 100*time.Millisecond); err != nil {
 		return cfg, err
 	}
-	if cfg.workerID, err = envInt("WORKER_ID", 0); err != nil {
+	// 没设 WORKER_ID 就从第一个订单库里租一个节点号（ADR-0028）：多副本时每个进程的号不能相同，
+	// 而一个 Deployment 的所有 Pod 环境变量是一样的。设了就固定用它，本机和测试脚本都是这样。
+	if cfg.workerID, err = envInt("WORKER_ID", idgen.Leased); err != nil {
 		return cfg, err
 	}
-	if cfg.workerID < 0 || cfg.workerID > idgen.MaxWorkerID {
-		return cfg, fmt.Errorf("WORKER_ID must be in [0, %d]", idgen.MaxWorkerID)
+	if cfg.workerID != idgen.Leased && (cfg.workerID < 0 || cfg.workerID > idgen.MaxWorkerID) {
+		return cfg, fmt.Errorf("WORKER_ID must be in [0, %d], or unset to lease one", idgen.MaxWorkerID)
 	}
 	if cfg.paymentTimeout, err = envDuration("PAYMENT_TIMEOUT", service.DefaultPaymentTimeout); err != nil {
 		return cfg, err
@@ -546,9 +548,18 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	logger.InfoContext(ctx, "order archive", "configured", cold != nil)
 
-	ids, err := idgen.New(cfg.workerID)
+	// 订单号的节点号。租约表放在第一个订单库（设计文档 2c 的 5.2）。
+	ids, idLease, err := idgen.Open(ctx, cfg.workerID, dbs[0], logger)
 	if err != nil {
-		return err
+		return fmt.Errorf("open id generator: %w", err)
+	}
+	if idLease != nil {
+		// 正常退出时由 app.Run 停（让出节点号）；这里兜的是装配中途失败的情况，免得这个号白占一个租期。Stop 可以重复调用。
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			defer cancel()
+			_ = idLease.Stop(sctx)
+		}()
 	}
 
 	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeout(inventoryHopTimeout))
@@ -808,7 +819,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 全部 leader 锁（每个中继一把、sweeper、回收任务）也在 app.Run 返回后释放（先于 Redis 连接关闭）：
 	// 此时所有中继、sweeper、回收任务都已停下。
 	// 汇总日志在 gRPC 停下之后才停（停止顺序与列表相反），停止时把最后一段的拒绝次数也记下来。
-	components := []app.Component{httpServer, readLimitReporter}
+	// 节点号的租约紧跟在健康检查之后：它比 gRPC 晚停，受理还在进行时一直能发号，gRPC 停了之后才让出。
+	components := []app.Component{httpServer}
+	if idLease != nil {
+		components = append(components, idLease)
+	}
+	components = append(components, readLimitReporter)
 	for _, r := range relays {
 		components = append(components, r)
 	}

@@ -1,0 +1,16 @@
+# order 在 chaos 那一套里的覆盖（叠在 e2e/order.yaml 之上）。数值和本机 scripts/chaos.sh 一样：时限调短，
+# 让系统在压测结束后几十秒内静止（设计文档 1b 的 7.3.2）。
+config:
+  # e2e 那一层是 3s（超时关单的用例要快）；本机 chaos 是 5s。
+  PAYMENT_TIMEOUT: 5s
+  # e2e 那一层故意设成 1m（要测的是延迟消息那条路径）；chaos 要兜底的扫表也跑起来：被删的 Pod 丢下的
+  # 半截订单（CREATING 超时、延迟消息丢了的 PENDING_PAYMENT）靠它收拾，静止才等得到。
+  SWEEP_INTERVAL: 2s
+  # 必须大于订单服务处理一条消息的时限（10s），本机 chaos 也是 11s。
+  CREATE_TIMEOUT: 11s
+  # 孤儿占用（受理到一半 Pod 没了）的回收：宽限期和间隔调短，同本机 chaos。
+  HOLD_REAP_GRACE: 5s
+  HOLD_REAP_INTERVAL: 1s
+  # e2e 那一层是 gtid（要测主从延迟）。chaos 回到长期运行那一套的默认值 primary：本机 chaos 没有从库，
+  # 读的就是主库；删 Pod 不碰 MySQL，读模式和要验证的东西无关，少一个变量。
+  ORDER_READ_MODE: primary

@@ -1,0 +1,16 @@
+# gateway 在 e2e 那一套里的覆盖（叠在 ../gateway.yaml 和 common.yaml 之上）。
+# 2 个副本：限流的按用户加接口那一维在 Redis 里，两个副本共用一个桶，ratelimit_test.go 验证的正是这个。
+replicas: 2
+
+config:
+  # 限流（ADR-0019）保持开启，ratelimit_test.go 要验证它。按 IP 的限额关掉：所有用例都从测试 Job 这一个
+  # 地址来（经入口之后网关看到的是 Job 的 Pod 地址，见 scripts/cluster/e2e.sh 开头的说明），默认每秒 200
+  # 会把并发用例几乎全部限住。按用户加接口的限额保持默认值（RATE_LIMIT_USER、RATE_LIMIT_ROUTE 不设）。
+  # 限流的 Redis 键前缀没设 RATE_LIMIT_REDIS_PREFIX 时跟随 REDIS_PREFIX（每次运行不同）。
+  RATE_LIMIT: "on"
+  RATE_LIMIT_IP: "off"
+
+# 挂到同一个入口（envoy-gateway-system/public），用自己的主机名，和长期运行那一套的 api.oppenheimer.test 分开。
+# 测试 Job 用 hostAliases 把这个名字指到入口的地址。
+route:
+  hostnames: [e2e.oppenheimer.test]

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,10 +51,18 @@ var ErrClockMovedBackwards = errors.New("idgen: clock moved backwards")
 
 // Generator 并发安全地生成 ID。同一个节点号在同一时刻只能有一个 Generator 在用，
 // 否则会生成重复的 ID。
+//
+// 节点号有两种来源：New 直接给定（本机、测试，由调用方保证不重复）；AcquireLease 从共享的存储里租
+// （多副本，见 lease.go）。租来的 Generator 只在毫秒区间 (floorMs, boundMs] 里发号。
 type Generator struct {
 	workerID int64
 	now      func() time.Time
 	sleep    func(time.Duration)
+
+	// 只有租来的节点号才用到下面三个字段（lease.go）。
+	leased  bool
+	floorMs int64        // 上一任持有者可能用到的最大毫秒（加保护间隔），只发比它大的
+	boundMs atomic.Int64 // 这一任登记在存储里的上界，只发不超过它的；-1 表示租约已经结束
 
 	mu     sync.Mutex
 	lastMs int64
@@ -103,25 +112,43 @@ func (g *Generator) Next(shardKey int64) (int64, error) {
 		}
 	}
 
+	// seq 先算在局部变量里，下面的检查都通过了才和 lastMs 一起写回：被拒绝的调用不能改动状态，
+	// 否则“这一毫秒的序号用到哪了”会被冲掉，时钟再回到同一毫秒时就会重号。
+	seq := int64(0)
 	if ms == g.lastMs {
-		g.seq = (g.seq + 1) & seqMask
-		if g.seq == 0 {
+		seq = (g.seq + 1) & seqMask
+		if seq == 0 {
 			// 这一毫秒的序号用完了，等到下一毫秒。
 			for ms <= g.lastMs {
 				g.sleep(100 * time.Microsecond)
 				ms = g.now().Sub(Epoch).Milliseconds()
 			}
 		}
-	} else {
-		g.seq = 0
 	}
-	g.lastMs = ms
+
+	if g.leased {
+		if ms <= g.floorMs {
+			return 0, fmt.Errorf("%w: at %d ms, not past the previous holder's bound %d ms", ErrClockMovedBackwards, ms, g.floorMs)
+		}
+		if ms > g.boundMs.Load() {
+			return 0, ErrLeaseExpired
+		}
+	}
+	// lastMs 只记真正发出去的号用过的毫秒，让出租约时要登记它。
+	g.lastMs, g.seq = ms, seq
 
 	if ms < 0 || ms >= 1<<41 {
 		return 0, fmt.Errorf("idgen: timestamp %d ms outside the 41-bit range", ms)
 	}
 
 	return ms<<timeShift | g.workerID<<workerShift | g.seq<<seqShift | GeneOf(shardKey), nil
+}
+
+// lastIssuedMs 返回发出过的号里最大的毫秒时间，没发过是 0。
+func (g *Generator) lastIssuedMs() int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastMs
 }
 
 // GeneOf 返回分片键对应的基因。

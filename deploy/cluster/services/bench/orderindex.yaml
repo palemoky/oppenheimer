@@ -1,0 +1,3 @@
+# orderindex 在 bench 那一套里的覆盖（叠在 e2e/orderindex.yaml 之上）。商家索引经 cdc 从 binlog 异步写，
+# 不在下单的关键路径上，但它和 cdc 一起给订单库的从库、Kafka 和 mysql-main 加了压力，所以照设计值部署。
+replicas: 2

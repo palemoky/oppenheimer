@@ -63,6 +63,12 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	defer func() { settle(published) }()
 
 	orderID, err := s.ids.Next(userID)
+	if errors.Is(err, idgen.ErrLeaseExpired) {
+		// 节点号的租约续不上（租约所在的订单库不可用，ADR-0028）：什么都还没发生，按“落不了库”降级，
+		// 不是内部错误。续租成功后自动恢复。
+		s.logger.WarnContext(ctx, "order id lease expired, rejecting admission", "user_id", userID)
+		return nil, admissionFailed(ctx, errLandingUnavailable)
+	}
 	if err != nil {
 		return nil, admissionFailed(ctx, s.internal(ctx, "generate order id", err, "user_id", userID))
 	}

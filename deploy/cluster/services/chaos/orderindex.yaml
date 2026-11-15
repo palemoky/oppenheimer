@@ -1,0 +1,3 @@
+# orderindex 在 chaos 那一套里的覆盖（叠在 e2e/orderindex.yaml 之上）。默认不在删 Pod 的名单里，
+# 但两个副本要在：商家索引（verify 的第 20 条、recon 的 index）跟着一起对账。
+replicas: 2

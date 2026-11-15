@@ -1,0 +1,111 @@
+# 删 Pod 对账测试的发压和对账 Job（scripts/cluster/chaos.sh）。模板：__IMAGE__、__LB_GATEWAY_IP__、__RUN_ID__
+# 由 chaos.sh 填入。镜像是 deploy/docker/chaos.Dockerfile：load、recon 加 busybox。
+#
+# 这个 Pod 自己什么都不做（sleep），chaos.sh 用 kubectl exec 分阶段启动命令（/phase/phase.sh，来自 ConfigMap
+# chaos-phase）：warmup、run、wait-quiet、recon、verify。这样账本留在 /work 里，几个阶段之间脚本在 MacBook 上
+# 等 Deployment 恢复、把收集的库存服务日志传进来。用 Job 而不是裸 Pod：activeDeadlineSeconds 兜底，
+# 脚本被强杀、命名空间又被 E2E_KEEP=1 留着的时候，它到点自己停。
+#
+# 对应本机 scripts/chaos.sh 的几样东西：
+#   -addr                   http://e2e.oppenheimer.test，经 hostAliases 指到入口的地址：流量从入口（Envoy Gateway）进，
+#                           和 e2e 一样（gateway 的路由主机名在 deploy/cluster/services/e2e/gateway.yaml）
+#   各库的 DSN              用 app 账号（e2e_create_dbs 给了它 e2e_* 库的全部权限），不用 root：这里只读库，
+#                           不像 e2e 要停从库的复制。密码来自本命名空间的 Secret oppenheimer-mysql
+#   LOAD_*_DSN(S)           load wait-quiet、load verify 读（test/load/verify_cmd.go 的 dsnEnv），不进命令行
+#   MYSQL_DSNS 等           recon 读（services/recon/cmd/recon 的环境变量，与本机 scripts/chaos.sh 传的一样，
+#                           另加从库和商家索引：集群这一套有，本机 chaos 没有）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chaos
+  labels:
+    app.kubernetes.io/name: chaos-load
+    app.kubernetes.io/part-of: oppenheimer
+    oppenheimer.test/run-id: "__RUN_ID__"
+spec:
+  backoffLimit: 0
+  # 两小时：部署、发压、静止、对账加起来正常在半小时以内。
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chaos-load
+        app.kubernetes.io/part-of: oppenheimer
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # sleep 是 1 号进程，不处理 SIGTERM，删的时候只能等到优雅期满；它没有要收尾的东西。
+      terminationGracePeriodSeconds: 1
+      # 和业务 Pod 一样不上控制面节点。
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      hostAliases:
+        - ip: "__LB_GATEWAY_IP__"
+          hostnames: [e2e.oppenheimer.test]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: chaos
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          command: ["/busybox/sh", "-c", "exec sleep 7200"]
+          # 被 $(...) 引用的变量排在前面。
+          env:
+            - name: MYSQL_ORDER_0_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: order-0-app-password}}
+            - name: MYSQL_ORDER_1_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: order-1-app-password}}
+            - name: MYSQL_MAIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}
+            # load wait-quiet、load verify
+            - name: LOAD_INVENTORY_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_inventory_db"
+            - name: LOAD_ORDER_DSNS
+              value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/e2e_order_db_1"
+            - name: LOAD_PAYMENT_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_payment_db"
+            - name: LOAD_MERCHANT_INDEX_DSNS
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_1"
+            # recon
+            - name: MYSQL_DSNS
+              value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/e2e_order_db_1"
+            - name: MYSQL_REPLICA_DSNS
+              value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/e2e_order_db_1"
+            - name: ARCHIVE_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_order_archive_db"
+            - name: MERCHANT_INDEX_DSNS
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_merchant_index_db_1"
+            - name: PAYMENT_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_payment_db"
+            - name: INVENTORY_DSN
+              value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_inventory_db"
+          resources:
+            requests: {cpu: 500m, memory: 128Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: phase
+              mountPath: /phase
+              readOnly: true
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: phase
+          configMap:
+            name: chaos-phase

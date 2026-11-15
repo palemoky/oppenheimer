@@ -1,0 +1,15 @@
+# orderindex 服务（设计文档 2c）。release 名 orderindex。边车配置来自 deploy/envoy/orderindex.yaml。
+replicas: 2
+ports: {http: 8084, grpc: 9084}
+resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
+sidecar: {enabled: true}
+
+config:
+  KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
+
+# 两个索引库在共享实例 mysql-main 上。
+secretEnv:
+  - {name: MYSQL_MAIN_PASSWORD, key: main-app-password}
+expandEnv:
+  - name: MYSQL_DSNS
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_1"

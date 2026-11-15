@@ -1,0 +1,76 @@
+# 吞吐对比的发压 Job（scripts/cluster/bench.sh）。这是模板：前后带两个下划线的占位符（IMAGE、LB_GATEWAY_IP、RUN_ID、
+# NODE、CPU、MEMORY）由 bench.sh 填入。镜像和 chaos 的同一个（deploy/docker/chaos.Dockerfile：load、recon 加 busybox）。
+#
+# 和 chaos 的 Job（deploy/cluster/chaos/load-job.yaml）一样，Pod 自己只 sleep，bench.sh 用 kubectl exec 分阶段启动
+# load warmup、load run（/phase/phase.sh，同一个 ConfigMap 的写法）。1a 和 1b 两段用同一个 Pod：同一个节点、
+# 同一份 CPU 份额，发压这一侧不是变量。
+#
+# 设计文档 2c 的 10.3：发压的进程和被测系统在同一个集群里会抢 CPU，所以
+#   - 钉在一个工作节点上（nodeSelector 按主机名，默认 k3s-agent-1，BENCH_LOAD_NODE 可改）
+#   - CPU requests 给足（默认 2 核，BENCH_LOAD_CPU 可改）：节点忙的时候，CFS 按 requests 的比例分 CPU，
+#     发压进程至少拿得到这么多。不设 CPU 上限：上限会让发压进程被节流，节流本身就成了测量误差。
+#   - QoS 是 Burstable（requests 小于 limits），不是 Guaranteed：Guaranteed 要 CPU 上限等于 requests，理由同上。
+# bench.sh 每一轮采样 kubectl top，发压 Pod 的 CPU 用量在 top-pods.txt 里，看它有没有到 requests、节点是否打满。
+#
+# 不需要数据库的密码：落库数由 bench.sh 在 mysql 的 Pod 里用 root 查（scripts/cluster/e2e-lib.sh 的 e2e_root_sql）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench
+  labels:
+    app.kubernetes.io/name: bench-load
+    app.kubernetes.io/part-of: oppenheimer
+    oppenheimer.test/run-id: "__RUN_ID__"
+spec:
+  backoffLimit: 0
+  # 四小时：两种架构、每种默认 3 档 x 2 次，加部署和排空，正常在两小时以内。
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bench-load
+        app.kubernetes.io/part-of: oppenheimer
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 1
+      nodeSelector:
+        kubernetes.io/hostname: "__NODE__"
+      # 1a 和 1b 的入口主机名都指到入口（Envoy Gateway）的 LoadBalancer 地址。Pod 访问 LoadBalancer 地址时，
+      # kube-proxy 在本节点上就把它转到入口 Envoy 的某个 Pod（集群内的路径，不出宿主机），见 bench.sh 开头的说明。
+      hostAliases:
+        - ip: "__LB_GATEWAY_IP__"
+          hostnames: [e2e.oppenheimer.test, bench1a.oppenheimer.test]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bench
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          command: ["/busybox/sh", "-c", "exec sleep 14400"]
+          resources:
+            requests: {cpu: "__CPU__", memory: "__MEMORY__"}
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: phase
+              mountPath: /phase
+              readOnly: true
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: phase
+          configMap:
+            name: bench-phase

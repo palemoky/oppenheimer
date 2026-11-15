@@ -1,0 +1,14 @@
+# 构建上下文是仓库根目录，只放构建用得到的东西。
+# 不能排掉：go.work（含 go.work.sum）、api/、pkg/、services/、test/
+# （go.work 列了 test/e2e 和 test/load，目录缺了 go 命令会报错）。
+.git
+.github
+bin/
+tmp/
+docs/
+deploy/
+scripts/
+*.md
+.DS_Store
+.idea
+.vscode

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: service
+description: 业务服务的公共 chart（gateway、order、inventory、payment、orderindex、cdc），每个服务装一次。见设计文档 2c 第 7 节。
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
