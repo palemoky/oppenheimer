@@ -54,9 +54,9 @@
 2. **新会话从这里开始：etcd 的恢复演练**（设计文档 2b 的 7.2；主人 2026-11-15 说在新会话里做）。它会把控制面重置到快照时的状态，最坏情况是 `make cluster-up` 加 `make middleware-up` 重来（约 20 分钟）；主人确认过要做，动手前仍然说一声。演练之前先把 etcd 快照同步到 NAS 的定时器做出来。
 3. **e2e 在 CI 上偶发失败过一次，原因查到了，没有修**（PR #10，`993c5c6` 的第一次运行；重跑通过）。`TestCancelReturnsStockOnce` 轮询订单是否落库时收到 503 `STOCK_GATE_UNAVAILABLE`。order 的日志里没有任何闸门或熔断的报错，所以走的是 `errReadBusy`：展示读读闸门占用的并发名额（`READ_GATE_MAX_CONCURRENCY`，默认 16，阶段 1 收尾时加的）满了，而订单还没落库，服务按设计回“说不清状态”的 503（`services/order/internal/service/service.go` 里 `errHoldPending` 那一段，这种情况有意不记日志）。用例的 `getOrder` 把任何非 200 当成致命错误（`test/e2e/e2e_test.go`）。和这次的 Redis 客户端改动无关。两种修法：轮询里把这个 503 当成“还没好，继续等”；或者 e2e 里把名额调大。涉及读路径的降级语义，先想清楚客户端该怎么对待这个 503 再改。
 4. 2b 剩下的其他项（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
-3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
-4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
-5. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
+5. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；CNI 已定为 flannel；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
+6. 2c 要定的：服务的镜像怎么构建和推送（MacBook 已经可以直接 `docker push` 到集群的仓库）；各服务连中间件的地址（Redis 用 `sentinel://`、`cluster://` 的写法，MySQL 连 `<release>-primary`、`<release>-replica` 两个 Service，Kafka 连 `kafka-kafka-bootstrap.kafka.svc:9092`）。
+7. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
 
 2a 用到的版本都已登记到 `versions.md`。已查证、还没有用到的：Cilium v1.20.4。
 
