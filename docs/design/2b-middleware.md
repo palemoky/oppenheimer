@@ -13,7 +13,7 @@
 - 键名在脚本里用前缀拼出来（`p .. 'gate:sku:' .. sku`），没有通过 `KEYS` 声明。Redis Cluster 要求脚本访问的键都在 `KEYS` 里，它靠这个判断请求该发给哪个节点。
 - 一次下单受理（`holdScript`）要原子地改这些键：每个 SKU 的可售数、每个 SKU 的限购计数、这个订单的占用、全局的两个有序集合（`gate:holds`、`gate:claimed`）、幂等键。它们的名字各不相同，在 Cluster 里会落到不同的槽，而一个脚本只能访问同一个槽里的键。
 
-要让它跑在 Cluster 上，只能给所有闸门的键加同一个 hash tag（`{gate}`），让它们全落在一个槽、也就是一个节点上。那样 Cluster 对闸门没有任何分摊作用，只多了一层间接。闸门的原子性来自“所有相关的键在同一个 Redis 上由一个脚本改”，这和分片是冲突的。
+要让它跑在 Cluster 上，只能给所有闸门的键加同一个 hash tag（`{gate}`），让它们全落在一个槽、也就是一个节点上，同时把调用方式改成经 `KEYS` 传键名（现在调用时 `KEYS` 是空的）。那样 Cluster 对闸门没有任何分摊作用，只多了一层间接。闸门的原子性来自“所有相关的键在同一个 Redis 上由一个脚本改”，这和分片是冲突的。
 
 另外两处也受影响：gateway 的限流脚本一次改多个桶（按接口、按用户、按 IP，`#KEYS` 个），在 Cluster 里会跨槽；`pkg/redisx` 现在只会建单节点的客户端（`redis.NewClient`）。分布式锁（两个键）和查询缓存（一个键）问题不大。
 
@@ -71,7 +71,7 @@ Operator 把“怎么搭复制、怎么故障切换、怎么备份”写成了�
 
 - 每个分片一个 StatefulSet，2 个副本。序号 0 是初始的主库，序号 1 是从库。`server-id` 由 chart 里给的基数加序号算出来（和本机的 11、12、21、22 对应）。
 - 一个 headless Service 给每个 Pod 稳定的名字：`mysql-order-0-0.mysql-order-0.mysql.svc`。从库找主库、CDC 找从库都用这种名字。
-- 另外两个普通的 Service 按标签选 Pod：`mysql-order-0-primary`（`role=primary`）和 `mysql-order-0-replica`（`role=replica`）。标签由搭建复制的脚本打上。服务连的是这两个名字，所以故障切换时改的是标签，不是服务的配置。**这个标签现在是人工维护的**，这正是 Operator 会自动做的那一步。
+- 另外两个普通的 Service：`mysql-order-0-primary` 和 `mysql-order-0-replica`，按 Pod 名选，主库是哪个序号写在 values 里（`primaryOrdinal`）。服务连的是这两个名字，所以故障切换时改的是这个值，不是服务的配置。**这个值是人工维护的**，这正是 Operator 会自动做的那一步。（最初的设计是给 Pod 打 `role` 标签，实现时发现不行，见第 10 节的发现 2。）
 - 从库的初始化用 init 容器：数据目录为空时，用 CLONE 从主库拉全量，再按 GTID 自动定位建立复制。`super_read_only` 在复制建立之后才设（1c 的教训：写在启动参数里官方镜像的首次初始化会失败）。逻辑从本机的 `scripts/mysql-replication.sh` 搬过来。
 - 存储用 local-path，每个 Pod 一个 PVC（`volumeClaimTemplates`）。卷建在哪个节点，这个 Pod 以后就只能在那个节点上；节点的磁盘没了，从库要重新 CLONE，主库就是数据丢失，只能提升从库。
 - 探针：startup 探针给足时间（崩溃恢复可能要几分钟），readiness 对从库检查复制线程在跑。liveness 只检查进程能应答，不检查复制，否则复制断了会把从库反复重启。
@@ -99,7 +99,7 @@ CDC 伪装成从库从每个分片的从库读 binlog，源地址用从库 Pod �
 
 ### 4.2 闸门这一套：主从加 Sentinel
 
-- 一个 StatefulSet，2 个副本，主从分在两个 agent 上。3 个 Sentinel 是一个单独的 Deployment，三个节点各一个：Sentinel 靠多数票判断主库是否下线，3 个里要 2 个同意，所以不能只放在两个 agent 上。
+- 一个 StatefulSet，2 个副本，主从分在两个 agent 上。3 个 Sentinel 是一个单独的 StatefulSet（带一个小的卷：它要把运行中学到的主库、纪元、其他 Sentinel 写回自己的配置文件），三个节点各一个：Sentinel 靠多数票判断主库是否下线，3 个里要 2 个同意，所以不能只放在两个 agent 上。
 - 服务用 go-redis 的 Sentinel 客户端（`NewFailoverClient`）：向 Sentinel 问当前的主库是谁，切换后自己重连。
 - **要想清楚的一件事：Redis 的复制是异步的。** 主库确认了一次受理、还没传给从库就挂了，Sentinel 提升从库之后，这次受理的占用就没了，而用户已经拿到了“受理成功”。现有的机制能不能兜住，2b 不验证，但要先把预期写下来：落库的消息是受理之后才发的，消息里带着订单的全部内容，落库时在 MySQL 里预占库存，MySQL 那一侧会发现超卖（ADR-0018）；闸门里的可售数会比实际多，靠 inventory 的 `reconcile` 纠正。这是阶段 4 的一个实验，实验前按这段推演写出预期。
 - `min-replicas-to-write` 先不设。设成 1 可以缩小上面那个窗口（从库不在时主库拒绝写），代价是唯一的从库一挂闸门就不可写，按 ADR-0021 就是拒绝下单。等阶段 4 量过再定。
@@ -148,7 +148,7 @@ Strimzi 1.3.1，Kafka 4.3.2，KRaft 模式。本机仍然是 4.4.0，两边差�
 
 ### 6.1 资源和 QoS
 
-有状态的中间件一律 requests 等于 limits（Guaranteed）：节点内存紧张时，kubelet 按 QoS 等级挑 Pod 驱逐，Guaranteed 排在最后；数据库被驱逐的代价比业务服务大得多。CPU 只设 requests，不设 limits，避免被节流。
+有状态的中间件内存的 requests 等于 limits，另外用一个 PriorityClass（`middleware`）让它们在节点内存紧张时排在业务服务之后被驱逐；数据库被驱逐的代价比业务服务大得多。（这里原来写的是“Guaranteed”，不对：CPU 不设 limits 就是 Burstable，见第 10 节的发现 3。）CPU 只设 requests，不设 limits，避免被节流。
 
 | 组件 | 实例 | 每个的内存 | 合计 |
 |---|---|---|---|
@@ -214,7 +214,7 @@ MySQL 的 root 密码、各服务的账号、复制账号、CDC 账号都存成 
 |---|---|
 | MySQL | 主库写入、从库读到，两边的 GTID 集合一致；删掉从库的 Pod，回来后自己接上复制；删掉从库的卷，重新 CLONE；两个分片的主库不在同一个节点 |
 | Redis 主从 | 删掉主库的 Pod，Sentinel 完成切换，记下耗时；用 Sentinel 客户端的测试程序在切换前后持续写，记下失败了多久、丢了几条 |
-| Redis Cluster | `redis-cli --cluster check` 通过；删掉一个主库的 Pod，从库被提升，旧主回来变成从库（4.3 里要先验证的那一点） |
+| Redis Cluster | `redis-cli --cluster check` 通过；删掉一个主库的 Pod 后集群恢复正常（4.3 里要先验证的那一点；实际发生的不是切换，见第 10 节的发现 5） |
 | Kafka | 建一个 3 副本的 topic，`acks=all` 压测一轮记下吞吐；删掉一个 broker 的 Pod，期间生产不中断，回来后没有落后的副本；停掉两个 broker 时写入被拒绝 |
 | 代码 | `redisx` 三种模式的集成测试；`make lint test e2e` 在本机仍然通过（本机还是单节点） |
 | 备份 | 7.1、7.2 的两次演练 |

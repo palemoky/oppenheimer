@@ -68,7 +68,7 @@ log "donor: $donor"
 # 从这里开始任何一步被杀，下次都会看到记号并从头来。
 # 容器以 mysql 用户运行（statefulset.yaml 里的 securityContext），这些文件本来就是它建的；卷的根目录属于 root、
 # 靠 fsGroup 可写，chown 它会失败，所以失败不算错。保留 chown 是为了以 root 运行时行为不变。
-chown mysql:mysql "$D" 2>/dev/null || true 2>/dev/null || true
+chown mysql:mysql "$D" 2>/dev/null || true
 touch "$FLAG"
 shopt -s dotglob nullglob
 for f in "$D"/*; do

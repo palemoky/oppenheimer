@@ -35,8 +35,9 @@ spec:
       {{- end }}
       terminationGracePeriodSeconds: 120
       # 以镜像里的 mysql 用户（999）运行，不用 root。
-      # 官方入口脚本以 root 启动时会用 gosu 切到 mysql 用户；在这个集群的节点上（内核 7.0）gosu 会一直占着
-      # CPU 空转、永远不往下走（2026-11-15 实测，原因没有查）。不是 root 时入口脚本跳过这一步。
+      # 数据库没有理由用 root 运行；不是 root 时官方入口脚本也不再经过 gosu 切换用户。
+      # （这一条是排查“容器里的信号被 AppArmor 拒绝”时加的：gosu 靠信号同步线程，当时会空转。
+      # 根因在节点上，已经在 scripts/cluster/vm.sh 里修掉，见设计文档 2b 第 10 节的发现 1。）
       # fsGroup 让卷对这个组可写；init 容器里的 chown 因此变成对自己的文件操作，不需要 root。
       securityContext:
         runAsNonRoot: true
