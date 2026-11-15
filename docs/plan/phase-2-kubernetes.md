@@ -51,7 +51,7 @@
 - [x] 评估 Kafka 消费者的静态成员（`group.instance.id`，用 Pod 名）：**结论是不做**。滚动 payment 时每个分区只停 0.5 到 3.2 秒；franz-go 的静态成员关闭时不离组，Deployment 的新 Pod 又是新名字，用了反而要等会话超时（设计文档 2c 第 13 节的第七步，ADR-0007 的补充）
 - [x] 阶段 1 的端到端测试在集群上通过：`make cluster-e2e`，19 个用例，流量经入口的 Envoy（设计文档 2c 第 13 节的第五步）。一致性测试见下一条
 - [x] 一致性测试在集群上通过：`make cluster-chaos`，压测期间每 5 秒随机删一个业务 Pod，静止后 `verify` 和 `recon` 无差异；正常删除（23 个 Pod，客户端 0 个 5xx）和强制删除（22 个 Pod，29 个 5xx）各通过一次。查出并修掉 `kafkax` 启动时查死信 topic 的缺陷（三个 broker 才出现）
-- [ ] 一键部署：`make deploy` 已能用（构建、推送、部署）；示例 SKU 的脚本（`make deploy-seed`）和降级开关的脚本（`make deploy-degrade`）已有；还差“从空集群重建一遍”的验收。Argo CD 在 2d
+- [x] 一键部署：`make cluster-up && make middleware-up && make deploy && make deploy-seed`，从删掉三台虚拟机到整套系统运行 17 分 34 秒，没有人工步骤；重建后没有容器重启，`make cluster-e2e` 19 个用例通过（设计文档 2c 第 13 节）。Argo CD 在 2d
 
 ## 2d 生态组件巡礼（按需）
 
