@@ -20,7 +20,7 @@
 #   E2E_OVERLAY_DIR e2e-up、e2e-render 在 e2e 那两层 values 之上再叠的一层（目录里的 common.yaml 和 <服务>.yaml），
 #                  scripts/cluster/chaos.sh 设成 deploy/cluster/services/chaos。没设就没有这一层。
 #                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
-#   MESH_ISTIO     哪些服务用 Istio 的边车（设计文档 2d，chart 的 mesh: istio）。空（默认）是全部用手写的 Envoy 边车；
+#   MESH_ISTIO     哪些服务用 Istio 的边车（设计文档 2d，chart 的 mesh: istio）。没设时是 all（默认）；显式设成空是全部用手写的 Envoy 边车；
 #                  all 是全部用 Istio；或者空格分隔的服务名，只有这些用 Istio（逐个服务迁移的中间态）。
 #                  Istio 形态的服务不渲染边车配置，values 在基础那一层之后叠 deploy/cluster/services/istio/<服务>.yaml
 #                  （在 e2e 等叠加层之前）。非空时 deploy、e2e-up 在部署任何 release 之前先对目标命名空间
@@ -62,6 +62,8 @@ ENVOY_DIR="$ROOT/deploy/envoy"
 # Istio 形态（MESH_ISTIO）：每个服务一层 values（叠在基础那一层之后），和对整个命名空间的流量规则。
 ISTIO_VALUES="$VALUES/istio"
 MESH_RULES="$ROOT/deploy/cluster/mesh"
+MESH_SECURITY="$MESH_RULES/security/policies.yaml"
+E2E_MESH_LOAD="$E2E_MANIFESTS/mesh-load.yaml"
 # 依赖顺序：被依赖的先部署。order 启动时要预热对 inventory 的调用，payment 调 order，gateway 调所有。
 SERVICES=(inventory order payment orderindex cdc gateway)
 # Envoy 的版本和 Makefile 的 envoy-validate、chart 里的边车镜像一致。
@@ -175,12 +177,43 @@ check_mesh_env() {
 apply_mesh_rules() {
   [[ -n "${MESH_ISTIO:-}" ]] || return 0
   echo "==> istio traffic rules (MESH_ISTIO=$MESH_ISTIO)"
+  # Istio 形态的 Pod 靠 istiod 的 webhook 注入边车；控制面不在的话 Pod 建不出来（webhook 的失败策略是 Fail），
+  # 规则的 CRD 也不存在。在这里说清楚，比 kubectl apply 报“no matches for kind”好懂。
+  if ! kubectl -n istio-system get deploy istiod >/dev/null 2>&1; then
+    echo "istiod is not installed; run make mesh-up first (or set MESH_ISTIO= to deploy with the hand-written Envoy sidecars)" >&2
+    exit 1
+  fi
   kubectl apply -n "$NS" -f "$MESH_RULES/" >/dev/null
   echo "    $MESH_RULES applied to $NS"
 }
 
 ensure_tmp() {
   if [[ -z "$TMP" ]]; then TMP="$(mktemp -d)"; fi
+}
+
+# mTLS 严格模式和按身份的访问控制（deploy/cluster/mesh/security/）。在 release 部署完之后调用。
+# 只有全部服务都是 Istio 形态才应用：还有手写边车的 Pod 时，它们的明文请求会被拒绝。不是 all 的时候反过来把它们删掉，
+# 这样“从 all 退回某个中间态”的第一步就是放开，退回才不会断流（策略不存在时删除是空操作；连 CRD 都没有时也忽略）。
+# 文件里的 __NS__ 换成目标命名空间。e2e 的命名空间多一份：测试的发压 Pod 的身份和它调 inventory 的许可。
+apply_mesh_security() {
+  local f files=("$MESH_SECURITY")
+  if [[ $E2E_MODE -eq 1 ]]; then files+=("$E2E_MESH_LOAD"); fi
+  if [[ "${MESH_ISTIO:-}" == all ]]; then
+    echo "==> istio mTLS (STRICT) and authorization policies"
+    # 这次只部署了一部分服务、命名空间里还有手写边车的 Pod（initContainer 叫 envoy）时不收紧。
+    if kubectl -n "$NS" get pods -o jsonpath='{range .items[*]}{.spec.initContainers[*].name}{"\n"}{end}' | grep -qw envoy; then
+      echo "    skipped: $NS still has pods with the hand-written sidecar; deploy the remaining services first" >&2
+      return 0
+    fi
+    for f in "${files[@]}"; do
+      sed "s/__NS__/$NS/g" "$f" | kubectl apply -n "$NS" -f - >/dev/null
+    done
+    echo "    applied to $NS"
+  else
+    # 只删策略；ServiceAccount load 留着（发压 Job 引用它）。
+    kubectl -n "$NS" delete peerauthentication.security.istio.io,authorizationpolicy.security.istio.io --all \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
 }
 
 # 渲染某个服务的边车配置到临时目录；没有边车（deploy/envoy 下没有它的文件，比如 cdc）或者这个服务是
@@ -322,12 +355,16 @@ deploy_releases() { # [服务...]
   done
 
   apply_mesh_rules
+  # 不是全部 Istio 形态时，先放开（删掉严格模式和访问控制）再滚动；是的话，滚动完再收紧。
+  if [[ "${MESH_ISTIO:-}" != all ]]; then apply_mesh_security; fi
 
   for s in "${list[@]}"; do
     echo "==> $s (image tag $IMAGE_TAG)"
     helm_args "$s" "$IMAGE_TAG"
     helm upgrade --install "$s" "$CHART" "${HELM_ARGS[@]}" --wait --timeout 10m >/dev/null
   done
+
+  if [[ "${MESH_ISTIO:-}" == all ]]; then apply_mesh_security; fi
 
   echo "==> pods"
   kubectl -n "$NS" get pods -o wide
@@ -380,6 +417,7 @@ cmd_e2e_prepare() {
   echo "==> otlp receiver service"
   kubectl -n "$NS" apply -f "$E2E_MANIFESTS/otlp-service.yaml" >/dev/null
   echo "    service $NS/e2e-otlp"
+  kubectl -n "$NS" apply -f "$E2E_MANIFESTS/load-serviceaccount.yaml" >/dev/null
 }
 
 cmd_e2e_up() { # [服务...]

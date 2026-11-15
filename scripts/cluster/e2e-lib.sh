@@ -18,9 +18,12 @@ E2E_MAIN_DBS="e2e_inventory_db e2e_payment_db e2e_merchant_index_db_0 e2e_mercha
 # 订单分片：release 序号 i 上是 e2e_order_db_i。
 E2E_ORDER_SHARDS="0 1"
 
-# 某个服务是不是 Istio 形态（设计文档 2d；services.sh 开头的 MESH_ISTIO）：空是全部用手写的 Envoy 边车，
+# 某个服务是不是 Istio 形态（设计文档 2d；services.sh 开头的 MESH_ISTIO）：没设是 all（见下），显式的空是全部用手写的 Envoy 边车，
 # all 是全部用 Istio，否则是空格分隔的服务名。services.sh 选 values，chaos.sh、bench.sh 选直连 inventory 的地址，
 # 三处用同一个判断。服务名的合法性由 services.sh 检查。
+# 默认是 all：长期运行的那一套在 2026-11-16 已经全部切到 Istio，默认还是手写边车的话，一次普通的 make deploy
+# 就会把它们全部退回去。没设才用默认值；显式设成空（MESH_ISTIO= make deploy）才是全部手写边车。
+export MESH_ISTIO="${MESH_ISTIO-all}"
 mesh_istio() { # 服务
   case "${MESH_ISTIO:-}" in
   "") return 1 ;;

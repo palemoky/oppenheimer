@@ -1,0 +1,19 @@
+# 测试用的发压 Pod（scripts/cluster/chaos.sh、bench.sh 的 Job）在网格里的身份和权限（设计文档 2d 第 10 节的第八步）。
+# 模板：__NS__ 由 scripts/cluster/services.sh 填。只在 e2e 的命名空间里有，长期运行的那一套没有这个口子。
+#
+# 发压 Pod 的 warmup 要直接调 inventory 的 gRPC（预热闸门）。严格模式下没有证书连不进去，所以它也注入边车、
+# 用自己的 ServiceAccount（load-serviceaccount.yaml，在 e2e-prepare 里建，先于 Job），再由下面这条策略单独放行。
+# 这条策略和 inventory-callers 一起应用（release 部署完之后）：单独先建它的话，inventory 上就只有“允许 load”这一条 ALLOW，
+# gateway 和 order 的调用反而全部被拒绝。ALLOW 策略是并集：它和 inventory-callers 各管各的名单。
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: inventory-load-test
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: inventory}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: [cluster.local/ns/__NS__/sa/load]
