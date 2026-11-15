@@ -22,7 +22,9 @@ strategy: RollingUpdate
 minReadySeconds: 5
 # 要大于 DRAIN_DELAY 加停止时限（20 秒）加边车退出的时间（设计文档 8.1）。不用 preStop。
 terminationGracePeriodSeconds: 45
-drainDelay: 15s
+# 5 秒：Istio 下端点的变化经 xDS 推送，实测 Pod 收到 SIGTERM 之后 0.5 秒内就不再有新请求进来（设计文档 2d 第 10 节）。
+# 手写边车靠 DNS 时最长要 9.5 秒，那时是 15 秒；MESH_ISTIO= 退回手写边车时要改回 15s。
+drainDelay: 5s
 
 # 服务容器监听的端口。chart 把它们同时渲染成 HTTP_ADDR、GRPC_ADDR（监听所有地址，探针才连得到）。
 # grpc 为 0 表示没有 gRPC（gateway 的 HTTP 是对外的，cdc 没有 gRPC）。

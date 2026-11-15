@@ -88,14 +88,14 @@
 - 第五步：`make cluster-fault`（`scripts/cluster/fault.sh`，Opus 写）八个场景通过，数值和 1d 对得上。三个发现（设计第 10 节）：摘除晚 0.5 到 1 秒生效（也解释了 1d 里那个没有解释的现象）；摘除时间在间隔几秒的重复故障下不累加（不需要 EnvoyFilter）；超时的请求有一部分是 504（被调用方的入站边车也在计时）。
 - 第六步：先在 e2e 上来回演练（十次滚动 0 失败），再切长期运行的那一套（七次部署，探针 18770 个请求 0 失败）。演练抓到回退时才出现的缺陷（Pod 模板残留的 ServiceAccount），已修。
 - 第八步：`deploy/cluster/mesh/security/policies.yaml`（模板，`__NS__`），部署脚本在全部是 Istio 形态、滚动完之后应用。删 Pod 测试和压测的 Job 进了网格（ServiceAccount `load`，e2e 命名空间里单独放行）。反向验证过：名单外的身份 403，没有边车的 Pod 连接被重置。
-- 第七步做了的：负载均衡（两个副本各一半）、内存（边车平均 32 Mi，istiod 76 Mi）。
+- 第七步做了的：负载均衡（两个副本各一半）、内存（边车平均 32 Mi，istiod 76 Mi）。端点传播时间重量了：Pod 收到 SIGTERM 后 0.5 秒内就不再有新请求（2c 是 1.7 到 9.5 秒），**`DRAIN_DELAY` 从 15 秒降到 5 秒**（chart 的默认值；已部署，之后的滚动和删 Pod 9570 个请求 0 失败；退回手写边车时要改回 15 秒）。
 
 本机 `make lint`（gateway、order、payment 三个模块）0 issues，`make test` 这三个模块通过，`make envoy-validate` 通过。**全量的 `make lint test` 和本机 `make e2e` 这一轮没有跑**（Go 只改了三个测试文件；本机的 e2e 走手写边车，没有动过它的配置）。推送之前跑一遍。
 
 **下一步，新会话从这里开始：**
 
 1. **2d 剩下的**（设计第 11 节）：
-   - 第七步剩下的：端点传播时间重量（2c 第四步的办法，一次性脚本当时没有入库），据此决定 `DRAIN_DELAY` 要不要从 15 秒降下来；HPA 的扩容点重量（边车的 CPU requests 变了）；经边车和直连的延迟对比；边车和 istiod 的 requests 各降一半。
+   - 第七步剩下的：HPA 的扩容点重量（边车的 CPU requests 变了）；经边车和直连的延迟对比；边车和 istiod 的 requests 各降一半。
    - 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；**从空集群重建验证一键部署**（顺序是 `make cluster-up && make middleware-up && make mesh-up && make deploy && make deploy-seed`；要删三台虚拟机，**先问主人**）；2d 的笔记（派 Sonnet，材料是设计第 1、3、10 节和 ADR-0029；面试考点已经补进阶段计划）。
    - 然后跑全量 `make lint test e2e`，推送，开 PR（CI 派 Haiku 看）。
 2. **阶段 3 压测之前要处理的**（都是 2c 发现、没有修的）：
