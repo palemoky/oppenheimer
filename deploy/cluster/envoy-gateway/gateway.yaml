@@ -12,11 +12,29 @@ spec:
     type: Kubernetes
     kubernetes:
       envoyDeployment:
-        replicas: 1
+        # 2 个副本，分在不同的节点上：入口是所有外部流量的必经之路，一个节点挂了不能跟着没。
+        # 流量不是在两个副本之间分摊的：MetalLB 的二层模式下入口的地址同一时刻只由一个节点应答 ARP，
+        # 加上下面的 externalTrafficPolicy: Local，流量全部落在那个节点上的那一个 Envoy。另一个是备用的：
+        # 持有地址的节点挂了，MetalLB 让另一个有就绪 Envoy 的节点接管地址（免费 ARP），这是故障切换。
+        replicas: 2
+        pod:
+          # 用分布约束而不是“必须不同节点”的反亲和：滚动更新时多出来的那个 Pod 可以落到第三个节点，
+          # 不会因为两个节点都已经各有一个而卡住。
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: envoy
+                  gateway.envoyproxy.io/owning-gateway-name: public
         container:
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { memory: 512Mi }
+      # 排空节点时一次最多带走一个 Envoy。
+      envoyPDB:
+        maxUnavailable: 1
       envoyService:
         type: LoadBalancer
         # Local：只转给本节点上的 Envoy，不改源地址，Envoy 看到的是真实的客户端地址（gateway 的按 IP
