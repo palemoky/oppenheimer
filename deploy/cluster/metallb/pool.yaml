@@ -1,0 +1,20 @@
+# 模板：__LB_POOL__ 由 scripts/cluster/addons.sh 从 cluster.env 填入。设计见 docs/design/2a-cluster.md 第 5 节。
+# autoAssign: false：池里的地址不自动分配，每个 Service 用注解 metallb.io/loadBalancerIPs 写明要哪个，
+# 地址的用途登记在 cluster.env 和 docs/infra/hardware.md。没写注解的 LoadBalancer Service 会一直 pending。
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lan
+  namespace: metallb-system
+spec:
+  addresses: ["__LB_POOL__"]
+  autoAssign: false
+---
+# 二层模式：某个节点上的 speaker 对池里地址的 ARP 请求作答。不写这个资源，地址分配了也没有人应答。
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lan
+  namespace: metallb-system
+spec:
+  ipAddressPools: [lan]

@@ -1,0 +1,106 @@
+# 镜像仓库（distribution）。模板：__NAS_IP__、__NAS_EXPORT__、__LB_REGISTRY_IP__、__REGISTRY_VERSION__
+# 由 scripts/cluster/addons.sh 从 cluster.env 填入。设计见 docs/design/2a-cluster.md 4.2、6.3。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: registry
+---
+# 手写的 PV，直接指向 NAS 上的子目录。挂的是子目录而不是共享文件夹的根：群晖的根目录带 ACL，
+# 非 root 的用户号进不去（实测）；子目录由 addons.sh 建好并 chown、chmod 过。
+# Retain：PVC 被删掉时 NAS 上的数据不动。集群重建后重新声明同一个 PV，镜像还在。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: registry-nfs
+spec:
+  capacity:
+    storage: 200Gi # NFS 不限制容量，这个数只用来和 PVC 匹配
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: [nfsvers=4.1, hard]
+  nfs:
+    server: __NAS_IP__
+    path: __NAS_EXPORT__/registry
+  claimRef:
+    namespace: registry
+    name: registry-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: registry
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: "" # 空字符串：不走默认的 local-path 动态供给，只绑定手写的 PV
+  volumeName: registry-nfs
+  resources:
+    requests:
+      storage: 200Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  replicas: 1
+  # Recreate：先停旧的再起新的。滚动更新会有两个实例同时写同一个目录的时刻。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      # 放在 server 节点：两个 agent 留给中间件，阶段 4 关 agent 时仓库不受影响。
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # 和 NAS 上 registry 目录的属主一致
+        runAsGroup: 1000
+      containers:
+        - name: registry
+          image: registry:__REGISTRY_VERSION__
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: ":5000"
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet: { path: /v2/, port: 5000 }
+          livenessProbe:
+            httpGet: { path: /v2/, port: 5000 }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: registry-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: registry
+  annotations:
+    metallb.io/loadBalancerIPs: "__LB_REGISTRY_IP__"
+spec:
+  type: LoadBalancer
+  selector:
+    app: registry
+  ports:
+    - port: 5000
+      targetPort: 5000

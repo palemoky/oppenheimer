@@ -46,6 +46,20 @@ for dev in /proc/sys/net/ipv4/conf/*/ignore_routes_with_linkdown; do
   echo 1 >"$dev"
 done
 
+# 虚拟机的帧都经过 br0。现在它们不过宿主机的 iptables，因为 br_netfilter 没有加载；一旦有东西把它
+# 加载起来，桥上的帧就要过 FORWARD 链，而 Docker 把这条链的默认策略设成了 DROP：三台虚拟机同时断网。
+# 这三个开关在模块加载之前不存在，所以只写 sysctl.d 不够，要用 udev 规则在模块加载的那一刻设成 0
+# （libvirt 文档的做法）。k3s 在虚拟机里面加载 br_netfilter 是它自己需要的，和这里无关。
+BRIDGE_NF_SYSCTLS="net.bridge.bridge-nf-call-iptables=0 net.bridge.bridge-nf-call-ip6tables=0 net.bridge.bridge-nf-call-arptables=0"
+printf '%s\n' \
+  "ACTION==\"add\", SUBSYSTEM==\"module\", KERNEL==\"br_netfilter\", RUN+=\"/usr/sbin/sysctl -w $BRIDGE_NF_SYSCTLS\"" \
+  >/etc/udev/rules.d/99-oppenheimer-bridge-nf.rules
+udevadm control --reload
+if [[ -d /proc/sys/net/bridge ]]; then
+  # shellcheck disable=SC2086  # 有意按空格拆成三个参数
+  sysctl -q -w $BRIDGE_NF_SYSCTLS
+fi
+
 echo "==> bridge $HOST_BRIDGE on $HOST_NIC ($HOST_IP/$LAN_PREFIX)"
 if [[ ! -e /sys/class/net/$HOST_NIC ]]; then
   echo "NIC $HOST_NIC not found" >&2

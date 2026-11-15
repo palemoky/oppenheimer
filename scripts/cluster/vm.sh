@@ -94,6 +94,9 @@ runcmd:
   - systemctl enable --now qemu-guest-agent
 EOF
   # 按 MAC 认网卡，不依赖网卡在虚拟机里叫什么名字。
+  # 不接受 IPv6 的路由通告：通告里带着一个 IPv6 的 DNS 服务器，它不经过 R2S 的代理，返回的是被污染的
+  # 真实地址；systemd-resolved 轮到它时节点和 Pod 就连不上镜像源（2026-11-15 实际发生，设计文档 2a 的 3.4）。
+  # 集群只用 IPv4，关掉通告之后节点没有全局的 IPv6 地址，DNS 上游只剩 R2S 的 IPv4 地址。
   cat >"$tmp/network-config" <<EOF
 version: 2
 ethernets:
@@ -101,6 +104,8 @@ ethernets:
     match:
       macaddress: "$N_MAC"
     set-name: eth0
+    dhcp6: false
+    accept-ra: false
     addresses: [$N_IP/$LAN_PREFIX]
     routes:
       - to: default

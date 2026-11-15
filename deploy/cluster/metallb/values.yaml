@@ -1,0 +1,8 @@
+# MetalLB 的 Helm values（chart 版本在 scripts/cluster/cluster.env 的 METALLB_VERSION）。
+# 只用二层模式（ARP）。chart 默认会装 frr-k8s 作为 BGP 的后端：每个节点一个 5 个容器的 Pod，
+# 再加一个 statuscleaner。二层模式用不到它，两处都关掉（frrk8s 是新的后端，speaker.frr 是已弃用的旧后端）。
+frrk8s:
+  enabled: false
+speaker:
+  frr:
+    enabled: false

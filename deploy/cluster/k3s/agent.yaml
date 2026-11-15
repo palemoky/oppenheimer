@@ -1,0 +1,9 @@
+# 模板：scripts/cluster/k3s.sh 渲染到 agent 节点的 /etc/rancher/k3s/config.yaml。
+# token 在渲染时才填入（从 server 读取），不入库。设计见 docs/design/2a-cluster.md 3.2。
+server: https://__SERVER_IP__:6443
+token: __TOKEN__
+node-ip: __NODE_IP__
+kubelet-arg:
+  - system-reserved=cpu=200m,memory=400Mi
+  - kube-reserved=cpu=300m,memory=300Mi # agent 上没有控制面，预留比 server 少
+  - eviction-hard=memory.available<200Mi,nodefs.available<5%,imagefs.available<5%
