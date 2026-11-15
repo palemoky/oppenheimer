@@ -5,7 +5,7 @@
 ## 当前状态
 
 - **当前阶段**：2b（中间件上集群）进行中：三种中间件已部署并验证，剩备份、恢复演练和收尾。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
-- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。2b 已推送，draft PR #10。
+- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。2b 已推送，draft PR #10，HEAD `993c5c6` 之后还有一个只改 PROGRESS 的提交。CI 27 项全部通过（2026-11-15；最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 52 秒、`test (./pkg)` 3 分 24 秒，没有明显变慢的 job）。工作区是干净的。
 - **最后更新**：2026-11-15
 
 ### 2a 做到哪（2026-11-15）
@@ -51,7 +51,9 @@
    - Go 代码：`pkg/redisx` 三种模式（地址写法 `sentinel://gate@...`、`cluster://...`）、`pkg/ratelimit` 在 Cluster 下按桶调用（ADR-0019 的补充）、调用方改成 `redis.UniversalClient`、`kafkax` 建 topic 的副本数用 broker 的默认值。全部 11 个模块 `make lint` 0 issues、`make build` 通过；`pkg`、四个服务和 `test/load` 的 `make test` 通过；`make e2e` 通过（都是 2026-11-15）。第一次推送时漏改了 `test/load`（它也用旧的客户端类型），CI 有 3 项编译失败，已修。
    - CNI 已改定为保留 flannel（ADR-0026 末尾）。
    - 本机：OrbStack 配了 `insecure-registries`，可以直接 `docker push 192.168.50.50:5000/...`；多了一个可选的测试环境 `make redis-modes-up`（11 个容器，现在在运行，不用时 `make redis-modes-down`）。
-2. 2b 剩下的（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
+2. **新会话从这里开始：etcd 的恢复演练**（设计文档 2b 的 7.2；主人 2026-11-15 说在新会话里做）。它会把控制面重置到快照时的状态，最坏情况是 `make cluster-up` 加 `make middleware-up` 重来（约 20 分钟）；主人确认过要做，动手前仍然说一声。演练之前先把 etcd 快照同步到 NAS 的定时器做出来。
+3. **e2e 在 CI 上偶发失败过一次，原因查到了，没有修**（PR #10，`993c5c6` 的第一次运行；重跑通过）。`TestCancelReturnsStockOnce` 轮询订单是否落库时收到 503 `STOCK_GATE_UNAVAILABLE`。order 的日志里没有任何闸门或熔断的报错，所以走的是 `errReadBusy`：展示读读闸门占用的并发名额（`READ_GATE_MAX_CONCURRENCY`，默认 16，阶段 1 收尾时加的）满了，而订单还没落库，服务按设计回“说不清状态”的 503（`services/order/internal/service/service.go` 里 `errHoldPending` 那一段，这种情况有意不记日志）。用例的 `getOrder` 把任何非 200 当成致命错误（`test/e2e/e2e_test.go`）。和这次的 Redis 客户端改动无关。两种修法：轮询里把这个 503 当成“还没好，继续等”；或者 e2e 里把名额调大。涉及读路径的降级语义，先想清楚客户端该怎么对待这个 503 再改。
+4. 2b 剩下的其他项（设计文档第 10 节“还没做的”）：给两个 Redis 的 chart 加 `priorityClassName`；MySQL 备份的 CronJob 和 etcd 快照同步到 NAS，以及两次恢复演练（etcd 的那次会重置控制面，动手前和主人说）；重启宿主机的检查；切换手册。面试笔记已写：`docs/notes/2b-middleware.md`（Sonnet 写，主会话抽查；只覆盖已经做了的部分，备份和演练做完后要补）。注意：`deploy/charts/mysql/files/init-replica.sh` 在部署之后改过一处无害的笔误，下次 `middleware.sh mysql` 会因为 ConfigMap 变了而滚动重启三个 MySQL 实例。没有查到的：Oracle MySQL Operator 的最新版本。
 3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
 4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
 5. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
