@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- **当前阶段**：2d（服务之间的流量治理迁到 Istio）进行中：设计已确认，九步里做完了第一步（见“2d 做到哪”）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-15 从空虚拟机重建过一次，六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
-- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出）。第一步的改动已提交（两个提交：装 istiod 的脚本和 values、设计文档和 ADR-0029），**没有推送，还没有开 PR**。工作区是干净的。
-- **最后更新**：2026-11-15
+- **当前阶段**：2d（服务之间的流量治理迁到 Istio）进行中：九步里做完了第一到六步和第八步，**六个服务已经不停机地切到 Istio**；剩第七步的重量和第九步的收尾（见“2d 做到哪”）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-15 从空虚拟机重建过一次，六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
+- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出）。改动都已提交，**没有推送，还没有开 PR**。工作区是干净的。
+- **最后更新**：2026-11-16
 
 ### 2c 做到哪（2026-11-15）
 
@@ -71,22 +71,33 @@
 
 **集群现状（重建之后）**：全新的集群，六个服务的镜像 tag 是 `178fe99`（含 `kafkax` 的修复），gateway、order 带 HPA；库里只有示例 SKU 和验收时探针下的几百单；MySQL 的密码是新生成的；主库都是序号 0。NAS 上旧集群的备份和 etcd 快照还在，对新集群没有意义。新集群还没有做过手工备份（定时的 CronJob 每天 19:00 UTC 起跑）。
 
-### 2d 做到哪（2026-11-15）
+### 2d 做到哪（2026-11-16）
 
-**PR #11（2c）已合并**（合并提交 `d36449f`）。分支 `phase-2d` 从合并后的 `main` 开出，第一步已提交，没有推送。
+**PR #11（2c）已合并**（合并提交 `d36449f`）。分支 `phase-2d` 从合并后的 `main` 开出，已提交，**没有推送，还没有开 PR**（主人说全部做完再一起推送、开 PR）。
 
-设计文档 [design/2d-mesh.md](design/2d-mesh.md)，**主人已确认第 2 节的八项，都按建议**，决定在 ADR-0029：Istio 1.32.0 边车模式；中间件的流量不过边车；入站只接管 gRPC 端口；摘除时间不固定（不用 EnvoyFilter）；本机和 CI 保留手写的边车；不停机地切；加 mTLS 严格模式和按身份的访问控制，Argo CD、cert-manager、灰度发布不做。实现顺序在设计第 8 节（九步），结果记在第 10 节。
+设计文档 [design/2d-mesh.md](design/2d-mesh.md)，主人确认了第 2 节的八项（都按建议），决定在 ADR-0029。实现顺序在设计第 8 节（九步），每一步的结果和量到的数在第 10 节，没做的在第 11 节。
 
-**第一步做完了**：`make mesh-up`（`scripts/cluster/mesh.sh`，values 在 `deploy/cluster/istio/istiod.yaml`）、`make mesh-status`、`make mesh-check`。istiod 1.32.0 在集群上跑着（`istio-system`，1 个副本，在 k3s-agent-1）。注入在这批节点上能用（默认的 iptables 写法、AppArmor 没拦、原生 sidecar、mTLS 都验证过）。空载内存：istiod 44 Mi，每个边车 34 到 36 Mi。**业务命名空间还没有打注入的标签，业务服务没有任何变化。** 临时命名空间 `mesh-check` 已删。
+**集群现状：六个服务已经全部在 Istio 上**（命名空间 `oppenheimer`，镜像 tag `c54615c`）。istiod 1.32.0 在 `istio-system`（1 个副本）；五个有 gRPC 的服务各带一个注入的 `istio-proxy`（按 Pod 的标签注入，命名空间没有打标签），cdc 不注入；mTLS 是严格模式，每个被调用方有一条按身份的 `AuthorizationPolicy`。手写边车的 headless Service 和 ConfigMap 已经没有了。**`make deploy` 的默认形态现在是 Istio**（`MESH_ISTIO` 没设时是 `all`；`MESH_ISTIO= make deploy` 才退回手写边车，退之前读设计第 10 节第六步）。
 
-- chart 不在官方 Helm 仓库里，`mesh.sh fetch` 从 GitHub 的发布包取到 `./bin/istio-1.32.0/`（里面有 istioctl，用 `scripts/cluster/mesh.sh istioctl ...` 调）。
-- 看了 Istio 生成的 Envoy 配置，四点记在设计第 10 节；要紧的一点：路由上有 `maxGrpcTimeout`，路由超时到期计不计入摘除要在第五步的场景 B 里实证。
-- `make mesh-up` 还没有写进一键部署的顺序和文档（第九步从空集群重建时一起做）。
-- 这一轮没有改 Go 代码；`mesh.sh` 过了 shellcheck。ADR-0020 的补充段落还没有写（第九步）。
+做完的（设计第 8 节的第一到六步、第八步，第七步的一部分）：
+
+- 第一步：`make mesh-up`、`make mesh-status`、`make mesh-check`（`scripts/cluster/mesh.sh`，values 在 `deploy/cluster/istio/istiod.yaml`）。chart 不在官方 Helm 仓库里，`mesh.sh fetch` 从 GitHub 的发布包取到 `./bin/istio-1.32.0/`（里面有 istioctl：`scripts/cluster/mesh.sh istioctl ...`）。
+- 第二步：chart 的 `mesh: envoy | istio`（Opus）；每条调用边的 `VirtualService`、`DestinationRule` 和每个服务的 `Sidecar` 在 `deploy/cluster/mesh/`（Fable）；各服务 Istio 形态下的 values 在 `deploy/cluster/services/istio/`。
+- 第三步：三个 Go 测试核对代码常量、`deploy/envoy/`、`deploy/cluster/mesh/` 三处超时一致、不重试（Sonnet）。
+- 第四步：`make cluster-e2e` 19 个用例通过；`make cluster-chaos` 正常删除、强制删除、严格模式下各通过一次。
+- 第五步：`make cluster-fault`（`scripts/cluster/fault.sh`，Opus 写）八个场景通过，数值和 1d 对得上。三个发现（设计第 10 节）：摘除晚 0.5 到 1 秒生效（也解释了 1d 里那个没有解释的现象）；摘除时间在间隔几秒的重复故障下不累加（不需要 EnvoyFilter）；超时的请求有一部分是 504（被调用方的入站边车也在计时）。
+- 第六步：先在 e2e 上来回演练（十次滚动 0 失败），再切长期运行的那一套（七次部署，探针 18770 个请求 0 失败）。演练抓到回退时才出现的缺陷（Pod 模板残留的 ServiceAccount），已修。
+- 第八步：`deploy/cluster/mesh/security/policies.yaml`（模板，`__NS__`），部署脚本在全部是 Istio 形态、滚动完之后应用。删 Pod 测试和压测的 Job 进了网格（ServiceAccount `load`，e2e 命名空间里单独放行）。反向验证过：名单外的身份 403，没有边车的 Pod 连接被重置。
+- 第七步做了的：负载均衡（两个副本各一半）、内存（边车平均 32 Mi，istiod 76 Mi）。
+
+本机 `make lint`（gateway、order、payment 三个模块）0 issues，`make test` 这三个模块通过，`make envoy-validate` 通过。**全量的 `make lint test` 和本机 `make e2e` 这一轮没有跑**（Go 只改了三个测试文件；本机的 e2e 走手写边车，没有动过它的配置）。推送之前跑一遍。
 
 **下一步，新会话从这里开始：**
 
-1. **2d 第二步**（设计第 8 节）：chart 加一个在“手写边车”和“Istio”两种形态之间选的开关（去掉 initContainer、边车的 ConfigMap、headless Service；Service 加名为 `grpc` 的端口；每个服务一个 ServiceAccount；Pod 注解：只接管 gRPC 入站端口、出站排除 3306、6379、16379、26379、9092，cdc 不注入），Opus 写；`deploy/cluster/mesh/` 下每条调用边的 `VirtualService`、`DestinationRule` 和每个被调用方的 `Sidecar`，Fable 写（数值见设计 3.4；`DestinationRule` 的 `workloadSelector`、`VirtualService` 的 `sourceLabels` 先对参考页）。然后第三步（Go 的测试核对三处超时，Sonnet）、第四步（`oppenheimer-e2e` 换成 Istio 形态，跑 `cluster-e2e` 和 `cluster-chaos`）。
+1. **2d 剩下的**（设计第 11 节）：
+   - 第七步剩下的：端点传播时间重量（2c 第四步的办法，一次性脚本当时没有入库），据此决定 `DRAIN_DELAY` 要不要从 15 秒降下来；HPA 的扩容点重量（边车的 CPU requests 变了）；经边车和直连的延迟对比；边车和 istiod 的 requests 各降一半。
+   - 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；**从空集群重建验证一键部署**（顺序是 `make cluster-up && make middleware-up && make mesh-up && make deploy && make deploy-seed`；要删三台虚拟机，**先问主人**）；2d 的笔记（派 Sonnet，材料是设计第 1、3、10 节和 ADR-0029；面试考点已经补进阶段计划）。
+   - 然后跑全量 `make lint test e2e`，推送，开 PR（CI 派 Haiku 看）。
 2. **阶段 3 压测之前要处理的**（都是 2c 发现、没有修的）：
    - 1b 在集群上的落库只有约 200 单/秒，是本机的四分之一左右，原因没有查（线索：最忙的是订单库 0 的从库，约 1 核）。
    - 扩容时新 order Pod 一就绪就有十几个 503（推断是冷连接池，Fable 改）。
@@ -94,7 +105,7 @@
    - inventory 和 payment 的两个副本可能挤在同一个节点上（软约束），阶段 4 关节点之前要定怎么办；server 节点的内存没有余量。
 3. 小的欠账：2c 的笔记没有包含删 Pod 测试、切换验证、吞吐对比和重建的结果（派 Sonnet 补）；本机 `scripts/bench.sh` 的 `BENCH_ARCH=1a` 是坏的；ADR-0028 没提正常退出时 `last_ms` 会降回实际发过的最后一毫秒；设计 7.4 的 `GOMAXPROCS` 没有确认；一次没有解释的 inventory 容器启动时重启（chaos 第二次运行）。
 4. 没有验证的：真正的 cdc 换源；在节点上直接杀进程；探针不发支付请求；租约所在的库不可用时受理被拒绝再恢复（集群上）。都适合放进阶段 4。
-5. 提交和推送：2c 的改动都在已合并的 PR #11 里；2d 第一步的改动已提交在 `phase-2d` 上，没有推送。
+5. 提交和推送：2c 的改动都在已合并的 PR #11 里；2d 的改动都已提交在 `phase-2d` 上，没有推送。
 
 ### 2a 做到哪（2026-11-15）
 
@@ -397,6 +408,7 @@
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
+| 2026-11-16 | 2d 的 NetworkPolicy 一条改用网格的 mTLS 严格模式加 `AuthorizationPolicy` 实现（只管服务之间的 gRPC）；Argo CD、cert-manager、灰度发布这次不做 | 主人确认（ADR-0029 第 8 项）：网格自带，按身份比按地址准；其余几项留到有需要时 |
 
 ## 会话日志
 

@@ -59,7 +59,8 @@
 - [ ] cert-manager：证书
 - [ ] Argo CD：GitOps
 - [ ] 灰度发布：Argo Rollouts 或 Ingress 金丝雀
-- [ ] 服务网格：把服务之间手写的 Envoy 边车迁到 Istio，熔断、并发上限、路由超时逐项对照 1d 的实测重新验证（设计文档 2c 的 6.5；主人 2026-11-15 定的，不是“按需”）
+- [ ] 服务网格：把服务之间手写的 Envoy 边车迁到 Istio，熔断、并发上限、路由超时逐项对照 1d 的实测重新验证（设计文档 [2d-mesh.md](../design/2d-mesh.md)，ADR-0029；主人 2026-11-15 定的，不是“按需”）。**已做完**：Istio 1.32.0 边车模式，六个服务不停机地切了过去（探针 18770 个请求 0 失败）；`make cluster-fault` 八个场景通过，数值和 1d 对得上；`make cluster-e2e`、`make cluster-chaos` 通过；mTLS 严格模式加按身份的访问控制。**还差**：端点传播时间和 `DRAIN_DELAY`、HPA 扩容点、延迟对比没有重量；chart 里手写边车的分支还没删；没有从空集群重建验证过（设计第 11 节）
+- [x] 服务之间的访问控制：用网格的 mTLS 严格模式加 `AuthorizationPolicy` 做了（按身份，只管 gRPC 端口），代替了 NetworkPolicy 那一条想防的大部分；gateway 的 HTTP 入口仍然没有限制
 
 ## 验收标准
 
@@ -94,6 +95,23 @@ Pod 生命周期与探针；Service、kube-proxy、Ingress 的流量路径；调
 - 一致性测试的判定标准为什么是“数据对得上”而不是“零报错”；正常删除和强制删除在客户端看到的差别来自哪里。
 - 异步削峰到底提升了什么：受理和落库是两个数；背压把持续过载时的受理压回落库速度，“快”只在突发时成立；压测时怎么认出自己量到的是保护机制的上限而不是系统的能力。
 - 做对照实验：没有“去掉保护就失败”的对照，零失败说明不了保护起了作用；对照改过的配置要先恢复干净。
+
+2d 补充（设计文档 [2d-mesh.md](../design/2d-mesh.md)，ADR-0029）：
+
+- 服务网格解决什么：端点发现、按请求的负载均衡、超时、熔断、mTLS 从每个服务的代码或手写配置里拿出来，由控制面统一下发。控制面（istiod）和数据面（边车）各做什么，xDS 的几种资源（LDS、RDS、CDS、EDS）。
+- 透明拦截怎么做到的：init 容器在 Pod 的网络命名空间里写 iptables 规则，出站重定向到 15001、入站到 15006；进程不知道边车存在。和“进程自己把地址指到代理”相比，排查时难在哪。
+- Istio 的默认重试（2 次，条件里有 gRPC 的 `unavailable`）为什么危险；重试应该放在调用链的哪一层；怎么证明“重试关掉了”（要有打开时的对照）。
+- 熔断在 Istio 里是两样东西：连接池上限（`connectionPool`）和异常检测（`outlierDetection`）。默认值哪些要改、为什么（`maxEjectionPercent` 10% 对两个副本是 0 个）；摘除为什么不是立刻生效的。
+- 慢下游怎么被熔断：只有路由上的超时到期才算失败；调用方进程自己的超时必须比它长，否则代理永远看不到失败。
+- `DestinationRule` 作用在调用方一侧；同一个下游对不同调用方用不同的额度怎么写（`workloadSelector`、`sourceLabels`）。
+- Service 的端口名为什么会改变行为（协议识别）；认成 TCP 时会怎样、为什么不报错。
+- 边车默认拿到全网格的配置，`Sidecar` 资源收窄可见范围为什么是大集群里必须做的。
+- 已有的服务怎么不停机地进网格：`PERMISSIVE` 模式、自动 mTLS 按端点判断、为什么按调用关系的拓扑序“调用方先切”；回退为什么要单独演练。
+- mTLS 的身份从哪来（ServiceAccount、SPIFFE）；`PeerAuthentication` 和 `AuthorizationPolicy` 各管什么；ALLOW 策略的语义（有一条 ALLOW 就默认拒绝其余的）和由此带来的应用顺序问题。
+- 删掉 Pod 模板里的 `serviceAccountName` 为什么不生效（废弃的同义字段 `serviceAccount`）。
+- 边车模式和 ambient 模式的区别，各自把七层的功能放在哪。
+- istiod 挂了会怎样：已有的流量、端点变化、新 Pod 的创建（注入 webhook 的失败策略）。
+- 原生 sidecar 之前，边车和 Job、和启动停止顺序的老问题是什么。
 
 2b 补充（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节，手册 [mysql-switchover.md](../infra/mysql-switchover.md)）：
 

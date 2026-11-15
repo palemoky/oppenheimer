@@ -350,3 +350,58 @@ mTLS 和访问控制（第 2 节第 8 项，主人同意才做）：迁移期间
 - Istio 默认只保留很少的统计项，集群级的要在 Pod 上用 `proxy.istio.io/config` 注解的 `proxyStatsMatcher` 打开（chart 加了通用的 `podAnnotations`，只有故障注入的叠加层在用）。阶段 3 接监控时要定保留哪些。
 
 日志在 `tmp/cluster-fault-logs/1794758107-*`。
+
+### 第六步：不停机地切过去（2026-11-16）
+
+**先在 e2e 的命名空间里演了一遍，来回各一趟**：从全部 Istio 形态按“被调用方先退”的顺序逐个退回手写边车（inventory、orderindex、order、payment、gateway），再按“调用方先切”的顺序逐个切回 Istio。十次滚动，探针（`probe.py`，三条同步调用链）19870 个请求，**0 失败**。第 7 节里两处没有实证的假设都成立：同一个 Service 后面有的 Pod 有 Istio 边车、有的没有时，调用方的边车逐个端点决定用不用 mTLS；规则先于 Pod 存在没有副作用。
+
+**演练抓到一个回退时才出现的缺陷，已修。** 第一次演练退回 inventory 时滚动卡在一半：新的 ReplicaSet 建出一个 Pod 之后报 `serviceaccount "inventory" not found`。原因是两件事叠在一起：
+
+- 手写边车形态的模板不写 `serviceAccountName`。但 Pod 模板里还有一个已废弃的同义字段 `serviceAccount`，API 在 `serviceAccountName` 被删掉时不清它，于是新模板实际上仍然指着 `inventory` 这个账号。
+- 同一次 `helm upgrade` 把这个 ServiceAccount 删了（手写边车形态不渲染它）。第一个新 Pod 赶在删除之前建了出来，第二个就建不出来了。
+
+探针这期间是 0 失败（旧 Pod 还在服务），但滚动永远完不成。修法：手写边车形态显式写 `serviceAccountName: default`。**教训是回退路径要和前进路径一样演练**：前进的方向一次就通过，问题只在退回时出现。
+
+**长期运行的那一套（命名空间 `oppenheimer`）已经切完。** 先做一次准备性的滚动（新镜像 `c54615c`、所有 Service 加上 gRPC 端口，形态不变），然后 gateway、payment、order、inventory、orderindex 逐个切，最后是 cdc（不注入，只是换成有自己的 ServiceAccount）。七次部署，约 7 分钟，探针 18770 个请求，**0 失败**；延迟 p50 10 到 13 毫秒，p99 15 到 34 毫秒。切完之后 headless Service 和 `<服务>-envoy` 的 ConfigMap 随 release 自动删掉了，`istioctl analyze` 没有问题，十个边车都和 istiod 同步。
+
+**切完之后把默认形态改成了 Istio**：没设 `MESH_ISTIO` 时是 `all`（原来是全部手写边车）。不改的话，一次普通的 `make deploy` 会把十个 Pod 全部退回去。显式设成空（`MESH_ISTIO= make deploy`）才是手写边车。控制面不在时部署脚本直接报错，提示先 `make mesh-up`。默认形态渲染出来的东西和集群上正在跑的没有差异（`kubectl diff` 为空）。
+
+### 第八步：mTLS 严格模式和按身份的访问控制（2026-11-16）
+
+`deploy/cluster/mesh/security/policies.yaml`（Fable 写）：一条命名空间级的 `PeerAuthentication`（`STRICT`），每个被调用方一条 `AuthorizationPolicy`，只允许它的调用方的身份（order 允许 gateway 和 payment，inventory 允许 gateway 和 order，payment、orderindex 只允许 gateway）。它们只管被边车接管的端口，也就是 gRPC 端口；探针和 gateway 对外的 HTTP 端口不受影响。
+
+- **身份里带命名空间**（`cluster.local/ns/<命名空间>/sa/<服务>`），所以这份文件是模板，部署脚本把 `__NS__` 换掉。不用后缀通配（`*/sa/gateway`）：那样 e2e 命名空间的 gateway 也能调长期运行的那一套的 order。
+- **应用的时机**：只在全部服务都是 Istio 形态时应用，而且在 release 滚动完之后（命名空间里还有手写边车的 Pod 时跳过并提示）；不是 `all` 时反过来在滚动之前先删掉，回退的第一步是放开。
+- **测试的发压 Pod 进了网格**。删 Pod 测试和压测的 Job 在 warmup 阶段直接调 inventory 的 gRPC，严格模式下没有证书连不进去。它们现在注入边车（只让到集群内服务的出站过边车：中间件的端口和入口的地址都排除，发压的请求不多过一层代理），用自己的 ServiceAccount `load`，由只存在于 e2e 命名空间的 `inventory-load-test` 放行。**这条策略必须和 `inventory-callers` 一起应用**：单独先建的话，inventory 上只有“允许 load”这一条 ALLOW，gateway 和 order 的调用反而全部被拒绝（ALLOW 的语义：工作负载上只要有 ALLOW 策略，没被任何一条允许的就拒绝）。
+
+验证：
+
+| | 结果 |
+|---|---|
+| `make cluster-chaos`（严格模式加访问控制下，删 Pod） | 通过，客户端 0 个 5xx，`verify` 和 `recon` 无差异 |
+| 名单里的身份（`load` 调 inventory 的 gRPC 端口） | 到了应用（返回 415，gRPC 服务端不认普通的 HTTP 请求） |
+| 名单外的身份（`load` 调 order、payment） | `403 Forbidden` |
+| 没有边车的 Pod 调 order 的 gRPC 端口 | 连接被重置 |
+| 同一个没有边车的 Pod 调 order 的 HTTP 端口 `/healthz` | 正常（不过边车） |
+| 应用到长期运行的那一套时 | 探针 3400 个请求 0 失败 |
+
+2c 留下的“任何 Pod 都能直接调任何服务的 gRPC”这个口子关上了。gateway 的 HTTP 入口仍然谁都能连（`TRUSTED_PROXIES` 信整个 Pod 网段的问题还在），那一段不在网格里，要靠 NetworkPolicy，这次没有做。
+
+### 第七步里做了的（2026-11-16）
+
+- **负载均衡**：探针跑 40 秒，两个 inventory 各处理 524 和 496 个 gRPC 请求，两个 order 是 512 和 508。按请求均衡，和手写边车时一样。
+- **内存**：十个边车平均 32 Mi，最大 34 Mi；istiod 76 Mi。比手写的边车每个多约 15 Mi，合计约 150 Mi，加 istiod 共 230 Mi 左右。requests（边车 64 Mi、istiod 256 Mi）可以各降一半，没有改。
+- **滚动发布零报错**：迁移本身就是七次滚动，0 失败。
+
+**没有做的**：端点传播时间没有重量，所以 `DRAIN_DELAY` 还是 15 秒（现在是经 xDS 推送，应当可以降，但没有数）；HPA 的扩容点没有重量（边车的 CPU requests 从 20m 变成 50m）；经边车和直连的延迟对比没有做。
+
+## 11. 还没做的
+
+- 第七步剩下的三项（上面）。
+- 第九步：删掉 chart 里手写边车的分支和 `MESH_ISTIO` 的中间态；从空集群重建验证一键部署（顺序里多了 `make mesh-up`；要删虚拟机，先问主人）；ADR-0020 的补充；笔记。
+- 摘除晚 0.5 到 1 秒生效的原因没有直接证实（用 EnvoyFilter 把 `update_merge_window` 设成 0 再量）。
+- 强制删 Pod 时客户端的 5xx 比 2c 多（133 对 29），两次删到的服务不同，没有做可比的对照。场景 C 表明被删的 Pod 是毫秒级失败，摘除时间也不累加，所以大概率只是这次 order 被删得多；没有证实。
+- `e2e` 的 OTLP 接收端的端口名不符合 Istio 的约定（被当成 TCP 透传）；`e2e_inventory_addr` 里 inventory 的端口是写死的。
+- 手写边车的入站上限在 Istio 下换成了 `Sidecar` 的 `inboundConnectionPool`，配置确认下发了（上限 1024），**没有压到上限验证过**。
+- istiod 不在时的行为（已有的边车继续工作、新 Pod 建不出来）没有实测，放进阶段 4。
+- server 节点的内存在这一天的测试之后是 76%（重建后轻载时 48%）；网格没有任何东西在它上面，来源没有查。
