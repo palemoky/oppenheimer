@@ -1,0 +1,24 @@
+image:
+  repository: redis
+  tag: "8.10.3"
+  pullPolicy: IfNotPresent
+
+clusterDomain: cluster.local
+
+# 总节点数；3 主 3 从 = 6，每个主库 1 个从库。
+replicas: 6
+replicasPerMaster: 1
+maxmemory: 128mb
+maxmemoryPolicy: allkeys-lru
+nodeTimeoutMs: 5000
+
+# 卷只放 nodes.conf，不放数据。
+storage: 1Gi
+storageClass: local-path
+
+resources:
+  requests: {cpu: 50m, memory: 192Mi}
+  limits: {memory: 192Mi}
+
+# PriorityClass 的名字，空表示不设。集群上用 middleware（由 middleware.sh 先建好）。
+priorityClassName: ""

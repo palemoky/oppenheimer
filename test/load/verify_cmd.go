@@ -427,7 +427,7 @@ func warmup(ctx context.Context, addr string, ids []int64, redisAddr, redisPrefi
 	return checkLoaded(ctx, rdb, redisPrefix, ids)
 }
 
-func checkLoaded(ctx context.Context, rdb *redis.Client, prefix string, ids []int64) error {
+func checkLoaded(ctx context.Context, rdb redis.UniversalClient, prefix string, ids []int64) error {
 	gate := stockgate.New(rdb, prefix)
 	for _, id := range ids {
 		if _, ok, err := gate.Stock(ctx, id); err != nil {

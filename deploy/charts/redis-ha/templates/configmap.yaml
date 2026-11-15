@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "redis-ha.name" . }}
+  labels: {{- include "redis-ha.labels" . | nindent 4 }}
+data:
+  # Redis 的静态参数。动态部分（replicaof、announce）由 start-redis.sh 在每次启动时追加，
+  # 写到 /data/redis.conf：Sentinel 切换主从时会用 CONFIG REWRITE 改这个文件，所以不能直接挂只读的 ConfigMap。
+  redis.conf: |
+    protected-mode no
+    appendonly yes
+    maxmemory {{ .Values.redis.maxmemory }}
+    maxmemory-policy {{ .Values.redis.maxmemoryPolicy }}
+    dir /data
+
+  start-redis.sh: |
+    #!/bin/sh
+    set -eu
+    # 环境变量由 StatefulSet 注入：POD_NAME、HEADLESS、SUFFIX、SENTINEL_SVC、MASTER_NAME、FIRST_MASTER_POD
+    ORDINAL="${POD_NAME##*-}"
+    MY_HOST="${POD_NAME}.${HEADLESS}.${SUFFIX}"
+    FIRST_MASTER="${FIRST_MASTER_POD}.${HEADLESS}.${SUFFIX}"
+
+    # 先问 Sentinel 现在谁是主库。切换之后谁是主库由 Sentinel 说了算：
+    # 旧主重启回来如果按序号自认为主库，而从库已被提升，就是两个主库（脑裂）。
+    ask_sentinel() {
+      m=$(timeout 3 redis-cli -h "${SENTINEL_SVC}" -p 26379 sentinel get-master-addr-by-name "${MASTER_NAME}" 2>/dev/null | head -n 1 | tr -d '\r' || true)
+      case "$m" in
+        ""|*" "*|ERR*|*error*) m="" ;;
+      esac
+      echo "$m"
+    }
+
+    MASTER="$(ask_sentinel)"
+    if [ -n "$MASTER" ]; then
+      echo "Sentinel 报告的主库：$MASTER"
+    else
+      # 问不到 = Sentinel 还没起来，即第一次部署：按序号，0 号是主库。
+      echo "问不到 Sentinel，按序号决定角色"
+      MASTER="$FIRST_MASTER"
+    fi
+
+    cp /conf/redis.conf /data/redis.conf
+    # 用稳定的域名通告自己：Pod 重建后 IP 会变，Sentinel 和主库记的是域名。
+    echo "replica-announce-ip ${MY_HOST}" >> /data/redis.conf
+    if [ "$MASTER" = "$MY_HOST" ]; then
+      echo "角色：主库"
+    else
+      echo "角色：从库，复制 ${MASTER}"
+      echo "replicaof ${MASTER} 6379" >> /data/redis.conf
+    fi
+    exec redis-server /data/redis.conf
+
+  start-sentinel.sh: |
+    #!/bin/sh
+    set -eu
+    # 环境变量：POD_NAME、SENTINEL_HEADLESS、REDIS_HEADLESS、SUFFIX、MASTER_NAME、QUORUM、
+    #   DOWN_AFTER、FAILOVER_TIMEOUT、PARALLEL_SYNCS、SENTINEL_REPLICAS、REDIS_REPLICAS、REDIS_NAME、SENTINEL_NAME
+    CONF=/data/sentinel.conf
+    MY_HOST="${POD_NAME}.${SENTINEL_HEADLESS}.${SUFFIX}"
+
+    # 在其他 Sentinel 或 Redis 节点上找出当前主库。只在没有 sentinel.conf 时用（第一次启动或数据卷丢了）。
+    # Sentinel 数据卷丢了就忘了当前主库是谁；写死 redis-gate-0 在切换之后是错的，
+    # 所以先问别的 Sentinel，再看哪个 Redis 节点自称主库。
+    find_master() {
+      i=0
+      while [ "$i" -lt "$SENTINEL_REPLICAS" ]; do
+        h="${SENTINEL_NAME}-${i}.${SENTINEL_HEADLESS}.${SUFFIX}"
+        if [ "$h" != "$MY_HOST" ]; then
+          m=$(timeout 3 redis-cli -h "$h" -p 26379 sentinel get-master-addr-by-name "$MASTER_NAME" 2>/dev/null | head -n 1 | tr -d '\r' || true)
+          case "$m" in ""|*" "*|ERR*|*error*) ;; *) echo "$m"; return 0 ;; esac
+        fi
+        i=$((i + 1))
+      done
+      i=0
+      while [ "$i" -lt "$REDIS_REPLICAS" ]; do
+        h="${REDIS_NAME}-${i}.${REDIS_HEADLESS}.${SUFFIX}"
+        r=$(timeout 3 redis-cli -h "$h" role 2>/dev/null | head -n 1 | tr -d '\r' || true)
+        if [ "$r" = "master" ]; then echo "$h"; return 0; fi
+        i=$((i + 1))
+      done
+      return 1
+    }
+
+    KEEP=/tmp/sentinel.keep
+    : > "$KEEP"
+    if [ -s "$CONF" ]; then
+      # 保留 Sentinel 运行中学到的状态（身份、主库、已知的其他 Sentinel 和从库、纪元），
+      # 静态参数每次按 ConfigMap 重新生成，这样改了 values 升级后会生效。
+      grep -E '^sentinel (myid|monitor|known-replica|known-sentinel|known-slave|current-epoch|config-epoch|leader-epoch) ' "$CONF" > "$KEEP" || true
+    fi
+    MONITOR="$(grep '^sentinel monitor ' "$KEEP" || true)"
+    if [ -n "$MONITOR" ]; then
+      MASTER_HOST="$(echo "$MONITOR" | cut -d' ' -f4)"
+    else
+      n=0
+      MASTER_HOST=""
+      while [ "$n" -lt 30 ]; do
+        MASTER_HOST="$(find_master || true)"
+        [ -n "$MASTER_HOST" ] && break
+        n=$((n + 1)); sleep 2
+      done
+      # 找不到（所有节点都没起来）才退回 0 号，这是第一次部署的情形。
+      [ -n "$MASTER_HOST" ] || MASTER_HOST="${REDIS_NAME}-0.${REDIS_HEADLESS}.${SUFFIX}"
+      MONITOR="sentinel monitor ${MASTER_NAME} ${MASTER_HOST} 6379 ${QUORUM}"
+    fi
+    grep -v '^sentinel monitor ' "$KEEP" > "$KEEP.rest" || true
+
+    # 启用 resolve-hostnames 之后，Sentinel 启动时解析不了 monitor 里的域名就会退出，所以等 DNS 就绪。
+    n=0
+    until getent hosts "$MASTER_HOST" >/dev/null 2>&1 || [ "$n" -ge 60 ]; do n=$((n + 1)); sleep 2; done
+
+    # 顺序有要求：resolve-hostnames 必须在 monitor 之前，monitor 必须在引用主库名的参数之前。
+    {
+      echo "port 26379"
+      echo "protected-mode no"
+      echo "dir /data"
+      echo "sentinel resolve-hostnames yes"
+      echo "sentinel announce-hostnames yes"
+      # 用域名通告自己，Pod 重建后其他 Sentinel 记的还是有效的。
+      echo "sentinel announce-ip ${MY_HOST}"
+      echo "$MONITOR"
+      echo "sentinel down-after-milliseconds ${MASTER_NAME} ${DOWN_AFTER}"
+      echo "sentinel failover-timeout ${MASTER_NAME} ${FAILOVER_TIMEOUT}"
+      echo "sentinel parallel-syncs ${MASTER_NAME} ${PARALLEL_SYNCS}"
+      cat "$KEEP.rest"
+    } > "$CONF.new"
+    mv "$CONF.new" "$CONF"
+    exec redis-sentinel "$CONF"

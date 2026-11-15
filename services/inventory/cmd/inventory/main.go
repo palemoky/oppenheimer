@@ -287,7 +287,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 // 也不登记 cache 开关（和 order 的订单缓存一样：没有缓存就没有可关的东西，DEGRADE 里写了 cache 会拒绝启动）。
 // 设了 CACHE_REDIS_ADDR（且与 REDIS_ADDR 不同）时连专用的缓存 Redis，否则复用 rdb。
 // 返回的 closeFn 关闭专用客户端（复用 rdb 时什么也不做），调用方在所有组件停止后调用。
-func newStockCache(ctx context.Context, logger *slog.Logger, cfg config, rdb *redis.Client, switches *degrade.Set) (c *cache.Cache[*inventoryv1.GetStockResponse], closeFn func(), err error) {
+func newStockCache(ctx context.Context, logger *slog.Logger, cfg config, rdb redis.UniversalClient, switches *degrade.Set) (c *cache.Cache[*inventoryv1.GetStockResponse], closeFn func(), err error) {
 	closeFn = func() {}
 	if cfg.stockCacheTTL <= 0 {
 		logger.InfoContext(ctx, "stock query cache disabled")

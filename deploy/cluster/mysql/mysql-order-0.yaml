@@ -1,0 +1,22 @@
+# 订单分片 0（slot 0、2、4、6），一主一从。设计文档 2b 的 3.1。
+# 主库偏好 agent-1，从库被反亲和挤到 agent-2；分片 1 正好反过来，一个 agent 挂了只丢一个分片的主库。
+replicas: 2
+primaryOrdinal: 0       # 切换后改这里再 helm upgrade（只改 -primary、-replica 两个 Service）
+priorityClassName: middleware
+serverIdBase: 11          # 和本机 compose 的 11、12 对应
+preferredNode: k3s-agent-1
+databases:
+  - order_db_0
+cdc:
+  enabled: true           # CDC 从这个分片的从库读 binlog
+mysqld:
+  maxConnections: 200
+  innodbBufferPoolSize: 512M
+resources:
+  memory: 1Gi
+  cpu: 250m
+storage:
+  size: 20Gi
+backup:
+  enabled: true
+  schedule: "0 19 * * *"   # UTC，北京时间 03:00；三个实例错开

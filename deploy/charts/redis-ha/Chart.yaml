@@ -1,0 +1,6 @@
+apiVersion: v2
+name: redis-ha
+description: Redis 一主一从加 3 个 Sentinel（库存闸门和分布式锁用）
+type: application
+version: 0.1.0
+appVersion: "8.10.3"

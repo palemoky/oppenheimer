@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/palemoky/oppenheimer/pkg/ratelimit"
@@ -103,6 +102,11 @@ func loadRateLimitConfig(lookup func(string) (string, bool)) (rateLimitConfig, e
 	} else {
 		cfg.redisAddr = cmp.Or(get("CACHE_REDIS_ADDR"), defaultRateLimitRedisAddr)
 	}
+	if cfg.redisAddr != "" {
+		if _, err := redisx.ParseAddr(cfg.redisAddr); err != nil {
+			return rateLimitConfig{}, fmt.Errorf("invalid rate limit redis address: %w", err)
+		}
+	}
 	if v, ok := lookup("RATE_LIMIT_REDIS_PREFIX"); ok {
 		cfg.redisPrefix = strings.TrimSpace(v)
 	} else {
@@ -150,23 +154,18 @@ func positiveDuration(get func(string) string, name string, def time.Duration) (
 //
 // 链路和指标和 redisx 里的一样（设计文档 1d 的 8.4）：每条命令一个 CLIENT span，不记命令内容（键里有用户号），
 // 不给建连单独出 span；连接池的统计进指标。埋点失败只返回错误，客户端照样可用，由调用方决定怎么处理。
-func newRateLimitRedis(addr string) (*redis.Client, error) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:                  addr,
-		ContextTimeoutEnabled: true,
-		MaxRetries:            -1,
-		DialerRetries:         1,
-		DialTimeout:           time.Second,
-		ReadTimeout:           time.Second,
-		WriteTimeout:          time.Second,
-		PoolSize:              redisx.DefaultPoolSize,
-		MinIdleConns:          redisx.DefaultPoolSize,
+//
+// 客户端本身由 redisx.New 创建（它不访问网络）：地址可以是单节点、Sentinel 或 Cluster 的写法（redisx.ParseAddr），
+// 集群上限流的桶放在 Redis Cluster 里，那时每个桶单独调用一次脚本（pkg/ratelimit 的 Redis）。
+func newRateLimitRedis(addr string) (redis.UniversalClient, error) {
+	rdb, err := redisx.New(redisx.Config{
+		Addr:          addr,
+		MaxRetries:    -1,
+		DialerRetries: 1,
+		DialTimeout:   time.Second,
 	})
-	if err := redisotel.InstrumentTracing(rdb, redisotel.WithDBStatement(false), redisotel.WithDialFilter(true)); err != nil {
-		return rdb, fmt.Errorf("instrument rate limit redis tracing: %w", err)
-	}
-	if err := redisotel.InstrumentMetrics(rdb); err != nil {
-		return rdb, fmt.Errorf("instrument rate limit redis metrics: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("rate limit redis: %w", err)
 	}
 	return rdb, nil
 }
@@ -206,12 +205,17 @@ func newRateLimit(ctx context.Context, logger *slog.Logger, cfg rateLimitConfig)
 	if anyEnabled(cfg.user) || anyEnabled(cfg.route) {
 		local := ratelimit.NewLocal(ratelimit.LocalConfig{})
 		rl.Shared = local
+		var rdb redis.UniversalClient
 		if cfg.redisAddr != "" {
-			rdb, err := newRateLimitRedis(cfg.redisAddr)
-			if err != nil {
-				// 可观测性是可选的（otelx.Setup 的约定）：埋点没装上不影响限流本身，记下来照常启动。
-				logger.WarnContext(ctx, "rate limit redis is not instrumented", "error", err)
+			var err error
+			// 地址的写法在读配置时已经校验过，这里出错只可能是埋点没装上。那样就不用 Redis，
+			// 按用户和按接口的限流退回进程内的令牌桶，照常启动。
+			if rdb, err = newRateLimitRedis(cfg.redisAddr); err != nil {
+				logger.WarnContext(ctx, "rate limit redis client was not created; per-user and per-route limits use the local limiter", "error", err)
+				rdb = nil
 			}
+		}
+		if rdb != nil {
 			pctx, cancel := context.WithTimeout(ctx, rateLimitRedisPingTimeout)
 			if err := rdb.Ping(pctx).Err(); err != nil {
 				logger.WarnContext(ctx, "rate limit redis is unreachable; starting anyway, per-user and per-route limits use the local limiter until it is back",

@@ -1,0 +1,40 @@
+# MySQL 备份用的 NAS 存储。模板：__NAS_IP__、__NAS_EXPORT__ 由 scripts/cluster/middleware.sh 从 cluster.env 填入，
+# 在装 chart 之前 apply（CronJob 的 Pod 引用这个 PVC）。写法同 deploy/cluster/registry/registry.yaml。
+#
+# 一个 PV 加一个 PVC，三个实例的 CronJob 共用，每个实例在里面用 <release>/ 子目录（由 backup.sh 自己建）。
+# 不为每个实例各建一个 PV：它们指向同一个 NFS 目录，没有隔离上的好处，只多三套对象。
+# 也不用 volumeMount 的 subPath：kubelet 以 root 建 subPath 的目录，属主 999 的 Pod 写不进去。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-backup-nfs
+spec:
+  capacity:
+    storage: 200Gi # NFS 不限制容量，这个数只用来和 PVC 匹配
+  # RWX：三个 CronJob 的 Pod 和恢复演练的 Pod 可能在不同节点上同时挂载。NFS 本来就支持多处读写，
+  # 写 RWO 在这里也能用（registry 那份就是），但语义上不对。
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  # 直接挂子目录，不挂共享文件夹的根再走进去：群晖的根目录带 ACL，非 root 的用户号进不去（实测）。
+  # 子目录由 addons.sh 的 cmd_nfs 建好，属主 999:999，chmod 过一次。
+  mountOptions: [nfsvers=4.1, hard]
+  nfs:
+    server: __NAS_IP__
+    path: __NAS_EXPORT__/backup/mysql
+  claimRef:
+    namespace: mysql
+    name: mysql-backup
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-backup
+  namespace: mysql
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: "" # 空字符串：不走默认的 local-path 动态供给，只绑定手写的 PV
+  volumeName: mysql-backup-nfs
+  resources:
+    requests:
+      storage: 200Gi

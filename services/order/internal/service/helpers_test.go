@@ -176,7 +176,7 @@ type env struct {
 	dbs     []*sql.DB // 下标是库号
 	router  *sharding.Router
 	store   *store.Store
-	rdb     *redis.Client
+	rdb     redis.UniversalClient
 	prefix  string
 	gate    *stockgate.Gate
 	sender  *fakeSender
@@ -242,7 +242,7 @@ type envOptions struct {
 	replica  replicaKind
 	readMode ReadMode
 	// marksRDB 是标记用的 Redis 客户端，为空时用闸门那个。给一个连不上的客户端可以模拟 Redis 不可用。
-	marksRDB *redis.Client
+	marksRDB redis.UniversalClient
 	// pinTTL、gtidWait 对应 Config 的同名字段，零值用默认值。
 	pinTTL   time.Duration
 	gtidWait time.Duration

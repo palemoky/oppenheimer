@@ -21,7 +21,7 @@
 | actions/upload-artifact | v7 | 稳定版 | 2026-11-11 | CI，端到端测试失败时上传服务日志 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
-| MySQL | 9.7.4 | LTS | 2026-11-11 | Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
+| MySQL | 9.7.4 | LTS | 2026-11-11 | 集群上也是这个版本，server-id：`mysql-order-0` 11、12，`mysql-order-1` 21、22，`mysql-main` 1（和本机 compose 对应）。Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
 | Envoy | v1.40.2 | 稳定版 | 2026-11-14 | 服务之间的熔断和并发隔离（ADR-0020）。镜像 `envoyproxy/envoy:v1.40.2`。没有 LTS，同时维护最近四个小版本 |
 | Redis | 8.10.3 | 稳定版 | 2026-11-11 | compose 里有两个实例，同一个镜像：`redis`（闸门和锁，`noeviction`，AOF）和 `redis-cache`（查询缓存和 gateway 的限流状态，`allkeys-lru`，不持久化；限流的桶丢了只是重新装满），升级时一起改 |
 | Kafka | 4.4.0 | 稳定版 | 2026-11-11 | `apache/kafka` 镜像，KRaft 模式 |
@@ -48,6 +48,8 @@
 | k3s | v1.37.2+k3s1 | 稳定版 | 2026-11-15 | 稳定通道当天的版本（`update.k3s.io`）；版本写在 `scripts/cluster/cluster.env`，不走通道。自带 containerd 2.3.7、Gateway API 的 CRD v1.6.3（标准通道） |
 | MetalLB | v0.16.2 | 稳定版 | 2026-11-15 | Helm chart 0.16.2，只用二层模式，`frrk8s.enabled=false`（ADR-0025） |
 | Envoy Gateway | v1.10.0 | 稳定版 | 2026-11-15 | chart `oci://docker.io/envoyproxy/gateway-helm`。兼容性表：Envoy v1.40.x、Gateway API v1.6.1、Kubernetes v1.34 到 v1.37，支持到 2027-05-05。实际用的 Gateway API CRD 是 k3s 自带的 v1.6.3（设计文档 2a 第 11 节） |
+| Strimzi | 1.3.1 | 稳定版 | 2026-11-15 | Kafka 的 Operator，chart `oci://quay.io/strimzi-helm/strimzi-kafka-operator`。支持 Kafka 4.2.0 到 4.3.2、Kubernetes 1.32 到 1.37 |
+| Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
 | kubectl / helm（MacBook） | v1.37.2 / v4.3.2 | 稳定版 | 2026-11-15 | Homebrew 安装 |

@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "redis-cluster.name" . }}
+  labels: {{- include "redis-cluster.labels" . | nindent 4 }}
+data:
+  redis.conf: |
+    protected-mode no
+    dir /data
+    # 缓存和限流：不持久化，内存满了淘汰旧 key。
+    appendonly no
+    save ""
+    maxmemory {{ .Values.maxmemory }}
+    maxmemory-policy {{ .Values.maxmemoryPolicy }}
+    cluster-enabled yes
+    # nodes.conf 在卷上：节点靠它记住自己的 ID 和拓扑，丢了这个节点就是一个陌生的新节点。
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout {{ .Values.nodeTimeoutMs }}
+    # 客户端拿到的节点地址（MOVED、CLUSTER SLOTS）用域名，Pod 重建后 IP 变了客户端不用重启。
+    cluster-preferred-endpoint-type hostname
+
+  start.sh: |
+    #!/bin/sh
+    set -eu
+    # 环境变量：POD_NAME、HEADLESS、SUFFIX
+    MY_HOST="${POD_NAME}.${HEADLESS}.${SUFFIX}"
+    cp /conf/redis.conf /data/redis.conf
+    echo "cluster-announce-hostname ${MY_HOST}" >> /data/redis.conf
+
+    # 重启后 nodes.conf 里记的是各节点旧的 IP。cluster-announce-hostname 只是元数据（客户端用），
+    # 节点之间互相连接仍然用 nodes.conf 里的 IP；单个 Pod 重建时别的节点会从连接来源学到新 IP，
+    # 但整个集群一起重启（所有 IP 都变）时谁也找不到谁。
+    # nodes.conf 每行的地址字段是 ip:port@cport,hostname，所以启动前按 hostname 重新解析，把 IP 换成最新的。
+    NODES=/data/nodes.conf
+    if [ -s "$NODES" ]; then
+      : > "$NODES.new"
+      while IFS= read -r line; do
+        case "$line" in
+          *:*@*,*)
+            id="${line%% *}"
+            rest="${line#* }"
+            addr="${rest%% *}"
+            tail="${rest#* }"
+            hostpart="${addr#*,}"
+            host="${hostpart%%,*}"
+            ip=""
+            if [ -n "$host" ]; then
+              tries=1
+              # 自己的域名要等 DNS 就绪（Pod 刚起来可能还没有记录），别的节点试一次就够。
+              case "$host" in "$MY_HOST") tries=10 ;; esac
+              while [ "$tries" -gt 0 ]; do
+                ip="$(getent hosts "$host" | awk '{print $1; exit}' || true)"
+                [ -n "$ip" ] && break
+                tries=$((tries - 1)); sleep 1
+              done
+            fi
+            if [ -n "$ip" ]; then
+              port="${addr%%@*}"; port="${port##*:}"
+              line="${id} ${ip}:${port}@${addr#*@} ${tail}"
+            fi
+            ;;
+        esac
+        printf '%s\n' "$line" >> "$NODES.new"
+      done < "$NODES"
+      mv "$NODES.new" "$NODES"
+    fi
+    exec redis-server /data/redis.conf
+
+  bootstrap.sh: |
+    #!/bin/sh
+    set -eu
+    # 环境变量：NAME、HEADLESS、SUFFIX、REPLICAS、REPLICAS_PER_MASTER
+    host() { echo "${NAME}-$1.${HEADLESS}.${SUFFIX}"; }
+    cli() { redis-cli "$@"; }
+
+    # 等所有节点能 PING 通。
+    i=0
+    while [ "$i" -lt "$REPLICAS" ]; do
+      n=0
+      until [ "$(timeout 3 redis-cli -h "$(host $i)" ping 2>/dev/null || true)" = "PONG" ]; do
+        n=$((n + 1))
+        [ "$n" -lt 100 ] || { echo "$(host $i) 一直 PING 不通" >&2; exit 1; }
+        sleep 3
+      done
+      i=$((i + 1))
+    done
+
+    info() { timeout 5 redis-cli -h "$(host 0)" cluster info | tr -d '\r'; }
+    healthy() {
+      out="$(info || true)"
+      echo "$out" | grep -q '^cluster_state:ok' && echo "$out" | grep -q "^cluster_known_nodes:${REPLICAS}\$"
+    }
+    report() {
+      echo "== 主从对应（和 kubectl get pod -o wide 对照节点，主从同节点要用 cluster replicate 重配）=="
+      timeout 5 redis-cli -h "$(host 0)" cluster nodes | tr -d '\r' | awk '
+        { split($2, a, ","); h = a[2]; if (h == "") h = a[1]; host[$1] = h; fl[$1] = $3; mid[$1] = $4 }
+        END { for (i in host) {
+                if (fl[i] ~ /slave/) print "REPLICA " host[i] " -> MASTER " host[mid[i]]
+                else if (fl[i] ~ /master/) print "MASTER  " host[i] } }' | sort
+    }
+
+    if healthy; then
+      echo "集群已经组建好，什么都不做"
+      report
+      exit 0
+    fi
+    known="$(info | sed -n 's/^cluster_known_nodes://p')"
+    if [ "${known:-1}" -gt 1 ]; then
+      echo "集群处于半成品状态（known_nodes=${known}，不是 ${REPLICAS}），不自动处理，人工检查" >&2
+      exit 1
+    fi
+
+    # redis-cli --cluster create 的 MEET 要用 IP，所以先把域名解析成 IP。
+    # 组建之后节点之间通告的是域名（见启动脚本）。
+    NODES=""
+    i=0
+    while [ "$i" -lt "$REPLICAS" ]; do
+      ip="$(getent hosts "$(host $i)" | awk '{print $1; exit}')"
+      [ -n "$ip" ] || { echo "解析不了 $(host $i)" >&2; exit 1; }
+      NODES="$NODES ${ip}:6379"
+      i=$((i + 1))
+    done
+    # shellcheck disable=SC2086
+    redis-cli --cluster create $NODES --cluster-replicas "$REPLICAS_PER_MASTER" --cluster-yes
+
+    n=0
+    until healthy; do
+      n=$((n + 1))
+      [ "$n" -lt 30 ] || { echo "组建后 60 秒内没有收敛" >&2; info >&2; exit 1; }
+      sleep 2
+    done
+    report

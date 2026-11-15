@@ -1,0 +1,74 @@
+# Kafka 集群（Strimzi）。设计见 docs/design/2b-middleware.md 第 5 节。
+# 由 scripts/cluster/middleware.sh kafka 提交；Strimzi 的 Operator 看到这两个资源后创建 Pod、Service、配置。
+#
+# 节点池：3 个节点，每个同时是 controller 和 broker（KRaft）。分开部署要 6 个 Pod，内存不够。
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: kafka
+spec:
+  replicas: 3
+  roles: [controller, broker]
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 20Gi
+        class: local-path
+        # 删掉 Kafka 资源时不删卷：重新声明后 broker 带着原来的数据回来。
+        deleteClaim: false
+        kraftMetadata: shared
+  resources:
+    # 内存 requests 等于 limits；CPU 不设上限，避免被节流（设计文档 6.1）。
+    requests:
+      memory: 1536Mi
+      cpu: 250m
+    limits:
+      memory: 1536Mi
+  # 堆只给一半：Kafka 的读写主要靠操作系统的页缓存，页缓存也算在容器的内存里。
+  jvmOptions:
+    "-Xms": 768m
+    "-Xmx": 768m
+  template:
+    pod:
+      priorityClassName: middleware
+      affinity:
+        # 三个节点各一个（包括 server 节点）：任何一个节点挂了都还剩两个，多数派还在（设计文档 6.2）。
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  strimzi.io/cluster: kafka
+                  strimzi.io/pool-name: dual
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  kafka:
+    # Strimzi 1.3.1 支持到 4.3.2；本机 compose 是 4.4.0（docs/infra/versions.md）。
+    version: 4.3.2
+    listeners:
+      # 只开集群内部的明文监听：服务都在集群里。地址是 kafka-kafka-bootstrap.kafka.svc:9092。
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    config:
+      # 副本数 3、最少同步副本 2，配合生产者的 acks=all：挂一个 broker 照常读写；
+      # 挂两个时剩下的那个拒绝写入，不会出现“写成功了但只有一份”。
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      # topic 由服务启动时自己建（kafkax），不靠自动创建：写错 topic 名时应该报错而不是悄悄建一个。
+      auto.create.topics.enable: false
+  # 不要 entityOperator：topic 不用 KafkaTopic 资源管理（设计文档 5.3），也没有用户和证书要管。

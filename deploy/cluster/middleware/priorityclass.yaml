@@ -1,0 +1,13 @@
+# 有状态中间件（MySQL、Redis、Kafka）的优先级，由 scripts/cluster/middleware.sh 在部署任何中间件之前建好。
+# 它们的内存 requests 等于 limits，但 CPU 不设 limits（避免被节流），QoS 是 Burstable 而不是 Guaranteed，
+# 驱逐的先后不能只靠 QoS 等级，所以再用优先级把它们排在业务服务之后：
+#   - 节点内存紧张时，kubelet 在用量都没超过 requests 的 Pod 里按优先级从低往高驱逐，业务服务先走；
+#   - 调度不下时，中间件的 Pod 可以抢占业务服务的 Pod（preemptionPolicy 用默认的 PreemptLowerPriority）。
+# value 远低于系统组件的 system-cluster-critical（2000000000），不会去抢 kube-system 里的东西。
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: middleware
+value: 1000000
+globalDefault: false
+description: 有状态中间件（MySQL、Redis、Kafka）。节点内存紧张时排在业务服务之后被驱逐；调度不下时可以抢占业务服务的 Pod。

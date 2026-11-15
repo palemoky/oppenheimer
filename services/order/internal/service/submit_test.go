@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -393,10 +394,10 @@ func TestSubmitCloseDelaySendFailure(t *testing.T) {
 func TestSubmitGateUnavailable(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	rdb, prefix := testredis.New(t)
+	_, prefix := testredis.New(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	broken, err := redisx.Open(ctx, redisx.Config{Addr: rdb.Options().Addr})
+	broken, err := redisx.Open(ctx, redisx.Config{Addr: os.Getenv(testredis.AddrEnv)})
 	if err != nil {
 		t.Fatal(err)
 	}

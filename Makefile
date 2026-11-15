@@ -27,6 +27,11 @@ KAFKA_PORT ?= 9092
 export OPPENHEIMER_TEST_REDIS_ADDR    ?= 127.0.0.1:$(REDIS_PORT)
 export OPPENHEIMER_TEST_KAFKA_BROKERS ?= 127.0.0.1:$(KAFKA_PORT)
 
+# Redis 的 Sentinel 和 Cluster 两种模式（profile redis-modes，make redis-modes-up 启动）。可选：
+# 这两个地址连不上时对应的测试跳过。地址是 compose 里给容器固定的 IP，OrbStack 下宿主机可以直接访问。
+export OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR ?= sentinel://gate@172.30.0.21:26379,172.30.0.22:26379,172.30.0.23:26379
+export OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR  ?= cluster://172.30.0.31:6379,172.30.0.32:6379,172.30.0.33:6379
+
 .PHONY: help
 help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -75,7 +80,7 @@ test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 
 .PHONY: test-unit
 test-unit: ## 只运行不依赖 MySQL、Redis、Kafka 的测试
-	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
+	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR= OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
 
 .PHONY: build
 build: ## 编译所有模块，并把各服务的二进制输出到 ./bin
@@ -183,6 +188,20 @@ down: ## 停止本地依赖（含 kafbat-ui、otel-lgtm），保留数据
 down-volumes: ## 停止本地依赖并删除全部数据（含扩容演练的 4 个实例、kafbat-ui 和 otel-lgtm）
 	$(COMPOSE) --profile expand --profile ui --profile obs down --volumes
 
+REDIS_MODES_SERVICES := redis-s-master redis-s-replica redis-sentinel-1 redis-sentinel-2 redis-sentinel-3 \
+	redis-c1 redis-c2 redis-c3 redis-c4 redis-c5 redis-c6
+
+.PHONY: redis-modes-up
+redis-modes-up: ## 启动 Redis 的 Sentinel（1 主 1 从 3 哨兵）和 Cluster（3 主 3 从）测试环境（profile redis-modes）并等待就绪，打印两个地址
+	$(COMPOSE) --profile redis-modes up -d --wait $(REDIS_MODES_SERVICES)
+	@scripts/redis-modes-wait.sh
+	@echo "OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR=$(OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR)"
+	@echo "OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR=$(OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR)"
+
+.PHONY: redis-modes-down
+redis-modes-down: ## 删除 Redis 的 Sentinel 和 Cluster 测试容器（不持久化，没有数据要保留）
+	$(COMPOSE) --profile redis-modes rm -sf $(REDIS_MODES_SERVICES)
+
 .PHONY: envoy-validate
 envoy-validate: ## 用 Envoy 自己的校验模式检查 deploy/envoy/ 下每个边车的配置（需要 docker，不需要 make up）
 	@for f in deploy/envoy/*.yaml; do \
@@ -246,6 +265,24 @@ cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s�
 	scripts/cluster/k3s.sh install
 	scripts/cluster/k3s.sh kubeconfig
 	scripts/cluster/addons.sh all
+	scripts/cluster/k3s.sh etcd-backup install
+
+.PHONY: middleware-up
+middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Cluster）、Kafka（Strimzi）、MySQL（两个分片加共享实例）；可重复执行
+	scripts/cluster/middleware.sh all
+
+.PHONY: etcd-backup
+etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server 节点上的定时器每 12 小时做一次）；scripts/cluster/k3s.sh etcd-backup list 查看
+	scripts/cluster/k3s.sh etcd-backup run
+
+.PHONY: middleware-backup
+middleware-backup: ## 立刻手工跑一次 MySQL 备份并等它完成（三个实例；只备一个：make middleware-backup RELEASE=mysql-main）
+	scripts/cluster/middleware.sh mysql-backup $(RELEASE)
+
+.PHONY: mysql-restore-drill
+mysql-restore-drill: ## 恢复演练：把某个实例的最新备份灌进临时 Pod，和线上从库逐表比对（make mysql-restore-drill RELEASE=mysql-main）
+	@test -n "$(RELEASE)" || { echo "usage: make mysql-restore-drill RELEASE=mysql-order-0|mysql-order-1|mysql-main" >&2; exit 2; }
+	scripts/cluster/mysql-restore-drill.sh $(RELEASE)
 
 .PHONY: cluster-status
 cluster-status: ## 查看各节点的 k3s 状态和集群里的 Pod

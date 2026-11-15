@@ -1,0 +1,115 @@
+{{- if .Values.backup.enabled }}
+{{- $name := include "mysql.name" . -}}
+{{- $replicas := int .Values.replicas -}}
+{{- $s := include "mysql.secretName" . -}}
+{{- if not .Values.databases }}
+{{- fail "backup.enabled needs a non-empty databases list" }}
+{{- end }}
+# 每天备份一次。连哪里：
+#   两个副本：连 <release>-replica（从库）。主库上不做：mysqldump 要把每张表读一遍，FLUSH TABLES WITH READ LOCK
+#   还会在开头短暂阻塞写入，这些都不该落在承接订单写入的主库上；从库本来就空闲（CDC 也只读它）。
+#   单实例（mysql-main）：没有 -replica Service（services.yaml 只在 2 个副本时建），只能连 <release>-primary，
+#   也就是它自己。它上面的是 inventory、payment 这类共享库，数据量小，--single-transaction 不锁表，
+#   在低峰做可以接受；代价是备份期间有读负载，且它挂了就没有别的副本可以备。
+# 这里用 Service 而不是 Pod 名：切换主从之后（改 primaryOrdinal 再 helm upgrade）Service 自己跟着变，CronJob 不用改。
+# 代价：切换之后、人工把旧主库重建成从库之前，-replica 指向旧主库，那时 backup.sh 看到它不是从库
+# （SHOW REPLICA STATUS 为空）会拒绝备份并让 Job 失败，而不是默默备一份主库。
+#
+# primaryOrdinal 只出现在 Service 里，不进 Pod 模板和 ConfigMap；CronJob 不是 StatefulSet 的模板，
+# 引用 Service 名不会触发 MySQL 的滚动重启。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-backup
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  # Forbid：上一次没跑完就跳过这一次，不并行。两个备份同时写同一个目录、同时清理会互相踩。
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      # 不重试：失败了第二天再来，每天有一份就够；重试出来的 Job 和下一次的计划时间可能撞车。
+      # 失败留在 failedJobsHistoryLimit 里，能看日志。
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: mysql-backup
+            app.kubernetes.io/instance: {{ .Release.Name }}
+        spec:
+          restartPolicy: Never
+          # 不用 middleware 这个 PriorityClass：它是给 MySQL 本体这类有状态服务的，备份被挤掉可以明天再做，
+          # 不该去驱逐别人。
+          securityContext:
+            runAsNonRoot: true
+            # 和镜像里的 mysql 用户一致，也是 NAS 上 backup/mysql 的属主（addons.sh 的 cmd_nfs）。
+            runAsUser: 999
+            runAsGroup: 999
+          affinity:
+            nodeAffinity:
+              {{- include "mysql.nodeAffinityRequired" . | nindent 14 }}
+          containers:
+            - name: backup
+              image: {{ .Values.image }}
+              command: ["/scripts/backup.sh"]
+              env:
+                - name: RELEASE
+                  value: {{ .Release.Name | quote }}
+                - name: BACKUP_HOST
+                  {{- if eq $replicas 2 }}
+                  value: {{ printf "%s-replica.%s.svc.%s" $name .Release.Namespace .Values.clusterDomain | quote }}
+                  {{- else }}
+                  value: {{ printf "%s-primary.%s.svc.%s" $name .Release.Namespace .Values.clusterDomain | quote }}
+                  {{- end }}
+                - name: DUMP_MODE
+                  value: {{ ternary "replica" "single" (eq $replicas 2) | quote }}
+                - name: BACKUP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $s }}
+                      key: backup-password
+                - name: BACKUP_ROOT
+                  value: /backup
+                - name: DATABASES
+                  value: {{ join " " .Values.databases | quote }}
+                - name: KEEP
+                  value: {{ .Values.backup.keep | quote }}
+                - name: ACTIVE_DEADLINE_SECONDS
+                  value: {{ .Values.backup.activeDeadlineSeconds | quote }}
+              resources:
+                requests:
+                  cpu: {{ .Values.backup.cpu }}
+                  memory: {{ .Values.backup.memory }}
+                limits:
+                  memory: {{ .Values.backup.memory }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                # 挂整个 PVC，不用 subPath：subPath 的子目录由 kubelet 以 root 建，属主 999 的 Pod 写不进去。
+                # 备份根目录的属主是 999，<release>/ 子目录由 backup.sh 自己建。代价：三个实例的 Job 互相
+                # 能看到、也能写对方的目录，这里靠脚本只碰 $BACKUP_ROOT/$RELEASE 来约束，不是权限隔离。
+                - name: backup
+                  mountPath: /backup
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ $name }}-config
+                defaultMode: 0755
+                items:
+                  {{- range $path, $_ := .Files.Glob "files/*.sh" }}
+                  - key: {{ base $path }}
+                    path: {{ base $path }}
+                  {{- end }}
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ .Values.backup.claimName }}
+{{- end }}

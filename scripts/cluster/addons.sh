@@ -70,8 +70,12 @@ trap 'umount "\$m"; rmdir "\$m"' EXIT
 mkdir -p "\$m/registry" "\$m/backup/mysql" "\$m/backup/etcd"
 chown 1000:1000 "\$m/registry"   # 仓库的 Pod 以用户号 1000 运行
 chmod 750 "\$m/registry"
-chown 0:0 "\$m/backup" "\$m/backup/mysql" "\$m/backup/etcd"   # 2b 用到时再定属主
+chown 0:0 "\$m/backup" "\$m/backup/etcd"   # etcd 快照由 server 节点上的 root 同步进来
+chown 999:999 "\$m/backup/mysql"           # MySQL 备份的 CronJob 以用户号 999（镜像里的 mysql 用户）运行；
+                                            # <实例名>/ 子目录由 backup.sh 自己建，不用 subPath（kubelet 以 root 建，999 写不进去）
 chmod 750 "\$m/backup" "\$m/backup/mysql" "\$m/backup/etcd"
+# backup 本身是 root 的 750：999 要走进 backup/mysql，必须直接挂载 backup/mysql 这个子目录（PV 就是这样写的），
+# 不能经过 backup/ 走进去。
 ls -lan "\$m" "\$m/backup"
 REMOTE
 }

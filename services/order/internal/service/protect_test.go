@@ -441,7 +441,7 @@ func TestReplicaTimeoutFallsBackToPrimary(t *testing.T) {
 
 // blackHoleRedis 返回一个连得上、但从不回复的 Redis 客户端：模拟 Redis 卡住。
 // 不用 CLIENT PAUSE：测试共用一个 Redis 实例，它会卡住所有并行的测试。
-func blackHoleRedis(t *testing.T) *redis.Client {
+func blackHoleRedis(t *testing.T) redis.UniversalClient {
 	t.Helper()
 	var lc net.ListenConfig
 	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")

@@ -46,7 +46,7 @@ type Gate struct {
 
 // New 返回使用 rdb 的闸门。prefix 是所有 key 的前缀（配置 REDIS_PREFIX），
 // 用来让不同环境共用一个 Redis 而互不干扰。
-func New(rdb *redis.Client, prefix string) *Gate {
+func New(rdb redis.UniversalClient, prefix string) *Gate {
 	return &Gate{rdb: rdb, client: rdb, prefix: prefix}
 }
 

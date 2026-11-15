@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **当前阶段**：2a（集群搭建）完成，集群在运行；下一步是 2b（中间件上集群）。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
-- **当前分支**：`phase-2a`（从 `main` 开出）。宿主机和虚拟机的准备已提交在本地（两个提交，脚本和文档），**没有推送**。2a 的全部工作已提交在本地（主人 2026-11-15 要求提交；脚本和清单、设计文档、面试笔记各一个提交），**没有推送**（主人没有要求推送）。
+- **当前阶段**：2b（中间件上集群）的任务全部做完，剩收尾（补笔记、推送、等 CI、PR #10 转正）。2a 已完成并合并。阶段 1 全部完成并合并进 `main`（PR #7、PR #8）。
+- **当前分支**：`phase-2b`（从 `phase-2a` 开出；`phase-2a` 已经由 PR #9 合并进 `main`）。已推送到 `593b880`，draft PR #10 的 CI 27 项全部通过（2026-11-15；最长的是 e2e 3 分 42 秒、`test (./services/gateway)` 3 分 17 秒、`test (./services/order)` 3 分 10 秒，没有变慢的 job）。之后还有一个只改文档的提交（笔记、设计文档的订正、切换手册），已推送，CI 结果见会话结束时的记录；PR #10 已转成正式的（主人 2026-11-15 同意），**合并由主人定**。工作区是干净的。
 - **最后更新**：2026-11-15
 
 ### 2a 做到哪（2026-11-15）
@@ -44,11 +44,30 @@
 
 下一步：
 
-1. 主人要求时推送 `phase-2a` 并开 PR。仓库是公开的：PROGRESS 里的地址主人已要求去掉；`hardware.md`、`cluster.env`、设计文档里仍有局域网的地址规划（脚本要用），推送前和主人确认一次。
-2. 2b 的设计文档（`docs/design/2b-middleware.md`）：MySQL 用 Operator 还是手写 StatefulSet（要写 ADR）、Redis Cluster、Strimzi；中间件用节点亲和放在两个 agent 上，server 只放轻负载；数据用 local-path，备份走 NFS。
-3. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；装完中间件、灌数据之前量内存定 CNI（ADR-0026）；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。
-4. 2c 要定的：MacBook 的 Docker 推明文仓库被拒绝，改 OrbStack 的 `insecure-registries` 要重启 Docker（会重启本机的 compose 依赖），或者用 skopeo、crane 一类的工具推。
-5. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
+1. **2b 的中间件已全部部署并验证（第一个会话）。** 分支 `phase-2b`。PR #9（2a）已合并进 `main`（2026-11-15）；2b 到目前为止的改动已分提交推送，在 draft PR 里（见“当前状态”）。设计文档 [design/2b-middleware.md](design/2b-middleware.md)，实现中的九个发现、量到的数和“还没做的”都在它的第 10 节。
+   - **集群在 2026-11-15 重建过一次**（主人确认）。原因是节点上的 AppArmor 拦掉了容器里进程之间的全部信号：官方的 MySQL 镜像起不来，所有 Go 程序的抢占信号被拒绝。根因是 Ubuntu 26.04 默认的 `kernel.apparmor_restrict_unprivileged_unconfined=1`，主人在一个节点上手工验证后同意写进 `vm.sh` 的 cloud-init 并重建。重建后三个节点没有任何信号被拒绝的记录。
+   - 现在集群上有：两套 Redis（`redis-gate` 主从加 Sentinel、`redis-cache` Cluster）、Strimzi 1.3.1 加 Kafka 4.3.2（3 个 broker）、MySQL 9.7.4（`mysql-order-0`、`mysql-order-1` 各一主一从，`mysql-main` 单实例）。`make cluster-up` 之后 `make middleware-up`（或 `scripts/cluster/middleware.sh redis|kafka|mysql`），都可重复执行。MySQL 的密码是脚本在集群里随机生成的 Secret（`<release>-auth`），重建后会变。
+   - MySQL 的主从由 values 里的 `primaryOrdinal` 决定（不是 Pod 的标签，发现 2）；`middleware.sh mysql` 最后只读地核对实际状态，不一致时非零退出。
+   - Go 代码：`pkg/redisx` 三种模式（地址写法 `sentinel://gate@...`、`cluster://...`）、`pkg/ratelimit` 在 Cluster 下按桶调用（ADR-0019 的补充）、调用方改成 `redis.UniversalClient`、`kafkax` 建 topic 的副本数用 broker 的默认值。全部 11 个模块 `make lint` 0 issues、`make build` 通过；`pkg`、四个服务和 `test/load` 的 `make test` 通过；`make e2e` 通过（都是 2026-11-15）。第一次推送时漏改了 `test/load`（它也用旧的客户端类型），CI 有 3 项编译失败，已修。
+   - CNI 已改定为保留 flannel（ADR-0026 末尾）。
+   - 本机：OrbStack 配了 `insecure-registries`，可以直接 `docker push 192.168.50.50:5000/...`；多了一个可选的测试环境 `make redis-modes-up`（11 个容器，现在在运行，不用时 `make redis-modes-down`）。
+2. **2026-11-15 第二个会话做完的（都没有提交）**，细节在设计文档 2b 第 10 节的发现 10 到 16：
+   - etcd 快照同步到 NAS：server 节点上的 systemd 定时器（`scripts/cluster/k3s.sh etcd-backup install|run|list`，模板在 `deploy/cluster/k3s/etcd-snapshot-sync.*`，已进 `make cluster-up`；`make etcd-backup` 立刻拍一份）。连 server 的 token 一起备份。NAS 上现在有一份按需快照。
+   - MySQL 备份：chart 里的 CronJob（三个实例每天 19:00、19:30、20:00 UTC）、`backup` 账号、NFS 的 PV 和 PVC；`make middleware-backup`、`make mysql-restore-drill RELEASE=<实例>`。三个实例的恢复演练都通过（各 1000 行记号数据，表叫 `drill_marker`，留在库里没有删；`mysql-order-1` 里还有 490 行切换探针写的）。Sonnet 写，主会话读过 diff 并在集群上执行，修了一个等 Job 完成的判断。
+   - MySQL 切换手册 `docs/infra/mysql-switchover.md`，计划内切换在 `mysql-order-1` 上演练了两趟（切过去再切回来），写入各中断约 5 秒，490 次确认的写入没有丢。现在主库都是序号 0，values 没有改动。
+   - 两个 Redis 的 chart 加了 `priorityClassName`。顺带发现并修掉两个问题：`redis-cache` 有一对主从在同一个节点（新脚本 `scripts/cluster/redis-cache-pairing.sh check|fix`，`middleware.sh redis` 结尾会调）；`redis-cache` 的 PDB 因为选中了 hook Job 的 Pod 一直允许 0 个中断（Job 的 Pod 换了标签）。
+   - 入口的 Envoy 改成 2 个副本加 PDB（`deploy/cluster/envoy-gateway/gateway.yaml`），现在在 k3s-server 和 k3s-agent-1 上。
+   - e2e 的偶发失败已修：`test/e2e/e2e_test.go` 的 `getOrder` 对带 `Retry-After` 的 503 重试（最多 10 秒）。本机 `make e2e` 通过，`make lint MODULES=$PWD/test/e2e` 0 issues。没有改服务。
+   - 这一轮没有跑全量的 `make lint test`（Go 代码只改了 e2e 的一个函数）；脚本过了 shellcheck，chart 过了 `helm lint`。提交前按 AGENTS.md 跑一遍。
+3. **etcd 的恢复演练和重启宿主机的检查都做了**（主人 2026-11-15 确认后做的，设计文档 2b 第 10 节的发现 17、18）：用 NAS 上的快照副本原地恢复，控制面中断 8 秒，快照之后的记号消失、之前的对象和所有 Pod 原样；重启宿主机后 240 秒内全部中间件自己恢复。演练的痕迹已清理（命名空间 `etcd-drill`、server 上的 `etcd-old-*`）。重启之后 Redis 主从的主库是 `redis-gate-0`。
+   **新会话从这里开始，2b 的收尾**：
+   - 笔记已补（Sonnet 写，主会话抽查了切换一章；现在 752 行，覆盖备份、恢复演练、切换、etcd、发现 10 到 18）。它报告的几处文档不一致已经改掉（设计文档里 Redis 的 `priorityClassName`、发现 5 的“恰好”、3.3 的标签描述；切换手册主库故障一节补了“提升前等从库把收到的事务应用完”的判据，那条语句在线上从库跑过）。
+   - 文档已提交并推送，PR #10 已转成正式的。剩下的只有：确认最后这次推送的 CI 通过，主人合并 PR #10。
+   - 然后进 2c，先写设计文档（要定的事在下面第 6 条）。
+4. 2b 留下、不在这个阶段做的（设计文档第 10 节“还没做的”）：换一台机器从快照加 token 恢复 etcd 没有演练；server 节点的内核日志里有少量 `profile="who"` 读 `/etc/passwd` 被 AppArmor 拒绝的记录（和信号无关，来源没有查）；备份失败没有告警（阶段 3）；备份脚本和 MySQL 共用 ConfigMap，改它会滚动重启 MySQL；主库故障时的切换和“停掉两个 broker”（阶段 4）；恢复耗时要在 2c 灌数据后重量；有流量时的恢复比对要用对账工具（2c）。没有查到的：Oracle MySQL Operator 的最新版本。
+5. 2b 里要回头看的：etcd 的 fsync 延迟（空集群上 p99 在 8 到 16 毫秒，超过 10 毫秒的参考线，原因没有查）；CNI 已定为 flannel；空集群三个节点已经用了约 3.1 GiB，比预算里的 2 GB 多。入口多了一个 Envoy 副本（requests 128 Mi）。
+6. 2c 要定的：服务的镜像怎么构建和推送（MacBook 已经可以直接 `docker push` 到集群的仓库）；各服务连中间件的地址（Redis 用 `sentinel://`、`cluster://` 的写法，MySQL 连 `<release>-primary`、`<release>-replica` 两个 Service，Kafka 连 `kafka-kafka-bootstrap.kafka.svc:9092`）。
+7. 2a 的面试笔记已写：`docs/notes/2a-cluster.md`（Sonnet 写，主会话抽查并补了 DNS 排查的步骤和重启宿主机一节）。标了“通用知识”的段落面试前要对照官方文档核对。
 
 2a 用到的版本都已登记到 `versions.md`。已查证、还没有用到的：Cilium v1.20.4。
 
@@ -283,6 +302,7 @@
 | 2026-11-15 | 链路后端从 SkyWalking 换成 Grafana Tempo，不部署 SkyWalking | 本机已经在用 Tempo；三种信号统一成 PromQL、LogQL、TraceQL，Agent 只对接一套；省约 3 GB 内存；去掉 ADR-0004 的待验证项。见 ADR-0024，主人提出并确认 |
 | 2026-11-15 | 阶段 5 增加“封闭式判断交给决策模型（Gemini Decision 1）”的对比实验，挂在模型分层下面；3d 和阶段 4 不接，主循环保持 Claude | 它只做是否、多选、打分，不能做主循环；适合判分、裁剪工具输出、告警分诊，接不接由评测数据决定。主人提出并确认 |
 | 2026-11-15 | 诊断 Agent 的 Kubernetes 只读工具从阶段 5 提前到 3d，pprof 工具提前到阶段 4（Go 代码缺陷实验之前） | 阶段 4 的 Pod 和节点类故障、Go 缺陷类故障没有这两个工具基本诊断不了，运行记录也就没有评测价值。主人提出并确认 |
+| 2026-11-15 | 2b 的 Redis 从“Redis Cluster 3 主 3 从”改为按用途分两套；Kafka 用 4.3.2 | 闸门的脚本不能在 Cluster 上运行；Strimzi 还不支持 4.4。见设计文档 2b 第 1、2 节；主人确认 |
 | 2026-11-15 | 2a 的入口控制器不再考虑 ingress-nginx；虚拟机等宿主机换上 1TB 的盘再建 | ingress-nginx 已于 2026 年 3 月停止维护；现有系统盘只剩 170 GB，放不下原规划的 360 GB，主人不想先建小规格再重建 |
 | 2026-11-11 | 设计修正：支付服务退款的前置条件增加 `notified = 0`（第一次答复为准） | 原设计下矛盾的答复会把已付清订单的钱退掉，由子 Agent 发现 |
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
@@ -393,6 +413,12 @@
 教训：Helm chart 的默认值要先 `helm show values` 看一遍再写 values。MetalLB 这次按记忆关了一个已经弃用的开关，真正的开关是另一个，结果多装了一套用不到的组件。
 
 教训：本机的 `rm` 是 `trash`，不认 `-f`。在 `&&` 串起来的命令里它失败会让后面的步骤全部跳过；脚本和一次性命令里用 `command rm`。
+
+教训：改公共库的类型之后要对**全部**模块跑 `make lint` 和 `make build`，不能只跑自己想到的那几个。这次按“谁在用 `*redis.Client`”搜了 `pkg` 和 `services`，漏了 `test/load`，推送后 CI 才发现。
+
+教训：新环境装完要看内核日志，不能只看功能。2a 里所有 Go 程序的抢占信号一直在被 AppArmor 拒绝，但什么都“正常”，直到 2b 碰上一个靠信号退出的程序（mysqld）才暴露。排查的顺序是：先用不带任何自定义配置的官方镜像复现，排除自己写的 chart；再逐个去掉可疑的保护层（这里是 AppArmor）；确认之后去内核日志里找具体被拒绝的操作。
+
+教训：子 Agent 报告里“我认为设计有问题”的那一条（主从角色记在 Pod 标签上，Pod 重建就丢）是对的，而且是主会话写设计时没有想到的。设计里凡是“把状态记在会被重建的对象上”的地方都要问一句：它重建之后谁来恢复这个状态。
 
 教训：静态地址的网桥在没有载波时地址和路由都还在，而且比备用网卡的路由优先。说“留了一条备用通道”之前要想清楚主通道以各种方式坏掉时内核会怎么选路；这次是拔网线后整台机器从 IPv4 连不上，靠 IPv6 的链路本地地址才进去修。
 

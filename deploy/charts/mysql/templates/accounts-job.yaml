@@ -1,0 +1,75 @@
+{{- $s := include "mysql.secretName" . -}}
+# 建库、建账号。用 Helm 的 hook 而不是普通的 Job：Job 的 Pod 模板不可修改，普通 Job 在 upgrade 时会报错；
+# hook 每次安装、升级都重建一次（before-hook-creation），values 里加了库，升级一次就建出来。
+# 部署时不要给 helm 加 --wait：--wait 要等从库就绪才跑 post hook，而从库的 CLONE 要等这里建好 repl 账号。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "mysql.name" . }}-accounts
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    # 成功就删；失败的留着看日志，下次安装或升级前删掉重建。
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ add .Values.accountsJob.waitSeconds 120 }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mysql-accounts
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          {{- include "mysql.nodeAffinityRequired" . | nindent 10 }}
+      containers:
+        - name: accounts
+          image: {{ .Values.image }}
+          command: ["/scripts/accounts.sh"]
+          env:
+            {{- include "mysql.peerEnv" . | nindent 12 }}
+            {{- include "mysql.secretEnv" . | nindent 12 }}
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s }}
+                  key: app-password
+            - name: CDC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s }}
+                  key: cdc-password
+            # 备份账号。Secret 里没有这个键 Pod 会起不来：middleware.sh 的 mysql_secret 会给已存在的 Secret 补上。
+            - name: BACKUP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s }}
+                  key: backup-password
+            - name: DATABASES
+              value: {{ join " " .Values.databases | quote }}
+            - name: CDC_ENABLED
+              value: {{ .Values.cdc.enabled | quote }}
+            - name: WAIT_SECONDS
+              value: {{ .Values.accountsJob.waitSeconds | quote }}
+          resources:
+            requests:
+              cpu: {{ .Values.accountsJob.cpu }}
+              memory: {{ .Values.accountsJob.memory }}
+            limits:
+              memory: {{ .Values.accountsJob.memory }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "mysql.name" . }}-config
+            defaultMode: 0755
+            items:
+              {{- range $path, $_ := .Files.Glob "files/*.sh" }}
+              - key: {{ base $path }}
+                path: {{ base $path }}
+              {{- end }}

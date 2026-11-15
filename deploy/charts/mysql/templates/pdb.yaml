@@ -1,0 +1,15 @@
+{{- if gt (int .Values.replicas) 1 }}
+# 排空节点时一次最多带走一个：主从不会同时不可用（设计文档 2b 的 6.2）。
+# 单实例不建 PDB：maxUnavailable 1 对它等于没有约束，minAvailable 1 又会让节点永远排不空。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "mysql.name" . }}
+  labels:
+    {{- include "mysql.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "mysql.selectorLabels" . | nindent 6 }}
+{{- end }}

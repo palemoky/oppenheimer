@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis-ha.name" . }}
+  labels: {{- include "redis-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: {{ include "redis-ha.name" . }}
+  replicas: {{ .Values.redis.replicas }}
+  # 并行启动：不然 1 号要等 0 号就绪，而 0 号和 Sentinel 之间没有这种依赖。
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "redis-ha.redisSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "redis-ha.redisSelector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # 有状态中间件的优先级（deploy/cluster/middleware/priorityclass.yaml）：QoS 是 Burstable，
+      # 靠它在节点内存紧张时排在业务服务之后被驱逐。
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      affinity:
+        # 不上控制面：etcd 和 apiserver 在那里，Redis 的 fsync 会和它们抢同一块盘。
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+        # 主从必须在不同节点，否则一个节点挂了主从一起没。
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "redis-ha.redisSelector" . | nindent 18 }}
+      containers:
+        - name: redis
+          image: {{ include "redis-ha.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/scripts/start-redis.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HEADLESS, value: {{ include "redis-ha.name" . | quote }}}
+            - {name: SUFFIX, value: {{ include "redis-ha.suffix" . | quote }}}
+            - {name: SENTINEL_SVC, value: {{ printf "%s.%s" (include "redis-ha.sentinelName" .) (include "redis-ha.suffix" .) | quote }}}
+            - {name: MASTER_NAME, value: {{ .Values.sentinel.masterName | quote }}}
+            - {name: FIRST_MASTER_POD, value: {{ printf "%s-0" (include "redis-ha.name" .) | quote }}}
+          ports:
+            - {name: redis, containerPort: 6379}
+          startupProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60   # 给 AOF 加载留 5 分钟
+          readinessProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: [redis-cli, ping]}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources: {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scripts, mountPath: /scripts}
+            - {name: scripts, mountPath: /conf/redis.conf, subPath: redis.conf}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "redis-ha.name" . }}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.redis.storageClass }}
+        resources: {requests: {storage: {{ .Values.redis.storage }}}}

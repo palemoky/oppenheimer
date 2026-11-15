@@ -39,7 +39,7 @@ type Sources struct {
 	ArchiveDB *sql.DB
 
 	// Redis 是闸门所在的实例，RedisPrefix 是服务的 REDIS_PREFIX。
-	Redis       *redis.Client
+	Redis       redis.UniversalClient
 	RedisPrefix string
 
 	// Kafka 为 nil 时不读死信 topic。KafkaBrokers 是它的引导地址（读死信时另建一个客户端），
@@ -369,7 +369,7 @@ func collectGate(ctx context.Context, src Sources, s *Snapshot) error {
 	return nil
 }
 
-func zsetMembers(ctx context.Context, rdb *redis.Client, key string) ([]int64, error) {
+func zsetMembers(ctx context.Context, rdb redis.UniversalClient, key string) ([]int64, error) {
 	ms, err := rdb.ZRange(ctx, key, 0, -1).Result()
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", key, err)

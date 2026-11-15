@@ -1,0 +1,12 @@
+# k3s 默认在每天 0 点和 12 点（节点的本地时间，这里是 UTC）拍快照，这里晚 20 分钟复制。
+# Persistent：节点在该运行的时刻关着机，开机后补跑一次。
+[Unit]
+Description=Copy k3s etcd snapshots to the NAS twice a day
+
+[Timer]
+OnCalendar=*-*-* 00,12:20:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
