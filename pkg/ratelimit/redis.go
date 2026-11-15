@@ -72,16 +72,26 @@ return {1, 0, 0}
 //   - 不要自动重试（MaxRetries 设为 -1）。扣令牌的脚本不是幂等的：第一次执行成功而回复超时，
 //     客户端重试会再扣一个。多扣一个令牌本身无伤大雅，但重试会把一次判断的耗时拉长到时限的好几倍。
 //
-// 一次调用里的几个桶在同一个脚本里处理，所以它们的键必须在同一个 Redis 节点上。
-// 单实例和主从没有问题；Redis Cluster 下不同的键可能落在不同的槽，这个脚本用不了。
+// 单节点和主从下，一次调用里的几个桶在同一个脚本里处理：要么每个桶各扣一个令牌，要么一个都不扣。
+//
+// Redis Cluster 下做不到这一点。一个脚本只能访问同一个槽里的键，而按接口、按用户、按 IP 的桶键名不同、
+// 落在不同的槽；它们也不能用 hash tag 绑到一起，因为同一个用户的桶要被他所有的请求共用，不能跟着某一次
+// 请求的其他键走。所以 Cluster 下每个桶单独调用一次脚本，按调用方给的顺序，遇到第一个拒绝就停。
+// 代价：排在前面的桶已经扣了令牌，而请求被后面的桶拒绝了，前面的令牌白扣。它让限流在被拒绝时略微偏严，
+// 不会偏松；调用方把最容易拒绝的桶放在前面可以减少这种情况。往返次数也从一次变成最多“桶的个数”次。
+// 见设计文档 2b 的 4.4、ADR-0019 的补充。
 type Redis struct {
 	rdb    redis.Scripter
 	prefix string
+	// perKey 为真时每个桶单独调用脚本（Cluster）。
+	perKey bool
 }
 
 // NewRedis 返回 Redis。prefix 加在每个键前面，用来隔离环境。
+// rdb 是 *redis.ClusterClient 时按桶逐个调用，见 Redis 的说明。
 func NewRedis(rdb redis.Scripter, prefix string) *Redis {
-	return &Redis{rdb: rdb, prefix: prefix}
+	_, cluster := rdb.(*redis.ClusterClient)
+	return &Redis{rdb: rdb, prefix: prefix, perKey: cluster}
 }
 
 // Allow 实现 Limiter。Redis 不可用或 ctx 到期时返回错误，这时没有令牌被扣（或者扣了而调用方不知道，
@@ -94,18 +104,27 @@ func (r *Redis) Allow(ctx context.Context, reqs ...Request) (Decision, error) {
 	if len(reqs) == 0 {
 		return allowed, nil
 	}
+	if r.perKey && len(reqs) > 1 {
+		for i, q := range reqs {
+			res, err := r.run(ctx, []string{r.prefix + "rl:" + q.Key}, q.Limit.Rate, q.Limit.Burst)
+			if err != nil {
+				return Decision{}, err
+			}
+			if res[0] != 1 {
+				return Decision{Denied: index[i], RetryAfter: time.Duration(res[2]) * time.Microsecond}, nil
+			}
+		}
+		return allowed, nil
+	}
 	keys := make([]string, len(reqs))
 	args := make([]any, 0, 2*len(reqs))
 	for i, q := range reqs {
 		keys[i] = r.prefix + "rl:" + q.Key
 		args = append(args, q.Limit.Rate, q.Limit.Burst)
 	}
-	res, err := allowScript.Run(ctx, r.rdb, keys, args...).Int64Slice()
+	res, err := r.run(ctx, keys, args...)
 	if err != nil {
-		return Decision{}, fmt.Errorf("ratelimit: redis: %w", err)
-	}
-	if len(res) != 3 {
-		return Decision{}, errors.New("ratelimit: redis: unexpected script reply")
+		return Decision{}, err
 	}
 	if res[0] == 1 {
 		return allowed, nil
@@ -114,4 +133,16 @@ func (r *Redis) Allow(ctx context.Context, reqs ...Request) (Decision, error) {
 		return Decision{}, errors.New("ratelimit: redis: denied bucket out of range")
 	}
 	return Decision{Denied: index[res[1]-1], RetryAfter: time.Duration(res[2]) * time.Microsecond}, nil
+}
+
+// run 执行一次脚本，返回它的三个数：是否放行、被哪个桶拒绝（从 1 起）、要等多少微秒。
+func (r *Redis) run(ctx context.Context, keys []string, args ...any) ([]int64, error) {
+	res, err := allowScript.Run(ctx, r.rdb, keys, args...).Int64Slice()
+	if err != nil {
+		return nil, fmt.Errorf("ratelimit: redis: %w", err)
+	}
+	if len(res) != 3 {
+		return nil, errors.New("ratelimit: redis: unexpected script reply")
+	}
+	return res, nil
 }

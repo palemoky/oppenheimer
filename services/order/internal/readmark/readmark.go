@@ -31,12 +31,12 @@ type Mark struct {
 
 // Marks 读写订单的标记。并发安全。
 type Marks struct {
-	rdb    *redis.Client
+	rdb    redis.UniversalClient
 	prefix string
 }
 
 // New 返回使用 rdb 的 Marks。prefix 是所有 key 的前缀（配置 REDIS_PREFIX）。
-func New(rdb *redis.Client, prefix string) *Marks {
+func New(rdb redis.UniversalClient, prefix string) *Marks {
 	return &Marks{rdb: rdb, prefix: prefix}
 }
 

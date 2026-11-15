@@ -20,7 +20,7 @@ const ttl = time.Hour
 type env struct {
 	t      *testing.T
 	gate   *stockgate.Gate
-	rdb    *redis.Client
+	rdb    redis.UniversalClient
 	prefix string
 	nextID atomic.Int64
 }

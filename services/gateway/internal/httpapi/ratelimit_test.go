@@ -409,7 +409,7 @@ func TestNoRateLimitByDefault(t *testing.T) {
 }
 
 // unreachableRedis 返回一个连不上的 Redis 客户端（端口上没有服务，连接立刻被拒绝）。
-func unreachableRedis(t *testing.T) *redis.Client {
+func unreachableRedis(t *testing.T) redis.UniversalClient {
 	t.Helper()
 	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {

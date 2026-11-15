@@ -29,7 +29,7 @@ type env struct {
 	store *store.Store
 	svc   *Service
 	gate  *stockgate.Gate
-	rdb   *redis.Client
+	rdb   redis.UniversalClient
 
 	// totals 是 seed 记下的每个 SKU 的入库总量，测试结束时的检查用它核对 sku_stock 的原始值。
 	totals map[int64]int64

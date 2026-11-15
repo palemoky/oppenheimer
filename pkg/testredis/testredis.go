@@ -22,7 +22,7 @@ const AddrEnv = "OPPENHEIMER_TEST_REDIS_ADDR"
 //
 // 未设置 AddrEnv 时跳过测试；但在 CI 里（CI 环境变量非空）视为失败，
 // 避免集成测试因为配置遗漏而悄悄不跑。
-func New(t testing.TB) (client *redis.Client, prefix string) {
+func New(t testing.TB) (client redis.UniversalClient, prefix string) {
 	t.Helper()
 	addr := os.Getenv(AddrEnv)
 	if addr == "" {

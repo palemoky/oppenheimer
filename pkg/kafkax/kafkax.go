@@ -48,7 +48,9 @@ func NewClient(ctx context.Context, cfg Config, opts ...kgo.Opt) (*kgo.Client, e
 type TopicSpec struct {
 	Name       string
 	Partitions int32
-	// ReplicationFactor 为 0 时取 1（本机单节点）。集群上由部署清单管理 topic，不走这里。
+	// ReplicationFactor 为 0 时用 broker 的默认值（default.replication.factor）：本机的单个 broker 是 1，
+	// 集群上是 3（deploy/cluster/kafka/kafka.yaml）。副本数是部署环境的属性，所以服务不写死它，
+	// 同一份代码在两边都对。只在创建时生效，topic 已存在时不修改。
 	ReplicationFactor int16
 	// Configs 是创建 topic 时的配置，例如 {"cleanup.policy": "compact"}；nil 表示全部用 broker 的默认值。
 	// 只在创建时生效：topic 已存在时不比较、不修改。
@@ -64,7 +66,8 @@ func EnsureTopics(ctx context.Context, client *kgo.Client, specs ...TopicSpec) e
 	for _, spec := range specs {
 		rf := spec.ReplicationFactor
 		if rf == 0 {
-			rf = 1
+			// -1 让 broker 用自己的默认值（Kafka 2.4 起支持）。
+			rf = -1
 		}
 		resp, err := adm.CreateTopic(ctx, spec.Partitions, rf, topicConfigs(spec.Configs), spec.Name)
 		if err == nil {

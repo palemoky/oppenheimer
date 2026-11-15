@@ -189,7 +189,7 @@ func TestOpenLazyClientIsInstrumentedToo(t *testing.T) {
 	}
 }
 
-func openLazy(t *testing.T, addr string) (*redis.Client, error) {
+func openLazy(t *testing.T, addr string) (redis.UniversalClient, error) {
 	t.Helper()
 	client, err := redisx.OpenLazy(t.Context(), redisx.Config{Addr: addr}, slog.New(slog.DiscardHandler))
 	if err == nil {
