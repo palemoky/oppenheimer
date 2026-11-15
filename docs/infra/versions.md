@@ -49,6 +49,7 @@
 | MetalLB | v0.16.2 | 稳定版 | 2026-11-15 | Helm chart 0.16.2，只用二层模式，`frrk8s.enabled=false`（ADR-0025） |
 | Envoy Gateway | v1.10.0 | 稳定版 | 2026-11-15 | chart `oci://docker.io/envoyproxy/gateway-helm`。兼容性表：Envoy v1.40.x、Gateway API v1.6.1、Kubernetes v1.34 到 v1.37，支持到 2027-05-05。实际用的 Gateway API CRD 是 k3s 自带的 v1.6.3（设计文档 2a 第 11 节） |
 | Strimzi | 1.3.1 | 稳定版 | 2026-11-15 | Kafka 的 Operator，chart `oci://quay.io/strimzi-helm/strimzi-kafka-operator`。支持 Kafka 4.2.0 到 4.3.2、Kubernetes 1.32 到 1.37 |
+| Istio | 1.32.0 | 稳定版 | 2026-11-15 | 服务网格（设计文档 2d）；2026-11-09 发布，没有 LTS，支持到约 2027-06，支持 Kubernetes 1.33 到 1.37，Envoy 分支 v1.40。chart（`base`、`istiod`）和 istioctl 取自 GitHub 发布包（官方 Helm 仓库当天还没有 1.31 以后的版本），镜像 `docker.io/istio/pilot:1.32.0`、`docker.io/istio/proxyv2:1.32.0` |
 | Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |

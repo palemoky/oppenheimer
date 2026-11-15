@@ -1,0 +1,56 @@
+# istiod（Istio 的控制面）的 values，chart 是发布包里的 manifests/charts/istio-control/istio-discovery。
+# 设计文档 2d（docs/design/2d-mesh.md），ADR-0029。由 scripts/cluster/mesh.sh up 使用。
+# 镜像的版本跟着 chart 走（docker.io/istio/pilot、proxyv2，tag 是 chart 的版本），这里不写。
+
+# 一个副本，不要它自带的 HPA：十几个边车的网格用不着，内存也放不下第二个。
+# 代价要知道：istiod 不在的时候，已经在跑的边车用最后一份配置继续工作，但端点的变化推不下去；
+# 注入的 webhook 的失败策略是 Fail，所以业务命名空间里建不出新 Pod（滚动发布、HPA 扩容、删掉重建都会卡住）。
+autoscaleEnabled: false
+replicaCount: 1
+
+# 默认是 500m、2 Gi，是给大网格的。这里的数是估的，装上之后按 kubectl top 改（设计文档第 6 节）。
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# 不上控制面节点，和业务服务同样的理由：它只有 6 GB，上面有 etcd（deploy/charts/service 的 avoidControlPlane）。
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node-role.kubernetes.io/control-plane
+              operator: DoesNotExist
+
+meshConfig:
+  # 同步调用链上不重试（设计文档 1d 的 5.6）。Istio 的默认是重试 2 次，条件里有 gRPC 的 unavailable：
+  # 下游返回 UNAVAILABLE 的写请求会被边车再发两次。每条调用边的 VirtualService 里还会各写一遍 attempts: 0，
+  # 这里是兜底：漏写某条路由时的结果是不重试，而不是悄悄重试。
+  defaultHttpRetryPolicy:
+    attempts: 0
+  # 入站一侧（被调用方的边车转给本机进程）的默认重试，1.32 起可配，同样关掉。
+  defaultInboundHttpRetryPolicy: {}
+  # 网格以外的地址照常放行（中间件、集群外）。这是默认值，写出来是因为设计依赖它。
+  outboundTrafficPolicy:
+    mode: ALLOW_ANY
+  # 边车的访问日志先不开（阶段 3 接入日志系统时再定格式和去向）。
+  accessLogFile: ""
+
+global:
+  proxy:
+    # 注入出来的边车的默认资源。默认值是 100m / 128 Mi、上限 2 核 / 1 Gi；手写的边车实际只用 16 到 18 Mi。
+    # 估的，装上之后按实际用量改。CPU 不设上限，和业务容器一致（被节流会造成延迟的长尾）。
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        # Helm 按键合并 values：只写 memory 的话默认的 cpu: 2000m 还留着，要显式置空才去得掉。
+        cpu: null
+        memory: 192Mi
+  # 节点上的 iptables 是 nf_tables 后端（iptables v1.8.11）。先用默认的写法（经 iptables 命令），
+  # 在临时 Pod 上验证规则写得进去；不行再把这个改成 true。
+  nativeNftables: false

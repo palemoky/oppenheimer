@@ -271,6 +271,18 @@ cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s�
 middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Cluster）、Kafka（Strimzi）、MySQL（两个分片加共享实例）；可重复执行
 	scripts/cluster/middleware.sh all
 
+.PHONY: mesh-up
+mesh-up: ## 装 Istio 的控制面 istiod；要在 make middleware-up 之后、make deploy 之前；可重复执行
+	scripts/cluster/mesh.sh up
+
+.PHONY: mesh-status
+mesh-status: ## 查看 Istio 控制面的状态（Pod、Helm release、istioctl 版本）
+	scripts/cluster/mesh.sh status
+
+.PHONY: mesh-check
+mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod，确认请求经过两边的边车并且是 mTLS，跑完清掉
+	scripts/cluster/mesh.sh check
+
 .PHONY: images
 images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓库，tag 是提交号（有未提交改动时带 -dirty-时间）；make images IMAGE_SERVICES="order gateway" 只做部分
 	scripts/cluster/images.sh all $(IMAGE_SERVICES)
