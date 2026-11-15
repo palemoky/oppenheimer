@@ -6,6 +6,9 @@
 #   k3s.sh kubeconfig           取回 kubeconfig 存到 $KUBECONFIG_OUT（server 地址和 context 名已改好）
 #   k3s.sh status               各节点的 k3s 版本、服务状态，以及集群里的节点和 Pod
 #   k3s.sh uninstall <节点名...> 在指定节点上卸载 k3s，必须写明节点名
+#   k3s.sh etcd-backup install  在 server 上装“把 etcd 快照复制到 NAS”的定时器（设计文档 2b 的 7.2）；可重复运行
+#   k3s.sh etcd-backup run      立刻拍一份快照并复制到 NAS
+#   k3s.sh etcd-backup list     列出本地和 NAS 上的快照
 #
 # 配置模板在 deploy/cluster/k3s/，渲染结果经 ssh 的标准输入送到节点，不在本机落盘：
 # agent 的 token 因此不会出现在输出、进程参数或本机文件里（只在 awk 进程的环境变量里短暂存在）。
@@ -32,6 +35,7 @@ usage: $0 <command>
   kubeconfig             取回 kubeconfig 到 \$KUBECONFIG_OUT
   status                 查看各节点 k3s 状态
   uninstall <node...>    卸载指定节点上的 k3s
+  etcd-backup install|run|list   etcd 快照复制到 NAS 的定时器
 USAGE
   exit 2
 }
@@ -275,6 +279,65 @@ cmd_uninstall() {
   echo "==> note: the node objects stay in the cluster; run 'kubectl delete node <name>' yourself if needed"
 }
 
+# etcd 的快照复制到 NAS（设计文档 2b 的 7.2）。快照本身由 k3s 自带的定时任务拍（默认每 12 小时、本地留 5 份，
+# 没有在 config.yaml 里改），这里装的是 server 节点上的一个 systemd 定时器加一个脚本，脚本里有详细说明。
+# 不放进集群里做成 CronJob：它要备份的正是集群的控制面，控制面坏了的时候它也得能跑。
+ETCD_BACKUP_KEEP=14 # NAS 上保留的份数，一天两份，约一周
+
+# 把内容（标准输入）装到节点上的 <dest>，权限 <mode>，有变化才覆盖。变了返回 0，没变返回 1。
+install_file() {
+  local ip="$1" dest="$2" mode="$3" content="$4"
+  if printf '%s\n' "$content" | rsh "$ip" "sudo cmp -s - $dest"; then
+    return 1
+  fi
+  printf '%s\n' "$content" | rsh "$ip" "sudo install -m $mode -o root -g root /dev/stdin $dest"
+  return 0
+}
+
+cmd_etcd_backup() {
+  resolve_server
+  local sub="${1:-}" script changed=0
+  case "$sub" in
+    install)
+      echo "==> $K3S_SERVER_NODE: installing etcd-snapshot-sync (NAS $NAS_IP:$NAS_EXPORT/backup/etcd, keep $ETCD_BACKUP_KEEP)"
+      script="$(render "$TPL_DIR/etcd-snapshot-sync.sh" \
+        "__NAS_IP__=$NAS_IP" "__NAS_EXPORT__=$NAS_EXPORT" "__KEEP__=$ETCD_BACKUP_KEEP")"
+      if install_file "$SERVER_IP" /usr/local/sbin/etcd-snapshot-sync 755 "$script"; then changed=1; fi
+      if install_file "$SERVER_IP" /etc/systemd/system/etcd-snapshot-sync.service 644 \
+        "$(cat "$TPL_DIR/etcd-snapshot-sync.service")"; then changed=1; fi
+      if install_file "$SERVER_IP" /etc/systemd/system/etcd-snapshot-sync.timer 644 \
+        "$(cat "$TPL_DIR/etcd-snapshot-sync.timer")"; then changed=1; fi
+      if [[ $changed -eq 1 ]]; then
+        rsh "$SERVER_IP" 'sudo systemctl daemon-reload'
+      else
+        echo "==> $K3S_SERVER_NODE: unchanged"
+      fi
+      rsh "$SERVER_IP" 'sudo systemctl enable --now etcd-snapshot-sync.timer'
+      rsh "$SERVER_IP" 'systemctl list-timers etcd-snapshot-sync.timer --no-pager'
+      ;;
+    run)
+      # 按需快照的名字是 on-demand-<节点名>-<时间>。按需快照不受“本地留 5 份”的限制，NAS 上和定时的一起按份数清理。
+      echo "==> $K3S_SERVER_NODE: taking an on-demand snapshot"
+      rsh "$SERVER_IP" 'sudo k3s etcd-snapshot save 2>&1 | grep -v "Unknown flag"'
+      echo "==> $K3S_SERVER_NODE: copying snapshots to the NAS"
+      # 经 systemd 运行而不是直接调脚本：和定时触发走同一条路，输出进 journal。
+      rsh "$SERVER_IP" 'sudo systemctl start etcd-snapshot-sync.service || { sudo journalctl -u etcd-snapshot-sync -n 20 --no-pager; exit 1; }'
+      rsh "$SERVER_IP" 'sudo journalctl -u etcd-snapshot-sync -n 8 --no-pager -o cat'
+      ;;
+    list)
+      echo "==> $K3S_SERVER_NODE: local snapshots"
+      rsh "$SERVER_IP" 'sudo ls -l --time-style=long-iso /var/lib/rancher/k3s/server/db/snapshots'
+      echo "==> NAS ($NAS_IP:$NAS_EXPORT/backup/etcd)"
+      rsh "$SERVER_IP" "m=\$(sudo mktemp -d); sudo mount -t nfs -o ro,nfsvers=4.1,soft,timeo=100,retrans=2 $NAS_IP:$NAS_EXPORT/backup/etcd \$m \
+        && sudo ls -l --time-style=long-iso \$m \$m/snapshots; sudo umount \$m; sudo rmdir \$m"
+      ;;
+    *)
+      echo "usage: $0 etcd-backup install | run | list" >&2
+      exit 2
+      ;;
+  esac
+}
+
 [[ $# -ge 1 ]] || usage
 cmd="$1"
 shift
@@ -284,5 +347,6 @@ case "$cmd" in
   kubeconfig) cmd_kubeconfig ;;
   status) cmd_status ;;
   uninstall) cmd_uninstall "$@" ;;
+  etcd-backup) cmd_etcd_backup "$@" ;;
   *) usage ;;
 esac

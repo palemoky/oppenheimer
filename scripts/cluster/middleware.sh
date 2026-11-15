@@ -5,6 +5,7 @@
 #   middleware.sh redis   两套 Redis：redis-gate（主从加 Sentinel）、redis-cache（Cluster）
 #   middleware.sh kafka   Strimzi 的 Operator 和 3 节点的 Kafka
 #   middleware.sh all     redis、kafka、mysql 依次执行
+#   middleware.sh mysql-backup [release...]   立刻手工跑一次 MySQL 备份并等它完成（不带参数是三个实例）
 #
 # 每个子命令之前先执行 common（建 PriorityClass）。
 #
@@ -40,23 +41,55 @@ MYSQL_CHART="$ROOT/deploy/charts/mysql"
 MYSQL_VALUES="$ROOT/deploy/cluster/mysql"
 MYSQL_RELEASES=(mysql-order-0 mysql-order-1 mysql-main)
 
-# Secret 不存在时用随机值创建，存在就不动：重跑脚本不能换掉正在用的密码（数据目录里的账号还是旧密码）。
+# 每个实例的 Secret 里应有的键。以后加账号就在这里加一个名字：已经存在的 Secret 会被补上缺的键。
+MYSQL_SECRET_KEYS=(root-password repl-password app-password cdc-password backup-password)
+
+# Secret 不存在时用随机值创建；存在就只补上缺的键，已有的键不动：重跑脚本不能换掉正在用的密码
+# （数据目录里的账号还是旧密码）。
 # 密码不打印，也不出现在命令行参数里：清单经标准输入交给 kubectl，printf 是 shell 的内建命令。
-# 用 create 而不是 apply：apply 会把整份清单（含密码）存进 last-applied-configuration 注解。
+# 创建用 create 而不是 apply：client-side apply 会把整份清单（含密码）存进 last-applied-configuration 注解。
+# 补键用 server-side apply：它不写 last-applied 注解，只在 managedFields 里记“这个管理者拥有哪些字段”
+# （字段路径，不含值），而且只带这一个键的话，别的键（别的管理者拥有的）不会被动。值用 data（base64）。
 mysql_secret() { # <release>
-  local name="$1-auth" found k
-  found="$(kubectl -n "$MYSQL_NS" get secret "$name" --ignore-not-found -o name)"
-  if [[ -n "$found" ]]; then
+  local name="$1-auth" have k missing=()
+  # 只取键名，不取值。
+  # shellcheck disable=SC2016 # go-template 的 $k 不是 shell 变量
+  have="$(kubectl -n "$MYSQL_NS" get secret "$name" --ignore-not-found -o go-template='{{range $k, $_ := .data}}{{$k}} {{end}}')"
+  # 存在的 Secret 至少有一个键，所以“一个键都没取到”就是不存在。
+  if [[ -z "$have" ]]; then
+    echo "    creating secret $name with random passwords"
+    {
+      printf 'apiVersion: v1\nkind: Secret\ntype: Opaque\nmetadata:\n  name: %s\n  namespace: %s\nstringData:\n' "$name" "$MYSQL_NS"
+      for k in "${MYSQL_SECRET_KEYS[@]}"; do
+        printf '  %s: "%s"\n' "$k" "$(openssl rand -hex 16)"
+      done
+    } | kubectl create -f - >/dev/null
+    return 0
+  fi
+  for k in "${MYSQL_SECRET_KEYS[@]}"; do
+    case " $have " in
+    *" $k "*) ;;
+    *) missing+=("$k") ;;
+    esac
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
     echo "    secret $name exists, keeping it"
     return 0
   fi
-  echo "    creating secret $name with random passwords"
+  echo "    secret $name exists; adding missing keys: ${missing[*]}"
   {
-    printf 'apiVersion: v1\nkind: Secret\ntype: Opaque\nmetadata:\n  name: %s\n  namespace: %s\nstringData:\n' "$name" "$MYSQL_NS"
-    for k in root-password repl-password app-password cdc-password; do
-      printf '  %s: "%s"\n' "$k" "$(openssl rand -hex 16)"
+    printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ndata:\n' "$name" "$MYSQL_NS"
+    for k in "${missing[@]}"; do
+      printf '  %s: "%s"\n' "$k" "$(openssl rand -hex 16 | base64 | tr -d '\n')"
     done
-  } | kubectl create -f - >/dev/null
+  } | kubectl apply --server-side --field-manager=middleware-sh -f - >/dev/null
+}
+
+# 备份用的 NAS 存储（PV 加 PVC），chart 里的 CronJob 引用这个 PVC，要先于 chart 存在。
+# 清单里的 __NAS_IP__、__NAS_EXPORT__ 不是密钥，可以用 sed 填。
+mysql_backup_storage() {
+  echo "==> mysql backup storage (NFS $NAS_IP:$NAS_EXPORT/backup/mysql)"
+  sed -e "s#__NAS_IP__#$NAS_IP#g" -e "s#__NAS_EXPORT__#$NAS_EXPORT#g" "$MYSQL_VALUES/backup-pv.yaml" | kubectl apply -f - >/dev/null
 }
 
 # 主从关系的核对，只读：不改任何东西，不一致就报出来、以非零退出，处理交给人。
@@ -85,6 +118,7 @@ cmd_mysql() {
   local rel failed=0
   echo "==> mysql (namespace $MYSQL_NS)"
   ensure_namespace "$MYSQL_NS"
+  mysql_backup_storage
   for rel in "${MYSQL_RELEASES[@]}"; do
     echo "==> $rel"
     mysql_secret "$rel"
@@ -108,6 +142,68 @@ cmd_mysql() {
   fi
 }
 
+# 立刻手工跑一次备份：从 CronJob 建一个 Job，等它完成，打印产物。不带参数就是三个实例都备。
+# 产物的路径和大小取自 Job 日志里 backup.sh 打的 "backup ok" 那一行（MacBook 上没有挂 NAS）。
+cmd_mysql_backup() { # [release...]
+  local rels=("$@") rel known job active found out path
+  if [[ ${#rels[@]} -eq 0 ]]; then rels=("${MYSQL_RELEASES[@]}"); fi
+  local failed=0
+  for rel in "${rels[@]}"; do
+    found=0
+    for known in "${MYSQL_RELEASES[@]}"; do [[ "$known" == "$rel" ]] && found=1; done
+    if [[ "$found" == 0 ]]; then
+      echo "unknown mysql release: $rel (known: ${MYSQL_RELEASES[*]})" >&2
+      return 2
+    fi
+  done
+  for rel in "${rels[@]}"; do
+    echo "==> backup $rel"
+    # 手工建的 Job 不受 concurrencyPolicy 约束，所以先自己看有没有正在跑的：两个备份同时写同一个实例的目录、
+    # 同时做保留清理会互相踩。
+    active="$(kubectl -n "$MYSQL_NS" get jobs -l "app.kubernetes.io/name=mysql-backup,app.kubernetes.io/instance=$rel" \
+      -o go-template='{{range .items}}{{if .status.active}}{{.metadata.name}} {{end}}{{end}}')"
+    if [[ -n "$active" ]]; then
+      echo "    a backup of $rel is already running: $active" >&2
+      failed=1
+      continue
+    fi
+    job="$rel-backup-manual-$(date -u +%y%m%d%H%M%S)"
+    if ! kubectl -n "$MYSQL_NS" create job "$job" --from="cronjob/$rel-backup" >/dev/null; then
+      echo "    cannot create a job from cronjob/$rel-backup (is backup.enabled and the chart installed?)" >&2
+      failed=1
+      continue
+    fi
+    # 等 Job 完成或失败。kubectl wait 一次只能等一个条件，等成功会把失败拖到超时，所以轮询状态。
+    local deadline=$((SECONDS + 3900)) state=""
+    while ((SECONDS < deadline)); do
+      # 只挑 Complete 和 Failed 这两个终态的条件。不能把所有为真的条件拼起来比：Kubernetes 1.31 起 Job 成功时
+      # 有两个为真的条件（SuccessCriteriaMet、Complete），失败时是 FailureTarget、Failed（2026-11-15 实测，
+      # 第一版因此一直等到超时，而备份 3 秒就做完了）。
+      state="$(kubectl -n "$MYSQL_NS" get job "$job" -o go-template='{{range .status.conditions}}{{if and (eq .status "True") (or (eq .type "Complete") (eq .type "Failed"))}}{{.type}}{{end}}{{end}}')"
+      [[ "$state" == Complete || "$state" == Failed ]] && break
+      sleep 3
+    done
+    if [[ "$state" != Complete ]]; then
+      echo "    FAILED ($job, state: ${state:-timeout}); last log lines:" >&2
+      kubectl -n "$MYSQL_NS" logs "job/$job" --tail=15 2>&1 | sed 's/^/      /' >&2 || true
+      failed=1
+      continue
+    fi
+    # 日志的最后一行就是产物的路径和大小（backup.sh 的 "backup ok: <路径> (<字节> bytes, ...)"）。
+    out="$(kubectl -n "$MYSQL_NS" logs "job/$job" --tail=50 2>&1 | grep 'backup ok:' || true)"
+    if [[ -z "$out" ]]; then
+      echo "    job $job completed but the log has no 'backup ok' line" >&2
+      failed=1
+      continue
+    fi
+    path="${out#*backup ok: }"
+    echo "    ${path}  (job $job)"
+    path="${path%% *}"
+    echo "    on the NAS: $NAS_EXPORT/backup/mysql/${path#/backup/}"
+  done
+  return "$failed"
+}
+
 cmd="${1:-}"
 # 新的子命令（redis、kafka）照 mysql 的样子加一个 cmd_xxx，在这里各加一行，并加进 all。
 # Redis：两套（设计文档 2b 第 4 节）。redis-gate 是一主一从加 3 个 Sentinel，给库存闸门和锁用；
@@ -127,8 +223,9 @@ cmd_redis() {
   info="$(kubectl -n redis exec redis-cache-0 -- redis-cli cluster info)"
   printf '%s\n' "$info" | tr -d '\r' | awk -F: '/^cluster_state|^cluster_known_nodes|^cluster_size/ { print "    " $0 }'
   # 主从配对由 redis-cli --cluster create 决定，它不知道 Pod 在哪个节点上。主从落在同一个节点时
-  # 那个节点一挂这一片就没了，要人工用 cluster replicate 重配（设计文档 2b 的 4.3）。这里只打印出来。
-  kubectl -n redis logs job/redis-cache-bootstrap --tail=8 2>/dev/null | grep -E '^(MASTER|REPLICA)' || true
+  # 那个节点一挂这一片就没了。原来这里只把配对打印出来，结果重建之后有一对同节点的没人发现
+  # （设计文档 2b 第 10 节的发现 10），现在交给这个脚本核对并改挂从库；它改不了的情况会以非零退出。
+  "$HERE/redis-cache-pairing.sh" fix
 }
 
 # Kafka：Strimzi 的 Operator 加一个 3 节点的 KRaft 集群（设计文档 2b 第 5 节）。
@@ -158,6 +255,10 @@ kafka)
   common
   cmd_kafka
   ;;
+mysql-backup)
+  shift
+  cmd_mysql_backup "$@"
+  ;;
 all)
   common
   cmd_redis
@@ -165,7 +266,7 @@ all)
   cmd_mysql
   ;;
 *)
-  echo "usage: $0 mysql | redis | kafka | all" >&2
+  echo "usage: $0 mysql | redis | kafka | all | mysql-backup [release...]" >&2
   exit 2
   ;;
 esac

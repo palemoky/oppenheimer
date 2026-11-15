@@ -42,6 +42,12 @@ spec:
                 secretKeyRef:
                   name: {{ $s }}
                   key: cdc-password
+            # 备份账号。Secret 里没有这个键 Pod 会起不来：middleware.sh 的 mysql_secret 会给已存在的 Secret 补上。
+            - name: BACKUP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s }}
+                  key: backup-password
             - name: DATABASES
               value: {{ join " " .Values.databases | quote }}
             - name: CDC_ENABLED

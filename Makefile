@@ -265,10 +265,24 @@ cluster-up: ## 从空的宿主机建出可用的集群：建虚拟机、装 k3s�
 	scripts/cluster/k3s.sh install
 	scripts/cluster/k3s.sh kubeconfig
 	scripts/cluster/addons.sh all
+	scripts/cluster/k3s.sh etcd-backup install
 
 .PHONY: middleware-up
 middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Cluster）、Kafka（Strimzi）、MySQL（两个分片加共享实例）；可重复执行
 	scripts/cluster/middleware.sh all
+
+.PHONY: etcd-backup
+etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server 节点上的定时器每 12 小时做一次）；scripts/cluster/k3s.sh etcd-backup list 查看
+	scripts/cluster/k3s.sh etcd-backup run
+
+.PHONY: middleware-backup
+middleware-backup: ## 立刻手工跑一次 MySQL 备份并等它完成（三个实例；只备一个：make middleware-backup RELEASE=mysql-main）
+	scripts/cluster/middleware.sh mysql-backup $(RELEASE)
+
+.PHONY: mysql-restore-drill
+mysql-restore-drill: ## 恢复演练：把某个实例的最新备份灌进临时 Pod，和线上从库逐表比对（make mysql-restore-drill RELEASE=mysql-main）
+	@test -n "$(RELEASE)" || { echo "usage: make mysql-restore-drill RELEASE=mysql-order-0|mysql-order-1|mysql-main" >&2; exit 2; }
+	scripts/cluster/mysql-restore-drill.sh $(RELEASE)
 
 .PHONY: cluster-status
 cluster-status: ## 查看各节点的 k3s 状态和集群里的 Pod

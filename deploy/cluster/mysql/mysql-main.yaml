@@ -22,3 +22,6 @@ resources:
   cpu: 250m
 storage:
   size: 30Gi
+backup:
+  enabled: true
+  schedule: "0 20 * * *"   # UTC，北京时间 04:00；三个实例错开

@@ -46,3 +46,23 @@ accountsJob:
   cpu: 50m
   # 等主库可用的上限（秒）。第一次安装要拉镜像、初始化数据目录，给足时间。
   waitSeconds: 900
+
+# 每天一次的逻辑备份（CronJob，脚本是 files/backup.sh），写到 NAS。默认关；开了之后要先有 PVC（claimName），
+# 它由 middleware.sh 在装 chart 之前从 deploy/cluster/mysql/backup-pv.yaml 建好。
+backup:
+  enabled: false
+  # cron 表达式，按 UTC（不设 timeZone，不依赖控制器里的时区数据库）。三个实例在各自的 values 里错开。
+  schedule: "0 19 * * *"
+  # 备份目录所在的 PVC，三个实例共用，每个实例在里面用 <release>/ 子目录。
+  claimName: mysql-backup
+  # 保留最近几份。
+  keep: 7
+  # 错过计划时间多久之内还补跑（集群或控制器停了一阵）。超过就放弃这一次。
+  startingDeadlineSeconds: 3600
+  # 一次备份最长跑多久，超时 Job 失败。也决定“多老的 .tmp-* 目录算失败留下的”。
+  activeDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # mysqldump 加 zstd，内存用量很小；dump 是流式的，不在内存里攒。
+  memory: 256Mi
+  cpu: 100m

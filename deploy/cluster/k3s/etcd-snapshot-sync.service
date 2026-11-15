@@ -1,0 +1,13 @@
+# 由 scripts/cluster/k3s.sh etcd-backup install 装到 server 节点的 /etc/systemd/system/。
+# 把本地的 etcd 快照复制到 NAS（脚本里有说明）。失败不重试：下一次定时再来，
+# 失败的记录用 systemctl status、journalctl -u etcd-snapshot-sync 看。
+[Unit]
+Description=Copy k3s etcd snapshots to the NAS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/etcd-snapshot-sync
+# NFS 的 soft 挂载已经会超时，这里再兜一层：整个任务最多 10 分钟。
+TimeoutStartSec=600
