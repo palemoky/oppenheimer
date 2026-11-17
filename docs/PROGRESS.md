@@ -40,7 +40,10 @@
 2. `redis-cache-5` 的复制断过约 3 小时（连的是主库重启前的旧地址），主人确认后已用 `cluster replicate` 修好（设计第 8 节最后一段）。根因没有查，主库下次换地址多半还会断，记给了阶段 4；3c 要加告警。
 3. 四个大盘已加载到 Grafana 的文件夹 Oppenheimer（业务总览、单服务、中间件、Collector，设计第 8 节有表）。**界面上的样子没有人看过，要主人在浏览器里看一遍**，顺便走一次“大盘上的 exemplar → 链路 → 日志”。地址 `http://grafana.oppenheimer.test/d/opp-business`（`/etc/hosts` 要有 `192.168.50.51 grafana.oppenheimer.test`）。
 4. “新 order Pod 一就绪就 503”已解决（改答 `429 READ_BUSY`，设计第 8 节）。
-5. 3a 剩下的：Istio 的 `PodMonitor` 和标签裁剪、网格的大盘（Sonnet）；尾部采样和对比（主会话）；按 QPS 的 HPA；实测内存和磁盘定保留期、从空集群重建一次、ADR、笔记。做大盘时发现的指标缺口在设计第 8 节，其中“Redis 没有命令耗时的指标”建议在 3b 之前补（`pkg/redisx`）。
+5. **尾部采样已上线，对比做完**（设计第 8 节“第 6 步”有表）：同样的故障，出错的链路头部 10% 只留下 10%，尾部全留；Collector 多 100 Mi 内存。“慢的全留”没有验证到。尾部采样之后 Tempo 的 metrics-generator 的指标是偏的，只用来看拓扑，RED 用 SDK 的指标。
+   **Istio 的指标已接上**（设计第 8 节最后一段）：标签在源头从 25 个裁到 9 个，新增 532 条序列；网格大盘 `opp-mesh` 已加载；gateway 到 order 一次调用 6.5 毫秒里有 2.7 毫秒在边车和网络上。
+   这一批（尾部采样、Istio 的指标和网格大盘、文档）已提交，**没有推送**（`origin/phase-3a` 停在 `ea3db7c`，还没有开 PR，CI 没有跑过）。新会话从“3a 剩下的”第一项（KEDA）开始。
+   **3a 剩下的**：按 QPS 的 HPA（第 7 步，KEDA，装上先验证它在 Kubernetes 1.37 上能用）；实测内存和磁盘定保留期（Tempo 的内存在压测里涨到 1.2 Gi，上限 2 Gi，要看）、从空集群重建一次、ADR 的补充、笔记（第 8 步）；验证 5（停掉 Collector gateway）、6（`make cluster-fault` 抽几个场景对指标）、7（停从库复制、停消费者看图）没有做；五个大盘在界面上的样子、“大盘 → 链路 → 日志”仍然要主人在浏览器里看一遍。做大盘时发现的指标缺口在设计第 8 节，其中“Redis 没有命令耗时的指标”建议在 3b 之前补（`pkg/redisx`）。
 6. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
 
 集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。

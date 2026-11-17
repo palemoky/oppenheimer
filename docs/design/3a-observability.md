@@ -344,3 +344,51 @@ metrics-generator 生成的指标验证了（第 3 步留下的）：`traces_ser
 - 订单缓存只看到 `miss`：探针对每一单只查一次，没有重复查询，所以没有命中。没有去核实别的原因。
 
 **大盘查出的一个真故障，主人确认后已修（2026-11-17）：`redis-cache-5` 的复制断了约 3 小时。** 它是 `redis-cache-1` 的从库，一直在连 10.42.0.124，那是 `redis-cache-1` 重启之前的 Pod 地址（现在是 10.42.0.135），日志里每隔几秒一条 `No route to host`；`master_link_down_since_seconds` 约 10260，对得上今天给 k3s-server 改内存时的那次重启。`cluster nodes` 里地址是新的、集群状态是 ok、16384 个槽都正常，另外两对主从也正常，所以业务没有受影响，只是这一个分片没有从库。修法是在 `redis-cache-5` 上执行 `redis-cli cluster replicate <redis-cache-1 的节点号>`（它会从主库全量同步，丢掉自己那点旧数据；这是缓存）。为什么集群总线学到了新地址而复制没有跟着换，没有查；Pod 重启换地址在这个集群上是常事，要查清并让它自己恢复（阶段 4）。这类故障现在没有告警，3c 要加（`redis_master_link_up == 0`）。修完之后：`master_link_status:up`，`redis-cache-1` 上 `connected_slaves:1`，集群状态 ok。它记下的主库仍然是一个 Pod 地址（10.42.0.135），主库下次换地址时多半还会断。
+
+### 第 6 步：尾部采样和头部采样的对比（2026-11-17）
+
+gateway 的链路管线加了 `tail_sampling`（`otel-gateway.yaml`）：等 10 秒，出错的全留、超过 500 毫秒的全留、其余留 10%。**现在集群上是这个配置**，SDK 仍然全量导出。
+
+对比实验（阶段计划里登记过）：`probe.py --workers 60 --rate 3 --duration 150`（405 请求/秒），第 60 秒把 inventory 缩到 0 个副本、20 秒后恢复，共三轮。头部 10% 那一轮只改了 gateway 的 `OTEL_TRACES_SAMPLER=parentbased_traceidratio`、`OTEL_TRACES_SAMPLER_ARG=0.1`（入口决定，后面每一跳跟着父 span 走），跑完已恢复。
+
+| | 不采样 | 头部 10% | 尾部（错的和慢的全留，其余 10%） |
+|---|---|---|---|
+| 探针看到的失败请求 | 5165 | 5682 | 5572 |
+| Tempo 里带 503 的链路 | 5164 | 567 | 5572 |
+| **出错的链路留下的比例** | 100% | **10%** | **100%** |
+| Tempo 里 gateway 的链路总数 | 61019 | 6062 | 11336 |
+| 服务发给 Collector 的 span | 72.0 万 | 9.0 万 | 68.4 万 |
+| Collector 发给 Tempo 的 span | 72.1 万 | 9.0 万 | 9.0 万 |
+| Collector gateway 的内存峰值 | 277 Mi | 275 Mi | 375 Mi |
+
+读法：
+
+- 头部采样留下的错误就是 10%，和别的请求一样被掷了骰子；尾部一条没丢。正常请求里尾部留下 5764 条，是 55448 条的 10.4%，和设定值对得上。
+- 存进 Tempo 的量两种做法差不多（都是 9 万个 span），尾部多花的是：服务端仍然全量导出（1d 量过全量采样让落库吞吐低约 7%）、Collector 多 100 Mi 内存（405 请求/秒时，10 秒窗口里约 4 万个 span）。内存和吞吐成正比，3b 压到几千请求/秒时要再量，requests 现在是 512 Mi。
+- **“慢的全留”这一条没有验证到**：三轮里没有一条链路超过 500 毫秒（inventory 不在时请求是快速失败，不是变慢）。阶段 4 注入延迟时再看。
+- Tempo 的内存在三轮里是 446、1114、1240 Mi，一路在涨，和采样方式对不上（不采样那轮最低）；它的 limits 是 2 Gi。没有查，第 8 步定保留期时要看。
+
+**3.5 留下的那个决定：先接受偏差，不在 Collector 里另算。** 尾部采样之后 Tempo 的 metrics-generator 只看得到被留下的 span，`traces_spanmetrics_*` 和 service graph 里出错和慢的占比偏高（错的全留、正常的只留十分之一），**不能再用它们算错误率和请求量**，只用来看拓扑。RED 一律用 SDK 的指标（大盘就是这样做的）。要准确的 span 指标就得在 Collector 里、采样之前用 `spanmetrics` 和 `servicegraph` 连接器算，多一份内存和序列；现在没有要靠它回答的问题。Tempo 数据源上“从 span 跳到 RED 指标”的链接因此是偏的，没有改。
+
+### 第 5 步的 Istio 部分（2026-11-17）
+
+Sonnet 写清单和网格大盘（不碰集群），主会话读过后应用。
+
+- 抓取：`deploy/cluster/monitoring/istio-monitors.yaml`（边车的 PodMonitor，15090；istiod 的 ServiceMonitor，15014），`scripts/cluster/monitoring.sh istio`，已并入 `make monitoring-up`。PodMonitor 用 `keep` 只留 Istio 的标准指标和下面那几项 Envoy 统计，不留的话每个边车有约 600 条 `envoy_*`。
+- 裁标签：`deploy/cluster/istio/telemetry.yaml`（全网格的 `Telemetry`，`make mesh-up` 会应用）。**在源头用 `tagOverrides` 去掉，不在 Prometheus 里 `labeldrop`**：前者省边车的内存和抓取的流量，后者只省存储，而且去掉标签后同一次抓取里出现重复序列会让整次抓取失败。一条 `istio_requests_total` 的标签从 25 个减到 9 个（`reporter`、`source_workload`、`destination_workload`、`destination_service_name`、`request_protocol`、`response_code`、`grpc_response_status`、`response_flags`、`connection_security_policy`）；请求和响应大小的直方图、gRPC 消息数整个关掉。两个目的标签都留着：请求在选出上游之前就失败（`UH`、`UO`）时，调用方一侧的 `destination_workload` 是 `unknown`，那正是要看的情况。
+- 摘除和并发上限的统计常开：`istiod.yaml` 的 `proxyStatsMatcher`（`outlier_detection.ejections_*`、`upstream_rq_pending_overflow`、`upstream_cx_overflow`）。它只在注入时读，所以五个带边车的服务重启了一遍（探针 16660 个请求 0 失败）。
+- 实际新增 532 条序列（子 Agent 估的是 1000 上下）。序列总数现在 19.0 万。
+- 网格大盘 `opp-mesh` 已加载（每条边的请求量、错误、`response_flags`、延迟，边车加出来的延迟，摘除和溢出，istiod，边车的资源）。**Istio 和 Envoy 的那些查询只核对过指标名，没有在界面上看过。**
+
+**2d 留下的“经边车多花多少时间”，现在量得到了**（gateway → order，90 请求/秒，两分钟的平均值）：
+
+| 量的位置 | 平均耗时 |
+|---|---|
+| gateway 进程（gRPC 客户端） | 6.46 毫秒 |
+| gateway 的边车 | 5.33 毫秒 |
+| order 的边车 | 4.23 毫秒 |
+| order 进程（gRPC 服务端） | 3.79 毫秒 |
+
+一次调用 6.5 毫秒里，order 自己只用了 3.8 毫秒；其余 2.7 毫秒在路上：进程到自己的边车 1.1、两个边车之间（网络加 mTLS）1.1、边车到 order 进程 0.4。这是低负载下的平均值，分位数因为 Istio 的桶太粗（5、10、25 毫秒……）读不准；3b 压测时再看它随负载怎么变。和直连的对比仍然没有做。
+
+没有处理的：`deploy/cluster/services/fault/gateway.yaml` 里用 Pod 注解打开统计项的那一段现在大半是重复的；全网格的 `proxyStatsMatcher` 和 Pod 注解是合并还是覆盖，没有验证（下次跑 `make cluster-fault` 时看）；istiod 的几个指标名（`galley_validation_*`、`pilot_xds_rejects`）没有出现过，未确认。

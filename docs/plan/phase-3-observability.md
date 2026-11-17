@@ -8,14 +8,15 @@
 
 - [x] kube-prometheus-stack：Prometheus、Grafana、Alertmanager、node-exporter、kube-state-metrics（设计文档 [3a-observability.md](../design/3a-observability.md)、ADR-0030）
 - [x] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0004）
-- [ ] Collector 的部署形态（DaemonSet 还是 Deployment）、批处理、采样、内存限制，以及对 Collector 自身的监控
-- [ ] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟
+- [x] Collector 的部署形态（DaemonSet 还是 Deployment）、批处理、采样、内存限制，以及对 Collector 自身的监控
+- [x] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟
 - [x] 中间件 exporter：MySQL、Redis、Kafka（含消费延迟）
 - [x] 日志：结构化日志（JSON，带 trace id），Loki 收集
-- [ ] 链路：Grafana Tempo（单体模式），由 Collector 经 OTLP 写入（ADR-0024，原计划是 SkyWalking）
+- [x] 链路：Grafana Tempo（单体模式），由 Collector 经 OTLP 写入（ADR-0024，原计划是 SkyWalking）
   - 存储放本地盘还是 NAS 上的对象存储；保留期和采样率按实测的数据量定
   - 打开 metrics-generator，生成 service graph（服务拓扑）和 span 指标，写进 Prometheus
   - 尾部采样在 Collector 里做（只留出错的和慢的），和 1d 的头部采样对比（设计文档 1d 的 8.7）
+    - 对比实验要注入的故障（2026-11-17 登记）：在长期运行的那一套上，压测中途把 inventory 的副本数改成 0 约 20 秒再改回 2，制造一批出错的和一批慢的链路；三轮（不采样、头部 10%、尾部），每轮同样的压法
 - [x] 链路打通 HTTP → gRPC → Kafka → MySQL、Redis
 - [x] Go 运行时指标与持续剖析入口：goroutine 数、堆、GC、pprof 端点（阶段 4 的泄漏类故障要用）
 - [ ] 指标、日志、链路通过 trace id 互相跳转
@@ -71,4 +72,4 @@
 
 ## 面试考点
 
-OpenTelemetry 的架构（API、SDK、Collector、OTLP）与上下文传播；Collector 的 agent 加 gateway 两层部署各自做什么、`memory_limiter` 为什么放最前；推和拉两种采集方式怎么发现“对方挂了”；日志的 `trace_id` 为什么不做 Loki 的标签（结构化元数据）；多目标模式的 exporter 里 `up` 和 `mysql_up` 的区别；pprof 端点为什么不能挂在对外或 Service 暴露的端口上；原因码答错会把排查引向哪里（展示读名额满了答成“闸门不可用”，设计文档 3a 第 8 节）；埋点把正常的返回值记成错误的例子（`driver.ErrSkip`，设计文档 3a 第 8 节第 4 步）；指标、日志、链路各自解决什么问题；Prometheus 拉模型、数据模型、PromQL、直方图与分位数；链路追踪的上下文传播与采样；SLI、SLO、错误预算；告警疲劳与如何设计好告警；压测方法论与常见瓶颈；Go 性能分析（pprof、trace、GC 调优）。
+OpenTelemetry 的架构（API、SDK、Collector、OTLP）与上下文传播；Collector 的 agent 加 gateway 两层部署各自做什么、`memory_limiter` 为什么放最前；推和拉两种采集方式怎么发现“对方挂了”；日志的 `trace_id` 为什么不做 Loki 的标签（结构化元数据）；多目标模式的 exporter 里 `up` 和 `mysql_up` 的区别；pprof 端点为什么不能挂在对外或 Service 暴露的端口上；原因码答错会把排查引向哪里（展示读名额满了答成“闸门不可用”，设计文档 3a 第 8 节）；头部采样和尾部采样各自在哪里做决定、各自的代价（实测：出错的链路头部 10% 只留下 10%，尾部全留，代价是服务全量导出和 Collector 的内存）；尾部采样之后从 span 算出来的指标为什么是偏的；网格指标的标签在源头裁和在 Prometheus 里裁的区别；埋点把正常的返回值记成错误的例子（`driver.ErrSkip`，设计文档 3a 第 8 节第 4 步）；指标、日志、链路各自解决什么问题；Prometheus 拉模型、数据模型、PromQL、直方图与分位数；链路追踪的上下文传播与采样；SLI、SLO、错误预算；告警疲劳与如何设计好告警；压测方法论与常见瓶颈；Go 性能分析（pprof、trace、GC 调优）。
