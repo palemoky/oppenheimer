@@ -7,7 +7,8 @@
 #   monitoring.sh collector         OpenTelemetry Collector：gateway（Deployment，收 OTLP 转发给后端）和 agent（DaemonSet，读容器日志）
 #   monitoring.sh exporters         MySQL、Redis 的 exporter（多目标模式，各一个 Deployment）、MySQL 的监控账号、Kafka 的 PodMonitor
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters
+#   monitoring.sh dashboards        把 deploy/cluster/monitoring/dashboards/*.json 做成 ConfigMap，Grafana 自动加载到文件夹 Oppenheimer
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、dashboards
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -220,6 +221,32 @@ cmd_datasources() {
   echo "    Grafana datasources (loki, tempo) applied"
 }
 
+# 大盘的 JSON 在 deploy/cluster/monitoring/dashboards/，一个文件一个大盘，各自做成一个带 grafana_dashboard 标签的
+# ConfigMap，Grafana 的 sidecar 自动加载到文件夹 Oppenheimer（不在界面上手工建，建了不留痕迹）。
+# 用服务端 apply：客户端 apply 会把整个 JSON 再存一份到注解里，大盘稍大就超过注解的 256 KB 上限。
+# 仓库里删掉的大盘，集群上对应的 ConfigMap 也删掉（按标签 oppenheimer.dashboard 认出是这个脚本建的）。
+cmd_dashboards() {
+  ensure_ns
+  local dir="$DEPLOY/dashboards" f name keep=" "
+  for f in "$dir"/*.json; do
+    [[ -e "$f" ]] || continue
+    python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f" # 不是合法的 JSON 就在这里停下
+    name="dashboard-$(basename "$f" .json)"
+    keep="$keep$name "
+    kubectl -n "$NS" create configmap "$name" --from-file="$f" --dry-run=client -o yaml |
+      kubectl label --local -f - grafana_dashboard=1 oppenheimer.dashboard=1 -o yaml |
+      kubectl annotate --local -f - grafana_folder=Oppenheimer -o yaml |
+      kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f - >/dev/null
+    echo "    $name"
+  done
+  for name in $(kubectl -n "$NS" get configmap -l oppenheimer.dashboard=1 -o jsonpath='{.items[*].metadata.name}'); do
+    if [[ "$keep" != *" $name "* ]]; then
+      kubectl -n "$NS" delete configmap "$name" >/dev/null
+      echo "    removed $name"
+    fi
+  done
+}
+
 cmd_status() {
   kubectl -n "$NS" get pods -o wide
   kubectl -n "$NS" get pvc
@@ -275,19 +302,21 @@ tempo) cmd_tempo ;;
 collector) cmd_collector ;;
 datasources) cmd_datasources ;;
 exporters) cmd_exporters ;;
+dashboards) cmd_dashboards ;;
 up)
   cmd_kps
   cmd_loki
   cmd_tempo
   cmd_collector
   cmd_exporters
+  cmd_dashboards
   ;;
 status) cmd_status ;;
 password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac
