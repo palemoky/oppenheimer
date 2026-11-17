@@ -781,6 +781,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	grpcServer, err := grpcx.Listen(ctx, logger, "grpc", cfg.grpcAddr, func(s *grpc.Server) {
 		orderv1.RegisterOrderServiceServer(s, svc)
 	})
@@ -814,7 +819,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	//     没处理完的消息不提交位点，下次启动（或别的副本）重新消费。
 	//  4. 各库的 outbox 中继：排在所有会写 outbox 的组件之后，让最后写入的事件尽量在退出前发出；
 	//     没发出的也不会丢，下次启动时中继会先跑一轮。
-	//  5. 健康检查最后停。
+	//  5. 健康检查最后停（调试端口开了的话在它之后停）。
 	// 生产者、Redis、数据库和库存的连接由 defer 在 app.Run 返回后关闭，此时已没有组件在用。
 	// 全部 leader 锁（每个中继一把、sweeper、回收任务）也在 app.Run 返回后释放（先于 Redis 连接关闭）：
 	// 此时所有中继、sweeper、回收任务都已停下。
@@ -830,7 +835,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
 	components = append(components, background...)
-	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, components...)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, app.WithDebug(debugServer, components...)...)
 }
 
 // openOrderCache 按配置创建订单查询缓存。ORDER_CACHE_TTL=0 时缓存为 nil（关闭）。

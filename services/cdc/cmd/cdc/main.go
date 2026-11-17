@@ -221,8 +221,13 @@ func run(ctx context.Context, logger *slog.Logger, resetName, printName string) 
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	logger.InfoContext(ctx, "listening", "http_addr", httpServer.Addr().String(), "pipelines", cfg.names)
 
-	// app.Run 按相反顺序停止：健康检查先停，然后各流水线停止读取、落最后一次位点。
-	return app.Run(ctx, logger, append(components, httpServer)...)
+	// app.Run 按相反顺序停止：健康检查先停，然后各流水线停止读取、落最后一次位点，调试端口（开了的话）最后停。
+	return app.Run(ctx, logger, app.WithDebug(debugServer, append(components, httpServer)...)...)
 }

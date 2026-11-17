@@ -107,6 +107,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开。不挂在对外的 8080 上；也不挂在管理端口上，
+	// 和其他服务统一用一个单独的端口，见 app.DebugAddrEnv。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	logger.InfoContext(ctx, "listening", "addr", httpServer.Addr().String(), "admin_addr", adminServer.Addr().String())
 
 	// 停止顺序与列出的顺序相反：
@@ -114,12 +120,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	//     让负载均衡把流量挪走，然后才开始下面的停止。本机默认 0。
 	//  1. 对外的 HTTP：不再接新请求，等在途的请求做完。
 	//  2. 限流的汇总日志：在 HTTP 停下之后才停，把停止前最后一段的拒绝次数也记下来。
-	//  3. 内部端口最后停：停止过程中探测和 /degrade 一直可用。
+	//  3. 内部端口最后停：停止过程中探测和 /degrade 一直可用。调试端口（开了的话）在它之后停。
 	// 下游连接和限流的 Redis 由 defer 在 RunWith 返回后关闭，此时已没有组件在用。
 	components := []app.Component{adminServer}
 	if rlReporter != nil {
 		components = append(components, rlReporter)
 	}
 	components = append(components, httpServer)
-	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: drainDelay}, components...)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: drainDelay}, app.WithDebug(debugServer, components...)...)
 }

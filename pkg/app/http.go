@@ -10,16 +10,27 @@ import (
 	"time"
 )
 
+// errNilHandler 表示 ListenHTTP 收到了 nil handler。
+var errNilHandler = errors.New("nil handler would serve http.DefaultServeMux")
+
 // HTTPServer 把 http.Server 适配成 Component。
 type HTTPServer struct {
 	name string
 	ln   net.Listener
 	srv  *http.Server
+	// closeOnStop 为真时 Stop 直接断开所有连接，不等在途请求（调试端口用，见 ListenDebug）。
+	closeOnStop bool
 }
 
 // ListenHTTP 立即绑定 addr 并返回尚未开始服务的 HTTPServer。
 // 在这里而不是在 Start 里监听，端口冲突等错误可以在启动其他组件之前暴露。
+//
+// handler 不能为 nil：http.Server 会把 nil 换成 DefaultServeMux，而导入 net/http/pprof 时它的 init
+// 往 DefaultServeMux 上注册了 pprof（见 DebugMux），用它服务就等于把 pprof 开在了这个端口上。
 func ListenHTTP(ctx context.Context, name, addr string, handler http.Handler) (*HTTPServer, error) {
+	if handler == nil {
+		return nil, fmt.Errorf("listen %s on %s: %w", name, addr, errNilHandler)
+	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -51,7 +62,12 @@ func (s *HTTPServer) Start(context.Context) error {
 
 // Stop 实现 Component：停止接收新连接，等待在途请求处理完或 ctx 到期。
 func (s *HTTPServer) Stop(ctx context.Context) error {
-	err := s.srv.Shutdown(ctx)
+	var err error
+	if s.closeOnStop {
+		err = s.srv.Close()
+	} else {
+		err = s.srv.Shutdown(ctx)
+	}
 	// Start 从未被调用时 Shutdown 不知道这个 listener，需要自己关。
 	// 已被 Shutdown 关过时这里会返回 net.ErrClosed，可以忽略。
 	if cerr := s.ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
