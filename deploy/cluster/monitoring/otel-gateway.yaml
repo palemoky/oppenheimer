@@ -63,6 +63,13 @@ config:
       limit_percentage: 80
       spike_limit_percentage: 20
     batch: {}
+    # 日志单独一个 batch，限制每批最多 2000 条（约 1.7 MB）。默认的 batch 没有上限：agent 把积压的日志一口气发过来时
+    # 会合成 8000 多条、6.9 MB 的一批，超过 Loki 单次能接受的突发量，Loki 每次都答 429，重试多少次都不会成功，
+    # 5 分钟后被丢弃（2026-11-17 实测丢了约 5.7 万行，设计文档 3a 第 8 节“验证 5”）。Loki 的限额也调大了（loki.yaml），
+    # 两边都改：批次有上限之后，一批能不能被接受就不再取决于积压了多少。
+    batch/logs:
+      send_batch_size: 2000
+      send_batch_max_size: 2000
     # 尾部采样（ADR-0030 第 6 项）：等一条链路的 span 到齐再决定留不留。三条策略是“或”的关系，命中任意一条就留：
     # 出错的全留、慢的全留、其余留 10%。头部采样在请求开始时就掷骰子，那时还不知道它会不会出错。
     #
@@ -116,5 +123,5 @@ config:
         exporters: [otlp_http/prometheus]
       logs:
         receivers: [otlp]
-        processors: [memory_limiter, batch]
+        processors: [memory_limiter, batch/logs]
         exporters: [otlp_http/loki]

@@ -47,6 +47,14 @@ loki:
     # 日志的时间戳比这个旧、或者比现在新太多的，直接拒绝。保留期是 7 天，没必要接受更旧的。
     reject_old_samples: true
     reject_old_samples_max_age: 168h
+    # 写入限额。默认是每秒 4 MB、突发 6 MB（整个租户），每条流每秒 3 MB、突发 15 MB。
+    # 突发量同时是“单次请求最大能多大”：比它大的请求永远被拒绝（429），重试没有用。
+    # Collector 积压之后补发、或者压测时日志量上来，都会撞上默认值（2026-11-17 实测，设计文档 3a 第 8 节“验证 5”）。
+    # 这里只有一个租户、一个写入方，限额的作用只剩下保护 Loki 自己的内存，放宽到内存受得了的程度。
+    ingestion_rate_mb: 16
+    ingestion_burst_size_mb: 32
+    per_stream_rate_limit: 8MB
+    per_stream_rate_limit_burst: 32MB
     # 单体模式下一次查询不要把自己撑爆。
     max_query_parallelism: 4
 

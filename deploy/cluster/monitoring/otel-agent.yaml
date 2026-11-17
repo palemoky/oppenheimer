@@ -51,7 +51,11 @@ config:
       check_interval: 1s
       limit_percentage: 80
       spike_limit_percentage: 20
-    batch: {}
+    # 每批最多 2000 条（约 1.7 MB）。默认没有上限：gateway 回来之后 filelog 一口气追读积压的日志，
+    # batch 会合出 7000 多条的一批，超过 gateway 的 gRPC 接收上限（4 MiB），这是不可重试的错误，整批被丢（2026-11-17 实测）。
+    batch:
+      send_batch_size: 2000
+      send_batch_max_size: 2000
 
     # 业务服务的日志是一行一个 JSON：{"time":..., "level":"INFO", "msg":..., "trace_id":..., "span_id":...}。
     # 这里只取三样：level 作为日志的 severity，trace_id、span_id 作为 LogRecord 自己的 trace 上下文
@@ -97,12 +101,21 @@ config:
 
   exporters:
     debug: null
-    # 发给 gateway，由它转发 Loki。重试和发送队列保持默认：gateway 不可用时在内存队列里排队（默认 1000 批），
-    # 队列满了新数据被拒绝，filelog 会按 retry_on_failure 重试，检查点不前进，所以不会丢，只是延迟。
+    # 发给 gateway，由它转发 Loki。gateway 不可用时的目标是“不丢，只是延迟”：日志文件还在磁盘上，agent 等得起。
+    # 默认值做不到这一点（2026-11-17 停掉 gateway 5 分钟实测丢了约 4700 行，设计文档 3a 第 8 节“验证 5”）：
+    #   - 重试默认最多 300 秒（max_elapsed_time），超过就丢掉这一批。改成 0：一直重试。
+    #   - 队列（默认 1000 批）满了默认是拒绝新数据，而前面的 batch 处理器是异步的，不会把这个错误传回 filelog，
+    #     数据就在 batch 那里被丢掉了。改成 block_on_overflow：队列满了就堵住 batch，batch 再堵住 filelog，
+    #     filelog 停止读文件，读到哪里的检查点不前进；gateway 回来之后从停下的地方接着读。
+    # 代价：gateway 长时间不在、而日志文件被 kubelet 轮转掉（单个文件 10 Mi、每个容器留 5 个）时，轮转掉的部分还是丢。
     otlp_grpc:
       endpoint: otel-gateway.monitoring:4317
       tls:
         insecure: true
+      retry_on_failure:
+        max_elapsed_time: 0
+      sending_queue:
+        block_on_overflow: true
 
   service:
     pipelines:
