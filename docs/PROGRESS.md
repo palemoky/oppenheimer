@@ -6,12 +6,12 @@
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
-- **最后更新**：2026-11-17（阶段 3a 的设计已确认，kube-prometheus-stack、Loki、Tempo 已装，见下面“3a 做到哪”；当前分支是 `phase-3a`，改动没有提交）
+- **最后更新**：2026-11-17（阶段 3a 做到设计第 6 节的第 4 步：Collector 已装，六个服务的指标、链路、日志都进了后端，见下面“3a 做到哪”；当前分支是 `phase-3a`，前三步已提交（`fe88b18`、`69030ff`），第 4 步的改动没有提交）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
 ### 3a 做到哪（2026-11-17）
 
-设计文档 [design/3a-observability.md](design/3a-observability.md)，**主人已确认第 2 节的十项，都按建议**（2026-11-17），决定在 ADR-0030。实现顺序在设计第 6 节，每一步的结果和量到的数在第 8 节。分支 `phase-3a`（从 `phase-2d` 开出，带着那个不在 `main` 里的文档提交），**下面的改动都没有提交**。
+设计文档 [design/3a-observability.md](design/3a-observability.md)，**主人已确认第 2 节的十项，都按建议**（2026-11-17），决定在 ADR-0030。实现顺序在设计第 6 节，每一步的结果和量到的数在第 8 节。分支 `phase-3a`（从 `phase-2d` 开出，带着那个不在 `main` 里的文档提交）。前三步已提交，**第 4 步的改动没有提交，也没有推送**。
 
 **做完的：**
 
@@ -20,17 +20,26 @@
 - k3s 的 scheduler、controller-manager、kube-proxy 的指标只监听本机，抓不到，先关了（设计第 8 节）。
 - 设计第 6 节的第 3 步，Loki 3.7.10 和 Tempo 3.1.1（单体模式、本地盘，都在 k3s-server 上）：`scripts/cluster/monitoring.sh loki|tempo`，`make monitoring-up` 现在依次装三样。Grafana 里 Loki、Tempo、Prometheus 三个数据源健康检查通过，互相跳转已配（`deploy/cluster/monitoring/datasources.yaml`）。Tempo 的 metrics-generator 已打开，写 Prometheus 的 remote write。**还没有任何日志和链路进来**：跳转、metrics-generator 生成的指标都要等第 4 步接上 Collector 才能验证。版本已登记。
 
+- 设计第 6 节的第 4 步，Collector 和服务接入（细节和量到的数在设计第 8 节“第 4 步”）：
+  - `scripts/cluster/monitoring.sh collector`（`make monitoring-up` 现在依次装四样）。Collector contrib 0.165.0，两个 release：`otel-gateway`（Deployment，在 k3s-server 上，收 OTLP 分发到 Tempo、Prometheus、Loki）和 `otel-agent`（DaemonSet，只读容器日志）。**尾部采样、`spanmetrics`、`servicegraph` 还没有加**（第 6 步）；agent 不开 `kubeletstats`（和设计 3.3 不一致，设计已改）。
+  - service chart：默认导出到 `http://otel-gateway.monitoring:4317`，指标 15 秒导出一次，资源属性里有命名空间、Pod、节点和 `service.version`（镜像 tag），出站排除加了 4317。
+  - 验证 1 到 3 用接口查过，都成立：六个服务的指标在 Prometheus 里；一单的三条链路在 Tempo 里（按订单号查要写成数字，不加引号）；按 `trace_id` 在 Loki 里查到同一条链路三个服务的日志；exemplar 查得到。**Grafana 界面上点一遍（大盘到链路到日志）还没有做，要主人或下个会话在浏览器里看一次。**
+  - **查出并修了一个埋点缺陷**：三分之一的 MySQL span 被标成 Error（`driver.ErrSkip`）。改了 `pkg/mysqlx`（两个 otelsql 选项）加一个用例。全量 `make lint test` 通过（输出在 `tmp/lint-test-3a-step4.log`）。
+  - 集群现状：六个服务的镜像 tag 是 `69030ff-dirty-20261117101712`（含上面的修复）；两次滚动期间探针 0 失败；没有不正常的 Pod。本机的 compose 中间件这次 `make up` 起来了，还在运行。
+
 **要回头看的：**
 
-- etcd 的 WAL fsync p99 装完时是 29.6 毫秒（2b 记的是 8 到 16）。量的时候 server 刚重启、在拉镜像，不能直接算在监控头上。**空转一天后再量**：`histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))`。
+- etcd 的 WAL fsync p99 在服务接上之后是 15.9 毫秒（装完时的 29.6 是启动期间的）。仍然**空转一天后再量**：`histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))`。
 - `local-path` 不限制卷的大小，PVC 上写的容量不起作用；server 的系统盘只有 60 GB，靠保留期兜着，3c 的磁盘告警要盖住它。
-- 什么业务指标都没接，序列数已经 13.2 万（kubelet 7.2 万、apiserver 4.7 万），比设计第 4 节估的多。
+- 序列数 16.5 万（业务服务只占 4600，kubelet 7.2 万、apiserver 4.7 万），比设计第 4 节估的多。
+- 第 4 步留下的小事（设计第 8 节末尾）：metrics-generator 的 exemplar 标签名是 `traceID`，数据源里配的是 `trace_id`，从它的图上跳不到链路；`evalsha` 遇到 `NOSCRIPT` 的 span 被标成 Error；Tempo 的搜索接口带时间范围时查不到刚写入的数据；旧的一个 gateway Pod 滚动前重启过 26 次，原因没有查；本机 `pkg/cache` 的 `TestHitDoesNotLoad` 在 `make up` 刚起来时连 Redis 超时失败过两次，之后三次通过。
 
 **下一步，新会话从这里开始**（设计第 6 节）：
 
-1. 第 4 步：Collector 的 gateway 和 agent（OTel Collector contrib，版本查到的是 v0.165.0，引入时核对；写入地址：Loki `http://loki.monitoring:3100/otlp`，Tempo `tempo.monitoring:4317`，Prometheus 的 OTLP 接收端 `http://kps-prometheus.monitoring:9090/api/v1/otlp`）；service chart 加 `OTEL_EXPORTER_OTLP_ENDPOINT` 和边车的出站排除（4317）；六个服务滚动一遍；做设计第 5 节的验证 1 到 3。
-2. 之后用监控重现“新 order Pod 一就绪就 503”（设计第 6 节第 1 条：2c 的“冷连接池”推断和代码对不上，`redisx.OpenLazy` 返回前已经把池子建满，原因未知，没有改代码）。必须在 HPA 和 3b 之前解决。
-3. 其余按设计第 6 节的第 5 到 8 步。
+1. 请主人看第 4 步的改动，决定提交（提交前已通过 `make lint test`；之后只改了 chart 的一行和文档）。
+2. 用监控重现“新 order Pod 一就绪就 503”（设计第 6 节第 1 条：2c 的“冷连接池”推断和代码对不上，`redisx.OpenLazy` 返回前已经把池子建满，原因未知，没有改代码）。做法：压到 HPA 扩容（2c 是约 810 请求/秒），看连接池的等待（`db_client_connections_waits`）、Pod 的 CPU 节流、出错请求的链路（现在不采样，全在 Tempo 里）。这两次滚动时探针（90 请求/秒）没有出现 503。必须在 HPA 和 3b 之前解决。
+3. 第 5 步，可以并行派出去：中间件的 exporter（Sonnet）；Istio 的 `PodMonitor` 和标签裁剪（Sonnet）；pprof 端点（Opus，`pkg/app`）；大盘（Sonnet，一个大盘一个任务）。
+4. 其余按设计第 6 节的第 6 到 8 步（尾部采样和对比、按 QPS 的 HPA、定保留期并重建一次）。
 
 没有查证的（设计 1.3）：除 kube-prometheus-stack、Prometheus、Loki、Tempo 之外的版本都是 Haiku 子 Agent 查的，主会话没有核对；KEDA 没有在 Kubernetes 1.37 上测过；mysqld_exporter 对 MySQL 9.x 的支持。
 

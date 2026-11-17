@@ -7,16 +7,16 @@
 ## 3a 可观测三件套
 
 - [x] kube-prometheus-stack：Prometheus、Grafana、Alertmanager、node-exporter、kube-state-metrics（设计文档 [3a-observability.md](../design/3a-observability.md)、ADR-0030）
-- [ ] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0004）
+- [x] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0004）
 - [ ] Collector 的部署形态（DaemonSet 还是 Deployment）、批处理、采样、内存限制，以及对 Collector 自身的监控
 - [ ] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟
 - [ ] 中间件 exporter：MySQL、Redis、Kafka（含消费延迟）
-- [ ] 日志：结构化日志（JSON，带 trace id），Loki 收集
+- [x] 日志：结构化日志（JSON，带 trace id），Loki 收集
 - [ ] 链路：Grafana Tempo（单体模式），由 Collector 经 OTLP 写入（ADR-0024，原计划是 SkyWalking）
   - 存储放本地盘还是 NAS 上的对象存储；保留期和采样率按实测的数据量定
   - 打开 metrics-generator，生成 service graph（服务拓扑）和 span 指标，写进 Prometheus
   - 尾部采样在 Collector 里做（只留出错的和慢的），和 1d 的头部采样对比（设计文档 1d 的 8.7）
-- [ ] 链路打通 HTTP → gRPC → Kafka → MySQL、Redis
+- [x] 链路打通 HTTP → gRPC → Kafka → MySQL、Redis
 - [ ] Go 运行时指标与持续剖析入口：goroutine 数、堆、GC、pprof 端点（阶段 4 的泄漏类故障要用）
 - [ ] 指标、日志、链路通过 trace id 互相跳转
 - [ ] Grafana 大盘：业务总览、单服务、中间件、集群资源
@@ -71,4 +71,4 @@
 
 ## 面试考点
 
-OpenTelemetry 的架构（API、SDK、Collector、OTLP）与上下文传播；指标、日志、链路各自解决什么问题；Prometheus 拉模型、数据模型、PromQL、直方图与分位数；链路追踪的上下文传播与采样；SLI、SLO、错误预算；告警疲劳与如何设计好告警；压测方法论与常见瓶颈；Go 性能分析（pprof、trace、GC 调优）。
+OpenTelemetry 的架构（API、SDK、Collector、OTLP）与上下文传播；Collector 的 agent 加 gateway 两层部署各自做什么、`memory_limiter` 为什么放最前；推和拉两种采集方式怎么发现“对方挂了”；日志的 `trace_id` 为什么不做 Loki 的标签（结构化元数据）；埋点把正常的返回值记成错误的例子（`driver.ErrSkip`，设计文档 3a 第 8 节第 4 步）；指标、日志、链路各自解决什么问题；Prometheus 拉模型、数据模型、PromQL、直方图与分位数；链路追踪的上下文传播与采样；SLI、SLO、错误预算；告警疲劳与如何设计好告警；压测方法论与常见瓶颈；Go 性能分析（pprof、trace、GC 调优）。

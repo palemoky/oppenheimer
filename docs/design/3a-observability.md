@@ -100,7 +100,7 @@ gateway 的管线：
 
 尾部采样只有 1 个副本时才成立。要多副本就得在前面加一层按 trace id 分流的 Collector（`loadbalancing` exporter）；这里不做，记成考点。1 个副本的代价是它重启时丢几秒数据，可以接受。
 
-agent 的管线：`filelog` 读 `/var/log/pods/` 下的容器日志，解析 containerd 的行格式，再解析我们的 JSON，取出级别、`trace_id`、`span_id`；`kubeletstats` 抓本节点 Pod 的资源用量。
+agent 的管线：`filelog` 读 `/var/log/pods/` 下的容器日志，解析 containerd 的行格式，再解析我们的 JSON，取出级别、`trace_id`、`span_id`。原来还计划用 `kubeletstats` 抓本节点 Pod 的资源用量，实现时去掉了（kube-prometheus-stack 已经在抓 kubelet，见第 8 节第 4 步）。
 
 **Collector 自己的监控**：它在 8888 端口出自己的指标（收了多少、拒了多少、丢了多少、队列多长、采样决定各多少），由 Prometheus 抓，进“Collector”大盘。3c 里给“拒收”和“导出失败”配告警。
 
@@ -229,3 +229,36 @@ gateway 和 order 现在按 CPU 伸缩。CPU 对 order 是个凑合的信号（�
 - **`local-path` 不限制卷的大小**：PVC 上写的 10 Gi、20 Gi 只是个标签，没有东西拦着它们写满节点的盘。真正起作用的是保留期（和 Prometheus 的容量上限）。server 的系统盘只有 60 GB，3c 的磁盘告警要盖住它。
 - 空载时的内存：Loki 39 Mi、Tempo 19 Mi、Prometheus 560 Mi（还在涨）、Grafana 422 Mi。server 节点 39%。
 - 没有处理的：Tempo 的 jaeger 接收端关不掉（chart 的模板直接引用它，删掉渲染失败），多开了几个没人用的监听；Loki 的 chart 即使关了缓存也会建一个 `loki-memcached` 的 ServiceAccount。
+
+### 第 4 步：Collector 和服务接入（2026-11-17）
+
+`scripts/cluster/monitoring.sh collector`，`make monitoring-up` 现在依次装四样。values 在 `deploy/cluster/monitoring/otel-gateway.yaml`、`otel-agent.yaml`。管线由主会话定，Sonnet 写 values 并在本机用真的镜像校验（`validate` 加一次喂假日志的实测），主会话读过后在集群上安装。
+
+- **版本核对过**：Collector contrib v0.165.0 是 GitHub 上最新的正式版（2026-11-07）；chart `opentelemetry-collector` 0.178.3 默认的是 0.163.2，用 `--set image.tag` 覆盖。
+- **gateway**（Deployment，1 个副本，在 k3s-server 上）：收 OTLP，`memory_limiter`、`batch`，三条管线分别到 Tempo、Prometheus 的 OTLP 接收端、Loki 的 OTLP 接收端。**尾部采样、`spanmetrics`、`servicegraph` 这一步没有加**，留给第 6 步：先有一段“全量、不采样”的数据作对照，也让下面第 1 条的排查能看到全部链路。
+- **agent**（DaemonSet，三个节点各一个）：只读本节点的容器日志发给 gateway。日志正文是 JSON 时取 `level` 作级别、`trace_id` 和 `span_id` 作日志记录自己的链路字段，正文保持原样，其余字段不提成属性；资源上没有 `service.name` 时用容器名补上（业务 Pod 的容器名就是服务名）。
+- **和 3.3 的设计不一致，改了设计**：agent 不开 `kubeletstats`。kube-prometheus-stack 已经在抓 kubelet 和 cAdvisor（7.2 万条序列），再收一份是重复的。agent 因此不需要访问 Kubernetes API，没有 ClusterRole。
+- chart 的几个行为（子 Agent 报的，渲染结果里核对过）：它把导出器和接收器的名字改写成新的（`otlp_grpc`、`otlp_http`、`file_log`），查日志和配置时按新名字找；values 里的列表是整体覆盖的，所以 JSON 的处理放在 `transform` 处理器里，没有去改预设生成的 `filelog` 操作符；开了检查点（重启后接着上次的位置读）之后 agent 以 root 运行并挂宿主机的 `/var/lib/otelcol`。
+- **service chart**：`config` 的默认值里加了 `OTEL_EXPORTER_OTLP_ENDPOINT`（`http://otel-gateway.monitoring:4317`）和 `OTEL_METRIC_EXPORT_INTERVAL`（15 秒，SDK 默认 60 秒）；e2e 那一套的叠加层本来就覆盖这个地址，chaos、bench 本来就置空，都不受影响。Downward API 把命名空间、Pod 名、节点名放进 `OTEL_RESOURCE_ATTRIBUTES`，`service.version` 用镜像的 tag（镜像构建时不带 `.git`，进程自己读不到提交号）。出站排除名单加了 4317。
+- 六个服务带着探针滚动了一遍：11120 个请求 0 失败。
+
+**验证 1 到 3 的结果：**
+
+1. 指标：六个服务都有，共约 4600 条序列（order 1682、inventory 944、orderindex 652、payment 536、gateway 400、cdc 15）。名字和本机一致（`rpc_server_call_duration_seconds_*`、`order_admissions_total`、`db_client_*`、`go_*` 等），每条带 `service_name`、`service_instance_id`、`k8s_pod_name`、`k8s_namespace_name`、`k8s_node_name`。滚动之后只有新 Pod 的序列在更新。
+2. 链路：经入口下一单并支付，按 `X-Trace-Id` 在 Tempo 里查到下单链路 52 个 span（gateway、order、inventory，含 PRODUCER 和 CONSUMER）、支付链路 20 个 span（gateway、order、payment）；按订单号查到第三条 `payment.complete`。**订单号是整数属性，TraceQL 里不能加引号**：`{ span.app.order_id = 910471714539307015 }`，加了引号查不到也不报错。Tempo 的搜索接口带 `start`、`end` 时查不到刚写进去的数据，不带就有（原因没有查）。
+3. 互相跳转：按 `trace_id` 在 Loki 里查到这条下单链路在 gateway、order、inventory 三个服务的 5 行日志（`{service_name=~".+"} | trace_id="..."`），Loki 的标签只有 `service_name`、`k8s_namespace_name`、`k8s_pod_name`、`k8s_container_name` 四个，`trace_id` 在结构化元数据里。Prometheus 里查得到 exemplar：SDK 的直方图上标签名是 `trace_id`，和数据源里配的一致；metrics-generator 生成的直方图上是 `traceID`，Grafana 里从这些图跳不过去（没有改）。**这三项是用接口查的，Grafana 界面上点一遍还没有做。**
+
+metrics-generator 生成的指标验证了（第 3 步留下的）：`traces_service_graph_*`、`traces_spanmetrics_*` 都有，共约 1900 条序列。service graph 里把每个 MySQL 库、每个 Redis 节点都算成了一个“服务”。
+
+**靠后端查出的第一个缺陷，已修：三分之一的 MySQL span 是假错误。** span 指标里 `mysql INSERT`、`mysql SELECT`、`mysql UPDATE` 各有三分之一是 `STATUS_CODE_ERROR`，错误信息是 `driver: skip fast-path; continue as if unimplemented`。原因：驱动没开 `interpolateParams` 时，带参数的语句先返回 `driver.ErrSkip`，`database/sql` 再改走“预处理、执行”；otelsql 默认把这个返回值记成了错误。1d 在本机看链路时没有按状态筛过，所以没发现。`pkg/mysqlx` 里打开了 `DisableErrSkip` 和 `WithDisableSkipErrMeasurement`，加了一个用例（修之前失败）。重新构建部署之后（镜像 tag `69030ff-dirty-20261117101712`，滚动期间探针 23140 个请求 0 失败），两分钟里 6.7 万个 MySQL span 没有一个是 Error，`target_info` 上有了 `service_version`。没有处理的：这样的语句仍然是三个 span（被跳过的那次、预处理、执行），otelsql 没有只去掉第一个的开关。
+
+类似但没有改的：go-redis 跑 Lua 脚本先发 `EVALSHA`，节点上没有这个脚本时返回 `NOSCRIPT` 再改发 `EVAL`，那个 `evalsha` span 被标成 Error。每个脚本在每个 Redis 节点上只出现一次（这次滚动之后共 4 个）。
+
+**量到的数**（服务接上之后约 10 分钟，只有探针的流量，不代表稳态）：
+
+- 序列总数 16.5 万（接之前 13.2 万）：业务服务 4600、metrics-generator 1900、Collector 自己 200，其余的增量来自新 Pod。
+- 内存：Prometheus 690 Mi、Grafana 434 Mi、Tempo 118 Mi、Loki 110 Mi、gateway 84 Mi、agent 71 到 80 Mi。server 节点 36%，两个 agent 节点 27%、29%。
+- etcd 的 WAL fsync p99 是 15.9 毫秒，回到了 2b 记的范围（装完时的 29.6 毫秒是启动期间的）。仍然按原计划空转一天后再量一次。
+- Collector 自己的计数：拒收 0、发送失败 0。
+
+没有处理的：agent 的 Pod 名是 `otel-agent-agent-*`（chart 在名字后面加模式名）；Loki 的结构化元数据里有 `k8s_pod_uid`、`k8s_container_restart_count` 这类用不上的；agent 的检查点在 gateway 不可用时是否真的不前进，没有验证（第 5 节的验证 5 一起做）；滚动前旧的一个 gateway Pod 显示重启过 26 次（最近一次在滚动前 73 分钟），Pod 已经换掉，原因没有查。
