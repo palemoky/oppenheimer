@@ -94,11 +94,16 @@ func OpenLazy(cfg Config) (*sql.DB, error) {
 	attrs := otelsql.WithAttributes(attribute.String("db.system.name", "mysql"), attribute.String("db.namespace", parsed.DBName))
 	db := otelsql.OpenDB(connector, attrs,
 		otelsql.WithSpanNameFormatter(spanName),
+		// 同上，耗时指标里也不把 ErrSkip 记成 status=error。
+		otelsql.WithDisableSkipErrMeasurement(true),
 		otelsql.WithSpanOptions(otelsql.SpanOptions{
 			// 这几类 span 每条语句都会多出来一两个，没有信息量：连接放回池子时的重置、遍历结果集、建连接。
 			OmitConnResetSession: true,
 			OmitRows:             true,
 			OmitConnectorConnect: true,
+			// 带参数的语句，驱动先返回 driver.ErrSkip，database/sql 再改走预处理：这是两者之间的约定，不是失败。
+			// 不关的话每条带参数的语句都有一个标成 Error 的 span，后端按错误筛选时全是它。
+			DisableErrSkip: true,
 			// 没有父 span 的语句不建 span。中继、sweeper、应用者这些后台循环每秒都在查，ctx 里没有 span，
 			// 不过滤的话每条语句都是一条孤立的链路。后台循环看指标。
 			SpanFilter: func(ctx context.Context, _ otelsql.Method, _ string, _ []driver.NamedValue) bool {
