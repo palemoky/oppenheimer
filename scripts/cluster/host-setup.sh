@@ -81,7 +81,41 @@ NIC_MAC="$(cat "/sys/class/net/$HOST_NIC/address")"
 # 文件名排在安装器写的 00-*.yaml 后面，同名的键以这里为准（网卡不再自己要地址）。
 # 网桥固定用网卡的 MAC：不固定的话每次重建网桥 MAC 会变，邻居的 ARP 缓存要等过期。
 # 关掉 STP：只有一个上联口，不会成环；开着的话每次起来要等 30 秒才转发。
+#
+# 板载网口是兜底的管理通道，和网桥在同一个网段。同一个网段有两个口时，内核回包只看目的地址：
+# 从板载口进来的连接，回包会从网桥出去。网桥的上联断了（网卡改名、网线拔了但虚拟机的端口让它
+# 保持有载波）时，这些回包就丢了，板载口插着线也登录不上（2026-11-17 实际发生过）。所以：
+#   - 地址写成 /32：主路由表里不出现“这个网段走板载口”的路由，宿主机自己发起的流量仍然只走网桥，
+#     不会因为插了板载口就去不了虚拟机；
+#   - 另建一张路由表，里面这个网段和默认路由都走板载口；
+#   - 一条策略路由：源地址是板载口地址的包查这张表。回包的源地址就是它，所以从哪个口进来就从哪个口回去。
+# 地址是静态的，不依赖 DHCP：兜底的通道不该再依赖别的设备。安装器给它写的 dhcp4 在这里关掉。
+#
+# Wi-Fi 有同样的问题，用同样的策略路由解决，但地址仍然由 DHCP 给：主路由表里它那条优先级低的路由要留着，
+# 网线拔掉（网桥没有载波）时宿主机自己发起的流量靠它出去。所以策略路由按 R2S 绑定的那个地址写；
+# 万一 DHCP 给了别的地址，规则不命中，退回到没有这段配置时的行为。
+# 这里只给安装器已经配好的 Wi-Fi 接口补几个键（netplan 按接口名合并各个文件）。接口名对不上时不能写：
+# 那等于定义一个没有接入点的 Wi-Fi，netplan 会报错，整份网络配置都不生效。
 NETPLAN=/etc/netplan/10-cluster-bridge.yaml
+WIFI_BLOCK=""
+if [[ "$(netplan get "wifis.$HOST_WIFI_NIC.access-points" 2>/dev/null)" == "null" ]]; then
+  echo "    wifi $HOST_WIFI_NIC is not configured in netplan; skip its policy route" >&2
+else
+  WIFI_BLOCK="  wifis:
+    $HOST_WIFI_NIC:
+      routes:
+        - to: $LAN_NET/$LAN_PREFIX
+          scope: link
+          table: $HOST_WIFI_TABLE
+        - to: default
+          via: $LAN_GATEWAY
+          on-link: true
+          table: $HOST_WIFI_TABLE
+      routing-policy:
+        - from: $HOST_WIFI_IP
+          table: $HOST_WIFI_TABLE
+          priority: 100"
+fi
 TMP="$(mktemp)"
 cat >"$TMP" <<EOF
 # 由 Oppenheimer 仓库的 scripts/cluster/host-setup.sh 生成，不要手工修改。
@@ -92,6 +126,23 @@ network:
       dhcp4: false
       dhcp6: false
       optional: true
+    $HOST_FALLBACK_NIC:
+      optional: true
+      dhcp4: false
+      addresses: [$HOST_FALLBACK_IP/32]
+      routes:
+        - to: $LAN_NET/$LAN_PREFIX
+          scope: link
+          table: $HOST_FALLBACK_TABLE
+        - to: default
+          via: $LAN_GATEWAY
+          on-link: true
+          table: $HOST_FALLBACK_TABLE
+      routing-policy:
+        - from: $HOST_FALLBACK_IP
+          table: $HOST_FALLBACK_TABLE
+          priority: 100
+$WIFI_BLOCK
   bridges:
     $HOST_BRIDGE:
       # optional：没插网线时开机不等它。不写的话 systemd-networkd-wait-online 要等满 2 分钟才超时，
@@ -115,9 +166,18 @@ if [[ -f $NETPLAN ]] && cmp -s "$TMP" "$NETPLAN"; then
   rm -f "$TMP"
   echo "    netplan unchanged"
 else
+  # 新配置通不过检查时把旧文件放回去：留一份坏的配置在那里，下次重启网络就起不来了。
+  OLD="$(mktemp)"
+  [[ -f $NETPLAN ]] && cp -p "$NETPLAN" "$OLD"
   install -m 600 "$TMP" "$NETPLAN"
   rm -f "$TMP"
-  netplan generate
+  if ! netplan generate; then
+    if [[ -s $OLD ]]; then install -m 600 "$OLD" "$NETPLAN"; else rm -f "$NETPLAN"; fi
+    rm -f "$OLD"
+    echo "netplan rejected the new config; restored the previous one" >&2
+    exit 1
+  fi
+  rm -f "$OLD"
   netplan apply
   echo "    netplan applied"
 fi
