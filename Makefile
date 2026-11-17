@@ -283,6 +283,14 @@ mesh-status: ## 查看 Istio 控制面的状态（Pod、Helm release、istioctl 
 mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod，确认请求经过两边的边车并且是 mTLS，跑完清掉
 	scripts/cluster/mesh.sh check
 
+.PHONY: monitoring-up
+monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo）；要在 make cluster-up 之后；可重复执行
+	scripts/cluster/monitoring.sh up
+
+.PHONY: monitoring-status
+monitoring-status: ## 看可观测后端的状态：Pod 在哪个节点、卷、不健康的抓取目标
+	scripts/cluster/monitoring.sh status
+
 .PHONY: images
 images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓库，tag 是提交号（有未提交改动时带 -dirty-时间）；make images IMAGE_SERVICES="order gateway" 只做部分
 	scripts/cluster/images.sh all $(IMAGE_SERVICES)

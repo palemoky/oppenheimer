@@ -1,0 +1,171 @@
+# kube-prometheus-stack 的 Helm values（chart 版本在 scripts/cluster/cluster.env 的 KPS_VERSION）。
+# 设计文档 3a、ADR-0030。由 scripts/cluster/monitoring.sh 安装到命名空间 monitoring。
+#
+# 放在哪：有状态的三样（Prometheus、Alertmanager、Grafana）优先调度到 k3s-server。阶段 4 关的是 agent 节点，
+# 监控不能跟着被关掉。用的是“优先”而不是“必须”：server 放不下时宁可落到别处，也不要起不来。
+# 数据在 local-path 的卷上，第一次调度到哪个节点，以后就一直在那个节点。
+
+# 资源名的前缀。不写的话是 kps-kube-prometheus-stack-prometheus 这样的长名字；脚本和别处按 kps-prometheus 引用。
+fullnameOverride: kps
+
+# ---- k3s 的布局和 kubeadm 不同 ----
+# k3s 把 apiserver、scheduler、controller-manager、kube-proxy 编在一个进程里。scheduler（10259）、
+# controller-manager（10257）、kube-proxy（10249）的指标端口只监听 127.0.0.1（在节点上 ss -ltnp 确认过），
+# Prometheus 抓不到。要抓得给 k3s 加三组启动参数并重启所有节点；这三个组件的指标眼下没有要回答的问题，先关掉，
+# 连同它们的告警规则（否则会一直报“目标消失”）。
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+# etcd 是内嵌的，2a 装 k3s 时开了 etcd-expose-metrics，监听在 server 节点的 2381（明文 HTTP）。
+# 它不是 Pod，没有标签可选，所以直接写节点地址。
+kubeEtcd:
+  enabled: true
+  endpoints: [__SERVER_IP__]
+  service:
+    port: 2381
+    targetPort: 2381
+
+defaultRules:
+  rules:
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    windows: false
+windowsMonitoring:
+  enabled: false
+
+prometheusOperator:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  affinity: &preferServer
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+
+prometheus:
+  prometheusSpec:
+    # 按版本规则用 LTS（3.13，支持到 2027-07-31），chart 默认的是最新的 3.16。
+    image:
+      tag: __PROMETHEUS_TAG__
+    replicas: 1
+    affinity: *preferServer
+    resources:
+      requests: {cpu: 200m, memory: 1536Mi}
+      limits: {memory: 3Gi}
+    # 保留期和容量上限哪个先到算哪个。容量上限要比卷小：WAL 和正在压缩的块不算在里面。
+    retention: 15d
+    retentionSize: 15GB
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+    # 服务的指标由 Collector 用 OTLP 写进来（ADR-0030 第 1 项），不是抓的。
+    enableOTLPReceiver: true
+    # Tempo 的 metrics-generator 把它从链路里算出的指标（service graph、span 指标）用 remote write 写进来。
+    enableRemoteWriteReceiver: true
+    otlp:
+      # 资源属性默认只进 target_info，查询时要 join。常用来筛选的这几个直接提成每条序列的标签。
+      # 都是低基数的：服务名、实例（Pod 名）、命名空间、节点。
+      promoteResourceAttributes:
+        - service.name
+        - service.instance.id
+        - service.version
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.node.name
+    # 推上来的点可能比 Prometheus 的时钟晚一点（Collector 的批处理、重试）。不给窗口的话晚到的点直接被拒。
+    tsdb:
+      outOfOrderTimeWindow: 5m
+    # exemplar：直方图的点上带 trace id，Grafana 里从延迟的图跳到链路。
+    enableFeatures: [exemplar-storage]
+    exemplars:
+      maxSize: 100000
+    # 默认只认带这个 release 标签的 ServiceMonitor、PodMonitor、规则。关掉之后集群里所有命名空间的都认，
+    # 中间件和业务服务的监控对象可以放在各自的目录里，不用记得打标签。
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+# 告警的路由和通知在 3c 做，这里只让它跑起来。
+alertmanager:
+  alertmanagerSpec:
+    replicas: 1
+    affinity: *preferServer
+    resources:
+      requests: {cpu: 10m, memory: 48Mi}
+      limits: {memory: 128Mi}
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 1Gi
+
+grafana:
+  # 密码在脚本生成的 Secret 里，不入库。
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  affinity: *preferServer
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  # 大盘和数据源都从 ConfigMap 加载（仓库里有），Grafana 自己的库里只剩用户设置，丢了无所谓；
+  # 仍然给一个小卷，免得每次重启都要重新登录、丢掉临时建的大盘。
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 2Gi
+  # 单副本加 RWO 的卷：滚动更新时新旧 Pod 抢同一个卷，改成先停后起。
+  deploymentStrategy:
+    type: Recreate
+  defaultDashboardsTimezone: browser
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL # 带 grafana_dashboard 标签的 ConfigMap，任何命名空间
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      searchNamespace: ALL
+      # chart 生成的 Prometheus 数据源上，exemplar 里的 trace_id 跳到 Tempo（数据源在 datasources.yaml，uid 是 tempo）。
+      exemplarTraceIdDestinations:
+        datasourceUid: tempo
+        traceIdLabelName: trace_id
+        urlDisplayLabel: View trace
+  grafana.ini:
+    server:
+      root_url: http://__GRAFANA_HOST__/
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+      check_for_plugin_updates: false
+
+kube-state-metrics:
+  resources:
+    requests: {cpu: 10m, memory: 48Mi}
+    limits: {memory: 192Mi}
+
+prometheus-node-exporter:
+  resources:
+    requests: {cpu: 20m, memory: 24Mi}
+    limits: {memory: 96Mi}

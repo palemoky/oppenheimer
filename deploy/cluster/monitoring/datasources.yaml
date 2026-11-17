@@ -1,0 +1,78 @@
+# Grafana 的 Loki 和 Tempo 数据源（设计文档 3a、ADR-0030）。由 scripts/cluster/monitoring.sh tempo 一并 apply。
+# Grafana 的 sidecar 搜所有命名空间里带 grafana_datasource 标签的 ConfigMap（kube-prometheus-stack.yaml 里开着），
+# 改了会自动重新加载，不用重启 Grafana。
+#
+# Prometheus 数据源是 kube-prometheus-stack 自己建的（uid 是 prometheus），这里不重复定义。
+# Prometheus 上从 exemplar 跳到链路的配置不在这里，在 kube-prometheus-stack.yaml 的
+# grafana.sidecar.datasources.exemplarTraceIdDestinations（它是 chart 生成的那个数据源的一个字段）。
+#
+# 注意 $$：Grafana 加载数据源配置时会展开 $VAR 和 ${VAR}（环境变量），要原样传给 Grafana 的占位符写成 $$。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources-logs-traces
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"
+data:
+  loki-tempo.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        # 单体模式没有 gateway，直接连 Loki 的 Service。
+        url: http://loki.monitoring:3100
+        jsonData:
+          maxLines: 1000
+          # 从日志跳到链路。日志是 JSON，trace id 也作为结构化元数据 trace_id 存在，
+          # 所以按名字取（matcherType: label 对结构化元数据和标签都有效），不用写正则去解析日志行。
+          derivedFields:
+            - name: trace_id
+              matcherType: label
+              matcherRegex: trace_id
+              datasourceUid: tempo
+              url: $${__value.raw}
+              urlDisplayLabel: View trace
+
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.monitoring:3200
+        jsonData:
+          # 从 span 跳到同一条链路的日志。OTLP 写进 Loki 的 service.name 会成为标签 service_name，
+          # trace_id 是结构化元数据，所以用自定义查询：先按服务选流，再按 trace_id 过滤，
+          # 不会退化成对全部日志做文本匹配。span 的起止前后各放宽 5 分钟（日志和 span 的时钟、写入都有延迟）。
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: -5m
+            spanEndTimeShift: 5m
+            tags:
+              - key: service.name
+                value: service_name
+            filterByTraceID: false
+            filterBySpanID: false
+            customQuery: true
+            query: '{$${__tags}} | trace_id="$${__trace.traceId}"'
+          # 从 span 跳到 metrics-generator 生成的 RED 指标。span-metrics 用 service 作服务名的标签。
+          tracesToMetrics:
+            datasourceUid: prometheus
+            spanStartTimeShift: -5m
+            spanEndTimeShift: 5m
+            tags:
+              - key: service.name
+                value: service
+            queries:
+              - name: Request rate
+                query: sum(rate(traces_spanmetrics_calls_total{$$__tags}[$$__rate_interval]))
+              - name: Error rate
+                query: sum(rate(traces_spanmetrics_calls_total{$$__tags, status_code="STATUS_CODE_ERROR"}[$$__rate_interval]))
+              - name: Latency p95
+                query: histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket{$$__tags}[$$__rate_interval])) by (le))
+          # 服务图用 metrics-generator 的 service-graphs 指标，查询发给 Prometheus。
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
