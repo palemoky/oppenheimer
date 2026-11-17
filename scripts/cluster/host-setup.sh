@@ -65,6 +65,13 @@ if [[ ! -e /sys/class/net/$HOST_NIC ]]; then
   echo "NIC $HOST_NIC not found" >&2
   exit 1
 fi
+# 新装的网卡还没有任何 netplan 配置，接口是关着的：这时读 carrier 会报错，不代表没插网线。
+# 先把接口打开，再等自协商完成（2.5G/5G 的网卡刚起来时链路会先起落一次）。
+ip link set "$HOST_NIC" up
+for _ in $(seq 15); do
+  [[ "$(cat "/sys/class/net/$HOST_NIC/carrier" 2>/dev/null || echo 0)" == "1" ]] && break
+  sleep 1
+done
 if [[ "$(cat "/sys/class/net/$HOST_NIC/carrier" 2>/dev/null || echo 0)" != "1" ]]; then
   echo "NIC $HOST_NIC has no link; plug in the cable first" >&2
   exit 1
