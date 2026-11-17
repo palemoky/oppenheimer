@@ -61,7 +61,13 @@
      - **主人 2026-11-17 的四个答复**：同意从空集群重建；五个大盘和“大盘 → 链路 → 日志”在浏览器里看过，没有问题（“互相跳转”已勾）；提交并推送；同意降入口的访问日志，已改成只留 5xx 和带 response flags 的（`deploy/cluster/envoy-gateway/gateway.yaml`，已应用并实测）。全量 `make lint test` 通过（输出在 `tmp/lint-test-3a-step7.log`）。
      - **从空集群重建做完了（2026-11-17 14:00 到 14:45 UTC）**，设计第 8 节“第 8 步：从空集群重建”：新的一键顺序走通，约 35 分钟；探针 0 失败，`make cluster-e2e` 通过，三种信号、Istio 的指标、KEDA、大盘都在。中途 `make deploy` 失败一次：提交号 `7390796` 全是数字，`helm --set` 把镜像 tag 当成整数，`services.sh` 已改成 `--set-string`。
      - **集群现状（重建之后）**：全新的集群，六个服务的镜像 tag 是 `7390796`；库里只有示例 SKU 和验收时探针、e2e 留下的几千单；MySQL 的密码、Grafana 的密码都是新生成的；主库都是序号 0；监控的数据从重建时重新开始攒；没有不正常的 Pod。上面“集群现状”那一段写的是重建之前的。
-   **3a 现在剩下的（新会话从这里开始）**：空转一天后（从重建算起，即 2026-11-18 15:00 UTC 之后）再量一次内存、磁盘和 etcd 的 fsync，量完勾掉“保留策略与资源占用评估”；笔记 `docs/notes/3a-observability.md`（派 Sonnet，材料是设计第 8 节）；验证 6（`make cluster-fault` 抽几个场景对指标；先确认 e2e 那一套的指标进不进 Prometheus）；
+     - PR #15 第二次推送（`c0fcda1`）的 CI 27 项全部通过（`test (./services/order)` 4 分 15 秒、e2e 3 分 36 秒，没有变慢）。
+     - **验证 6 和笔记做完了（2026-11-17，这一批没有提交）**：
+       - 验证 6：`FAULT_TELEMETRY=1 E2E_KEEP=1 FAULT_SCENARIOS="A B D E" make cluster-fault` 通过，脚本、Istio 的指标、服务自己的指标三边对得上（设计第 8 节“验证 6”）。`FAULT_TELEMETRY` 和 `deploy/cluster/services/fault-telemetry/` 是新加的。**查出并修了**：并发上限的拒绝记在 `upstream_rq_active_overflow` 上，全网格保留的和网格大盘画的是另外两项（`istiod.yaml`、`istio-monitors.yaml`、`mesh.json`、`fault.sh` 已改，五个带边车的服务滚动过，Pod 模板上多了 `restartedAt` 注解，无害）。Pod 注解里的 `proxyStatsMatcher` 是覆盖不是合并。熔断器和降级开关的指标没有对（要对中间件做故障注入，阶段 4）。
+       - 尾部采样之后 exemplar 大半跳不到链路（40 个里查得到 14 个），没有改，记在设计第 8 节最后一段和 ADR-0030 的补充里。
+       - 笔记 `docs/notes/3a-observability.md`（Sonnet 写，640 行上下；主会话抽查了数字、补了 14a 一节、按它报的不一致改了 ADR 和设计）。它提的、没有处理的质疑：`READ_BUSY` 那件事的样本很小、16 个读名额为什么会满只是推断；etcd 的 fsync 三次都高于 10 毫秒却一直没有查；“监控自己看不见的故障”（推送的指标没有 `up`、KEDA 取数失败、复制停了延迟指标消失）在 3c 之前没有任何告警兜着。
+       - 没有改 Go 代码；脚本过了 `shellcheck -x`，没有重新跑 `make lint test`。`oppenheimer-e2e` 命名空间已清掉，没有不正常的 Pod。
+   **3a 现在剩下的（新会话从这里开始）**：空转一天后（从重建算起，即 2026-11-18 15:00 UTC 之后；注意重建之后又做过一轮故障注入和两次短的探针）再量一次内存、磁盘和 etcd 的 fsync，量完勾掉“监控数据保留策略与资源占用评估”，3a 就收尾了；这一批改动等主人说了再提交和推送；PR #15 还是 draft。3a 收尾后是 3b（压测，需要 Mac mini，还没有装 k6）。3b 之前的小事：Grafana 主容器的 requests 调到 384 Mi；agent 的内存上限；拆开看 405 请求/秒时 CPU 就到 70% 的原因。
 7. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
 
 集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；命名空间 `keda` 里有 KEDA 的三个 Pod；Loki、Collector（gateway 和三个 agent）按新配置滚动过；gateway、order 的伸缩由 `ScaledObject` 管（各 2 个副本）；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。

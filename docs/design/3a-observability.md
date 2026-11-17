@@ -490,7 +490,7 @@ CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kaf
 
 - 空闲时三样加起来一天不到 2 GB（Prometheus 估 1 到 1.3 GB/天，按每个样本 1.5 到 2 字节算的，是估计；Loki 空闲时每秒 17 行，可以忽略；Tempo 空闲时每秒约 200 个 span，约 3 GB/天会被 3 天的保留期截在 9 GB 上下）。Prometheus 有容量上限兜底，另外两样没有。
 - **盘是被压测写满的，不是被保留期。** 按这几轮的数折算，每个请求大约落 1.2 个 span（尾部采样后）和 1.4 KB 的日志。2000 请求/秒压一小时：Tempo 约 1.5 GB，Loki 约 1.4 GB（压缩后）。3b 的长稳测试压几个小时就是十几到二十 GB，盘装得下，但和 etcd 在同一块盘上。3b 开始前先定：长稳测试期间日志和链路要不要再降。
-- **日志的 60% 是入口 Envoy 的访问日志**（4 小时里 776 MB，gateway 229、order 127、inventory 125，其余可以忽略）。每个请求在入口记一行、在 gateway 又记一行，内容是重复的。最便宜的降法是关掉入口的访问日志或者只留出错的。**主人同意后已改成只留出错的**（`deploy/cluster/envoy-gateway/gateway.yaml` 的 `telemetry.accessLog`：5xx 或者带 response flags 的才记，这两类正好是 gateway 的日志里没有的）。实测正常请求不再记、`Host` 不存在的请求（404、`NR`）记了，改动经 xDS 下发，Envoy 没有重启。一个坑：CRD 的文档说多条 `matches` 满足一条就记，Envoy Gateway v1.10.0 实际生成的是 `and_filter`，“或”要写在一条 CEL 表达式里。
+- **日志的 60% 是入口 Envoy 的访问日志**（4 小时里各服务写进 Loki 的日志量，压缩前：入口 776 MB、gateway 229 MB、order 127 MB、inventory 125 MB，其余可以忽略）。每个请求在入口记一行、在 gateway 又记一行，内容是重复的。最便宜的降法是关掉入口的访问日志或者只留出错的。**主人同意后已改成只留出错的**（`deploy/cluster/envoy-gateway/gateway.yaml` 的 `telemetry.accessLog`：5xx 或者带 response flags 的才记，这两类正好是 gateway 的日志里没有的）。实测正常请求不再记、`Host` 不存在的请求（404、`NR`）记了，改动经 xDS 下发，Envoy 没有重启。一个坑：CRD 的文档说多条 `matches` 满足一条就记，Envoy Gateway v1.10.0 实际生成的是 `and_filter`，“或”要写在一条 CEL 表达式里。
 - 序列数：活跃的 21.8 万（头块里 26.8 万，多出来的是这几个小时里消失的 Pod 留下的）。kubelet 9.9 万、apiserver 6.3 万，两样占四分之三，业务服务加中间件不到 3 万。比上次量的 19.0 万多出来的主要在这两样上（扩容出来的 Pod、KEDA 带来的新资源类型）。Prometheus 的内存还有余量，没有裁；要裁先裁 apiserver 的直方图和 cAdvisor 里用不到的指标。
 - etcd 的 WAL fsync p99 这次是 19.1 毫秒（上次 15.9）。仍然高于 10 毫秒的参考线，仍然没有查原因。
 
@@ -508,7 +508,7 @@ CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kaf
 
 | 信号 | 停掉的 5 分钟 | 为什么 |
 |---|---|---|
-| 指标 | 图上断 5 分钟，**累计的数没有丢**：`increase` 算出来 61293 个请求，探针发了 60855 个 | SDK 导出的是累计值（每次都是从进程启动到现在的总数），中间几次没送到，下一次送到的数里已经包含了 |
+| 指标 | 图上断 5 分钟，**累计的数没有丢**：`increase` 算出来 61293 个请求，探针发了 60855 个（多出来的不到 1%，`increase` 会按窗口外推，窗口里还有探针开始前的几个请求） | SDK 导出的是累计值（每次都是从进程启动到现在的总数），中间几次没送到，下一次送到的数里已经包含了 |
 | 链路 | **丢了**。停掉期间 Tempo 里是 0 条，恢复前最后几十秒有 50 条 | SDK 的队列只有 2048 个 span，满了就丢新的；链路没有“下次补上”这回事 |
 | 日志 | 改配置之前丢了约 6 万行，改之后**不丢，延迟到 gateway 回来之后补齐** | 日志文件在磁盘上，agent 可以停下来等 |
 
@@ -544,7 +544,7 @@ CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kaf
 - **主从延迟的图在复制停掉时不是变大，而是断掉。** SQL 线程不在运行时 MySQL 的 `Seconds_Behind_Source` 是 `NULL`，exporter 就不出这个指标。所以“延迟大于若干秒”的告警对“复制停了”这种最严重的情况恰恰不响。3c 的主从告警要写成三条：`replica_sql_running == 0`、`replica_io_running == 0`、延迟超过阈值；中间件大盘上运行状态的那一格已经有了。
 - 另外 `Seconds_Behind_Source` 量的是“从库正在执行的事务比主库晚多少”，从库空闲时是 0，IO 线程断了它也可能是 0。要准的延迟得靠心跳表，这是 3c 里“CDC 源库心跳”那一项。
 
-没有做的：验证 6（`make cluster-fault` 抽几个场景对指标）。
+验证 6 见后面单独的一节。
 
 ### 第 8 步：从空集群重建（2026-11-17）
 
@@ -572,3 +572,34 @@ CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kaf
 - 重建之后三个节点的内存是 29%、30%、40%（server 5.1 GiB）。活跃序列 22.0 万。
 
 重建把监控的数据清空了，所以“空转一天后再量”要从这次重建算起（2026-11-17 14:40 UTC 之后没有再压测）。
+
+### 验证 6：故障注入时监控上的数和实际发生的事对不对得上（2026-11-17）
+
+`FAULT_TELEMETRY=1 E2E_KEEP=1 FAULT_SCENARIOS="A B D E" make cluster-fault`，四个场景都通过（输出在 `tmp/cluster-fault-3a.log`）。`FAULT_TELEMETRY=1` 是这次加的：fault 那一套平时把导出关掉，开了之后多叠一层 `deploy/cluster/services/fault-telemetry/`，服务的指标和链路进集群里的 Collector（`k8s_namespace_name` 是 `oppenheimer-e2e`）。跑完保留现场，等一次抓取之后到 Prometheus 里对数，再清掉。
+
+没有做 C（强制删 Pod，被删的边车上的计数跟着没了，对不了）、F、G。**熔断器（`pkg/breaker`）和降级开关的指标这次没有对**：`make cluster-fault` 的场景只碰边车，不碰 Redis 和 MySQL；设计第 5 节写的“熔断器、开关”要等阶段 4 对中间件做故障注入时才对得了。
+
+三个来源的数：脚本自己数的（从 MacBook 收到的响应、直接读边车的统计）、Istio 的指标、服务自己的指标（SDK）。
+
+| 发生的事 | 脚本 | Istio 的指标（调用方一侧） | 服务自己的指标（gateway） |
+|---|---|---|---|
+| D：400 个并发里被并发上限当场拒绝的 | 144 个快速 503；边车 `upstream_rq_active_overflow` 74 + 70 | `response_flags="UO"` 144 | 合在下面的 503 里，分不出来 |
+| B、D：发到被挂住的 inventory、等到边车超时的 | B 60 个加 D 256 个；边车 `upstream_rq_timeout` 159 + 155 = 314 | `UT` 314，另有 3 个是 gateway 进程自己先超时（gRPC 状态 4，没有响应标志）；被调用方一侧看到 317 个被取消的请求 | `DEADLINE_EXCEEDED` 3（对应 HTTP 504 3 个） |
+| B：摘除生效之后被当场拒绝的 | 11 个；边车 `upstream_cx_none_healthy` 7 + 4 | `UH` 11 | 合在 503 里 |
+| 查库存失败的合计 | B 71 个（503 70、504 1）加 D 400 个 = 471 | 144 + 314 + 11 + 3 = 472 | HTTP 503 469、504 3 = 472；gRPC 客户端 `UNAVAILABLE` 469、`DEADLINE_EXCEEDED` 3 |
+| E：查不存在的 SKU | 404 30 个，摘除计数不变 | gRPC 状态 5（`NOT_FOUND`），没有响应标志 | HTTP 404 30、`NOT_FOUND` 30 |
+| 摘除的次数 | B 期间 +4 | `ejections_enforced_total` 两个 gateway 各 4（含 D） | 没有这个指标 |
+
+结论：
+
+- **三个来源对得上。** 合计差的 1 个（471 对 472）推断是脚本等恢复时发的探测请求，没有计进它打印的数；没有证实。
+- **分得清“为什么失败”的只有 Istio 的指标。** 同样是 503，服务自己的指标里都是 `UNAVAILABLE`，响应标志才分得出是并发上限（`UO`）、超时（`UT`）还是没有健康的端点（`UH`）。这是留着网格指标的理由，也是 2d 里靠读边车统计才看得到的东西，现在在 Prometheus 里。
+- **查出大盘上一格是错的，已修。** 并发上限拒绝的 144 个请求全部记在 `upstream_rq_active_overflow` 上（gRPC 是 HTTP/2，超的是在途请求数），而全网格的 `proxyStatsMatcher` 留的、网格大盘“并发上限溢出”画的是 `upstream_rq_pending_overflow` 和 `upstream_cx_overflow`，这两项从头到尾是 0。也就是说长期运行的那一套真的发生溢出时，那一格是空的（响应标志那一格看得到 `UO`）。`istiod.yaml`、`istio-monitors.yaml` 的保留名单、`mesh.json` 的查询都加上了 `active`，`fault.sh` 场景 D 的输出也加了；五个带边车的服务滚动了一遍（探针 4100 个请求 0 失败），新的统计项已经在 Prometheus 里。
+- **Pod 注解里的 `proxyStatsMatcher` 是覆盖全网格的，不是合并**（上一节“没有处理的”里留的问题）：带注解的 gateway 只有注解匹配的那一个集群有摘除和溢出的统计，没带注解的 order 每个出站集群都有。`istiod.yaml` 里写“会合并”的注释已改。`fault/gateway.yaml` 的注解不动：它匹配的范围对场景够用。
+- 对数要等一次抓取：边车 30 秒抓一次，刚跑完就查，有一个 gateway 的 `UT` 少了一百多。
+
+### 尾部采样之后 exemplar 大半跳不到链路（2026-11-17）
+
+写笔记的子 Agent 提出来、主会话实测的。直方图上的 exemplar 是 SDK 在记指标时顺手带上的 trace id，那时不知道这条链路会不会被 Collector 的尾部采样留下。抽了 gateway 延迟直方图最近几分钟的 40 个 exemplar，Tempo 里查得到的只有 14 个。
+
+第 4 步验证“从延迟的图上点 exemplar 跳到链路”时还没有开尾部采样，所以当时没有发现。影响是有限的：慢的和出错的链路全留，高延迟的桶上的 exemplar 跳得过去，那也是最需要跳的；跳不过去的是普通请求的。没有改。要改的话是让 SDK 只给“会被留下”的请求带 exemplar，而这在请求结束前不知道。Grafana 上点到一条不存在的链路时要知道是这个原因。
