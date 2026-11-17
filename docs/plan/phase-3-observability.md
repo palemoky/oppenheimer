@@ -6,7 +6,7 @@
 
 ## 3a 可观测三件套
 
-- [ ] kube-prometheus-stack：Prometheus、Grafana、Alertmanager、node-exporter、kube-state-metrics
+- [x] kube-prometheus-stack：Prometheus、Grafana、Alertmanager、node-exporter、kube-state-metrics（设计文档 [3a-observability.md](../design/3a-observability.md)、ADR-0030）
 - [ ] OpenTelemetry Collector：服务统一用 OTLP 上报，由 Collector 分发指标、日志、链路（见 ADR-0004）
 - [ ] Collector 的部署形态（DaemonSet 还是 Deployment）、批处理、采样、内存限制，以及对 Collector 自身的监控
 - [ ] 业务服务指标接入 Prometheus，按 RED 方法整理：请求量、错误率、延迟

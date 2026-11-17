@@ -6,8 +6,33 @@
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
-- **最后更新**：2026-11-17（宿主机加内存、换网卡、挪插槽、改地址、启动菜单，见会话日志）
+- **最后更新**：2026-11-17（阶段 3a 的设计已确认，kube-prometheus-stack、Loki、Tempo 已装，见下面“3a 做到哪”；当前分支是 `phase-3a`，改动没有提交）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
+
+### 3a 做到哪（2026-11-17）
+
+设计文档 [design/3a-observability.md](design/3a-observability.md)，**主人已确认第 2 节的十项，都按建议**（2026-11-17），决定在 ADR-0030。实现顺序在设计第 6 节，每一步的结果和量到的数在第 8 节。分支 `phase-3a`（从 `phase-2d` 开出，带着那个不在 `main` 里的文档提交），**下面的改动都没有提交**。
+
+**做完的：**
+
+- 三台虚拟机的内存改成各 14 GiB（ADR-0030 第 5 项），逐台重启，集群自己恢复。重启时 Sentinel 切了一次，**闸门 Redis 的主库现在是 `redis-gate-1`**。`cluster.env`、`hardware.md` 已改。
+- 设计第 6 节的第 2 步，kube-prometheus-stack：`make monitoring-up`（`scripts/cluster/monitoring.sh`，values 在 `deploy/cluster/monitoring/`），命名空间 `monitoring`，release 名 `kps`。Prometheus 是 LTS 的 v3.13.5，OTLP 接收端和 exemplar 已打开；全部 Pod 和三个卷在 k3s-server 上；没有不健康的抓取目标。Grafana 经入口访问（`Host: grafana.oppenheimer.test`，地址 192.168.50.51；密码 `scripts/cluster/monitoring.sh password`）。`scripts/cluster/monitoring.sh promql '<查询>'` 直接查 Prometheus。版本已登记到 `versions.md`。
+- k3s 的 scheduler、controller-manager、kube-proxy 的指标只监听本机，抓不到，先关了（设计第 8 节）。
+- 设计第 6 节的第 3 步，Loki 3.7.10 和 Tempo 3.1.1（单体模式、本地盘，都在 k3s-server 上）：`scripts/cluster/monitoring.sh loki|tempo`，`make monitoring-up` 现在依次装三样。Grafana 里 Loki、Tempo、Prometheus 三个数据源健康检查通过，互相跳转已配（`deploy/cluster/monitoring/datasources.yaml`）。Tempo 的 metrics-generator 已打开，写 Prometheus 的 remote write。**还没有任何日志和链路进来**：跳转、metrics-generator 生成的指标都要等第 4 步接上 Collector 才能验证。版本已登记。
+
+**要回头看的：**
+
+- etcd 的 WAL fsync p99 装完时是 29.6 毫秒（2b 记的是 8 到 16）。量的时候 server 刚重启、在拉镜像，不能直接算在监控头上。**空转一天后再量**：`histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))`。
+- `local-path` 不限制卷的大小，PVC 上写的容量不起作用；server 的系统盘只有 60 GB，靠保留期兜着，3c 的磁盘告警要盖住它。
+- 什么业务指标都没接，序列数已经 13.2 万（kubelet 7.2 万、apiserver 4.7 万），比设计第 4 节估的多。
+
+**下一步，新会话从这里开始**（设计第 6 节）：
+
+1. 第 4 步：Collector 的 gateway 和 agent（OTel Collector contrib，版本查到的是 v0.165.0，引入时核对；写入地址：Loki `http://loki.monitoring:3100/otlp`，Tempo `tempo.monitoring:4317`，Prometheus 的 OTLP 接收端 `http://kps-prometheus.monitoring:9090/api/v1/otlp`）；service chart 加 `OTEL_EXPORTER_OTLP_ENDPOINT` 和边车的出站排除（4317）；六个服务滚动一遍；做设计第 5 节的验证 1 到 3。
+2. 之后用监控重现“新 order Pod 一就绪就 503”（设计第 6 节第 1 条：2c 的“冷连接池”推断和代码对不上，`redisx.OpenLazy` 返回前已经把池子建满，原因未知，没有改代码）。必须在 HPA 和 3b 之前解决。
+3. 其余按设计第 6 节的第 5 到 8 步。
+
+没有查证的（设计 1.3）：除 kube-prometheus-stack、Prometheus、Loki、Tempo 之外的版本都是 Haiku 子 Agent 查的，主会话没有核对；KEDA 没有在 Kubernetes 1.37 上测过；mysqld_exporter 对 MySQL 9.x 的支持。
 
 ### 2c 做到哪（2026-11-15）
 
@@ -356,7 +381,7 @@
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机 10、16、16 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
+| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机各 14 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 开机（2026-11-17），`ssh mini`，还没有装 k6 |
 | DS218+ | 开机（2026-11-17） |
 
@@ -414,6 +439,8 @@
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
 | 2026-11-16 | 2d 的 NetworkPolicy 一条改用网格的 mTLS 严格模式加 `AuthorizationPolicy` 实现（只管服务之间的 gRPC）；Argo CD、cert-manager、灰度发布这次不做 | 主人确认（ADR-0029 第 8 项）：网格自带，按身份比按地址准；其余几项留到有需要时 |
+| 2026-11-17 | 三台虚拟机的内存从 10、16、16 改成各 14 GiB；监控的后端优先放在 k3s-server | 阶段 4 关 agent 节点时监控不能跟着没。见 ADR-0030，主人确认 |
+| 2026-11-17 | 2c 留下的“新 order Pod 一就绪就 503”不按“冷连接池”去改，等监控装好后重现再定 | 读代码发现连接池在就绪前已经建满，原推断只有时间上的吻合 |
 
 ## 会话日志
 
