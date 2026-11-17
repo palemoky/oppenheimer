@@ -5,8 +5,9 @@
 ## 当前状态
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
-- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。工作区是干净的。
-- **最后更新**：2026-11-17（宿主机加内存、换网卡，见会话日志；这些改动已提交并推送到 `phase-2d`）
+- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。2026-11-17 晚些时候又追加了一个提交（宿主机的地址和兜底通道、`hardware.md` 精简），**没有推送**。工作区是干净的。
+- **最后更新**：2026-11-17（宿主机加内存、换网卡、挪插槽、改地址、启动菜单，见会话日志）
+- **开始阶段 3 之前先看**：`redis-gate-1`（现在的主库）还在 CrashLoopBackOff（AOF 损坏，见“2a 做到哪”的第 2 项和会话日志 2026-11-17），没有处理；PR #13 还没有合并，新追加的提交没有推送；Mac mini 要开机。
 
 ### 2c 做到哪（2026-11-15）
 
@@ -142,7 +143,7 @@
 停在哪、在等什么：
 
 1. 2a 没有在等的事。重启宿主机的检查已做（2026-11-15）：不做任何操作，104 秒后集群全部恢复。宿主机上有主人自己的一个 traefik 容器，以后重启宿主机前仍然先说一声。
-2. **PCIe 网卡已装好，有线是千兆了（2026-11-17），但宿主机自己出不了外网，等主人改 R2S**。新网卡是 `eno1`（RTL8126），`cluster.env` 的 `HOST_NIC` 已改、`host-setup.sh` 已重跑，`br0` 的 MAC 跟着变成了新网卡的。R2S 上 192.168.50.19 的静态绑定和代理白名单还认旧 MAC，所以宿主机解析域名拿到假地址、连接超时（虚拟机不受影响，实测正常）。主人在 R2S 上把这两处换成新 MAC 之后，在宿主机上 `curl -m 8 https://github.com` 验证。同一天还有两件没处理的事，见会话日志 2026-11-17：NAS 没开机（镜像仓库的 Pod 挂不上 NFS）；`redis-gate-1` 的 AOF 损坏，在 CrashLoopBackOff。以下是装之前写的说明，留作记录。原文：PCIe 网卡还没装，有线仍是 100 Mbit/s。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。2026-11-16 补充：主人选了一块最高 5G 的 PCIe 网卡（型号和芯片装好后用 `lspci -nn` 确认并记到 `hardware.md`）；新网卡的 MAC 和板载的不同，R2S 上 192.168.50.19 的静态绑定和代理白名单要跟着改。板载网口（RTL8168h，r8169）不支持 `ethtool --cable-test`；水晶头在这个口上卡不住，重新插入并用力按住仍然降到百兆，所以是插座内部的线对坏了，不用再查。
+2. **PCIe 网卡已装好，有线是千兆，宿主机出网正常（2026-11-17 晚些时候验证：`curl https://github.com` 返回 200）。网卡后来挪到了 `PCI_E4`，接口名现在是 `enp41s0`，见会话日志同日最后一段；下面写的 `eno1` 是挪之前的名字。R2S 上 `.19` 的静态绑定仍然认板载口的 MAC（板载口插线后 DHCP 拿到的也是 `.19`），要不要清掉由主人定。** 以下是当时的记录：PCIe 网卡装好后宿主机一度出不了外网，等主人改 R2S。新网卡是 `eno1`（RTL8126），`cluster.env` 的 `HOST_NIC` 已改、`host-setup.sh` 已重跑，`br0` 的 MAC 跟着变成了新网卡的。R2S 上 192.168.50.19 的静态绑定和代理白名单还认旧 MAC，所以宿主机解析域名拿到假地址、连接超时（虚拟机不受影响，实测正常）。主人在 R2S 上把这两处换成新 MAC 之后，在宿主机上 `curl -m 8 https://github.com` 验证。同一天还有两件没处理的事，见会话日志 2026-11-17：NAS 没开机（镜像仓库的 Pod 挂不上 NFS）；`redis-gate-1` 的 AOF 损坏，在 CrashLoopBackOff。以下是装之前写的说明，留作记录。原文：PCIe 网卡还没装，有线仍是 100 Mbit/s。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。2026-11-16 补充：主人选了一块最高 5G 的 PCIe 网卡（型号和芯片装好后用 `lspci -nn` 确认并记到 `hardware.md`）；新网卡的 MAC 和板载的不同，R2S 上 192.168.50.19 的静态绑定和代理白名单要跟着改。板载网口（RTL8168h，r8169）不支持 `ethtool --cable-test`；水晶头在这个口上卡不住，重新插入并用力按住仍然降到百兆，所以是插座内部的线对坏了，不用再查。
 3. 出网的白名单由主人管，**不要去改 R2S**。R2S 经路由通告下发的 IPv6 DNS 不走代理、返回被污染的地址，节点一侧已经绕开（`accept-ra: false`）；局域网里其他在白名单内的设备可能有同样的问题，已告诉主人。
 
 下一步：
@@ -348,14 +349,14 @@
 
 ## 阻塞项与待确认
 
-- 内存只测了一部分（见会话日志 2026-11-17），完整的 memtest86+ 还没有跑，要主人在开机菜单里选。
+- 内存测试已做完：memtest86+ 完整跑了两轮没有错误（2026-11-17，主人在开机菜单里跑的），之后已卸载。
 
 ## 设备状态（上次已知）
 
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机 10、16、16 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `eno1` 接在网桥 `br0` 上（千兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
+| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机 10、16、16 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 关机，阶段 3 开始需要 |
 | DS218+ | 开机（2026-11-17） |
 
@@ -560,3 +561,16 @@
 - 三台虚拟机的内存改成 10、16、16 GiB（主人同意的方案）：`vm.sh` 加了 `resize` 子命令（正常关机、`virsh setmaxmem` 和 `setmem --config`、开机），`cluster.env` 已改。按 agent-1、agent-2、server 的顺序一次一台，每台开机后 40 到 70 秒集群全部恢复。改完节点内存占用是 server 34%、两个 agent 24% 和 25%。
 - 关 agent-2 时 Sentinel 做了一次切换，**Redis 主从现在的主库是 `redis-gate-1`**（上面“2a 做到哪”里写的 `redis-gate-0` 已过时）。
 - 当天的改动（`scripts/cluster/cluster.env`、`host-setup.sh`、`vm.sh`、`docs/infra/hardware.md`、本文件）已在当天提交并推送到 `phase-2d`。
+
+同一天最后（主人挪了网卡的插槽之后）：
+
+- 主人把 Wi-Fi 和有线网卡从 `PCI_E4`、`PCI_E5` 挪到了 `PCI_E3`、`PCI_E4`（`PCI_E5` 的位置不好插拔网线）。两块网卡的接口名都变了（有线 `eno1` 变成 `enp41s0`，Wi-Fi `wlp41s0` 变成 `wlp35s0`），netplan 里的旧名字对不上，宿主机开机后两条路都不通，虚拟机在跑但没有上联。
+- 恢复的过程：网线临时插到板载口（名字没变，安装器的 DHCP 配置还在），从 MacBook 用 `ping6 ff02::1%en0` 找邻居、按主机密钥认出宿主机，经板载口的 IPv6 链路本地地址登录；先把 `/etc/netplan/00-installer-config-wifi.yaml` 里的接口名改成 `wlp35s0`（原件在宿主机的 `/root/00-installer-config-wifi.yaml.bak-20261117`），Wi-Fi 起来后网线换回 PCIe 网卡，`cluster.env` 的 `HOST_NIC` 改成 `enp41s0`，经 Wi-Fi 的 IPv6 重跑 `host-setup.sh`。
+- 恢复后验证过：`ssh ubt` 通，`enp41s0` 协商到 1Gbps 全双工，三台虚拟机和镜像仓库可达，三个节点 Ready，宿主机 `curl https://github.com` 返回 200。`redis-gate-1` 仍在 CrashLoopBackOff（上面记的 AOF 损坏，还没处理）。
+- 没有做的：让 netplan 按 MAC 认网卡（挪插槽就不会再断）。向主人提过，主人还没定。
+- 内存测试做完了：主人在开机菜单里跑 memtest86+，两轮没有错误。之后 `apt purge memtest86+`，菜单里的内存测试项没有了（`memtester` 还装着）。
+- 启动菜单：Windows 那一项从 `/etc/grub.d/40_custom` 挪到了新建的 `/etc/grub.d/15_windows`，名字改成 `Windows`，排在 `Ubuntu`、`Advanced options for Ubuntu` 之后（这两项是 `10_linux` 一起输出的，中间插不进去）；`40_custom` 恢复成原样。`update-grub` 之后 `grub-script-check` 通过，默认项仍是 Ubuntu。**改完没有重启验证过，Windows 这一项也仍然没有实际启动过。** 改之前的备份在宿主机的 `/root/grub.cfg.bak-20261117-menu` 和 `/root/40_custom.bak-20261117-menu`。
+- **宿主机的三个地址改成了连续的（主人要求）：板载 192.168.50.6、有线（`br0`）192.168.50.7、Wi-Fi 192.168.50.8。本文件更早的记录里的 .19 和 .14 指的是改之前的有线和 Wi-Fi。** 主人在 R2S 上改了三条静态绑定和代理白名单，把 MacBook 的 `~/.ssh/config` 里 `ubt` 改成了 .8；主会话把 `cluster.env` 的 `HOST_IP` 改成 .7 并重跑了 `host-setup.sh`，让 Wi-Fi 重新拿了地址，把核对过的主机公钥登记到 MacBook 的 `known_hosts` 里这三个地址下。验证过：`ssh ubt` 和 .7 都能登录，.19 和 .14 不再应答，三个节点 Ready，镜像仓库可达，宿主机 `curl https://github.com` 返回 200，脚本再跑一次没有变化。三块网卡的 MAC 不写进仓库，要用时在宿主机上 `ethtool -P <接口名>` 读。R2S 的白名单里旧的 .19 有没有删由主人处理。
+- **板载口配成了兜底通道**（主人要求）：`cluster.env` 加了 `HOST_FALLBACK_NIC`、`HOST_FALLBACK_IP`、`HOST_FALLBACK_TABLE`、`LAN_NET`，`host-setup.sh` 生成的 netplan 里给板载口写静态的 `/32` 地址、一张单独的路由表和一条按源地址的策略路由（为什么这样写在脚本的注释里）。验证过：板载口插线后从 .6 能登录；把 `enp41s0` 关掉 25 秒，期间 .19 不通而 .6 能新建 ssh 连接；宿主机到虚拟机的流量仍然走 `br0`。板载口现在插着一根线（只协商到百兆，水晶头卡不住）。Wi-Fi 随后也做了同样的处理（主人要求）：`cluster.env` 加了 `HOST_WIFI_NIC`、`HOST_WIFI_IP`、`HOST_WIFI_TABLE`，地址仍由 DHCP 给，脚本只在安装器已经配好这个 Wi-Fi 接口时才补策略路由；同样关掉 `enp41s0` 25 秒验证过，期间 `ssh ubt` 能新建连接。`host-setup.sh` 还加了一道保护：新的 netplan 通不过 `netplan generate` 时把旧文件放回去。
+- `docs/infra/hardware.md` 按主人的要求精简过：只写现状，过程性的记录（百兆的排查、换网卡、改地址的经过）不再放在那里，要查看本文件的会话日志。
+- 这一段的改动（`scripts/cluster/cluster.env`、`scripts/cluster/host-setup.sh`、`docs/infra/hardware.md`、本文件）已提交在 `phase-2d` 上，没有推送。
