@@ -545,3 +545,30 @@ CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kaf
 - 另外 `Seconds_Behind_Source` 量的是“从库正在执行的事务比主库晚多少”，从库空闲时是 0，IO 线程断了它也可能是 0。要准的延迟得靠心跳表，这是 3c 里“CDC 源库心跳”那一项。
 
 没有做的：验证 6（`make cluster-fault` 抽几个场景对指标）。
+
+### 第 8 步：从空集群重建（2026-11-17）
+
+主人确认后做的。删掉三台虚拟机，按新的顺序一步步执行（日志在 `tmp/rebuild-3a.log`）：
+
+| 步骤 | 耗时 |
+|---|---|
+| `make cluster-up` | 7 分 53 秒 |
+| `make middleware-up` | 11 分 23 秒 |
+| `make mesh-up`、`make mesh-check` | 29 秒、50 秒 |
+| `make monitoring-up` | 12 分 30 秒 |
+| `make deploy`（镜像层都在仓库里，构建和推送只用了十几秒） | 第一次失败，改了脚本后重跑 1 分 28 秒 |
+| `make deploy-seed` | 不到 1 秒 |
+
+不算失败的那一次约 35 分钟（2d 不含监控是 17 分半）。**`make monitoring-up` 排在 `make deploy` 之前这个顺序走通了**：KEDA 先于业务服务装好，gateway、order 的 `ScaledObject` 一次建成；经代理的下载这次没有断。
+
+**`make deploy` 失败的那一次查出一个早就有的隐患**：镜像 tag 是提交号的前 7 位，这次的提交号 `7390796` 恰好全是数字，`helm --set image.tag=7390796` 把它当成整数，模板里的 `printf "%s"` 渲染出 `%!s(int64=7390796)`，Pod 报 `InvalidImageName`，Helm 等了 10 分钟超时。`services.sh` 改成 `--set-string`。7 位十六进制全是数字的概率约 3.7%（(10/16)^7），所以之前几十次部署都没有碰上。
+
+验收：
+
+- 没有不正常的 Pod；除了 KEDA 的 operator 那一次预期内的重启（生成证书后自己退出），没有容器重启过。
+- 探针 5448 个请求 0 失败。`make cluster-e2e` 通过（输出在 `tmp/cluster-e2e-rebuild-3a.log`）。
+- 没有不健康的抓取目标，`mysql_up`、`redis_up` 都是 1；六个服务的指标、gateway 的链路、六个服务的日志都在后端里；Istio 的指标有数据；五个大盘的 ConfigMap 都在；KEDA 的两个 HPA 取得到数，取数失败的计数是 0。
+- 入口的访问日志：30 分钟里入口只有 64 行，gateway 是 5468 行（过滤在新集群上生效）。
+- 重建之后三个节点的内存是 29%、30%、40%（server 5.1 GiB）。活跃序列 22.0 万。
+
+重建把监控的数据清空了，所以“空转一天后再量”要从这次重建算起（2026-11-17 14:40 UTC 之后没有再压测）。
