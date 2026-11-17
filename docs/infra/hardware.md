@@ -8,7 +8,7 @@
 |---|---|---|---|
 | MacBook Pro | M5，32GB，1TB | arm64 | 开发机；OrbStack 跑本地 compose；集群操作端 |
 | Ubuntu（3900X） | 12 核 24 线程，MSI MPG X570 GAMING PLUS，48GB，1TB 系统盘加 500GB 的 Windows 盘，GTX 1660 | x86_64 | 集群宿主机：KVM 虚拟机跑 k3s |
-| Mac mini | M4，16GB，256GB | arm64 | 压测发起机（k6）；诊断 Agent 运行机 |
+| Mac mini | M4，16GB，256GB（`ssh mini`） | arm64 | 压测发起机（k6）；诊断 Agent 运行机 |
 | DS218+ | 12TB | x86_64 | NFS、镜像仓库存储、MySQL 备份 |
 | R2S | OpenWrt | — | 网关、DNS、DHCP、出网代理 |
 | RT-AC5300 | — | — | 交换和 Wi-Fi 接入（口是千兆） |
