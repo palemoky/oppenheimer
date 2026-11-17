@@ -272,7 +272,7 @@ middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Clu
 	scripts/cluster/middleware.sh all
 
 .PHONY: mesh-up
-mesh-up: ## 装 Istio 的控制面 istiod；要在 make middleware-up 之后、make deploy 之前；可重复执行
+mesh-up: ## 装 Istio 的控制面 istiod 和全网格的指标配置（Telemetry）；要在 make middleware-up 之后、make deploy 之前；可重复执行
 	scripts/cluster/mesh.sh up
 
 .PHONY: mesh-status
@@ -284,7 +284,7 @@ mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod�
 	scripts/cluster/mesh.sh check
 
 .PHONY: monitoring-up
-monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter）；要在 make cluster-up 之后；可重复执行
+monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter、Istio 边车和 istiod 的抓取对象）；要在 make cluster-up 之后；可重复执行
 	scripts/cluster/monitoring.sh up
 
 .PHONY: monitoring-status

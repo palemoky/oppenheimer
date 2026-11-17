@@ -6,9 +6,10 @@
 #   monitoring.sh tempo             Tempo（单体模式，链路；带 metrics-generator），并 apply Grafana 的数据源
 #   monitoring.sh collector         OpenTelemetry Collector：gateway（Deployment，收 OTLP 转发给后端）和 agent（DaemonSet，读容器日志）
 #   monitoring.sh exporters         MySQL、Redis 的 exporter（多目标模式，各一个 Deployment）、MySQL 的监控账号、Kafka 的 PodMonitor
+#   monitoring.sh istio             Istio 边车的 PodMonitor 和 istiod 的 ServiceMonitor（边车指标的标签裁剪在 mesh.sh up 提交的 Telemetry 里）
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
 #   monitoring.sh dashboards        把 deploy/cluster/monitoring/dashboards/*.json 做成 ConfigMap，Grafana 自动加载到文件夹 Oppenheimer
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、dashboards
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、dashboards
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -202,6 +203,16 @@ cmd_exporters() {
   echo "    Kafka: broker 和 Kafka Exporter 的指标要 middleware.sh kafka 提交 metricsConfig 之后才有（会滚动重启 broker）"
 }
 
+# Istio 的抓取对象。只依赖 kps 的 CRD，不依赖 Istio 装没装：istiod、边车不在时 Prometheus 里这两个目标是空的。
+# 指标要有数据，要 mesh.sh up（Telemetry 和 proxyStatsMatcher）之后滚动重启过业务 Pod：
+# 在那之前边车导出的是没裁过的标签，序列会比预期多（抓取时 metricRelabelings 只留了要用的指标名，不裁标签）。
+cmd_istio() {
+  echo "==> istio monitors: sidecar PodMonitor, istiod ServiceMonitor"
+  ensure_ns
+  render "$DEPLOY/istio-monitors.yaml" | kubectl apply -f - >/dev/null
+  echo "    targets show up in Prometheus within one scrape interval (30 s); check: $0 status"
+}
+
 cmd_tempo() {
   echo "==> Tempo $TEMPO_VERSION (chart $TEMPO_CHART_VERSION)"
   ensure_ns
@@ -302,6 +313,7 @@ tempo) cmd_tempo ;;
 collector) cmd_collector ;;
 datasources) cmd_datasources ;;
 exporters) cmd_exporters ;;
+istio) cmd_istio ;;
 dashboards) cmd_dashboards ;;
 up)
   cmd_kps
@@ -309,6 +321,7 @@ up)
   cmd_tempo
   cmd_collector
   cmd_exporters
+  cmd_istio
   cmd_dashboards
   ;;
 status) cmd_status ;;
@@ -316,7 +329,7 @@ password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

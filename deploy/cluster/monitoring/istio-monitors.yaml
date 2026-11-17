@@ -1,0 +1,69 @@
+# Istio 边车和 istiod 的抓取对象（设计文档 3a、ADR-0030 第 7 项）。由 scripts/cluster/monitoring.sh istio 提交。
+# 依赖 kps 装的 CRD。边车的标签裁剪在源头做（deploy/cluster/istio/telemetry.yaml），这里只管抓什么、丢什么。
+#
+# 边车：端口 http-envoy-prom（15090，Envoy 自己的指标，路径 /stats/prometheus）。不走 15020 的“合并指标”
+# （Pod 上 prometheus.io/* 注解指的那个）：它把 pilot-agent 和应用的指标并进来，这里的服务指标走 OTLP，合并没有意义，
+# 还会多出一批 pilot-agent 的序列。istio-proxy 是原生边车（init 容器），Prometheus 的服务发现会把 init 容器的端口也列出来，
+# 所以按端口名选就够了。
+# 选的是带 security.istio.io/tlsMode 标签的 Pod（注入时由 Istio 加的），所有命名空间的都抓：长期运行的和 e2e 的各是一个命名空间。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: istio-proxy
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    matchExpressions:
+      - {key: security.istio.io/tlsMode, operator: Exists}
+  namespaceSelector:
+    any: true
+  podMetricsEndpoints:
+    - port: http-envoy-prom
+      path: /stats/prometheus
+      relabelings:
+        # instance 用 Pod 名，重启后 IP 变了也认得出。
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
+      metricRelabelings:
+        # 只留要回答的问题用的：
+        #   istio_requests_total、istio_request_duration_milliseconds_*   每条边的请求量、错误、延迟
+        #   istio_tcp_*                                                    TCP 的几项（目前没有 TCP 流量，有了就有）
+        #   envoy_cluster_*：并发上限溢出和摘除（proxyStatsMatcher 打开的那几项），只要出站的集群：
+        #   xds-grpc、prometheus_stats 这些边车自己的集群不要。
+        # 两列用 ; 连起来匹配（第二列是 cluster_name），istio_ 的指标没有这个标签，所以 ; 后面是空。
+        - action: keep
+          sourceLabels: [__name__, cluster_name]
+          regex: 'istio_(requests_total|request_duration_milliseconds_(bucket|sum|count)|tcp_[a-z_]+);|envoy_cluster_(upstream_rq_pending_overflow|upstream_cx_overflow|outlier_detection_ejections_[a-z0-9_]+);outbound\|.+'
+---
+# istiod：Service istiod 的 http-monitoring 端口（15014）。只留有用的：
+#   pilot_xds                    连着的代理数
+#   pilot_xds_pushes             xDS 推送次数，type 里带 err、reject 的是推送失败
+#   pilot_xds_push_time_*        推送耗时
+#   pilot_proxy_convergence_time_*   从配置变更到代理收到的耗时
+#   pilot_total_xds_rejects、pilot_xds_rejects   代理拒收配置（NACK）
+#   pilot_conflict_*             监听器冲突（配置写错了的信号）
+#   galley_validation_*          配置校验（准入 webhook）的通过和失败
+# 其余约 400 条（Go 运行时、各种 k8s 事件计数）丢掉：内存和 CPU 用 cAdvisor 的就够了。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: istiod
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: istiod
+      istio: pilot
+  namespaceSelector:
+    matchNames: [istio-system]
+  endpoints:
+    - port: http-monitoring
+      path: /metrics
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: 'pilot_xds|pilot_xds_pushes|pilot_xds_push_time_(bucket|sum|count)|pilot_proxy_convergence_time_(bucket|sum|count)|pilot_total_xds_rejects|pilot_xds_rejects|pilot_conflict_.+|galley_validation_.+'
