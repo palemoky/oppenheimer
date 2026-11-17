@@ -4,8 +4,9 @@
 #   monitoring.sh kps               kube-prometheus-stack：Prometheus、Alertmanager、Grafana、node-exporter、kube-state-metrics
 #   monitoring.sh loki              Loki（单体模式，日志）
 #   monitoring.sh tempo             Tempo（单体模式，链路；带 metrics-generator），并 apply Grafana 的数据源
+#   monitoring.sh collector         OpenTelemetry Collector：gateway（Deployment，收 OTLP 转发给后端）和 agent（DaemonSet，读容器日志）
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -111,6 +112,24 @@ cmd_loki() {
   echo "    OTLP: http://loki.$NS:3100/otlp  (Collector 的 otlphttp 导出器 endpoint 写 http://loki.$NS:3100/otlp)"
 }
 
+OTELCOL_REPO="https://open-telemetry.github.io/opentelemetry-helm-charts"
+
+# 先装 gateway 再装 agent：agent 把日志发给 gateway，gateway 先就绪，agent 起来时就不会一开始就发送失败。
+# 镜像 tag 同样用 cluster.env 的版本覆盖（chart 默认的应用版本落后）；镜像仓库在 values 里。
+cmd_collector() {
+  echo "==> OpenTelemetry Collector $OTELCOL_VERSION (chart $OTELCOL_CHART_VERSION)"
+  ensure_ns
+  local rel
+  for rel in gateway agent; do
+    helm_retry helm upgrade --install "otel-$rel" opentelemetry-collector \
+      --repo "$OTELCOL_REPO" \
+      --version "$OTELCOL_CHART_VERSION" --namespace "$NS" \
+      -f "$DEPLOY/otel-$rel.yaml" --set "image.tag=$OTELCOL_VERSION" \
+      --wait --timeout 10m >/dev/null
+  done
+  echo "    OTLP: otel-gateway.$NS:4317 (gRPC)、otel-gateway.$NS:4318 (HTTP)；agent 在每个节点上读容器日志"
+}
+
 cmd_tempo() {
   echo "==> Tempo $TEMPO_VERSION (chart $TEMPO_CHART_VERSION)"
   ensure_ns
@@ -173,18 +192,20 @@ case "$cmd" in
 kps) cmd_kps ;;
 loki) cmd_loki ;;
 tempo) cmd_tempo ;;
+collector) cmd_collector ;;
 datasources) cmd_datasources ;;
 up)
   cmd_kps
   cmd_loki
   cmd_tempo
+  cmd_collector
   ;;
 status) cmd_status ;;
 password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

@@ -284,7 +284,7 @@ mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod�
 	scripts/cluster/mesh.sh check
 
 .PHONY: monitoring-up
-monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo）；要在 make cluster-up 之后；可重复执行
+monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector）；要在 make cluster-up 之后；可重复执行
 	scripts/cluster/monitoring.sh up
 
 .PHONY: monitoring-status

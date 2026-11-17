@@ -54,6 +54,7 @@
 | Prometheus | v3.13.5 | LTS | 2026-11-17 | 3.13 是当前的 LTS（支持到 2027-07-31）；chart 默认的是 v3.16.0，在 values 里换掉（`cluster.env` 的 `PROMETHEUS_VERSION`，镜像 tag `v3.13.5-distroless`）。补丁号是从 quay.io 的 tag 列表查的；打开了 OTLP 接收端和 exemplar 存储 |
 | Grafana Loki | 3.7.10 | 稳定版 | 2026-11-17 | 日志（设计文档 3a）。GitHub releases 的最新正式版（4.0 只有 rc），没有 LTS。chart 是 `grafana-community/loki` 21.3.1（仓库 `https://grafana-community.github.io/helm-charts`），单体模式、文件系统存储 |
 | Grafana Tempo | 3.1.1 | 稳定版 | 2026-11-17 | 链路（ADR-0024）。GitHub releases 的最新正式版，没有 LTS。chart 是 `grafana-community/tempo` 3.2.1（单体模式；旧仓库 `grafana/helm-charts` 里的 `tempo`、`tempo-distributed` 已标弃用）。3.x 的单体模式不需要 Kafka |
+| OpenTelemetry Collector contrib | 0.165.0 | 稳定版 | 2026-11-17 | 链路、指标、日志的汇聚和转发（设计文档 3a），命名空间 `monitoring`，两个 release：`otel-gateway`（Deployment）和 `otel-agent`（DaemonSet，读容器日志）。GitHub releases 的最新正式版，没有 LTS；镜像 `otel/opentelemetry-collector-contrib:0.165.0`（要 contrib 的 transform、filelog、otlphttp）。chart 是 `open-telemetry/opentelemetry-collector` 0.178.3（仓库 `https://open-telemetry.github.io/opentelemetry-helm-charts`），默认的应用版本是 0.163.2，用 `--set image.tag` 覆盖 |
 | Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |

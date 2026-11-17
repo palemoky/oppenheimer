@@ -1,0 +1,100 @@
+# OpenTelemetry Collector（gateway）的 Helm values（chart 和镜像版本在 scripts/cluster/cluster.env 的
+# OTELCOL_CHART_VERSION、OTELCOL_VERSION）。设计文档 3a、ADR-0030。
+# 由 scripts/cluster/monitoring.sh collector 安装到命名空间 monitoring，release 名 otel-gateway。
+#
+# 业务服务的链路、指标、日志（经 agent）都先发到这里，由它统一转发给 Tempo、Prometheus、Loki。
+# 把这一层放在中间，是为了让后端的地址、重试、队列、以及后面要加的采样都只在一处配置，业务服务只认 otel-gateway:4317。
+# 一个副本：这是学习用的集群，没有高可用；Pod 重启时的数据靠上游（服务的 SDK、agent 的队列）重试兜住。
+
+mode: deployment
+replicaCount: 1
+# Service 的名字必须是 otel-gateway：服务和 agent 发到 otel-gateway.monitoring:4317。
+fullnameOverride: otel-gateway
+
+image:
+  repository: otel/opentelemetry-collector-contrib # tag 由 monitoring.sh 用 --set 传入（cluster.env 的 OTELCOL_VERSION）
+
+resources:
+  requests: {cpu: 100m, memory: 512Mi}
+  limits: {memory: 1Gi}
+
+# 优先放到 k3s-server（理由同 loki.yaml：阶段 4 关的是 agent 节点，监控不能跟着被关）。用“优先”不是“必须”。
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+
+# 只留 OTLP 的 gRPC（4317）和 HTTP（4318）。chart 默认还开着 jaeger、zipkin 的端口，没有人用。
+ports:
+  jaeger-compact: {enabled: false}
+  jaeger-thrift: {enabled: false}
+  jaeger-grpc: {enabled: false}
+  zipkin: {enabled: false}
+  # 自身指标（队列长度、发送失败数、被 memory_limiter 拒绝的数量……）在 8888。
+  metrics: {enabled: true}
+
+# 用 PodMonitor 而不是 ServiceMonitor：8888 抓的是 Pod 自己，不需要经过 Service；
+# 并且同一份写法 agent 也能用（DaemonSet 没有 Service），两边保持一致。
+podMonitor:
+  enabled: true
+
+config:
+  # 自身指标直接由 Prometheus 抓，chart 默认的 prometheus 接收器（Collector 抓自己再导出）是多余的，去掉。
+  # 内部遥测监听的地址由 chart 渲染成 ${env:MY_POD_IP}:8888（不是 127.0.0.1），Prometheus 才连得上。
+  receivers:
+    jaeger: null
+    zipkin: null
+    prometheus: null
+    otlp:
+      protocols:
+        grpc:
+          endpoint: ${env:MY_POD_IP}:4317
+        http:
+          endpoint: ${env:MY_POD_IP}:4318
+
+  processors:
+    # 内存保护必须在最前：先拒绝新数据，才不会在处理器里堆积到被 OOM 杀掉。
+    # 限额取容器 limits 的 80%（1Gi），突发余量 20%；被拒绝的数据由上游的重试和队列承担。
+    memory_limiter:
+      check_interval: 1s
+      limit_percentage: 80
+      spike_limit_percentage: 20
+    batch: {}
+    # 后面加 tail_sampling 时放在 memory_limiter 之后、batch 之前：采样要看到完整的 trace，
+    # 不能在 batch 之后（batch 会把同一个 trace 的 span 拆散到不同批次）。
+
+  # 三个导出器都保留默认的重试和发送队列（chart 不改它们的默认值）：
+  #   重试：失败后指数退避重试，最长 5 分钟，超过就丢弃这一批。
+  #   发送队列：内存里的队列，默认 1000 个批次；后端不可用时先在队列里排队。
+  #   队列满了：新进来的数据直接被拒绝（不是丢旧的）并计入 otelcol_exporter_enqueue_failed_*；
+  #   拒绝会沿着管线回传给发送方，发送方（服务的 SDK、agent）再按自己的重试和队列处理。
+  # 队列在内存里，gateway 重启会丢掉队列里的数据，这个取舍对学习用的集群是可以接受的。
+  exporters:
+    debug: null
+    otlp_grpc:
+      endpoint: tempo.monitoring:4317
+      tls:
+        insecure: true # 集群内明文
+    otlp_http/prometheus:
+      # Prometheus 的 OTLP 接收端；导出器自己会在后面加 /v1/metrics。
+      endpoint: http://kps-prometheus.monitoring:9090/api/v1/otlp
+    otlp_http/loki:
+      endpoint: http://loki.monitoring:3100/otlp
+
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp_grpc]
+      metrics:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp_http/prometheus]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp_http/loki]
