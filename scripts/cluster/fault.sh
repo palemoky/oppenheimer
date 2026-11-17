@@ -56,6 +56,8 @@
 #   FAULT_F_CONTROL    设为 1 时场景 F 再做一次对照：把 VirtualService inventory 的 from-gateway 路由改成重试 2 次，
 #                      预期 upstream_rq_retry > 0；做完 kubectl apply deploy/cluster/mesh/inventory.yaml 改回来
 #   FAULT_G_CYCLES     场景 G 的次数，默认 4
+#   FAULT_TELEMETRY    设为 1 时服务把指标和链路导出到集群里的 Collector（多叠一层 deploy/cluster/services/fault-telemetry/），
+#                      配合 E2E_KEEP=1 可以在跑完之后到 Prometheus 里对数；默认 0
 #   IMAGE_TAG、E2E_SKIP_IMAGES、E2E_KEEP、E2E_RUN_ID（默认当前 Unix 时间）、E2E_NAMESPACE（默认 oppenheimer-e2e）：同 chaos.sh
 # 退出码：0 全部通过；1 有场景失败（脚本中途出错被 set -e 中止的也多半是 1，看输出区分）；2 参数或环境不对；3 命名空间被占用。
 #
@@ -81,6 +83,11 @@ source "$HERE/e2e-lib.sh"
 NS="${E2E_NAMESPACE:-oppenheimer-e2e}"
 export E2E_NAMESPACE="$NS"
 export E2E_OVERLAY_DIR="$ROOT/deploy/cluster/services/fault"
+# FAULT_TELEMETRY=1：再叠一层，把指标和链路导出到集群里的 Collector（要先 make monitoring-up），
+# 用来拿监控上的数和这里从边车读到的数对照。默认不开，断言不依赖监控。
+if [[ "${FAULT_TELEMETRY:-0}" == 1 ]]; then
+  E2E_OVERLAY_DIR="$E2E_OVERLAY_DIR:$ROOT/deploy/cluster/services/fault-telemetry"
+fi
 IMAGES="gateway order inventory payment orderindex cdc"
 SKIP_DEPLOY="${FAULT_SKIP_DEPLOY:-0}"
 
@@ -1099,7 +1106,7 @@ if wanted D; then
     log "  latency of the waited ones min/max: $(awk '$3 >= 1000' "$OUT" | sort -k3 -n | awk 'NR == 1 {a = $3} {b = $3} END {print a "/" b}')ms"
     for gw in $GW_PODS; do
       log "    $gw: app->sidecar +$(stat_delta d0 d1 down downstream_rq_total "$gw"), sidecar->inventory +$(stat_delta d0 d1 up upstream_rq_total "$gw")," \
-        "pending_overflow +$(stat_delta d0 d1 up upstream_rq_pending_overflow "$gw"), cx_none_healthy +$(stat_delta d0 d1 up upstream_cx_none_healthy "$gw")"
+        "active_overflow +$(stat_delta d0 d1 up upstream_rq_active_overflow "$gw"), pending_overflow +$(stat_delta d0 d1 up upstream_rq_pending_overflow "$gw"), cx_none_healthy +$(stat_delta d0 d1 up upstream_cx_none_healthy "$gw")"
     done
     expect "$total responses received" [ "$total" = "$D_N" ]
     expect "$fast503 rejected immediately (503 under 1s), need >= $need" [ "$fast503" -ge "$need" ]
