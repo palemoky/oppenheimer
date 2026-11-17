@@ -71,4 +71,31 @@ spec:
       transaction.state.log.min.isr: 2
       # topic 由服务启动时自己建（kafkax），不靠自动创建：写错 topic 名时应该报错而不是悄悄建一个。
       auto.create.topics.enable: false
+    # 指标：每个 broker 里带一个 JMX Prometheus Exporter（Java agent），在 9404 端口（端口名 tcp-prometheus）输出。
+    # 规则在 ConfigMap kafka-metrics（kafka-metrics.yaml，由 middleware.sh 先于本文件提交）。
+    # 加上或改动这一段，Strimzi 会滚动重启 broker，一次一个；min.insync.replicas 是 2，滚动期间照常读写。
+    # 抓取对象是 deploy/cluster/monitoring/kafka-podmonitor.yaml（由 monitoring.sh exporters 提交）。
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
   # 不要 entityOperator：topic 不用 KafkaTopic 资源管理（设计文档 5.3），也没有用户和证书要管。
+  # 消费延迟（每个消费组、每个分区的 lag）。broker 的 JMX 里没有这个：延迟是“分区末尾位点减消费组已提交位点”，
+  # 只有一个以客户端身份连上来查两边位点的进程算得出，Kafka Exporter 就是干这个的，一个 Pod，独立于 broker。
+  # 指标 kafka_consumergroup_lag 的标签是消费组、topic、分区，数量由拓扑决定，有界。
+  kafkaExporter:
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {memory: 128Mi}
+    template:
+      pod:
+        # 优先放到 k3s-server（理由同 monitoring/loki.yaml：阶段 4 关的是 agent 节点，监控不能跟着被关）。
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - {key: node-role.kubernetes.io/control-plane, operator: Exists}

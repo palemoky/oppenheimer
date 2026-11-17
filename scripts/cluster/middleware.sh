@@ -3,7 +3,7 @@
 #
 #   middleware.sh mysql   三个 MySQL 实例：Secret、chart，最后只读地核对并打印主从状态
 #   middleware.sh redis   两套 Redis：redis-gate（主从加 Sentinel）、redis-cache（Cluster）
-#   middleware.sh kafka   Strimzi 的 Operator 和 3 节点的 Kafka
+#   middleware.sh kafka   Strimzi 的 Operator 和 3 节点的 Kafka（含指标：broker 的 JMX exporter 规则、Kafka Exporter；改动指标配置会滚动重启 broker）
 #   middleware.sh all     redis、kafka、mysql 依次执行
 #   middleware.sh mysql-backup [release...]   立刻手工跑一次 MySQL 备份并等它完成（不带参数是三个实例）
 #
@@ -235,6 +235,9 @@ cmd_kafka() {
   ensure_namespace kafka
   helm upgrade --install strimzi oci://quay.io/strimzi-helm/strimzi-kafka-operator \
     --version "$STRIMZI_VERSION" -n kafka --wait --timeout 10m >/dev/null
+  # 先提交指标规则的 ConfigMap：kafka.yaml 里 Kafka 的 metricsConfig 引用它，不存在的话 broker 起不来。
+  # 第一次带 metricsConfig 提交时，Strimzi 会滚动重启 broker（一次一个，等 Ready 再下一个）。
+  kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka-metrics.yaml"
   kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka.yaml"
   kubectl -n kafka wait kafka/kafka --for=condition=Ready --timeout=15m
   kubectl -n kafka get pods -o wide

@@ -1,0 +1,115 @@
+# Redis 的 Prometheus exporter（redis_exporter），多目标模式。设计文档 3a、ADR-0030 第 8 项。
+# 由 scripts/cluster/monitoring.sh exporters 安装到命名空间 monitoring；__REDIS_EXPORTER_TAG__ 来自 cluster.env。
+#
+# 理由同 mysqld-exporter.yaml：不改 Redis 的 Pod（不重启），一个无状态的 Deployment 现连现抓。
+# redis_exporter 的多目标端点是 /scrape?target=redis://主机:端口。目标是每个 Pod：
+#   redis-gate     主从（0、1）：主从分开看，谁是主库以指标里的 redis_instance_info{role=...} 为准
+#   redis-gate-sentinel  三个 Sentinel：exporter 认出是 Sentinel 后给 redis_sentinel_* 指标（主库状态、法定票数、从库数）
+#   redis-cache    Redis Cluster 的六个节点：每个节点单独抓（不开 --is-cluster，那会让一个目标去扫全部节点）
+# 两套 Redis 都没设密码（chart 里没有 requirepass，靠集群内网），所以这里不配凭据。以后加密码要用 REDIS_PASSWORD 环境变量。
+#
+# 没有用 prometheus-community 的 redis-exporter chart：理由同 mysqld-exporter.yaml。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: monitoring
+  labels: &labels
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-exporter
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      # 优先放到 k3s-server（理由同 loki.yaml）。用“优先”不是“必须”。
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:__REDIS_EXPORTER_TAG__-alpine
+          args:
+            # 连接超时 3 秒，小于抓取超时（10 秒）：目标不可达时 exporter 自己先返回 redis_up 0，
+            # 而不是让 Prometheus 超时、把这次抓取记成 up 0（两者的含义不同：前者是“Redis 挂了”，后者是“exporter 有问题”）。
+            - --connection-timeout=3s
+            # 不开 --check-keys、--check-single-keys：它们会把 key 名放进标签。
+            # 不开 --include-system-metrics：那是 exporter 所在机器的指标，node-exporter 已经有了。
+          ports:
+            - {name: http, containerPort: 9121}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          # 探针只看端口：这个版本没有 /healthz（返回 404，第一次安装时因此反复被重启）。
+          readinessProbe:
+            tcpSocket: {port: http}
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: redis-exporter
+  ports:
+    - {name: http, port: 9121, targetPort: http}
+---
+# 抓取对象，写法同 mysqld-exporter.yaml 里的 ScrapeConfig。
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: redis
+  namespace: monitoring
+spec:
+  jobName: redis
+  metricsPath: /scrape
+  scrapeTimeout: 10s
+  staticConfigs:
+    - labels: {cluster: redis-gate}
+      targets:
+        - redis-gate-0.redis-gate.redis.svc:6379
+        - redis-gate-1.redis-gate.redis.svc:6379
+        - redis-gate-sentinel-0.redis-gate-sentinel-headless.redis.svc:26379
+        - redis-gate-sentinel-1.redis-gate-sentinel-headless.redis.svc:26379
+        - redis-gate-sentinel-2.redis-gate-sentinel-headless.redis.svc:26379
+    - labels: {cluster: redis-cache}
+      targets:
+        - redis-cache-0.redis-cache.redis.svc:6379
+        - redis-cache-1.redis-cache.redis.svc:6379
+        - redis-cache-2.redis-cache.redis.svc:6379
+        - redis-cache-3.redis-cache.redis.svc:6379
+        - redis-cache-4.redis-cache.redis.svc:6379
+        - redis-cache-5.redis-cache.redis.svc:6379
+  relabelings:
+    # 顺序不能换：先把目标地址包成 redis://… 存进 ?target=，再取出 Pod 名当 instance，最后把请求发给 exporter。
+    - sourceLabels: [__address__]
+      targetLabel: __param_target
+      replacement: redis://$1
+    - sourceLabels: [__address__]
+      regex: ([^.]+)\..*
+      targetLabel: instance
+    - targetLabel: __address__
+      replacement: redis-exporter.monitoring.svc:9121

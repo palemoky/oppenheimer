@@ -55,6 +55,8 @@
 | Grafana Loki | 3.7.10 | 稳定版 | 2026-11-17 | 日志（设计文档 3a）。GitHub releases 的最新正式版（4.0 只有 rc），没有 LTS。chart 是 `grafana-community/loki` 21.3.1（仓库 `https://grafana-community.github.io/helm-charts`），单体模式、文件系统存储 |
 | Grafana Tempo | 3.1.1 | 稳定版 | 2026-11-17 | 链路（ADR-0024）。GitHub releases 的最新正式版，没有 LTS。chart 是 `grafana-community/tempo` 3.2.1（单体模式；旧仓库 `grafana/helm-charts` 里的 `tempo`、`tempo-distributed` 已标弃用）。3.x 的单体模式不需要 Kafka |
 | OpenTelemetry Collector contrib | 0.165.0 | 稳定版 | 2026-11-17 | 链路、指标、日志的汇聚和转发（设计文档 3a），命名空间 `monitoring`，两个 release：`otel-gateway`（Deployment）和 `otel-agent`（DaemonSet，读容器日志）。GitHub releases 的最新正式版，没有 LTS；镜像 `otel/opentelemetry-collector-contrib:0.165.0`（要 contrib 的 transform、filelog、otlphttp）。chart 是 `open-telemetry/opentelemetry-collector` 0.178.3（仓库 `https://open-telemetry.github.io/opentelemetry-helm-charts`），默认的应用版本是 0.163.2，用 `--set image.tag` 覆盖 |
+| mysqld_exporter | v0.21.0 | 稳定版 | 2026-11-17 | MySQL 的指标（设计文档 3a、ADR-0030 第 8 项），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-10-22），没有 LTS；镜像 `quay.io/prometheus/mysqld-exporter:v0.21.0`。在 MySQL 9.7.4 上实测：`SHOW REPLICA STATUS` 能用（它依次试 `SHOW ALL SLAVES STATUS`、`SHOW SLAVE STATUS`、`SHOW REPLICA STATUS`），指标名仍带 `slave_status`，但 9.x 的字段名是新的（`seconds_behind_source`、`replica_io_running`） |
+| redis_exporter | v1.97.0 | 稳定版 | 2026-11-17 | Redis 的指标（同上），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-11-04），没有 LTS；镜像 `oliver006/redis_exporter:v1.97.0-alpine`（Docker Hub 的 tag 带 `v`） |
 | Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
