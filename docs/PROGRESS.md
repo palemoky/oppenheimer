@@ -36,11 +36,12 @@
 
 **下一步，新会话从这里开始**（设计第 6 节）：
 
-1. **请主人看这一批没有提交的改动，决定提交**（全量 `make lint test` 已通过）。已经提交的：第 4 步（`f264235`、`5e8fe3e`、`59ab718`）和 pprof（`c79f81c`，从子 Agent 的 worktree 摘过来的），都没有推送。没有提交的：503 的改法（`services/order/internal/service/`、`api/openapi/gateway.yaml`）、exporter（`deploy/cluster/monitoring/` 三个新文件、`deploy/cluster/kafka/`、`monitoring.sh`、`middleware.sh`、`cluster.env`、`versions.md`、`Makefile`）、chart 的 `DEBUG_ADDR`、文档。
-2. “新 order Pod 一就绪就 503”已解决（设计第 8 节）：不是冷连接池，是展示读读闸门的名额（16）满了、订单又还没落库时答了 `503 STOCK_GATE_UNAVAILABLE`；主人同意后改答 `429 READ_BUSY`，同样的压法复压 0 失败。名额要不要调大等 3b。
-3. 第 5 步做了两项：中间件的 exporter 和 pprof（设计第 8 节最后一段）。**剩下两项**：Istio 的 `PodMonitor` 和标签裁剪（Sonnet）；大盘（Sonnet，一个大盘一个任务，放 `deploy/cluster/monitoring/dashboards/`；指标名见设计第 8 节，MySQL 的延迟是 `mysql_slave_status_seconds_behind_source`，Kafka 的是 `kafka_consumergroup_lag`）。
-4. 其余按设计第 6 节的第 6 到 8 步（尾部采样和对比、按 QPS 的 HPA、定保留期并重建一次）。Grafana 界面上“大盘到链路到日志”点一遍仍然没有做。
-5. 这个会话记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时（原因没有查）。
+1. 到 exporter 和 pprof 为止的改动都已提交并推送到 `origin/phase-3a`（最后一个是 `4ff3ca0`），**还没有开 PR，所以 CI 没有跑**。之后的大盘（`deploy/cluster/monitoring/dashboards/` 四个 JSON、`monitoring.sh` 的 `dashboards` 子命令）和文档已提交，**没有推送**。
+2. `redis-cache-5` 的复制断过约 3 小时（连的是主库重启前的旧地址），主人确认后已用 `cluster replicate` 修好（设计第 8 节最后一段）。根因没有查，主库下次换地址多半还会断，记给了阶段 4；3c 要加告警。
+3. 四个大盘已加载到 Grafana 的文件夹 Oppenheimer（业务总览、单服务、中间件、Collector，设计第 8 节有表）。**界面上的样子没有人看过，要主人在浏览器里看一遍**，顺便走一次“大盘上的 exemplar → 链路 → 日志”。地址 `http://grafana.oppenheimer.test/d/opp-business`（`/etc/hosts` 要有 `192.168.50.51 grafana.oppenheimer.test`）。
+4. “新 order Pod 一就绪就 503”已解决（改答 `429 READ_BUSY`，设计第 8 节）。
+5. 3a 剩下的：Istio 的 `PodMonitor` 和标签裁剪、网格的大盘（Sonnet）；尾部采样和对比（主会话）；按 QPS 的 HPA；实测内存和磁盘定保留期、从空集群重建一次、ADR、笔记。做大盘时发现的指标缺口在设计第 8 节，其中“Redis 没有命令耗时的指标”建议在 3b 之前补（`pkg/redisx`）。
+6. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
 
 集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。
 

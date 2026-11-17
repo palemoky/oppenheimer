@@ -315,3 +315,32 @@ metrics-generator 生成的指标验证了（第 3 步留下的）：`traces_ser
 - 没有做的：block 和 mutex 的剖析默认不采样，要用得改代码或加一个运行时的开关。
 
 全量 `make lint test` 通过（`tmp/lint-test-3a-step5.log`）。集群上六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`。
+
+### 第 5 步的大盘（2026-11-17）
+
+`scripts/cluster/monitoring.sh dashboards`（已并入 `make monitoring-up`）：`deploy/cluster/monitoring/dashboards/*.json` 一个文件一个大盘，各做成一个带 `grafana_dashboard` 标签的 ConfigMap，Grafana 的 sidecar 自动加载到文件夹 Oppenheimer；仓库里删掉的大盘，集群上的 ConfigMap 跟着删。加载脚本主会话写，四个大盘由三个 Sonnet 子 Agent 并行写（各写各的文件），每条查询都对着集群上的 Prometheus 执行过。
+
+| 大盘 | uid | 内容 |
+|---|---|---|
+| 业务总览 | `opp-business` | 下单的受理和落库、支付、保护机制（闸门、限流、读名额、熔断器、降级开关）、状态流转和缓存、异步链路（CDC、商家索引、库存应用和对账）、入口 |
+| 单服务 | `opp-service` | 变量选服务和 Pod。gRPC 和 HTTP 的 RED、出站调用、MySQL、Redis、Kafka、Go 运行时、容器资源、日志 |
+| 中间件 | `opp-middleware` | MySQL、Redis（含 Sentinel 和 Cluster）、Kafka（含消费延迟，`order.order-close-delay` 单独一张） |
+| Collector | `opp-collector` | 接收和拒收、导出和失败、发送队列、处理器、进程、日志采集 |
+
+集群资源用 kube-prometheus-stack 自带的；网格的大盘等 Istio 的指标接上再做。延迟的直方图都开了 exemplar（业务总览 10 条查询、单服务 17 条）。四个大盘在 Grafana 里都加载成功，**界面上的样子（布局、颜色、状态图的映射）没有人看过**。
+
+查询为空的都核对过是“现在没有这种事件”：没有熔断、限流、降级、对账偏差、Collector 导出失败；这些图要等阶段 4 的故障实验才有数据，那时顺便验证。支付的几条当时为空是因为探针不付款，手工付了 5 单之后名字对上了。Kafka 消费者的重试和死信两个计数器从没触发过，名字是按代码推的。
+
+**做大盘时发现的指标上的缺口（都没有处理）：**
+
+- **Redis 没有命令耗时的指标**：`db_client_operation_duration_seconds` 只有 MySQL 的，Redis 只有连接池的指标。单服务大盘里用“连接占用时间”近似。
+- 同一类量的单位不统一：服务和 Kafka 的直方图是秒，Redis 连接池的是毫秒，还有一个是纳秒。
+- 两个 Redis 连接池的名字一个是地址、一个是 `FailoverClient`。
+- 没有商家索引端到端落后多少的指标（只有批处理耗时）；`cdc_lag_ms` 在源库没有写入时会一直涨。
+- 受理成功率的分母里有“库存不足”这类业务上的拒绝，售罄时会掉。3c 定 SLI 时要把它们分开。
+- Kafka 的 JMX 规则里没有请求耗时（`RequestMetrics`），要看 produce、fetch 的 p99 得加规则（会再滚动一次 broker）。
+- Collector 0.165 没有 `memory_limiter` 的拒绝数，只能从接收端的拒收间接看。
+- istio-proxy 是原生的 sidecar（init 容器），它的 requests 和 limits 在 `kube_pod_init_container_resource_*` 里。
+- 订单缓存只看到 `miss`：探针对每一单只查一次，没有重复查询，所以没有命中。没有去核实别的原因。
+
+**大盘查出的一个真故障，主人确认后已修（2026-11-17）：`redis-cache-5` 的复制断了约 3 小时。** 它是 `redis-cache-1` 的从库，一直在连 10.42.0.124，那是 `redis-cache-1` 重启之前的 Pod 地址（现在是 10.42.0.135），日志里每隔几秒一条 `No route to host`；`master_link_down_since_seconds` 约 10260，对得上今天给 k3s-server 改内存时的那次重启。`cluster nodes` 里地址是新的、集群状态是 ok、16384 个槽都正常，另外两对主从也正常，所以业务没有受影响，只是这一个分片没有从库。修法是在 `redis-cache-5` 上执行 `redis-cli cluster replicate <redis-cache-1 的节点号>`（它会从主库全量同步，丢掉自己那点旧数据；这是缓存）。为什么集群总线学到了新地址而复制没有跟着换，没有查；Pod 重启换地址在这个集群上是常事，要查清并让它自己恢复（阶段 4）。这类故障现在没有告警，3c 要加（`redis_master_link_up == 0`）。修完之后：`master_link_status:up`，`redis-cache-1` 上 `connected_slaves:1`，集群状态 ok。它记下的主库仍然是一个 Pod 地址（10.42.0.135），主库下次换地址时多半还会断。
