@@ -262,3 +262,56 @@ metrics-generator 生成的指标验证了（第 3 步留下的）：`traces_ser
 - Collector 自己的计数：拒收 0、发送失败 0。
 
 没有处理的：agent 的 Pod 名是 `otel-agent-agent-*`（chart 在名字后面加模式名）；Loki 的结构化元数据里有 `k8s_pod_uid`、`k8s_container_restart_count` 这类用不上的；agent 的检查点在 gateway 不可用时是否真的不前进，没有验证（第 5 节的验证 5 一起做）；滚动前旧的一个 gateway Pod 显示重启过 26 次（最近一次在滚动前 73 分钟），Pod 已经换掉，原因没有查。
+
+### 第 1 条：“新 order Pod 一就绪就 503”查清了原因，没有改代码，等主人定（2026-11-17）
+
+复现：`scripts/cluster/probe.py --workers 120 --rate 3 --duration 240`（和 2c 同样的压法，811 请求/秒）。gateway 和 order 都从 2 扩到 4。195240 个请求里 2 个失败，都是查订单返回 `503 STOCK_GATE_UNAVAILABLE`，在 10:38:20.28；第 4 个 order Pod 是 10:38:18 就绪的。现象和 2c 一致（2c 是 14 个）。
+
+**2c 的“冷连接池”推断不成立。** 证据：
+
+- 两条失败的链路都落在新 Pod 上，order 一侧只用了 3.5 和 10.9 毫秒就答了 `FAILED_PRECONDITION`，链路里**没有读闸门的 Redis span**，只有读缓存和读订单行。也就是根本没去读闸门，谈不上“撞上 300 毫秒时限”。
+- 新 Pod 的两个 Redis 连接池：等待 1 次，超时 0 次。闸门的熔断器在四个 Pod 上都没有打开过。order 容器的 CPU 每个 Pod 约 0.2 核，没有被挤。
+
+**实际的原因是三件事叠在一起：**
+
+1. 展示读读闸门有并发名额（`READ_GATE_MAX_CONCURRENCY`，默认 16，1d 的 8.18 为了不让查询占满闸门的连接池加的）。名额满了就不读闸门，只读订单行。
+2. 名额满了、订单行又不在库里时，`fetch` 分不清订单是在排队还是不存在，答 `503 STOCK_GATE_UNAVAILABLE`（`errHoldPending`）。这是 1d 有意的行为，有用例（`TestDisplayReadGateLimitDoesNotTripBreaker`）。
+3. 名额被占满**不是新 Pod 才有的**：这一轮里四个 Pod 都有（`order_bulkhead_rejected_total{name="read_gate"}`：11、6、4、6，共 27 次），最早的 3 次在 10:36:15，那时还没有开始扩容。27 次里只有 2 次变成了 503，因为其余的订单已经落库，读订单行就答了。扩容之后的几秒里变成 503 的机会多：消费组重新分配分区，落库会晚一点。两个失败的订单从受理到开始落库隔了 0.6 秒和 1.0 秒（其中一个的落库正是新 Pod 在 10:38:19.45 拿到分区之后做的），查询正好落在这段时间里。
+
+所以它不是“新 Pod 冷”，而是“查询的突发超过 16 个名额”加“扩容时落库晚了一秒”。没有量到的：16 个名额为什么会满。一次读闸门不到 1 毫秒，按平均到达率远远占不满；推断是探针的 120 个 worker 按同一个节拍发请求，一个 Pod 在同一毫秒里收到二三十个查询（`order_bulkhead_in_flight` 15 秒采一次，采到过 13）。真实的客户端不会这么整齐，3b 用 k6 压的时候要再看。
+
+**可选的做法（没有做，涉及 1d 定过的行为，由主人定）：**
+
+- 名额满了、订单行又不在时答 `429 READ_BUSY`，而不是 `503 STOCK_GATE_UNAVAILABLE`。这时闸门没有坏，降级也没有发生，是查询太多；`READ_BUSY` 本来就是“展示读拿不到名额”的原因码，订单库的名额满了答的就是它。改动在 `fetch` 的一个分支，加上改那个用例。**建议做这个**：现在的原因码会让人去查 Redis，这一次就查错了方向。
+- 把 `READ_GATE_MAX_CONCURRENCY` 调大（比如 32 或 64，连接池是 128）。读闸门是亚毫秒的操作，16 对突发偏紧。要不要调、调到多少，等 3b 有了不那么整齐的流量再定。
+- 不做的：就绪前预热连接池（已经是热的）、Envoy 的慢启动（新 Pod 并不慢）。
+
+对第 7 步（按 QPS 的 HPA）和 3b 的影响：这不是扩容本身的缺陷，不挡这两步；但压测时会看到少量这样的 503，要认得它。
+
+**主人定了按建议改（2026-11-17），已改并验证。** 名额满了、订单行又不在时 `fetch` 答 `429 READ_BUSY`；`TestDisplayReadGateLimitDoesNotTripBreaker` 和接口规范里 `READ_BUSY` 的说明跟着改了。部署后同样的压法再跑一次：194760 个请求 0 失败，gateway 和 order 同样从 2 扩到 4；期间名额仍然被占满过（新的四个 Pod 上 14、11、3、0 次），现在这些要么读订单行答了，要么是 429。名额的大小没有动。
+
+### 第 5 步的前两项：中间件的 exporter 和 pprof（2026-11-17）
+
+**exporter**（Sonnet 写清单和脚本、在本机用 docker 实测，主会话读过后安装）：`scripts/cluster/monitoring.sh exporters`（已并入 `make monitoring-up`），Kafka 的部分在 `scripts/cluster/middleware.sh kafka`。
+
+- 版本核对过：mysqld_exporter v0.21.0、redis_exporter v1.97.0，都是 GitHub 上最新的正式版。
+- MySQL、Redis 各一个 Deployment，多目标模式，清单是手写的（`deploy/cluster/monitoring/mysqld-exporter.yaml`、`redis-exporter.yaml`），抓取对象用 operator 的 `ScrapeConfig`。目标是每个 Pod（5 个 MySQL、6 个 Redis Cluster 节点、2 个闸门 Redis、3 个 Sentinel），`instance` 标签是 Pod 名，`cluster` 标签是实例名。**目标写死在清单里，加实例时要加一行。**
+- MySQL 的监控账号 `exporter` 由脚本在三个主库上建（复制到从库），密码随机生成放在 Secret `mysql-exporter-auth`；**只给了 `REPLICATION CLIENT`**，没有给官方文档建议的 `PROCESS` 和 `SELECT ON *.*`：现在开的三个采集器（全局状态、全局变量、复制状态）用不到，而后者能读全部业务数据。
+- **mysqld_exporter 在 MySQL 9.7.4 上能用**（1.3 节没有查证的那一项）。指标的前缀还是 `mysql_slave_status_`，但字段是新名字：延迟是 `mysql_slave_status_seconds_behind_source`，线程是 `replica_io_running`、`replica_sql_running`。写大盘和告警时按这个名字。
+- **exporter 连不上数据库时 `up` 仍然是 1**（它自己活着），要看 `mysql_up`、`redis_up`。`monitoring.sh status` 加了这一项，3c 的告警也要按它写。
+- Kafka：CR 里加了 `metricsConfig`（JMX 的规则在 `deploy/cluster/kafka/kafka-metrics.yaml`，取自 Strimzi 1.3.1 的官方例子，去掉了两条标签值不是有限枚举的）和 `kafkaExporter`。消费延迟是 `kafka_consumergroup_lag`。`order.order-close-delay` 这个组的延迟有 1.7 万，是延迟关单的机制本身（消息到期前不提交位点，ADR-0009），不是积压；大盘和告警要把它单独对待。
+- 序列：三样合计 1.5 万条（Kafka 4700）。
+- **装的时候出的两件事：**
+  - redis_exporter 第一次起不来：清单里的探针打 `/healthz`，这个版本返回 404，容器被反复重启。改成只探端口。子 Agent 在本机只测了 `/scrape`，没有测探针的路径。
+  - **滚动重启 broker 期间有 31 个下单失败**（探针 90 请求/秒，3 个 broker 一次一个，共约 2 分钟；29 个 `503 upstream request timeout`、2 个 504，分布在 59 秒里，下单的 p99 到了 3 秒）。查询和查库存没有受影响。原因没有查：看起来是分区的 leader 换人时生产者的发送等过了这一跳的时限。2b 滚动 broker 时上面还没有服务，所以这是第一次看到。**记给阶段 4（“停掉 broker”的实验）**；以后改 JMX 规则也会触发同样的滚动。
+
+**pprof**（Opus 在独立的 worktree 里写，主会话读过 diff 后合入，提交 `c79f81c`）：
+
+- `pkg/app` 加了 `ListenDebug`、`DebugMux`、`WithDebug`。环境变量 `DEBUG_ADDR` 设了才监听，chart 的默认值是 `127.0.0.1:6060`。**六个服务统一用一个单独的调试端口，不挂在健康检查的端口上**：那个端口在 Service 里，集群里任何 Pod 都连得到，而 `profile`、`trace` 会让进程按调用方要求的时长采样；gateway 的 8080 更是对外的。只监听回环地址，所以只能 `kubectl port-forward`。
+- 常开而不是要用时再加：改环境变量会重启 Pod，想看的泄漏现场就没了。
+- 调试端口最后停、而且停的时候直接断开连接：停止卡住时还能取 goroutine 的现场；一个正在跑的 30 秒 profile 不会拖住停止。
+- `ListenHTTP` 现在拒绝空的 handler（空的会落到 `http.DefaultServeMux`，而导入 `net/http/pprof` 就会往那上面注册）。
+- 集群上验证过：`port-forward` 到 order 和 gateway 的 6060 取到了 goroutine 的现场；经入口访问 `/debug/pprof/` 是 404；集群里别的 Pod 访问 order 的 Service 是 404、直接连 Pod 的 6060 连不上。部署期间探针 13004 个请求 0 失败。
+- 没有做的：block 和 mutex 的剖析默认不采样，要用得改代码或加一个运行时的开关。
+
+全量 `make lint test` 通过（`tmp/lint-test-3a-step5.log`）。集群上六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`。
