@@ -3,6 +3,7 @@
 #
 #   vm.sh create [名字...]    创建 cluster.env 里登记的虚拟机（不给名字就是全部）；已存在的跳过
 #   vm.sh list                列出虚拟机和它们的状态
+#   vm.sh resize <名字...>    把虚拟机的内存改成 cluster.env 里登记的值：正常关机、改配置、再开机。必须写明名字
 #   vm.sh destroy <名字...>   关机并删除虚拟机和它的磁盘。不可恢复，必须写明名字
 #
 # 做法：每台虚拟机的系统盘由 Ubuntu 的 cloud image 复制而来并放大到指定大小；第一次开机时
@@ -154,6 +155,42 @@ wait_ssh() {
   return 1
 }
 
+# 内存上限是虚拟机启动时定的，运行中改不了（气球只能在上限以内收放），所以要关机再开。
+# 用 virsh shutdown 让系统自己关机：容器收到 SIGTERM、文件系统落盘。等不到关机就报错退出，不强行断电
+# （2026-11-17 宿主机断电后 redis-gate-1 的 AOF 尾部补零，起不来）。
+resize_one() {
+  local name="$N_NAME" want_kib=$((N_MEM * 1024)) have_kib _
+  if ! vm_exists "$name"; then
+    echo "$name does not exist" >&2
+    return 1
+  fi
+  have_kib="$(virsh dominfo "$name" | awk '/^Max memory:/ {print $3}')"
+  if [[ "$have_kib" == "$want_kib" ]]; then
+    echo "==> $name already has $N_MEM MiB, skipped"
+    return 0
+  fi
+  echo "==> $name: $((have_kib / 1024)) MiB -> $N_MEM MiB"
+  if [[ "$(virsh domstate "$name")" == "running" ]]; then
+    virsh shutdown "$name" >/dev/null
+    printf '    wait for shutdown '
+    for _ in $(seq 90); do
+      [[ "$(virsh domstate "$name")" == "shut off" ]] && break
+      printf .
+      sleep 2
+    done
+    echo
+    if [[ "$(virsh domstate "$name")" != "shut off" ]]; then
+      echo "$name did not shut down in 180 s; left as is" >&2
+      return 1
+    fi
+  fi
+  # 先放大上限再设当前值：当前值不能超过上限。
+  virsh setmaxmem "$name" "${want_kib}" --config >/dev/null
+  virsh setmem "$name" "${want_kib}" --config >/dev/null
+  virsh start "$name" >/dev/null
+  wait_ssh
+}
+
 cmd="${1:-}"
 shift || true
 case "$cmd" in
@@ -179,6 +216,20 @@ list)
   virsh list --all
   ls -lh "$VM_IMAGE_DIR"/*.qcow2 2>/dev/null || true
   ;;
+resize)
+  if [[ $# -eq 0 ]]; then
+    echo "resize needs explicit VM names (one node at a time is safer)" >&2
+    exit 2
+  fi
+  for n in "$@"; do
+    find_node "$n" || {
+      echo "unknown node $n (not in cluster.env)" >&2
+      exit 2
+    }
+    resize_one
+  done
+  virsh list --all
+  ;;
 destroy)
   if [[ $# -eq 0 ]]; then
     echo "destroy needs explicit VM names" >&2
@@ -198,7 +249,7 @@ destroy)
   done
   ;;
 *)
-  echo "usage: $0 create [name...] | list | destroy <name...>" >&2
+  echo "usage: $0 create [name...] | list | resize <name...> | destroy <name...>" >&2
   exit 2
   ;;
 esac

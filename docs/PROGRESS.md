@@ -6,7 +6,7 @@
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完了，等主人看 PR。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送，**draft PR #12**（2026-11-16）。CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。工作区是干净的。
-- **最后更新**：2026-11-16
+- **最后更新**：2026-11-17（宿主机加内存、换网卡，见会话日志；这些改动已提交并推送到 `phase-2d`）
 
 ### 2c 做到哪（2026-11-15）
 
@@ -142,7 +142,7 @@
 停在哪、在等什么：
 
 1. 2a 没有在等的事。重启宿主机的检查已做（2026-11-15）：不做任何操作，104 秒后集群全部恢复。宿主机上有主人自己的一个 traefik 容器，以后重启宿主机前仍然先说一声。
-2. **PCIe 网卡还没装，有线仍是 100 Mbit/s**。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。
+2. **PCIe 网卡已装好，有线是千兆了（2026-11-17），但宿主机自己出不了外网，等主人改 R2S**。新网卡是 `eno1`（RTL8126），`cluster.env` 的 `HOST_NIC` 已改、`host-setup.sh` 已重跑，`br0` 的 MAC 跟着变成了新网卡的。R2S 上 192.168.50.19 的静态绑定和代理白名单还认旧 MAC，所以宿主机解析域名拿到假地址、连接超时（虚拟机不受影响，实测正常）。主人在 R2S 上把这两处换成新 MAC 之后，在宿主机上 `curl -m 8 https://github.com` 验证。同一天还有两件没处理的事，见会话日志 2026-11-17：NAS 没开机（镜像仓库的 Pod 挂不上 NFS）；`redis-gate-1` 的 AOF 损坏，在 CrashLoopBackOff。以下是装之前写的说明，留作记录。原文：PCIe 网卡还没装，有线仍是 100 Mbit/s。装好之后：确认设备在线，把 `scripts/cluster/cluster.env` 的 `HOST_NIC` 改成新网卡的名字（`ip -br link` 看，板载的是 `enp39s0`，建议插 `PCI_E5`），重跑 `scripts/cluster/on-host.sh host-setup.sh`，用 `ethtool` 确认协商到千兆。改网桥时 ssh 走 Wi-Fi（`ssh ubt`），不要走有线的地址。阶段 3 压测之前要解决；在那之前往仓库推镜像约 11 MB/s。2026-11-16 补充：主人选了一块最高 5G 的 PCIe 网卡（型号和芯片装好后用 `lspci -nn` 确认并记到 `hardware.md`）；新网卡的 MAC 和板载的不同，R2S 上 192.168.50.19 的静态绑定和代理白名单要跟着改。板载网口（RTL8168h，r8169）不支持 `ethtool --cable-test`；水晶头在这个口上卡不住，重新插入并用力按住仍然降到百兆，所以是插座内部的线对坏了，不用再查。
 3. 出网的白名单由主人管，**不要去改 R2S**。R2S 经路由通告下发的 IPv6 DNS 不走代理、返回被污染的地址，节点一侧已经绕开（`accept-ra: false`）；局域网里其他在白名单内的设备可能有同样的问题，已告诉主人。
 
 下一步：
@@ -348,16 +348,16 @@
 
 ## 阻塞项与待确认
 
-- 见“当前状态”里的“停在哪、在等什么”：千兆网卡。
+- 内存只测了一部分（见会话日志 2026-11-17），完整的 memtest86+ 还没有跑，要主人在开机菜单里选。
 
 ## 设备状态（上次已知）
 
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 开机（2026-11-15），k3s 集群在运行（中间件加六个业务服务），Ubuntu 26.04.1，有线接在网桥 `br0` 上（百兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
+| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机 10、16、16 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `eno1` 接在网桥 `br0` 上（千兆），Wi-Fi 是备用的管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 关机，阶段 3 开始需要 |
-| DS218+ | 开机（2026-11-15） |
+| DS218+ | 开机（2026-11-17） |
 
 ## 计划变更记录
 
@@ -531,3 +531,32 @@
 教训：`set -o pipefail` 下不要写 `命令 | grep -q`，grep 匹配到就退出，前面的命令收到 SIGPIPE，整条管道算失败。这次让“停掉默认网络”那一步悄悄没有执行。
 
 教训：链路只协商到百兆时，让网卡只通告千兆是个决定性的测试：起不来就是物理层少了线对，不用再猜驱动和设置。
+
+### 2026-11-17
+
+主人给宿主机加了两条 8GB 内存（威刚 3200，插 A1、B1；原有两条金士顿 16GB 在 A2、B2），共 48GB，XMP 关着，跑默认的 2400MHz；又装了 PCIe 网卡并把网线换到它上面。没有动业务代码，改了 `scripts/cluster/cluster.env`（`HOST_NIC="eno1"`）和 `host-setup.sh`（检查链路前先把接口打开并等自协商），都没有提交。
+
+- 开机后有线和 Wi-Fi 的 IPv4 都连不上，从 Wi-Fi 的 IPv6 链路本地地址进去的。原因：网线换到了新网卡，新网卡没有任何 netplan 配置；`br0` 还绑着没有网线的板载口，但三台虚拟机的 `vnet` 口让 `br0` 仍然有载波，它的路由没有被标成 linkdown，发往局域网的包照样进了网桥。重跑 `host-setup.sh` 后恢复，`eno1` 协商到 1Gbps 全双工（对端只通告到千兆）。
+- 经 IPv6 跑 `on-host.sh` 的写法：`HOST_SSH_OPTS="-o HostName=IPv6地址%%en0 -o HostKeyAlias=192.168.50.14" scripts/cluster/on-host.sh host-setup.sh`（`%` 要写成 `%%`，ssh 会展开它）。
+- 宿主机上手工加了 Windows 的启动项（不在仓库的脚本里）：`/etc/grub.d/40_custom` 里一条按 EFI 分区 UUID `2014-FDA8` 链式加载 `bootmgfw.efi` 的菜单项，`/etc/default/grub.d/50-boot-menu.cfg` 把菜单设成显示 5 秒，默认仍是 Ubuntu。`grub-script-check` 通过，**没有重启验证过**。改之前的备份在宿主机的 `/root/40_custom.bak-20261117` 和 `/root/grub.cfg.bak-20261117`。
+- `redis-gate-1`（从库）启动时报 `Bad file format reading the append only file appendonlydir/appendonly.aof.3.incr.aof at offset 63837`，已重启 23 次；主库 `redis-gate-0` 正常，`connected_slaves:0`。损坏在文件中间而不是末尾，所以 `aof-load-truncated` 救不了。多半是今天宿主机几次断电时虚拟机没有正常关机，没有证实。没有修。
+- 内存没有跑过测试（memtester 或 memtest86+）。混插的内存在灌数据和压测之前应该测一遍。
+
+教训：`ignore_routes_with_linkdown` 只在网桥自己没有载波时起作用。网桥上只要还有虚拟机的端口，上联口断了它也有载波，Wi-Fi 这条“备用通道”在 IPv4 上仍然是死的。上联断开时可靠的入口只有 Wi-Fi 的 IPv6 链路本地地址。
+
+教训：给机器加一块网卡不等于它会自己联网。netplan 只配置写了名字的接口，新接口是关着的，路由器上也就看不到它的租约；这时读 `/sys/class/net/<网卡>/carrier` 会报错，和“没插网线”不是一回事。
+
+同一天的后续（主人确认后做的）：
+
+- 主人在 R2S 的代理名单里加了新网卡的 MAC，宿主机出网恢复（`curl https://github.com` 返回 200）。“停在哪”第 2 条里等 R2S 的那部分已经不用等了。
+- `redis-gate-1` 修好了。损坏的样子：`appendonly.aof.3.incr.aof` 共 63976 字节，从 63837 起的最后 139 字节全是 0，之前的内容是完整的命令；文件的最后修改时间是 2026-11-16 23:55（北京时间）。这是断电的典型痕迹：文件长度已经落盘，数据块还没有。Redis 把它当成格式错误而不是截断，所以拒绝启动。修法：在 k3s-agent-1 上把 `appendonlydir` 和 `dump.rdb` 移到 `/home/ubuntu/redis-gate-1-appendonlydir.bad-20261117`、`/home/ubuntu/redis-gate-1-dump.rdb.20261117`（没有删），删 Pod 重建；从库向 Sentinel 问到主库后全量同步，主从各 17 个键，三个 Sentinel 都报 `slaves=1`、`master-link-status ok`。那两份备份看完可以删。
+- 这件事值得记成面试考点（还没有写进阶段计划）：`appendfsync everysec` 在断电时除了丢最后一秒，还可能留下补零的尾巴；`aof-load-truncated` 只管“读到一半没了”，不管补零；`redis-check-aof --fix` 能截掉；从库的数据可以直接丢掉重新同步，主库不行。
+
+同一天再往后（主人确认后做的）：
+
+- NAS 开机后镜像仓库自己恢复了（`http://192.168.50.50:5000/v2/` 返回 200）。
+- 网络测试：从 k3s-server 挂 NAS 的 NFS，直读 2GiB 是 113 MB/s（千兆跑满）；带缓冲写 77 MB/s，`oflag=direct` 每 1MB 落盘的写只有 20 MB/s（NAS 机械盘的同步写，不是网络）。`eno1` 接收错误为 0，向网关连发 200 个包 0 丢失。
+- 内存测试：宿主机上 `memtester 22G 1` 跑了 1 小时 20 分，0 个 FAILURE，内核日志里没有硬件错误。它只测得到当时空闲的内存。装了 `memtest86+`（8.00），开机菜单的 `Advanced options for Ubuntu` 下有 `Memory test (mt86+x64)`，完整的一轮没有跑。
+- 三台虚拟机的内存改成 10、16、16 GiB（主人同意的方案）：`vm.sh` 加了 `resize` 子命令（正常关机、`virsh setmaxmem` 和 `setmem --config`、开机），`cluster.env` 已改。按 agent-1、agent-2、server 的顺序一次一台，每台开机后 40 到 70 秒集群全部恢复。改完节点内存占用是 server 34%、两个 agent 24% 和 25%。
+- 关 agent-2 时 Sentinel 做了一次切换，**Redis 主从现在的主库是 `redis-gate-1`**（上面“2a 做到哪”里写的 `redis-gate-0` 已过时）。
+- 当天的改动（`scripts/cluster/cluster.env`、`host-setup.sh`、`vm.sh`、`docs/infra/hardware.md`、本文件）已在当天提交并推送到 `phase-2d`。
