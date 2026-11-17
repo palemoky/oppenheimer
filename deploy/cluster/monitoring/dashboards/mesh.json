@@ -809,7 +809,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "并发上限溢出（请求和连接）",
-      "description": "connectionPool 的并发上限被顶满：rq 是在途请求或排队超过上限（响应标志 UO），cx 是连接数超过上限。大于 0 说明下游慢了、请求在边车堆积，被边车直接拒绝。",
+      "description": "connectionPool 的并发上限被顶满：rq 是在途请求（upstream_rq_active_overflow，gRPC 走的是这一项）或排队（upstream_rq_pending_overflow）超过上限，响应标志 UO；cx 是连接数超过上限。大于 0 说明下游慢了、请求在边车堆积，被边车直接拒绝。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -820,7 +820,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "label_replace(sum by (pod, cluster_name) (increase(envoy_cluster_upstream_rq_pending_overflow{namespace=\"$namespace\"}[$__rate_interval])), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
+          "expr": "label_replace(sum by (pod, cluster_name) (increase({__name__=~\"envoy_cluster_upstream_rq_(active|pending)_overflow\",namespace=\"$namespace\"}[$__rate_interval])), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
           "legendFormat": "请求 {{pod}} → {{to}}",
           "refId": "A",
           "range": true,

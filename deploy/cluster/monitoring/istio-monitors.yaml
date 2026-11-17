@@ -35,7 +35,7 @@ spec:
         # 两列用 ; 连起来匹配（第二列是 cluster_name），istio_ 的指标没有这个标签，所以 ; 后面是空。
         - action: keep
           sourceLabels: [__name__, cluster_name]
-          regex: 'istio_(requests_total|request_duration_milliseconds_(bucket|sum|count)|tcp_[a-z_]+);|envoy_cluster_(upstream_rq_pending_overflow|upstream_cx_overflow|outlier_detection_ejections_[a-z0-9_]+);outbound\|.+'
+          regex: 'istio_(requests_total|request_duration_milliseconds_(bucket|sum|count)|tcp_[a-z_]+);|envoy_cluster_(upstream_rq_active_overflow|upstream_rq_pending_overflow|upstream_cx_overflow|outlier_detection_ejections_[a-z0-9_]+);outbound\|.+'
 ---
 # istiod：Service istiod 的 http-monitoring 端口（15014）。只留有用的：
 #   pilot_xds                    连着的代理数
