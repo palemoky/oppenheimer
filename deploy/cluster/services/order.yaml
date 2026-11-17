@@ -24,6 +24,13 @@ expandEnv:
     value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"
   # 不设 WORKER_ID：节点号启动时从自己的库里租（ADR-0028），每个副本各一个。
 
-# 按 CPU 伸缩，2 到 4 个副本（设计文档 2c 第 9 节）。上面的 replicas 不再起作用。
-# CPU 对 order 只是个凑合的信号：落库卡在下游时 CPU 是低的，不会扩。
-autoscaling: {enabled: true}
+# 按请求速率伸缩，2 到 4 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 查询数的是 order 收到的 gRPC 请求（受理和查询）。它不包含消费 Kafka 落库的那一半工作：
+# 落库的量跟着受理走，但落库卡在下游时请求速率和 CPU 都不涨，那种情况要按消费延迟伸缩（KEDA 的 kafka 触发器），没有做。
+# perReplica 的来历（设计文档第 8 节“第 7 步”）：探针的请求组合（查询和下单约 4 比 1）下每个请求每秒约 2.3 毫核
+#（服务加边车，含落库），每个 Pod 的 CPU requests 是 350m，70% 对应 108 请求/秒；取 100。下单的占比变了这个数就不准，3b 压测后重定。
+autoscaling:
+  enabled: true
+  requestRate:
+    query: sum(rate(rpc_server_call_duration_seconds_count{k8s_namespace_name="oppenheimer",service_name="order"}[1m]))
+    perReplica: 100

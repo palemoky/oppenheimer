@@ -284,7 +284,7 @@ mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod�
 	scripts/cluster/mesh.sh check
 
 .PHONY: monitoring-up
-monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter、Istio 边车和 istiod 的抓取对象）；要在 make cluster-up 之后；可重复执行
+monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter、Istio 边车和 istiod 的抓取对象），再装 KEDA 到命名空间 keda；要在 make middleware-up 之后、make deploy 之前（exporter 要连 MySQL，gateway 和 order 的 chart 里有 KEDA 的 ScaledObject）；可重复执行
 	scripts/cluster/monitoring.sh up
 
 .PHONY: monitoring-status
@@ -296,7 +296,7 @@ images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓�
 	scripts/cluster/images.sh all $(IMAGE_SERVICES)
 
 .PHONY: deploy
-deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
+deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up；gateway、order 按请求速率伸缩，要先 make monitoring-up（装 KEDA）；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
 	@tag="$$(scripts/cluster/images.sh tag)" && \
 	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
 	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)

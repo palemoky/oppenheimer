@@ -7,9 +7,10 @@
 #   monitoring.sh collector         OpenTelemetry Collector：gateway（Deployment，收 OTLP 转发给后端）和 agent（DaemonSet，读容器日志）
 #   monitoring.sh exporters         MySQL、Redis 的 exporter（多目标模式，各一个 Deployment）、MySQL 的监控账号、Kafka 的 PodMonitor
 #   monitoring.sh istio             Istio 边车的 PodMonitor 和 istiod 的 ServiceMonitor（边车指标的标签裁剪在 mesh.sh up 提交的 Telemetry 里）
+#   monitoring.sh keda              KEDA（命名空间 keda）：按 Prometheus 里的请求速率伸缩 gateway、order 用的；要在 services.sh deploy 之前装（chart 里有 ScaledObject）
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
 #   monitoring.sh dashboards        把 deploy/cluster/monitoring/dashboards/*.json 做成 ConfigMap，Grafana 自动加载到文件夹 Oppenheimer
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、dashboards
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -213,6 +214,21 @@ cmd_istio() {
   echo "    targets show up in Prometheus within one scrape interval (30 s); check: $0 status"
 }
 
+# KEDA（设计文档 3a 的 3.8）。装在自己的命名空间 keda：它是集群级的组件（一个聚合 API、一个准入 webhook、几个 CRD），
+# 不属于可观测的后端；放在这个脚本里是因为它依赖 kps 的 CRD（ServiceMonitor）并且读的是这里装的 Prometheus。
+# 业务服务的 chart 里有 ScaledObject，所以它要在 services.sh deploy 之前装好（CRD 不在时 helm 会直接失败）。
+KEDA_NS="keda"
+cmd_keda() {
+  echo "==> KEDA $KEDA_VERSION"
+  kubectl get namespace "$KEDA_NS" >/dev/null 2>&1 || kubectl create namespace "$KEDA_NS" >/dev/null
+  helm_retry helm upgrade --install keda keda \
+    --repo https://kedacore.github.io/charts \
+    --version "$KEDA_VERSION" --namespace "$KEDA_NS" \
+    -f "$DEPLOY/keda.yaml" --wait --timeout 10m >/dev/null
+  # helm --wait 只等 Deployment；聚合 API 要 apiserver 探测到后端才可用，在那之前 HPA 取不到数。
+  kubectl wait --for=condition=Available apiservice/v1beta1.external.metrics.k8s.io --timeout=2m
+}
+
 cmd_tempo() {
   echo "==> Tempo $TEMPO_VERSION (chart $TEMPO_CHART_VERSION)"
   ensure_ns
@@ -314,6 +330,7 @@ collector) cmd_collector ;;
 datasources) cmd_datasources ;;
 exporters) cmd_exporters ;;
 istio) cmd_istio ;;
+keda) cmd_keda ;;
 dashboards) cmd_dashboards ;;
 up)
   cmd_kps
@@ -322,6 +339,7 @@ up)
   cmd_collector
   cmd_exporters
   cmd_istio
+  cmd_keda
   cmd_dashboards
   ;;
 status) cmd_status ;;
@@ -329,7 +347,7 @@ password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

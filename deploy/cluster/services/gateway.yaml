@@ -23,5 +23,13 @@ route:
   hostnames: [api.oppenheimer.test]
   parentRef: {name: public, namespace: envoy-gateway-system}
 
-# 按 CPU 伸缩，2 到 4 个副本（设计文档 2c 第 9 节）。上面的 replicas 不再起作用。
-autoscaling: {enabled: true}
+# 按请求速率伸缩，2 到 4 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 查询数的是 gateway 自己记的 HTTP 请求（SDK 的指标，不含探针）；窗口 1 分钟：指标每 15 秒导出一次，
+# 窗口太短速率会跳，太长扩容就慢。
+# perReplica 的来历（设计文档第 8 节“第 7 步”）：探针的请求组合下每个请求每秒约 0.92 毫核（服务加边车），
+# 每个 Pod 的 CPU requests 是 250m，70% 对应 190 请求/秒；取 180，让请求速率比 CPU 早一步触发。3b 压测后重定。
+autoscaling:
+  enabled: true
+  requestRate:
+    query: sum(rate(http_server_request_duration_seconds_count{k8s_namespace_name="oppenheimer",service_name="gateway"}[1m]))
+    perReplica: 180
