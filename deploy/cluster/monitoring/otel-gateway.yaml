@@ -63,8 +63,28 @@ config:
       limit_percentage: 80
       spike_limit_percentage: 20
     batch: {}
-    # 后面加 tail_sampling 时放在 memory_limiter 之后、batch 之前：采样要看到完整的 trace，
-    # 不能在 batch 之后（batch 会把同一个 trace 的 span 拆散到不同批次）。
+    # 尾部采样（ADR-0030 第 6 项）：等一条链路的 span 到齐再决定留不留。三条策略是“或”的关系，命中任意一条就留：
+    # 出错的全留、慢的全留、其余留 10%。头部采样在请求开始时就掷骰子，那时还不知道它会不会出错。
+    #
+    # 放在 memory_limiter 之后、batch 之前：它要看到一条链路的全部 span，batch 会把它们拆到不同的批里。
+    # 代价：decision_wait 这段时间里的 span 全在内存里（num_traces 是上限，超过就提前对最老的链路做决定）；
+    # 一条链路的 span 必须到同一个 Collector，所以 gateway 只能是 1 个副本（多副本要在前面加一层按 trace id 分流的）。
+    # 晚于 decision_wait 才到的 span（比如延迟关单的消费，隔了 15 分钟）赶不上这次决定：我们的异步链路是用 link
+    # 关联的另一条链路，各自决定，不受影响。
+    tail_sampling:
+      decision_wait: 10s
+      num_traces: 50000
+      expected_new_traces_per_sec: 1000
+      policies:
+        - name: errors
+          type: status_code
+          status_code: {status_codes: [ERROR]}
+        - name: slow
+          type: latency
+          latency: {threshold_ms: 500}
+        - name: rest
+          type: probabilistic
+          probabilistic: {sampling_percentage: 10}
 
   # 三个导出器都保留默认的重试和发送队列（chart 不改它们的默认值）：
   #   重试：失败后指数退避重试，最长 5 分钟，超过就丢弃这一批。
@@ -88,7 +108,7 @@ config:
     pipelines:
       traces:
         receivers: [otlp]
-        processors: [memory_limiter, batch]
+        processors: [memory_limiter, tail_sampling, batch]
         exporters: [otlp_grpc]
       metrics:
         receivers: [otlp]
