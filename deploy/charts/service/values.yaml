@@ -49,6 +49,12 @@ config:
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-gateway.monitoring:4317
   # 指标的导出间隔（毫秒）。SDK 默认 60 秒，对 rate() 的常用窗口太稀；15 秒和抓取来的指标是一个量级。
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  # pprof（pkg/app 的 ListenDebug）。只监听回环地址：不进 Service、不声明 containerPort，集群里别的 Pod 连不到，
+  # 只能 kubectl port-forward（要 pods/portforward 权限）。常开而不是要用时再加：改它会重启 Pod，
+  # 想看的泄漏现场就没了。用法：
+  #   kubectl -n oppenheimer port-forward deploy/order 6060:6060
+  #   go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+  DEBUG_ADDR: "127.0.0.1:6060"
 
 # 密码：从 Secret 取。secretName 是本命名空间里的 Secret（services.sh 从 mysql 命名空间复制）。
 # 这些变量排在 env 列表的最前面，expandEnv 里的 $(变量名) 才能引用它们（被引用的必须在前面）。
