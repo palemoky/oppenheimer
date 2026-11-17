@@ -70,13 +70,16 @@
 | MySQL：2 分片 × 一主一从 | 4GB |
 | Redis Cluster：6 节点 | 1.5GB |
 | Kafka：3 broker | 4.5GB |
-| Prometheus、Grafana、Alertmanager、Loki | 4GB |
-| Tempo（单体模式） | 1GB（阶段 3a 实测） |
-| OpenTelemetry Collector | 0.5GB |
+| Prometheus、Grafana、Alertmanager、Loki | 4GB（3a 实测：空闲时约 2 GB，压测时的峰值约 2.4 GB） |
+| Tempo（单体模式） | 1GB（3a 实测：空闲 0.2 GB，不采样压测时峰值 1.55 GB，上限 2 GB） |
+| OpenTelemetry Collector | 0.5GB（3a 实测：gateway 加三个 agent 空闲 0.4 GB，压测时 0.6 GB） |
+| KEDA | 0.1GB（3a 实测） |
 | Chaos Mesh | 0.5GB |
 | 业务服务（多副本，含 CDC） | 3GB |
 | 归档 MySQL 实例 | 1GB |
 | 余量 | 约 20GB |
+
+监控各组件实测的内存、磁盘和保留期见设计文档 3a 第 8 节“第 8 步的前一半”。
 
 中间件实际的 requests 见设计文档 2b 的 6.1（比这里多一个 `mysql-main` 和 Sentinel）。
 

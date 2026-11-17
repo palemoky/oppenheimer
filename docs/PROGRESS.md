@@ -6,7 +6,7 @@
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
-- **最后更新**：2026-11-17（阶段 3a 做到设计第 6 节的第 4 步：Collector 已装，六个服务的指标、链路、日志都进了后端，见下面“3a 做到哪”；当前分支是 `phase-3a`，前三步已提交（`fe88b18`、`69030ff`），第 4 步的改动没有提交）
+- **最后更新**：2026-11-17（阶段 3a 的第 7 步，按请求速率的 HPA（KEDA），做完并在集群上验证过，**改动没有提交**；见下面“3a 做到哪”的“下一步”第 6 条。当前分支 `phase-3a`，`origin/phase-3a` 停在 `ea3db7c`，还没有开 PR）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
 ### 3a 做到哪（2026-11-17）
@@ -44,11 +44,27 @@
    **Istio 的指标已接上**（设计第 8 节最后一段）：标签在源头从 25 个裁到 9 个，新增 532 条序列；网格大盘 `opp-mesh` 已加载；gateway 到 order 一次调用 6.5 毫秒里有 2.7 毫秒在边车和网络上。
    这一批（尾部采样、Istio 的指标和网格大盘、文档）已提交，**没有推送**（`origin/phase-3a` 停在 `ea3db7c`，还没有开 PR，CI 没有跑过）。新会话从“3a 剩下的”第一项（KEDA）开始。
    **3a 剩下的**：按 QPS 的 HPA（第 7 步，KEDA，装上先验证它在 Kubernetes 1.37 上能用）；实测内存和磁盘定保留期（Tempo 的内存在压测里涨到 1.2 Gi，上限 2 Gi，要看）、从空集群重建一次、ADR 的补充、笔记（第 8 步）；验证 5（停掉 Collector gateway）、6（`make cluster-fault` 抽几个场景对指标）、7（停从库复制、停消费者看图）没有做；五个大盘在界面上的样子、“大盘 → 链路 → 日志”仍然要主人在浏览器里看一遍。做大盘时发现的指标缺口在设计第 8 节，其中“Redis 没有命令耗时的指标”建议在 3b 之前补（`pkg/redisx`）。
-6. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
+6. **第 7 步，按请求速率的 HPA，做完了（2026-11-17 晚）**，细节和数在设计第 8 节“第 7 步”、ADR-0030 的补充：
+   - KEDA 2.21.1 装在命名空间 `keda`（`scripts/cluster/monitoring.sh keda`，已并入 `make monitoring-up`），在 Kubernetes 1.37 上实测可用。版本主会话在 GitHub 的发布页核对过，已登记。
+   - service chart：`autoscaling.requestRate.query` 非空就渲染 `ScaledObject`（请求速率加 CPU 两个触发器），gateway 每副本 180 请求/秒、order 100，是用 CPU 70% 反推的初值，**3b 压测后重定**。集群上现在是 `keda-hpa-gateway`、`keda-hpa-order` 两个 HPA，旧的两个已手工删掉（旧 HPA 在时 KEDA 的 webhook 会拒绝，`helm upgrade` 过不去）。
+   - 验证过：507 请求/秒下两个服务各扩到 3（gateway 48 秒、order 79 秒，order 是请求速率触发的），122025 个请求 0 失败，停压 5 分 19 秒后缩回 2；Prometheus 连不上时不缩容、CPU 仍然能扩。
+   - **一键部署的顺序变了**：`make cluster-up && make middleware-up && make mesh-up && make monitoring-up && make deploy && make deploy-seed`（KEDA 要先于业务服务）。没有从空集群走过，重建时验证。
+   - 顺带的发现：405 请求/秒时 gateway、order 的 CPU 已到 71% 到 75%（2c 是约 810 请求/秒才扩容），3b 做基线时要拆开看多出来的 CPU 花在哪。
+   - 这一步的改动**没有提交**：`deploy/cluster/monitoring/keda.yaml`、`deploy/charts/service/`（新模板 `scaledobject.yaml`、`hpa.yaml`、`values.yaml`）、`deploy/cluster/services/gateway.yaml` 和 `order.yaml`、`scripts/cluster/monitoring.sh`、`cluster.env`、`Makefile`、文档。没有改 Go 代码；脚本过了 `shellcheck -x`，chart 过了 `helm lint`，没有跑 `make lint test`。
+   - 记给 3c 的：KEDA 取数失败的告警（`keda_scaler_detail_errors_total`、HPA 的 `ScalingActive`）。记给阶段 4 的：KEDA 不在时的行为、聚合 API 不可用时删命名空间会不会卡住。没有做的：按 Kafka 消费延迟伸缩 order；大盘上的副本数图；扩到 4 个副本没有压到。
+   - **同一个会话接着做的（都没有提交）**：
+     - 实测内存和磁盘（设计第 8 节“第 8 步的前一半”，`hardware.md` 的预算表已改）：保留期不改；盘是被压测写满的，不是被保留期（2000 请求/秒压一小时，Tempo 和 Loki 各约 1.5 GB）；**日志的 60% 是入口 Envoy 的访问日志，3b 之前定要不要关**；活跃序列 21.8 万；etcd 的 fsync p99 是 19.1 毫秒。空转一天后的数没有量。
+     - 验证 5（停 Collector gateway 5 分钟，做了三轮）：业务 0 影响、内存不涨；指标断图但累计值不丢；链路丢；**日志原来会丢约 6 万行，查出三处并修了**（`otel-agent.yaml` 的重试、队列、批次上限，`otel-gateway.yaml` 的 `batch/logs`，`loki.yaml` 的写入限额），第三轮不丢。已应用到集群（Loki、Collector 都滚动过）。
+     - 验证 7（停 `mysql-order-0-1` 的 SQL 线程、把 orderindex 缩到 0，各 2 分钟）：都已恢复；消费延迟的图有反应；**复制停掉时主从延迟的指标是断掉而不是变大**，3c 的告警要按运行状态写。
+     - 没有解释的：验证 5 第三轮有 15 个查库存请求同时超时，入口和 gateway 都没有收到过它们，卡在 MacBook 到入口之间，原因没有查到；入口的两个 Envoy Pod 各重启过 26 次（43 小时里），原因没有查。
+     - 留给 3b 之前的小事：Grafana 主容器的内存（峰值 357 Mi）超过 requests（256 Mi），调到 384；agent 的内存在队列堵满时到过 204 Mi（上限 256 Mi）。
+     - **主人 2026-11-17 的四个答复**：同意从空集群重建；五个大盘和“大盘 → 链路 → 日志”在浏览器里看过，没有问题（“互相跳转”已勾）；提交并推送；同意降入口的访问日志，已改成只留 5xx 和带 response flags 的（`deploy/cluster/envoy-gateway/gateway.yaml`，已应用并实测）。全量 `make lint test` 通过（输出在 `tmp/lint-test-3a-step7.log`）。
+   **3a 现在剩下的（新会话从这里开始）**：从空集群重建一次（主人已同意，顺便验证新的一键顺序）；空转一天后再量一次内存、磁盘和 etcd 的 fsync，量完勾掉“保留策略与资源占用评估”；笔记 `docs/notes/3a-observability.md`（派 Sonnet，材料是设计第 8 节）；验证 6（`make cluster-fault` 抽几个场景对指标；先确认 e2e 那一套的指标进不进 Prometheus）；
+7. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
 
-集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。
+集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；命名空间 `keda` 里有 KEDA 的三个 Pod；Loki、Collector（gateway 和三个 agent）按新配置滚动过；gateway、order 的伸缩由 `ScaledObject` 管（各 2 个副本）；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。
 
-没有查证的（设计 1.3）：除 kube-prometheus-stack、Prometheus、Loki、Tempo 之外的版本都是 Haiku 子 Agent 查的，主会话没有核对；KEDA 没有在 Kubernetes 1.37 上测过；mysqld_exporter 对 MySQL 9.x 的支持。
+没有查证的（设计 1.3）：除 kube-prometheus-stack、Prometheus、Loki、Tempo 之外的版本都是 Haiku 子 Agent 查的，主会话没有核对；mysqld_exporter 对 MySQL 9.x 的支持（`versions.md` 里记了实测可用）。KEDA 的版本和在 1.37 上能用已经核对过。
 
 ### 2c 做到哪（2026-11-15）
 

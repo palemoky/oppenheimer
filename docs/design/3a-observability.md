@@ -142,7 +142,7 @@ Grafana 经入口暴露（`Host: grafana.oppenheimer.test`，和业务入口同�
 
 ### 3.8 按 QPS 的 HPA
 
-gateway 和 order 现在按 CPU 伸缩。CPU 对 order 是个凑合的信号（落库卡在下游时 CPU 是低的）。改成按每个副本的请求速率，指标来自 Prometheus；具体组件见第 10 项。放在 3a 的最后做，因为扩容点要对着 3b 的压测数据定，这里先把链路接通、用现有的 CPU 目标反推一个初值。
+gateway 和 order 现在按 CPU 伸缩。CPU 对 order 是个凑合的信号（落库卡在下游时 CPU 是低的）。改成按每个副本的请求速率，指标来自 Prometheus；具体组件见第 10 项。放在 3a 的最后做，因为扩容点要对着 3b 的压测数据定，这里先把链路接通、用现有的 CPU 目标反推一个初值。实际做成了请求速率和 CPU 两个触发器并存（第 8 节“第 7 步”）。
 
 2c 留下的“新 order Pod 一就绪就有十几个 503”要在这一步之前查清并修掉（它会污染扩容实验的结论），见第 6 节第 1 条。
 
@@ -392,3 +392,156 @@ Sonnet 写清单和网格大盘（不碰集群），主会话读过后应用。
 一次调用 6.5 毫秒里，order 自己只用了 3.8 毫秒；其余 2.7 毫秒在路上：进程到自己的边车 1.1、两个边车之间（网络加 mTLS）1.1、边车到 order 进程 0.4。这是低负载下的平均值，分位数因为 Istio 的桶太粗（5、10、25 毫秒……）读不准；3b 压测时再看它随负载怎么变。和直连的对比仍然没有做。
 
 没有处理的：`deploy/cluster/services/fault/gateway.yaml` 里用 Pod 注解打开统计项的那一段现在大半是重复的；全网格的 `proxyStatsMatcher` 和 Pod 注解是合并还是覆盖，没有验证（下次跑 `make cluster-fault` 时看）；istiod 的几个指标名（`galley_validation_*`、`pilot_xds_rejects`）没有出现过，未确认。
+
+### 第 7 步：按请求速率的 HPA（2026-11-17）
+
+主会话写并在集群上执行（改动小，没有派出去）。
+
+**装了什么。** `scripts/cluster/monitoring.sh keda`（已并入 `make monitoring-up`），values 在 `deploy/cluster/monitoring/keda.yaml`。KEDA 2.21.1，命名空间 `keda`，三个 Deployment 各 1 个副本，都在 agent 节点上。**官方没有在 Kubernetes 1.37 上测过，实测可用**：聚合 API `external.metrics.k8s.io` 可用，`prometheus`、`cpu` 两种触发器扩缩都正常。第一次安装 1 分 53 秒（大半是拉镜像）。实际内存：operator 46 Mi、metrics-apiserver 35 Mi、webhook 12 Mi，requests 定成 96、64、48 Mi。它自己的指标已被抓（chart 自带的 ServiceMonitor）。
+
+operator 第一次启动会自己重启一次（日志：`Secrets have been updated; exiting so pod can be restarted`）：它生成了 webhook 和聚合 API 用的证书，退出好让新证书被加载。不是故障。
+
+**service chart。** `autoscaling.requestRate.query` 非空时渲染 `ScaledObject`（`templates/scaledobject.yaml`），不再渲染原来的 HPA；为空时和以前一样。gateway、order 开了，e2e 那一套仍然不开伸缩，所以 `make cluster-e2e` 不依赖 KEDA。
+
+KEDA 不是另一套伸缩器。它照着 `ScaledObject` 建一个普通的 HPA（`keda-hpa-gateway`、`keda-hpa-order`），请求速率在里面是 `External` 类型的指标；HPA 控制器每 15 秒经聚合 API 向 KEDA 取数，KEDA 当场去 Prometheus 执行查询。算副本数、稳定窗口、改 Deployment 的仍然是 HPA 控制器。
+
+两个触发器，HPA 各算一个期望副本数，取大的：
+
+| 服务 | 请求速率的查询（整个服务合计） | 每个副本的阈值 | CPU |
+|---|---|---|---|
+| gateway | `sum(rate(http_server_request_duration_seconds_count{...service_name="gateway"}[1m]))` | 180 请求/秒 | 70% |
+| order | `sum(rate(rpc_server_call_duration_seconds_count{...service_name="order"}[1m]))` | 100 请求/秒 | 70% |
+
+CPU 留着兜底：请求速率只数了同步的请求。order 还要消费 Kafka 落库，那一半工作不在这个数里。
+
+**阈值是用 CPU 目标反推的初值**（3.8 说的做法）。`probe.py --workers 60 --rate 3`（405 请求/秒，查库存、查订单、下单约 4 比 4 比 1），各 2 个副本，两分钟的平均值：
+
+| | 请求速率 | CPU（服务加边车） | 每个请求每秒 | 每个 Pod 的 requests | 70% 对应的速率 |
+|---|---|---|---|---|---|
+| gateway | 404.6/秒（HTTP） | 0.249 + 0.124 核 | 0.92 毫核 | 250m | 190/秒 |
+| order | 221.9/秒（gRPC：查询 176.8、受理 45.1） | 0.387 + 0.118 核 | 2.3 毫核 | 350m | 108/秒 |
+
+各取小一点的整数（180、100），让请求速率比 CPU 早一步触发。order 的数依赖请求的组合（受理比查询贵得多，还带着落库），组合变了就不准；3b 压测后重定。
+
+顺带看到的：**405 请求/秒时两个服务的 CPU 已经到 71% 到 75%**，而 2c 是压到约 810 请求/秒才扩容。这中间多了 Istio 的边车（gateway 的 CPU 里三分之一是边车）、全量的链路导出和 15 秒一次的指标导出，没有逐项拆。2d 记的“HPA 的扩容点要重量”就是这件事，3b 做基线时要拆开看。
+
+**扩缩实验**（`probe.py --workers 75 --rate 3 --duration 240`，507 请求/秒；每 5 秒记一次两个 HPA 的状态）：
+
+| | gateway | order |
+|---|---|---|
+| 发压到期望副本数变成 3 | 48 秒 | 79 秒 |
+| 那一刻的指标 | 速率 194.5（阈值 180），CPU 78% | 速率 111.2（阈值 100），**CPU 65%** |
+| 新 Pod 加入后稳定值 | 速率 169，CPU 72% | 速率 94，CPU 65% |
+| 停压到缩回 2 | 5 分 19 秒 | 5 分 19 秒 |
+
+- 122025 个请求 **0 失败**，包括两个新 Pod 加入的时候（2c 留下的“新 order Pod 一就绪就 503”已经改成 `429 READ_BUSY`，这一轮查订单的 429 有 4126 个，没有区分是它还是按用户的限流）。
+- order 的那次扩容是请求速率触发的：CPU 当时只有 65%，按 CPU 不会扩。
+- **请求速率并不比 CPU 快。** `rate(...[1m])` 在负载突然上来之后要 60 秒才爬到真实值（记录里 gateway 每个副本的速率是 25、105、195 这样爬上去的，真实值是 253）；metrics-server 的 CPU 在 33 秒时就到了 63%。2c 按 CPU 是约 55 秒扩容，现在 48 秒，差别在误差里。把窗口缩短能快一些，但指标 15 秒才导出一次，30 秒的窗口里只有两个点，少一个点就没有结果；没有改。**换成请求速率的理由是信号对不对，不是快不快**：它不受 requests 写错的影响，也和“这个服务一个副本能扛多少”这个容量结论直接对应。
+- 缩容的 5 分钟是 HPA 默认的稳定窗口（取过去 5 分钟里算出的最大期望值），加上速率窗口退空的一分钟里有一部分重叠。
+
+**Prometheus 连不上时会怎样**（在临时命名空间里验证的，做完已删）：一个 3 副本、CPU 是 0 的 Deployment，`ScaledObject` 的 `serverAddress` 指向不存在的地址。
+
+- HPA 的条件变成 `ScalingActive=False FailedGetExternalMetric`，**7 分半没有缩容**（已经超过 5 分钟的稳定窗口；按 CPU 它该缩到 1）。HPA 的规则是：有任何一个指标取不到就不缩，因为不知道那一项要不要更多副本。
+- 把同一个 Deployment 改成 1 个副本并让它烧 CPU：30 秒内从 1 扩到 4。**取得到的指标仍然能扩容**，这是留着 CPU 触发器的另一个用处。
+- **`ScaledObject` 的 `READY` 这时仍然是 `True`**（它只表示定义合法），看它发现不了问题。能发现的是 KEDA 的 `keda_scaler_detail_errors_total`（这个临时对象上涨到了 3，gateway、order 是 0）和 HPA 的 `ScalingActive` 条件。3c 要加这条告警：Prometheus 是单副本，它不在的时候伸缩是悄悄停掉的。
+- 没有配 KEDA 的 `fallback`（取数连续失败几次后按一个固定的副本数算）。现在的行为是“停在原地、CPU 还能扩”，够用；`fallback` 和 `cpu` 触发器能不能一起用没有查证。
+
+**从旧的 HPA 切过来要手工删一次。** 旧的 HPA 还在时建 `ScaledObject` 会被 KEDA 的准入 webhook 拒绝（`the workload 'gateway' of type 'apps/v1.Deployment' is already managed by the hpa 'gateway'`），而 `helm upgrade` 是先建新资源、后删旧资源，所以直接升级会失败。这次是先 `kubectl -n oppenheimer delete hpa gateway order` 再 `services.sh deploy gateway order`（镜像 tag 不变，Pod 没有滚动；中间二十几秒没有 HPA，副本数不动）。脚本里没有加这一步：从空集群部署不会遇到，只有带着 CPU HPA 的旧集群升级时才有。反方向（把 `query` 清空退回 CPU 的 HPA）没有试，推断是两个 HPA 短暂并存再由 Helm 删掉 `ScaledObject`。KEDA 有一个接管现有 HPA 的注解（`scaledobject.keda.sh/transfer-hpa-ownership`），没有用：接管之后 Helm 仍然会把那个 HPA 当成自己不再要的资源删掉。
+
+**一键部署的顺序变了**：`make monitoring-up` 要在 `make deploy` 之前（chart 里有 `ScaledObject`，CRD 不在时 Helm 直接失败），顺序是 `make cluster-up && make middleware-up && make mesh-up && make monitoring-up && make deploy && make deploy-seed`。这个顺序还没有从空集群走过，第 8 步重建时验证。
+
+没有做的：
+
+- 按消费延迟伸缩 order（KEDA 的 `kafka` 触发器）。落库卡在下游时请求速率和 CPU 都不涨，现在的两个触发器都看不到。
+- KEDA 不在时（聚合 API 不可用）的行为没有实测，推断和 Prometheus 连不上一样；另外聚合 API 不可用时删命名空间可能卡住（`make cluster-e2e` 每次都删命名空间），阶段 4 做。
+- 大盘上没有加副本数和 HPA 指标的图（`kube_horizontalpodautoscaler_*` 已经有）。
+- 扩到 4 个副本的情况这次没有压到。
+
+### 第 8 步的前一半：实测内存和磁盘，保留期（2026-11-17）
+
+装上约 3 个半小时后量的，期间做过七八轮压测（每轮 400 到 500 请求/秒、两到四分钟）。**不是空转一天的数**，空转的那一次还要再量（etcd 的 fsync 也是）。
+
+内存（工作集，单位 Mi）：
+
+| 组件 | 现在（空闲） | 4 小时里的峰值 | requests | limits | 结论 |
+|---|---|---|---|---|---|
+| Prometheus | 951 | 1000 | 1536 | 3072 | 不动 |
+| Tempo | 197 | **1553** | 512 | 2048 | 见下 |
+| Loki | 330 | 507 | 512 | 1536 | 不动 |
+| Collector gateway | 161 | 261（这个 Pod；上一个到过 375） | 512 | 1024 | 不动，3b 再量 |
+| Collector agent × 3 | 70 上下 | 103 | 128 | 256 | 不动 |
+| Grafana（含两个 sidecar） | 449 | 357（只算主容器） | 256 | 512 | 主容器已经超过 requests，3b 之前把 requests 调到 384 |
+| KEDA 三个组件 | 93 合计 | | 208 合计 | | 不动 |
+
+- Tempo 的内存不是泄漏：每 20 分钟一个点是 28、32、32、148、521、268、205、244、376、319、121，跟着写入量走，停压后回落；峰值出现在不采样的那几轮（每轮 72 万个 span 全写进去）。尾部采样常开之后写入量是十分之一。上限 2 Gi 不动，但 **3b 不要关采样压测**，要关就先调它。没有重启过。
+- server 节点现在用了 6.4 GiB（51%），其中监控约 2.5 GiB。
+
+磁盘（都在 server 的系统盘上，`local-path` 不限大小；节点上 `du` 量的，PVC 的用量指标对 `local-path` 没有意义，五个卷报的都是整块盘的数）：
+
+| | 现在 | 写入了多少 | 落盘的密度 | 保留期 |
+|---|---|---|---|---|
+| Prometheus | 477 MB | 约 7300 个样本/秒 | 没有量（还没有压缩过的块） | 15 天，另有 15 GB 的容量上限 |
+| Tempo | 1362 MB | 807 万个 span，2545 MB | 约 170 字节/span | 3 天 |
+| Loki | 234 MB | 284 万行，1631 MB | 压缩约 7 比 1 | 7 天 |
+
+系统盘 58 GB，用了 12 GB（其中镜像 6.3 GB、etcd 0.5 GB），剩 46 GB。
+
+**保留期不改**（Prometheus 15 天加 15 GB 上限、Loki 7 天、Tempo 3 天）。理由和要记住的事：
+
+- 空闲时三样加起来一天不到 2 GB（Prometheus 估 1 到 1.3 GB/天，按每个样本 1.5 到 2 字节算的，是估计；Loki 空闲时每秒 17 行，可以忽略；Tempo 空闲时每秒约 200 个 span，约 3 GB/天会被 3 天的保留期截在 9 GB 上下）。Prometheus 有容量上限兜底，另外两样没有。
+- **盘是被压测写满的，不是被保留期。** 按这几轮的数折算，每个请求大约落 1.2 个 span（尾部采样后）和 1.4 KB 的日志。2000 请求/秒压一小时：Tempo 约 1.5 GB，Loki 约 1.4 GB（压缩后）。3b 的长稳测试压几个小时就是十几到二十 GB，盘装得下，但和 etcd 在同一块盘上。3b 开始前先定：长稳测试期间日志和链路要不要再降。
+- **日志的 60% 是入口 Envoy 的访问日志**（4 小时里 776 MB，gateway 229、order 127、inventory 125，其余可以忽略）。每个请求在入口记一行、在 gateway 又记一行，内容是重复的。最便宜的降法是关掉入口的访问日志或者只留出错的。**主人同意后已改成只留出错的**（`deploy/cluster/envoy-gateway/gateway.yaml` 的 `telemetry.accessLog`：5xx 或者带 response flags 的才记，这两类正好是 gateway 的日志里没有的）。实测正常请求不再记、`Host` 不存在的请求（404、`NR`）记了，改动经 xDS 下发，Envoy 没有重启。一个坑：CRD 的文档说多条 `matches` 满足一条就记，Envoy Gateway v1.10.0 实际生成的是 `and_filter`，“或”要写在一条 CEL 表达式里。
+- 序列数：活跃的 21.8 万（头块里 26.8 万，多出来的是这几个小时里消失的 Pod 留下的）。kubelet 9.9 万、apiserver 6.3 万，两样占四分之三，业务服务加中间件不到 3 万。比上次量的 19.0 万多出来的主要在这两样上（扩容出来的 Pod、KEDA 带来的新资源类型）。Prometheus 的内存还有余量，没有裁；要裁先裁 apiserver 的直方图和 cAdvisor 里用不到的指标。
+- etcd 的 WAL fsync p99 这次是 19.1 毫秒（上次 15.9）。仍然高于 10 毫秒的参考线，仍然没有查原因。
+
+没有做的：空转一天后的数；Prometheus 压缩之后每个样本的实际字节数；磁盘的告警（3c）。
+
+### 验证 5：停掉 Collector gateway（2026-11-17）
+
+阶段计划里登记过。`probe.py --workers 15 --rate 3`（约 100 请求/秒）压 9 到 10 分钟，第 1 分钟把 `otel-gateway` 的副本数改成 0，5 分钟后改回 1。一共做了三轮：第一轮查出日志在两个地方被丢，改了配置；第二轮又查出一处；第三轮没有再丢。
+
+**业务不受影响**（三轮一致）：第一、二轮 60855、60795 个请求 0 失败，延迟没有变化；六个服务的内存在停掉期间是平的（gateway 两个 Pod 一直是 38 到 41 Mi）。SDK 的导出失败只在日志里留下 `telemetry error`（`otelx` 做了合并，每 10 秒一条）。1d 的 8.17 没有长时间验证过的那一条成立。
+
+第三轮有 15 个查库存的请求同时超时（恢复后约 55 秒，同一个时刻发出的一批）。入口 Envoy 和 gateway 的访问日志里都没有这 15 个请求，Tempo 里也没有超过 1 秒的链路，所以它们没有到达入口；**卡在 MacBook 到入口之间的哪里没有查到**。和这个实验有没有关系说不清，前两轮没有出现。
+
+**三种信号各自丢了什么**：
+
+| 信号 | 停掉的 5 分钟 | 为什么 |
+|---|---|---|
+| 指标 | 图上断 5 分钟，**累计的数没有丢**：`increase` 算出来 61293 个请求，探针发了 60855 个 | SDK 导出的是累计值（每次都是从进程启动到现在的总数），中间几次没送到，下一次送到的数里已经包含了 |
+| 链路 | **丢了**。停掉期间 Tempo 里是 0 条，恢复前最后几十秒有 50 条 | SDK 的队列只有 2048 个 span，满了就丢新的；链路没有“下次补上”这回事 |
+| 日志 | 改配置之前丢了约 6 万行，改之后**不丢，延迟到 gateway 回来之后补齐** | 日志文件在磁盘上，agent 可以停下来等 |
+
+**日志丢在三个地方，都是批次没有上限引出来的**（第一轮查出前两个，第二轮查出第三个）：
+
+1. **agent 自己丢**（约 4700 行）。原来的配置注释写的是“不会丢，只是延迟”，不成立：重试默认最多 300 秒，超过就丢这一批（日志里是 `Exporting failed. Dropping data`，每个 agent 正好 10 批，等于并发发送的个数）；队列满了之后新数据被拒绝，而 `batch` 处理器是异步的，这个错误传不回 `filelog`，数据就在 `batch` 那里没了（`otelcol_exporter_enqueue_failed_log_records` 涨了 3881）。改成 `retry_on_failure.max_elapsed_time: 0` 加 `sending_queue.block_on_overflow: true`：队列满了就一路堵回 `filelog`，它停止读文件。
+2. **gateway 发给 Loki 时被丢**（7 批、约 5.7 万行，这是大头）。agent 把积压的日志一起发过来，gateway 的 `batch` 把它们合成 8000 多条、6.9 MB 的一批；Loki 的写入限额是每秒 4 MB、突发 6 MB，**突发量同时是单次请求的上限，比它大的请求永远是 429**，重试多少次都一样，5 分钟后被丢（`no more retries left ... ingestion rate limit exceeded`）。改了两处：gateway 的日志管线单独用一个每批最多 2000 条的 `batch/logs`；Loki 的限额放宽到每秒 16 MB、突发 32 MB。
+3. **agent 发给 gateway 时被丢**（1 批、7309 行）。队列改成堵住之后，gateway 一回来 `filelog` 一口气追读，agent 的 `batch` 合出一批超过 gateway 的 gRPC 接收上限（4 MiB），这是不可重试的错误，整批丢掉。agent 的 `batch` 也加了每批最多 2000 条。
+
+第三轮：三个服务的日志在停掉的 5 分钟里每分钟的行数和平时一样（gateway 6087、入口 6070 上下），`Dropping data` 0 次，`enqueue_failed`、`send_failed` 都是 0。Loki 仍然记了 1.8 万行 `rate_limited`，那是补发时被 429 之后重试成功的，没有丢。
+
+**这三处在压测时同样会出现，不只是 Collector 停机时**：日志量一上来，`batch` 攒满 8192 条的时候一批就超过 6 MB。之前几轮 500 请求/秒的压测里 Loki 没有丢弃的记录（查过），但 3b 的量会大得多。
+
+留下的问题：
+
+- agent 的内存在队列堵满时到过 204 Mi，上限是 256 Mi，余量不大。队列是 1000 批，现在一批最多 2000 条。3b 之前看一下要不要把队列改小或者把上限加到 384 Mi。
+- gateway 到 Loki 这一段仍然是默认的重试 300 秒：Loki 停超过 5 分钟，gateway 会丢，而且它前面的 `batch` 同样不把错误传回 agent。没有改，阶段 4 停 Loki 的实验里看。
+- gateway 长时间不在、日志文件被 kubelet 轮转掉的部分还是会丢（没有实测）。
+- 链路在 Collector 停机时必丢。要不丢就得在每个节点上放一个收 OTLP 的 agent 并落盘排队，没有做，也不打算做：链路本来就是采样的。
+
+### 验证 7：停从库复制、停消费者（2026-11-17）
+
+阶段计划里登记过。探针约 100 请求/秒压着，在 `mysql-order-0-1` 上 `STOP REPLICA SQL_THREAD`，同时把 `orderindex` 缩到 0 个副本，2 分钟后都恢复。探针 40535 个请求 0 失败。每 30 秒一个点：
+
+| 指标 | 故障前 | 故障的 2 分钟 | 恢复后 |
+|---|---|---|---|
+| `mysql_slave_status_replica_sql_running` | 1 | 0 | 1 |
+| `mysql_slave_status_seconds_behind_source` | 0 | **没有数据** | 0 |
+| `kafka_consumergroup_lag`（`orderindex.cdc-orders`） | 0 | 271、581、901、1211 | 30 秒内回到 0 |
+| `kafka_consumergroup_members` | 2 | 0 | 2 |
+
+- 消费延迟的图有反应，涨的速度和写入的速度对得上。
+- **主从延迟的图在复制停掉时不是变大，而是断掉。** SQL 线程不在运行时 MySQL 的 `Seconds_Behind_Source` 是 `NULL`，exporter 就不出这个指标。所以“延迟大于若干秒”的告警对“复制停了”这种最严重的情况恰恰不响。3c 的主从告警要写成三条：`replica_sql_running == 0`、`replica_io_running == 0`、延迟超过阈值；中间件大盘上运行状态的那一格已经有了。
+- 另外 `Seconds_Behind_Source` 量的是“从库正在执行的事务比主库晚多少”，从库空闲时是 0，IO 线程断了它也可能是 0。要准的延迟得靠心跳表，这是 3c 里“CDC 源库心跳”那一项。
+
+没有做的：验证 6（`make cluster-fault` 抽几个场景对指标）。
