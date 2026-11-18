@@ -124,8 +124,9 @@ grafana:
     userKey: admin-user
     passwordKey: admin-password
   affinity: *preferServer
+  # 主容器实测：空转一天的峰值 294 Mi，压测加看大盘时到过 357 Mi（设计文档 3a 第 8 节）。requests 按实际用量给，调度器才不会把这块内存再许给别人。
   resources:
-    requests: {cpu: 50m, memory: 256Mi}
+    requests: {cpu: 50m, memory: 384Mi}
     limits: {memory: 512Mi}
   # 大盘和数据源都从 ConfigMap 加载（仓库里有），Grafana 自己的库里只剩用户设置，丢了无所谓；
   # 仍然给一个小卷，免得每次重启都要重新登录、丢掉临时建的大盘。
