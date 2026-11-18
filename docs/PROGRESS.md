@@ -11,6 +11,25 @@
 
 ### 3b 做到哪（2026-11-18 更新，这一段在最前面，比下面 2026-11-17 写的新）
 
+**断点（2026-11-18 19:50 UTC，夜间那一段做完时写的）。新会话先读这一小段，再读 `docs/notes/3b-rounds/round-0-first-bottleneck.md`。**
+
+- 做完的：3a 收尾；3b 设计第 4 节的第 1 到 6 步（脚本和工具、灌 1000 万单、备份恢复、基线三个场景、可观测开销对照、普通下单场景的阶梯加压、第一个瓶颈的定位）。所有轮次对账通过。全部已提交并推送到 `origin/phase-3b`，没有开 PR，所以没有 CI 结果；**这一夜没有跑过 `make lint test`**（改的是脚本、values 和文档，脚本过了 `shellcheck -x`，没有改 Go 代码）。
+- **等主人定的**：第 1 轮优化做哪几条（记录第 7 节的七条；建议从库放松刷盘加修支付的串行循环）。夜里按约定没有改业务代码。
+- **集群现在的状态（和平时不一样的地方，做完 3b 要恢复）**：
+  - gateway 按地址的限流是关的（`LOADTEST=1` 部署的）。恢复：不带 `LOADTEST=1` 再 `make deploy`。
+  - gateway、order 钉在 2 个副本（KEDA 暂停）。恢复：`scripts/cluster/loadtest.sh unpin gateway order`。
+  - 镜像 tag `61bb6be-dirty-20261118173536`（工作区不干净时构建的，内容等于提交 `61bb6be` 加当时没提交的备份 Job 内存那一行 values，Go 代码没有差别）。
+  - MySQL 五个实例的上限 2560 Mi、缓冲池 1 G；备份 Job 1 Gi。都已入库。
+  - 库里：1000 万造数订单，加压测留下的约 31 万单（用户号 2^39 段）。压测 SKU 用到 7053，**下一批从 7054 起**；`verify` 要的初始库存在本机 `tmp/loadtest/sku-initial.txt`（不入库，丢了就用 `VERIFY_INITIAL` 手工给，库存都是 10 亿，7011 是 1 万）。
+  - 灌数之后的备份（回到基准状态用）：NAS 上 `mysql-order-0/20261118T173525Z`、`mysql-order-1/20261118T173606Z`、`mysql-main/20261118T173407Z`。**定时备份只留 7 份，一周后会被轮掉，要留就在 NAS 上另存。**注意这份 `mysql-main` 的备份是在商家索引追平之后做的，三份之间差几十秒，恢复后要让索引按 CDC 追一下。
+  - server 节点的系统盘剩 42 GB（夜里的压测写了约 5 GB 的日志和链路）。
+- **压测时必须记住的两件事**：支付的速率压在每秒 15 笔以下（`PAY_RATIO`），否则量到的是 payment 的串行循环，而且会产生退款；每轮压完要等 15 分钟以上才能对账，从库追平还要更久（阶梯那一轮追了 36 分钟）。
+- 还没有做的（设计第 4 节）：秒杀和混合读写场景的阶梯；空表上的对照；1、4 个副本的扩容系数；三轮优化；弹性测试和重定 HPA；长稳测试；容量结论、`GOALS.md` 的修正、笔记。夜里发现、没有处理的小事：Tempo 在过载时被 OOMKilled（上限 2 Gi）；落库延迟的直方图只到 10 秒；支付单出结果的时延没有指标；k6 只给下单接口留了客户端的分位数（别的接口要加阈值才有）；入口没有 `BackendTrafficPolicy`；备份写 NFS 的页缓存问题只是把上限抬高了；灌数的 Pod 里订单库的密码出现在进程参数上（`loadtest.sh seed-orders`）；k6 的 remote write 输出已弃用。
+- 用法速查：`make k6 SCENARIO=...`；`RUN_ID=<名字> SKUS=... RATE=... scripts/cluster/loadtest-round.sh <场景>`（预检、条件、k6、pprof、服务端指标存档）；`make loadtest ARGS="preflight|conditions|skus|pin|unpin|wait-quiet|recon|verify|seed-orders"`；`LOADTEST_IMAGE_TAG=42c5fd6` 免去重建 chaos 镜像。结果在 `tmp/k6/<运行号>/`（不入库）。
+
+以下是这一天里按时间写的各段，细节以设计文档 3b 第 6 节为准。
+
+
 - **3a 收尾了**：空转一天后的数量完（设计文档 3a 第 8 节最后一段“空转一天后的数”），阶段计划里最后一项已勾。保留期不改；Grafana 的 requests 调到 384 Mi；agent 没有加内存上限，改的是发送队列（1000 批改成 20 批），改完重做了一次“停 Collector gateway 2 分 30 秒”，日志不丢、agent 的内存峰值从 204 Mi 降到 94 Mi。etcd 的 fsync p99 仍是 16 到 18 毫秒，和负载无关，先接受。**这些改动在 `phase-3b` 的工作区里，不在 `phase-3a` 和 PR #15 里**：PR #15 合并时 3a 的计划那一项还是没勾的样子，等 `phase-3b` 合并才带上。
 - **Mac mini**：`ssh mini` 能登录，k6 v2.4.0 核对过。三件要主人处理的事：
   1. **它走的是 Wi-Fi，有线口没插线**。量基线之前要插网线，否则客户端的延迟不可信（现在查一次库存 11 到 15 毫秒，大半是无线这一段）。
