@@ -63,6 +63,8 @@ backup:
   activeDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
-  # mysqldump 加 zstd，内存用量很小；dump 是流式的，不在内存里攒。
-  memory: 256Mi
+  # 原来写的是“mysqldump 加 zstd，内存用量很小；dump 是流式的”，给了 256Mi。库里只有几万行时成立；
+  # 2026-11-18 灌到每个分片 500 万单之后，两个订单库的备份 Job 开始十几秒就被 OOMKilled（mysql-main 的没有）。
+  # 实际用量见设计文档 3b 第 6 节。
+  memory: 1Gi
   cpu: 100m

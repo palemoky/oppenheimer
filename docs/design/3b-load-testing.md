@@ -308,3 +308,24 @@ scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 20
   差的那 400 MB 推断是分配器留着的：镜像里的 `mysqld` 没有预加载 jemalloc 或 tcmalloc（`LD_PRELOAD` 是空的），用的是 glibc 的 malloc，大批量插入时申请过的内存释放后留在分配器手里，不还给系统。这是推断，没有换分配器做对照。所以**缓冲池之外要留的不是“一点余量”，而是固定开销约 400 MB 加分配器留着的约 400 MB**。上限 1 Gi 配 512 M 的缓冲池、上限 2 Gi 配 1 G 的缓冲池都算不过来：灌完之后四个订单库实例在 1854 到 1902 Mi（上限 2048），cgroup 的 `memory.events` 里 `max` 是 29 和 72（撞到过上限，靠回收文件缓存过去的），`oom_kill` 是 0。
 - 没有做完的判断：分配器留着的这部分在之后的在线流量下会被重复利用还是继续涨，没有数据；压测时看 `container_memory_working_set_bytes` 和 `memory.events`。订单库的上限要不要再提，等主人定。
 - 面试里这件事的说法：`innodb_buffer_pool_size` 不是 MySQL 的内存上限；容器里给 MySQL 定内存要算缓冲池、固定开销（log buffer、`performance_schema`、每个连接的缓冲区）和分配器的碎片三样；`kubectl top` 看到的数贴着上限时要分清是匿名内存还是文件缓存（`memory.stat`），后者能回收、前者不能；怎么确认是分配器的问题（进程的 RSS 减去 `performance_schema` 记的合计）。
+
+### 第 4 步的后一半：备份和恢复的耗时，备份 Job 被 OOMKilled（2026-11-18）
+
+灌完之后做一次手工备份（`make middleware-backup`），这是“回到基准状态”用的那一份：NAS 上 `mysql-order-0/20261118T173525Z`、`mysql-order-1/20261118T173606Z`、`mysql-main/20261118T173407Z`。定时备份只留最近 7 份，**要长期留着的话得在 NAS 上另存一份**（没有做）。
+
+| 实例 | 数据 | 备份（mysqldump 加 zstd，从从库读） | 压缩后 | 恢复到临时实例 |
+|---|---|---|---|---|
+| `mysql-order-0` | 502 万单、1005 万行明细 | 29 秒 | 505 MB | 177 秒 |
+| `mysql-order-1` | 498 万单 | 约 30 秒 | 501 MB | 没有做 |
+| `mysql-main` | 库存、支付、1000 万行商家索引 | 约 20 秒 | 342 MB | 没有做 |
+
+- 恢复演练（`make mysql-restore-drill RELEASE=mysql-order-0`）：恢复出来的 `gtid_executed` 和备份记录一致；订单、明细、支付结果、outbox、进度表共 16 张表的行数和 `CHECKSUM TABLE` 都和线上从库一致；只有 `idgen_worker`（节点号租约，一直在续租）对不上，是 2c 就知道的。2b 留下的“恢复耗时等有百万行再量”到这里算量了：**500 万单恢复约 3 分钟，是备份的 6 倍**（逻辑备份的恢复要重新建索引）。按这个比例，1 亿单的逻辑恢复是一小时的量级，那时该换物理备份。
+- **备份 Job 第一次在两个订单库上都被 OOMKilled**（上限 256 Mi，开始十几秒就被杀；`mysql-main` 的成功了）。values 里的注释写的是“dump 是流式的，内存用量很小”，对进程本身是对的：重跑时看 `memory.stat`，`mysqldump` 加 `zstd` 的匿名内存只有 41 Mi。占内存的是**输出文件的页缓存**：备份写在 NFS 上，脏页和正在回写的页都记在这个容器的 cgroup 里（采到过 `file` 481 Mi、其中 `file_writeback` 213 Mi，峰值 526 Mi），NAS 收得没有 dump 产生得快，256 Mi 装不下。库里只有几万行时文件只有 1 MB，所以一直没有暴露。
+- 处理：备份 Job 的内存提到 1 Gi（`deploy/charts/mysql/values.yaml`，只改了 CronJob，三个实例没有滚动），重跑成功。**这是把上限抬过了现在的数据量，不是修好了**：数据再大十倍，回写跟不上时还会撞。真正的修法是让写出去的数据不在页缓存里积压（例如输出经 `dd oflag=direct` 或者定期 `fsync`），没有做，记给阶段 4 的备份恢复实验。
+- 面试里这件事的说法：容器的内存上限管的不只是进程的堆，写文件产生的脏页也算；本地盘上脏页回写得快看不出来，写到 NFS 这种慢的后端就会 OOM；“流式处理所以不占内存”要连输出端一起看。
+
+### 第 5 步之前：关按地址的限流、钉副本数、运行一轮的脚本（2026-11-18）
+
+- `LOADTEST=1 make deploy`：构建加滚动 2 分 07 秒，镜像 tag `61bb6be-dirty-20261118173536`（比上一版多了 `pkg/redisx` 的命令耗时指标），gateway 的 `RATE_LIMIT_IP` 是 `off`，其余限流是默认值。**长期运行的那一套现在一直是这个状态**，压测做完要不带 `LOADTEST=1` 再部署一次恢复。
+- gateway、order 用 `loadtest.sh pin gateway=2 order=2` 钉在 2 个副本（KEDA 暂停）。
+- `scripts/cluster/loadtest-round.sh <场景>`：预检、把这一轮的条件存进结果目录、跑 k6、中途抓 pprof（CPU 30 秒、堆、goroutine）、把服务端的指标按发压的时间窗从 Prometheus 取出来存成 `server.txt`。等静止和对账不在里面，几轮连着跑、最后一起对。
