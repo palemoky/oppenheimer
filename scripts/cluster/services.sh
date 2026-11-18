@@ -20,6 +20,8 @@
 #   E2E_OVERLAY_DIR e2e-up、e2e-render 在 e2e 那两层 values 之上再叠的一层（目录里的 common.yaml 和 <服务>.yaml），
 #                  scripts/cluster/chaos.sh 设成 deploy/cluster/services/chaos。没设就没有这一层。
 #                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
+#   LOADTEST       deploy 时设为 1，在 deploy/cluster/services/<服务>.yaml 之上叠 deploy/cluster/services/loadtest/<服务>.yaml
+#                  （压测用：关掉 gateway 按客户端地址的限流 RATE_LIMIT_IP）。不影响 e2e 那一套。压完不带它再 deploy 一次就恢复。
 # 服务之间走 Istio 的边车（设计文档 2d）：deploy、e2e-up 要求 istiod 已经装好（make mesh-up），在部署任何 release
 # 之前对目标命名空间 kubectl apply deploy/cluster/mesh/（流量规则先于 Pod 存在），全部滚动完之后再应用
 # deploy/cluster/mesh/security/（mTLS 严格模式和按身份的访问控制）。
@@ -71,7 +73,7 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 E2E_ROOT_SECRET_KEYS=(root-password)
 
 usage() {
-  sed -n '2,29p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,31p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -152,6 +154,10 @@ helm_args() { # 服务 tag
   # tag 用 --set-string：tag 是提交号的前 7 位，碰上全是数字的（7390796）时 --set 会把它当成整数，
   # 模板里的 printf "%s" 渲染出 %!s(int64=7390796)，Pod 报 InvalidImageName（2026-11-17 重建时遇到）。
   HELM_ARGS+=(--set "image.repository=$REGISTRY_ADDR/oppenheimer/$s" --set-string "image.tag=$tag")
+  # LOADTEST=1：长期运行的那一套叠压测用的一层（scripts/cluster/loadtest.sh 的 pin、preflight 配合使用）。
+  if [[ $E2E_MODE -eq 0 && "${LOADTEST:-0}" == 1 && -f "$VALUES/loadtest/$s.yaml" ]]; then
+    HELM_ARGS+=(-f "$VALUES/loadtest/$s.yaml")
+  fi
   if [[ $E2E_MODE -eq 1 ]]; then
     HELM_ARGS+=(-f "$E2E_VALUES/common.yaml")
     if [[ -f "$E2E_VALUES/$s.yaml" ]]; then
