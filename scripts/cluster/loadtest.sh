@@ -14,6 +14,9 @@
 #   loadtest.sh recon [recon 的参数]    跑 recon，默认 -pairs payment,stock,replica,index -settle 0 -recheck 30s
 #   loadtest.sh verify <SKU 列表> <orders.jsonl>
 #                                      跑 load verify 的限定范围模式（-scope-skus、-orders-jsonl）
+#   loadtest.sh seed-orders <load seed 的参数>
+#                                      直接向两个订单主库灌历史订单（load seed，设计文档 1c 的 5.3）。可中断续跑，但必须用同一组参数
+#                                      （参数指纹记在 seed_progress 里，换了参数会被拒绝），所以 -orders、-from、-to 每次都要写全
 #   loadtest.sh image                  只构建并推送 chaos 镜像（load、recon），打印 tag
 #
 # 环境变量：
@@ -29,6 +32,7 @@
 #   VERIFY_INITIAL          verify 的 -initial（"7001=1000,7002=1000"）；没给就读 skus 记下的 tmp/loadtest/sku-initial.txt
 #   LOADTEST_IMAGE_TAG      chaos 镜像的 tag；没给就用 images.sh tag（工作区干净时是短提交号，不干净时每次都不同）。
 #                           仓库里已经有这个 tag 就不再构建
+#   SEED_TIMEOUT            等 seed-orders 跑完的时限（秒），默认 21600。超时或 MacBook 这边中断时 Pod 被删，重跑同样的命令接着灌
 #   LOADTEST_OUT            输出目录，默认 tmp/loadtest/<时间>
 #
 # wait-quiet、recon、verify 在集群里起一个一次性的 Pod（oppenheimer 命名空间，chaos 镜像，不进网格），
@@ -678,6 +682,16 @@ cmd_verify() { # SKU 列表 orders.jsonl
   phase_result
 }
 
+# 灌历史订单。订单主库的 DSN 在 Pod 的环境变量里（带密码），所以经 sh 在 Pod 里展开，不出现在命令行上。
+# 写入会经过 binlog 流到从库和 CDC，再进商家索引：灌完要等从库和索引的消费延迟追平（preflight 会看）。
+cmd_seed_orders() {
+  [[ $# -ge 1 ]] || die 2 "usage: loadtest.sh seed-orders -orders N -from YYYY-MM-DD -to YYYY-MM-DD [more load seed flags]"
+  with_pod
+  # shellcheck disable=SC2016 # 要的就是在 Pod 里展开
+  run_phase seed "${SEED_TIMEOUT:-21600}" sh -c 'exec load seed -order-dsns "$LOAD_ORDER_DSNS" "$@"' seed "$@"
+  phase_result
+}
+
 # ---------- 入口 ----------
 cmd="${1:-}"
 shift || true
@@ -690,9 +704,10 @@ unpin) cmd_unpin "$@" ;;
 wait-quiet) cmd_wait_quiet ;;
 recon) cmd_recon "$@" ;;
 verify) cmd_verify "$@" ;;
+seed-orders) cmd_seed_orders "$@" ;;
 image) cmd_image ;;
 *)
-  sed -n '2,33p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,37p' "${BASH_SOURCE[0]}" >&2
   exit 2
   ;;
 esac

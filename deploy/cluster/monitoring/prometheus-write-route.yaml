@@ -1,5 +1,6 @@
 # Prometheus 的 remote write 接收端挂到入口上，给集群外的发压机（Mac mini 上的 k6）写客户端指标用
-# （设计文档 3b 第 2 节第 7 项）。只放行写入这一个路径：查询接口和界面仍然不对外
+# （设计文档 3b 第 2 节第 7 项）。不限 Host：k6 2.4 的 remote write 输出设不了 Host 头（配了也被忽略，2026-11-18 实测是 404），
+# 只能按地址访问 http://<入口地址>/api/v1/write。业务入口的路由带主机名，比这一条更具体，互不影响。只放行写入这一个路径：查询接口和界面仍然不对外
 # （用 scripts/cluster/monitoring.sh forward）。入口的地址只在局域网里可达；这个路径没有鉴权，
 # 局域网里的任何设备都能往里写序列，这是练习环境接受的代价。
 apiVersion: gateway.networking.k8s.io/v1
@@ -13,8 +14,6 @@ spec:
       kind: Gateway
       name: public
       namespace: envoy-gateway-system
-  hostnames:
-    - __PROM_WRITE_HOST__
   rules:
     - matches:
         - path:

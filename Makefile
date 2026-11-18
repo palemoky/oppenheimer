@@ -321,6 +321,10 @@ cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（
 k6: ## 从本机发起，在发压机（Mac mini）上跑 k6 压测集群：make k6 SCENARIO=order|flash|mixed|ratelimit，配置走环境变量（见 test/k6/README.md），K6_PROM=off 不写 Prometheus；结果在 tmp/k6/<RUN_ID>/
 	scripts/cluster/k6.sh $(SCENARIO) $(K6_ARGS)
 
+.PHONY: loadtest
+loadtest: ## 压测的辅助动作（预检、记录条件、准备 SKU、钉副本数、灌历史订单、wait-quiet、recon、verify）：make loadtest ARGS="preflight"，子命令见 scripts/cluster/loadtest.sh 的头部
+	scripts/cluster/loadtest.sh $(ARGS)
+
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
 	scripts/cluster/services.sh status

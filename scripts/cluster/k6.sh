@@ -11,7 +11,7 @@
 # 流程：
 #   1. rsync 把 test/k6/ 同步到发压机的 ~/oppenheimer-k6/scripts/（--delete）
 #   2. ssh 上去跑 k6：调高 ulimit -n，用 caffeinate 防止发压机睡眠（它空闲 1 分钟就睡，没有 sudo 改不了）
-#   3. k6 的指标实时 remote write 到集群的 Prometheus（经入口，按 Host 头 $PROM_WRITE_HOST 路由），
+#   3. k6 的指标实时 remote write 到集群的 Prometheus（经入口的 /api/v1/write，不限 Host），
 #      每条序列带标签 testid=<RUN_ID>；趋势类指标按 K6_PROM_TREND_STATS 输出成独立的序列
 #   4. 跑完把结果拉回 tmp/k6/<RUN_ID>/，结构同 scripts/k6-local.sh：
 #      summary.json、orders.jsonl、conditions.txt、k6.log（conditions.txt 里另有发压机的信息）
@@ -27,7 +27,6 @@
 #   透传给 k6 的那些和 k6-local.sh 一致（见 test/k6/README.md）；BASE_URL 默认 http://$LB_GATEWAY_IP，
 #   HOST_HEADER 默认 api.oppenheimer.test。
 #   LOAD_SSH           发压机的 ssh 别名，默认 mini
-#   PROM_WRITE_HOST    remote write 用的 Host 头，默认 prom-write.oppenheimer.test
 #   K6_PROM            设成 off 不写 Prometheus
 #   K6_PROM_TREND_STATS  趋势类指标输出哪些统计，默认 p(50),p(95),p(99),max
 #
@@ -42,7 +41,6 @@ source "$HERE/cluster.env"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 LOAD_SSH="${LOAD_SSH:-mini}"
-PROM_WRITE_HOST="${PROM_WRITE_HOST:-prom-write.oppenheimer.test}"
 K6_PROM="${K6_PROM:-on}"
 K6_PROM_TREND_STATS="${K6_PROM_TREND_STATS:-p(50),p(95),p(99),max}"
 REMOTE_BASE='oppenheimer-k6' # 相对发压机的 $HOME
@@ -161,10 +159,9 @@ PROM_LINES=""
 PROM_ARGS=""
 PROM_NOTE="off"
 if [ "$K6_PROM" != off ]; then
-  PROM_NOTE="on (http://$LB_GATEWAY_IP/api/v1/write, Host: $PROM_WRITE_HOST, testid=$RUN_ID, trend_stats=$K6_PROM_TREND_STATS)"
+  PROM_NOTE="on (http://$LB_GATEWAY_IP/api/v1/write, testid=$RUN_ID, trend_stats=$K6_PROM_TREND_STATS)"
   PROM_LINES="
 export K6_PROMETHEUS_RW_SERVER_URL=$(printf '%q' "http://$LB_GATEWAY_IP/api/v1/write")
-export K6_PROMETHEUS_RW_HEADERS_Host=$(printf '%q' "$PROM_WRITE_HOST")
 export K6_PROMETHEUS_RW_TREND_STATS=$(printf '%q' "$K6_PROM_TREND_STATS")
 export K6_PROMETHEUS_RW_STALE_MARKERS=true"
   PROM_ARGS="-o experimental-prometheus-rw --tag testid=$RUN_ID"

@@ -51,7 +51,6 @@ render() {
   sed -e "s#__SERVER_IP__#$(server_ip)#g" \
     -e "s#__PROMETHEUS_TAG__#$PROMETHEUS_VERSION#g" \
     -e "s#__GRAFANA_HOST__#$GRAFANA_HOST#g" \
-    -e "s#__PROM_WRITE_HOST__#$PROM_WRITE_HOST#g" \
     -e "s#__MYSQLD_EXPORTER_TAG__#$MYSQLD_EXPORTER_VERSION#g" \
     -e "s#__REDIS_EXPORTER_TAG__#$REDIS_EXPORTER_VERSION#g" \
     "$1"
@@ -105,7 +104,7 @@ cmd_kps() {
   render "$DEPLOY/grafana-route.yaml" | kubectl apply -f - >/dev/null
   render "$DEPLOY/prometheus-write-route.yaml" | kubectl apply -f - >/dev/null
   echo "    Grafana: curl -H 'Host: $GRAFANA_HOST' http://$LB_GATEWAY_IP/  (browser: add '$LB_GATEWAY_IP $GRAFANA_HOST' to /etc/hosts)"
-  echo "    remote write (k6): POST http://$LB_GATEWAY_IP/api/v1/write with 'Host: $PROM_WRITE_HOST'"
+  echo "    remote write (k6): POST http://$LB_GATEWAY_IP/api/v1/write (any Host)"
 }
 
 # Loki 和 Tempo 的 chart 在 grafana-community 的仓库（版本和来由见 cluster.env）。values 里没有占位符，直接用。
