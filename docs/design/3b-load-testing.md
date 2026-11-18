@@ -288,3 +288,23 @@ scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 20
 - 没有限速是主会话的疏忽：1c 在本机灌的时候没有内存上限，集群上有。
 - 处理（主人同意）：四个订单库实例的上限提到 2 Gi、缓冲池 1 G（`deploy/cluster/mysql/mysql-order-*.yaml`，滚动了一遍，1 分 40 秒，主从状态正常）；灌数加 `-rate 5000`。`mysql-main` 没有动（上限 1536 Mi、缓冲池 768 M，灌数期间在 986 Mi 上下），商家索引追数时看着它。
 - 3c 要加的告警：容器内存接近上限、容器被 OOMKilled。这一次是从客户端的 `invalid connection` 才发现的。
+
+**续灌和结果（2026-11-18，16:54 到 17:24 UTC）。** `-rate 5000` 续灌，29 分 45 秒写完剩下的 8935765 单，全程稳定在 5000 单/秒。
+
+- 两个分片各 360 个块，5023016 加 4976984 正好 1000 万单；主从的 `gtid_executed` 一致；灌完时所有消费组的延迟是 0（商家索引的消费者在灌数期间最多积压约 3 万条，5000 单/秒跟得上）；`preflight` 通过。
+- 数据目录：订单库的主库 3.4 GB、从库 4.3 GB（各 500 万单加 1000 万行明细，含 binlog），`mysql-main` 3.0 GB。两个 agent 节点的盘各剩 126 到 128 GB。
+- **`mysql-main` 在灌数期间也被 OOMKilled 了一次**（约 17:00 UTC，上限 1536 Mi，商家索引追数时涨上去的；主会话看到它在 1530 Mi 时去请主人同意，等答复的几分钟里它被杀了）。主人同意后提到 2560 Mi、缓冲池 1 G，滚动 28 秒。
+- **内存的账（灌完时在 `mysql-order-0-0` 上量的）**：
+
+  | | MB |
+  |---|---|
+  | 容器的匿名内存（`memory.stat` 的 `anon`，也是进程的 `RssAnon`） | 1844 |
+  | MySQL 自己记的（`performance_schema.memory_summary_global_by_event_name` 合计） | 1448 |
+  | 其中缓冲池（配的是 1 G，实际 1047） | 1047 |
+  | 其中 redo 的 log buffer | 64 |
+  | 其中 `performance_schema` 自己的几张表 | 约 100 |
+  | **MySQL 没有记、进程却占着的** | **约 400** |
+
+  差的那 400 MB 推断是分配器留着的：镜像里的 `mysqld` 没有预加载 jemalloc 或 tcmalloc（`LD_PRELOAD` 是空的），用的是 glibc 的 malloc，大批量插入时申请过的内存释放后留在分配器手里，不还给系统。这是推断，没有换分配器做对照。所以**缓冲池之外要留的不是“一点余量”，而是固定开销约 400 MB 加分配器留着的约 400 MB**。上限 1 Gi 配 512 M 的缓冲池、上限 2 Gi 配 1 G 的缓冲池都算不过来：灌完之后四个订单库实例在 1854 到 1902 Mi（上限 2048），cgroup 的 `memory.events` 里 `max` 是 29 和 72（撞到过上限，靠回收文件缓存过去的），`oom_kill` 是 0。
+- 没有做完的判断：分配器留着的这部分在之后的在线流量下会被重复利用还是继续涨，没有数据；压测时看 `container_memory_working_set_bytes` 和 `memory.events`。订单库的上限要不要再提，等主人定。
+- 面试里这件事的说法：`innodb_buffer_pool_size` 不是 MySQL 的内存上限；容器里给 MySQL 定内存要算缓冲池、固定开销（log buffer、`performance_schema`、每个连接的缓冲区）和分配器的碎片三样；`kubectl top` 看到的数贴着上限时要分清是匿名内存还是文件缓存（`memory.stat`），后者能回收、前者不能；怎么确认是分配器的问题（进程的 RSS 减去 `performance_schema` 记的合计）。
