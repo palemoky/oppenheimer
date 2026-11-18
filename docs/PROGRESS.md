@@ -23,8 +23,9 @@
   - k6 2.4 的 remote write 输出设不了 Host 头，写入的路由改成了不限 Host（`http://192.168.50.51/api/v1/write`）。这个输出已标弃用（v3 移除），以后换 OpenTelemetry 输出。
   - 每轮压完要等 15 分钟（没付款的订单等支付超时关单）`wait-quiet` 才过；`preflight` 的消费延迟不算 `order.order-close-delay` 这个组。
   - `verify` 需要的初始库存记在本机 `tmp/loadtest/sku-initial.txt`（`skus` 子命令写的，不入库）。
-  - 两个子 Agent 的 worktree 和分支（`worktree-agent-a1f1e333da3aef2e9`、`worktree-agent-a8f0b87f41866675d`）**还没有删**。
-- **第 4 步（灌数）停在这里，等主人定**：`LOADTEST_IMAGE_TAG=42c5fd6 scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 2026-11-18`（**参数必须原样**，指纹记在库里，换了会被拒绝；可以另加 `-rate`、`-timeout`）。试跑 30 秒灌进去 1064235 单（约 4.3 万单/秒），**把 `mysql-order-0-0` 打到 1 Gi 的内存上限被 OOMKilled 一次**（16:18:51 UTC），7 秒后自己恢复；两个分片主从的 GTID 一致，`seed_progress` 的合计等于工具报的数，没有丢已提交的数据。另外三个订单库实例当时也在 990 到 1014 Mi。缓冲池是 512 MB。**续灌之前要先定 MySQL 的内存**（建议订单库四个实例的上限提到 2 Gi，并给灌数加 `-rate`）；商家索引的消费者当时积压 35 万条，在追。
+  - 两个子 Agent 的 worktree 和分支已删（2026-11-18，主人同意）。
+- **第 4 步（灌数）停在这里，等主人定**：`LOADTEST_IMAGE_TAG=42c5fd6 scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 2026-11-18`（**参数必须原样**，指纹记在库里，换了会被拒绝；可以另加 `-rate`、`-timeout`）。试跑 30 秒灌进去 1064235 单（约 4.3 万单/秒），**把 `mysql-order-0-0` 打到 1 Gi 的内存上限被 OOMKilled 一次**（16:18:51 UTC），7 秒后自己恢复；两个分片主从的 GTID 一致，`seed_progress` 的合计等于工具报的数，没有丢已提交的数据。另外三个订单库实例当时也在 990 到 1014 Mi。缓冲池是 512 MB。**续灌之前要先定 MySQL 的内存**（建议订单库四个实例的上限提到 2 Gi，并给灌数加 `-rate`）；商家索引的消费者当时积压 35 万条，在追。 **主人同意后已做**：四个订单库实例 2 Gi、缓冲池 1 G（已滚动）；16:54 UTC 起以 `-rate 5000` 续灌（`LOADTEST_OUT=tmp/loadtest/seed-10m`）。灌到 35% 时订单库各实例 1.3 Gi 上下；**`mysql-main-0` 到了 1482 Mi，上限 1536 Mi**，要不要提它的上限在等主人定（见设计文档 3b 第 6 节“第 4 步”）。灌完之后：等从库和商家索引追平（`loadtest.sh preflight`）、`seed-report`、做一次备份并量备份和恢复的耗时。
+- **Mac mini 已接千兆有线**（2026-11-18）：有线口的地址是 192.168.50.19，到入口的路由走有线（`en0`，1000baseT），`ssh mini` 仍然连 Wi-Fi 的 .14；休眠已关；重启之后“本地网络”的授权还在（经 ssh 的 k6 20 个请求 0 失败，中位数 3.4 毫秒）。重启后要在本机登录一次，否则 ssh 提示 `This system is locked`。
 - 细节在设计文档 3b 第 6 节“第 2、3 步”。
 
 ### 3b 做到哪（2026-11-17）

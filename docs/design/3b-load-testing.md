@@ -251,3 +251,40 @@ MacBook：发起（ssh mini 跑 k6）、灌数和清理、对账、抓 pprof、�
 - 入口的地址不应答 ping（MetalLB 二层模式下只有 Service 的端口通），用它判断连通性会误判，要用 HTTP。
 
 **Prometheus 的写入地址**（第 2 节第 7 项）：入口上加了一条 `HTTPRoute`（`deploy/cluster/monitoring/prometheus-write-route.yaml`，`monitoring.sh kps` 会应用），`Host: prom-write.oppenheimer.test`，只放行 `POST /api/v1/write`，查询接口不对外（从 Mac mini 实测：写入口有应答，查询是 404）。没有鉴权，局域网里的设备都能写，是练习环境接受的代价。remote write 接收端 3a 时已经为 Tempo 打开过，不用改 Prometheus。
+
+### 第 3 步的结果：运行入口和辅助脚本（2026-11-18）
+
+两块各由一个 Sonnet 子 Agent 写，主会话读过后合并、在集群上复验。
+
+**`make k6 SCENARIO=<场景>`**（`scripts/cluster/k6.sh`）：把 `test/k6/` 同步到 Mac mini，经 ssh 在那里原生运行 k6，结果拉回 `tmp/k6/<运行号>/`（结构和 `k6-local.sh` 一样，`conditions.txt` 里多了发压机的信息和走的是哪个网卡）。调高文件描述符上限、用 `caffeinate` 防睡眠、中断时把远端的 k6 一起停掉。
+
+- **macOS 的“本地网络”权限**：brew 装的 k6 是临时签名的，第一次经 ssh 启动时访问不了任何局域网地址（全部超时，访问 127.0.0.1 正常，同一个会话里系统自带的 `curl` 也正常）。主人在 Mac mini 自己的终端里跑了一次 k6、在弹窗里点了允许之后，经 ssh 启动的也通了。重装 k6 或升级系统之后可能要再来一次。面试里可以讲的点：同一台机器上 `curl` 通而压测工具不通时，先想到的不该是网络。
+- **指标用 remote write 写进 Prometheus**（`-o experimental-prometheus-rw`）。趋势类指标每个统计量一条序列（`k6_http_req_duration_p99` 这样的名字，带 `name`、`method`、`status`、`scenario`、`testid` 标签），不是直方图，所以不能跨运行再聚合分位数。一轮约 200 条序列。运行结束时 k6 写入 stale 标记，之后即时查询查不到，要用 `last_over_time(...[10m])` 或者范围查询。
+- k6 2.4 的这个输出**设不了 Host 头**（配了 `K6_PROMETHEUS_RW_HEADERS_Host` 也被忽略，实测入口答 404），入口上那条路由因此改成不限 Host、只认 `POST /api/v1/write`。带业务主机名的请求仍然走业务的路由（实测 `Host: api.oppenheimer.test` 访问这个路径是 404）。
+- 这个输出在 k6 2.4 里已经标了弃用（v3 移除，建议换 OpenTelemetry 输出）。Prometheus 的 OTLP 接收端 3a 时已经开着，以后换过去不用动集群。
+- 冒烟（Wi-Fi 下，延迟不算数）：`order` 30 单/秒 20 秒，601 单全部受理并落库，清单 601 行；`mixed` 30 请求/秒，601 个请求 0 失败。
+
+**`scripts/cluster/loadtest.sh`**（`make loadtest ARGS="..."`）：`preflight`、`conditions`、`skus`、`pin`/`unpin`、`seed-orders`、`wait-quiet`、`recon`、`verify`。后四个在集群里起一个一次性的 Pod（chaos 镜像），DSN 来自已有的 Secret。**`LOADTEST=1 make deploy`** 叠一层 values 把 gateway 的 `RATE_LIMIT_IP` 关掉。
+
+- 冒烟：造 SKU 6901、6902，20 单/秒压 15 秒（300 单：已付 161、取消 65、超时关单 74），`wait-quiet`、`recon -since 30m`（差异 0）、`verify`（通过，两个 SKU 的已售合计 161，等于已付的订单数）。
+- **每一轮压完要等 15 分钟才能对账**：没付款的订单要等支付超时才关单，在那之前 `wait-quiet` 不过，延迟关单那个消费组的延迟也不为 0（`preflight` 因此不把这个组算进“消费延迟为 0”）。三轮优化、每轮几次对比，这 15 分钟会反复付；要缩短得给压测单独调短支付超时，那就不是平时的配置了。先不改。
+- `verify` 需要每个 SKU 的初始库存，卖过之后库里没有这个数：`skus` 建的时候记在本机的 `tmp/loadtest/sku-initial.txt`（不入库），换机器要用 `VERIFY_INITIAL` 手工给。
+- 副本数用 KEDA 的注解 `autoscaling.keda.sh/paused-replicas` 钉死（暂停期间 KEDA 会把 HPA 删掉，放开后重建）。钉着的时候再 `make deploy` 会把 Deployment 的副本数改回 values 里的数，所以顺序是先部署、再钉、再用 `preflight` 的 `EXPECT_REPLICAS` 核对。
+- `recon` 默认带 `-settle 0`：它自己的默认值 30 分钟会把刚压完的这一轮排除在外。
+- 没有验证的：几十万行的订单号清单送进 Pod（只试过 300 行）；`LOADTEST=1 make deploy` 的实际部署。
+
+### 第 4 步：灌数时主库被 OOMKilled（2026-11-18）
+
+灌数的命令（参数的指纹记在库里的 `seed_progress`，**续跑必须原样**，只有 `-rate`、`-timeout`、`-progress` 可以变）：
+
+```
+scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 2026-11-18
+```
+
+第一次没有限速，带 `-timeout 30s` 试跑：约 4.3 万单/秒，24 秒灌进去 1064235 单，然后 **`mysql-order-0-0`（分片 0 的主库）撞到 1 Gi 的内存上限被 OOMKilled**，7 秒后重启完成。
+
+- 数据没有受影响：崩溃恢复后两个分片主从的 `gtid_executed` 一致，`seed_progress` 的合计（513909 加 550326）等于工具报的数；没提交的事务回滚了，同样的命令可以接着灌。
+- 另外三个订单库实例当时是 990 到 1014 Mi，也贴着上限。缓冲池是 512 MB，也就是**缓冲池之外还有 500 Mi 上下**：8 个 slot 并发、每个事务 1000 单加 2000 行明细，事务的 binlog 缓存、连接的缓冲区、`performance_schema` 加起来的。这部分是个绝对量，不随缓冲池按比例变，“缓冲池给上限的一半”在 1 Gi 这个量级下不安全。
+- 没有限速是主会话的疏忽：1c 在本机灌的时候没有内存上限，集群上有。
+- 处理（主人同意）：四个订单库实例的上限提到 2 Gi、缓冲池 1 G（`deploy/cluster/mysql/mysql-order-*.yaml`，滚动了一遍，1 分 40 秒，主从状态正常）；灌数加 `-rate 5000`。`mysql-main` 没有动（上限 1536 Mi、缓冲池 768 M，灌数期间在 986 Mi 上下），商家索引追数时看着它。
+- 3c 要加的告警：容器内存接近上限、容器被 OOMKilled。这一次是从客户端的 `invalid connection` 才发现的。
