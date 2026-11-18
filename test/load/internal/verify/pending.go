@@ -63,10 +63,15 @@ FROM p WHERE NOT EXISTS (SELECT 1 FROM sku_stock s WHERE s.sku_id = p.sku_id)`
 // collectStock 读 sku_stock 和 stock_pending：Snapshot.RawStock 是表里的值，Snapshot.Stock 是真实的数
 // （原始值加上没有应用的增量），Snapshot.Pending 是各 SKU 没有应用的增量。
 func collectStock(ctx context.Context, db *sql.DB, s *Snapshot) error {
+	return scanStock(ctx, db, pendingStockSQL, nil, s)
+}
+
+// scanStock 执行 pendingStockSQL 或它只取部分 SKU 的版本（列相同），填 Stock、RawStock、Pending。
+func scanStock(ctx context.Context, db *sql.DB, query string, args []any, s *Snapshot) error {
 	s.Stock = map[int64]SKUStock{}
 	s.RawStock = map[int64]SKUStock{}
 	s.Pending = map[int64]PendingSKU{}
-	return wrapPendingErr(queryEach(ctx, db, pendingStockSQL, func(r *sql.Rows) error {
+	return wrapPendingErr(queryArgs(ctx, db, query, args, func(r *sql.Rows) error {
 		var (
 			raw       SKUStock
 			inStock   int
