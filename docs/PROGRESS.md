@@ -18,6 +18,13 @@
   3. 默认文件描述符上限 256，脚本里调高，不用主人管。
 - **Prometheus 的写入地址已暴露**：入口上 `Host: prom-write.oppenheimer.test`，只放行 `POST /api/v1/write`（`deploy/cluster/monitoring/prometheus-write-route.yaml`，`cluster.env` 的 `PROM_WRITE_HOST`，`monitoring.sh kps` 会应用）。
 - **主人 2026-11-18 确认：压测的订单不删**（设计文档 3b 第 6 节第一条、ADR-0031 第 4 项）。下面 2026-11-17 那段里“主人还没有看过”“请主人过目”两处已经过时。
+- **第 3 步做完了**（2026-11-18，提交 `abb92f3`、`e822c39`、`43f2c26`，后两个之后的没有推送，见 git log）：`make k6 SCENARIO=...`（`scripts/cluster/k6.sh`，在 Mac mini 上原生跑 k6，结果拉回 `tmp/k6/<运行号>/`，指标 remote write 进 Prometheus，标签 `testid=<运行号>`，一轮约 200 条序列；结束后序列带 stale 标记，查的时候用 `last_over_time(...[10m])`）；`scripts/cluster/loadtest.sh`（`make loadtest ARGS=...`：`preflight`、`conditions`、`skus`、`pin`/`unpin`、`seed-orders`、`wait-quiet`、`recon`、`verify`）；`LOADTEST=1 make deploy` 关掉 gateway 按地址的限流（**还没有部署**）。冒烟：order、mixed 从 Mac mini 各跑通一次；`loadtest.sh` 的 `wait-quiet`、`recon`、`verify` 在 300 单上通过（SKU 6901、6902，冒烟用掉了）。chaos 镜像 tag `42c5fd6`（`LOADTEST_IMAGE_TAG=42c5fd6` 可以免去重建）。
+  - Mac mini 上 k6 起初连不上局域网（macOS 的“本地网络”权限），主人在 Mac mini 的终端里跑过一次 k6 并允许之后，经 ssh 启动的也通了。重装 k6 或升级系统后可能要再授权一次。
+  - k6 2.4 的 remote write 输出设不了 Host 头，写入的路由改成了不限 Host（`http://192.168.50.51/api/v1/write`）。这个输出已标弃用（v3 移除），以后换 OpenTelemetry 输出。
+  - 每轮压完要等 15 分钟（没付款的订单等支付超时关单）`wait-quiet` 才过；`preflight` 的消费延迟不算 `order.order-close-delay` 这个组。
+  - `verify` 需要的初始库存记在本机 `tmp/loadtest/sku-initial.txt`（`skus` 子命令写的，不入库）。
+  - 两个子 Agent 的 worktree 和分支（`worktree-agent-a1f1e333da3aef2e9`、`worktree-agent-a8f0b87f41866675d`）**还没有删**。
+- **第 4 步（灌数）停在这里，等主人定**：`LOADTEST_IMAGE_TAG=42c5fd6 scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 2026-11-18`（**参数必须原样**，指纹记在库里，换了会被拒绝；可以另加 `-rate`、`-timeout`）。试跑 30 秒灌进去 1064235 单（约 4.3 万单/秒），**把 `mysql-order-0-0` 打到 1 Gi 的内存上限被 OOMKilled 一次**（16:18:51 UTC），7 秒后自己恢复；两个分片主从的 GTID 一致，`seed_progress` 的合计等于工具报的数，没有丢已提交的数据。另外三个订单库实例当时也在 990 到 1014 Mi。缓冲池是 512 MB。**续灌之前要先定 MySQL 的内存**（建议订单库四个实例的上限提到 2 Gi，并给灌数加 `-rate`）；商家索引的消费者当时积压 35 万条，在追。
 - 细节在设计文档 3b 第 6 节“第 2、3 步”。
 
 ### 3b 做到哪（2026-11-17）
