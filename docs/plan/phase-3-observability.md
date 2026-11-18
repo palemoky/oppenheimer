@@ -51,19 +51,19 @@
 - [ ] 错误预算与多窗口燃烧率告警
 - [ ] 基础设施告警：节点、Pod 重启、磁盘、主从延迟、Kafka 消费积压、Redis 内存
 - [ ] 业务告警：下单成功率骤降、对账差异、库存异常
-- [ ] Alertmanager 路由、分组、抑制、静默；通知渠道（webhook，为阶段 5 的 Agent 留接口）
+- [ ] Alertmanager 路由、分组、抑制、静默；通知渠道（webhook，为阶段 6 的 Agent 留接口）
 - [ ] 每条告警配一份 runbook（`docs/runbooks/`）
 - [ ] 告警质量检查：人为触发每条告警，确认能响且不误报
 
 ## 3d 最小诊断 Agent
 
-提前做一个最小版本，让它跟着阶段 4 的每次故障实验一起跑、一起迭代，而不是等实验全做完再开始。完整设计见 [phase-5-agent.md](phase-5-agent.md)。
+提前做一个最小版本，让它跟着阶段 4 的每次故障实验一起跑、一起迭代，而不是等实验全做完再开始。完整设计见 [phase-6-agent.md](phase-6-agent.md)。
 
 动工前先查最新的 Claude API 和 Agent SDK 文档。
 
 - [ ] Agent 主循环（Go + Claude API 工具调用）：多轮推理、终止条件、步数与费用上限
 - [ ] 三个只读工具：Prometheus 查询（PromQL 即时与范围）、Loki 日志查询、Kubernetes（get、describe、events、logs）
-  - Kubernetes 工具从阶段 5 提前到这里（2026-11-15）：阶段 4 的故障里有一大类是 Pod 被杀、OOM、节点失联、调度不上，只有指标和日志时 Agent 只能从数据的缺口去猜
+  - Kubernetes 工具从阶段 6 提前到这里（2026-11-15）：阶段 4 的故障里有一大类是 Pod 被杀、OOM、节点失联、调度不上，只有指标和日志时 Agent 只能从数据的缺口去猜
   - 用 client-go，单独的 ServiceAccount，只给 get、list、watch；不给 exec、不给任何写权限，权限写在清单里入库
 - [ ] 工具输出的裁剪，控制上下文长度
 - [ ] 触发方式：Alertmanager webhook 和命令行手动提问
