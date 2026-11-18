@@ -18,6 +18,16 @@ STAGES=100:3m,125:3m,156:3m scripts/k6-local.sh order
 scripts/k6-local.sh order --quiet
 ```
 
+## 在集群上跑（发压机）
+
+```sh
+SKUS=3001 RATE=30 DURATION=20s make k6 SCENARIO=order     # 等价于 scripts/cluster/k6.sh order
+```
+
+`scripts/cluster/k6.sh` 把本目录 rsync 到发压机（Mac mini，ssh 别名 `mini`）的 `~/oppenheimer-k6/scripts/`，在上面原生运行 k6（调高 `ulimit -n`，用 `caffeinate` 防睡眠），`BASE_URL` 默认 `http://$LB_GATEWAY_IP`、`HOST_HEADER` 默认 `api.oppenheimer.test`，其余环境变量和上面一致。结果拉回 `tmp/k6/<RUN_ID>/`，结构相同，`conditions.txt` 里多记发压机的主机、系统、`ulimit -n` 和网络接口。发压机走 Wi-Fi 时终端会有醒目提示：客户端延迟不可信。Ctrl-C 会让发压机上的 k6 收尾退出，结果照常拉回。
+
+指标同时 remote write 到集群的 Prometheus（`-o experimental-prometheus-rw`，经入口按 Host 头 `prom-write.oppenheimer.test` 路由），每条序列带标签 `testid=<RUN_ID>`；趋势类指标按 `K6_PROM_TREND_STATS`（默认 `p(50),p(95),p(99),max`）各输出成一条序列，如 `k6_http_req_duration_p99`。`K6_PROM=off` 关掉。
+
 结果在 `tmp/k6/<RUN_ID>/`：
 
 - `summary.json`：k6 的完整汇总（含自定义指标、阈值结果、`load_config`）

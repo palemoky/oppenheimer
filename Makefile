@@ -317,6 +317,10 @@ cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、�
 cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（732f9ab，各 1 副本）后 1b（设计副本数），共用 oppenheimer-e2e；BENCH_* 见脚本，结果在 tmp/cluster-bench/，E2E_KEEP=1 保留现场
 	scripts/cluster/bench.sh
 
+.PHONY: k6
+k6: ## 从本机发起，在发压机（Mac mini）上跑 k6 压测集群：make k6 SCENARIO=order|flash|mixed|ratelimit，配置走环境变量（见 test/k6/README.md），K6_PROM=off 不写 Prometheus；结果在 tmp/k6/<RUN_ID>/
+	scripts/cluster/k6.sh $(SCENARIO) $(K6_ARGS)
+
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
 	scripts/cluster/services.sh status
