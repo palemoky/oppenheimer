@@ -10,6 +10,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -33,12 +35,16 @@ func (dropRootClient) Description() string { return "test DropRootClient" }
 // 全局的 TracerProvider 是进程级的，在 TestMain 里设一次：redisotel 在 InstrumentTracing 时取全局的 provider。
 var spans = tracetest.NewSpanRecorder()
 
+// metrics 收全局 MeterProvider 的指标。redisx 的命令耗时直方图建在全局的（代理）meter 上，设了之后生效。
+var metrics = sdkmetric.NewManualReader()
+
 func TestMain(m *testing.M) {
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(dropRootClient{}),
 		sdktrace.WithSpanProcessor(spans),
 	))
 	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)))
 	os.Exit(m.Run())
 }
 
@@ -193,6 +199,50 @@ func TestOpenLazyClientIsInstrumentedToo(t *testing.T) {
 	if !found {
 		t.Error("no CLIENT span under the request for a client from OpenLazy")
 	}
+}
+
+// OpenLazy 的客户端也记命令耗时。全局的直方图是各个用例共用的，这里只看 ping 的次数有没有增加。
+func TestOpenLazyClientRecordsCommandDuration(t *testing.T) {
+	_, _ = testredis.New(t) // 没有 Redis 时跳过
+	client, err := openLazy(t, os.Getenv(testredis.AddrEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := pingCount(t)
+	for range 3 {
+		if err := client.Ping(t.Context()).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := pingCount(t) - before; got < 3 {
+		t.Errorf("db.client.operation.duration recorded %d successful redis pings, want at least 3", got)
+	}
+}
+
+func pingCount(t *testing.T) uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := metrics.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var n uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if m.Name != "db.client.operation.duration" || !ok {
+				continue
+			}
+			for _, dp := range h.DataPoints {
+				sys, _ := dp.Attributes.Value("db.system.name")
+				op, _ := dp.Attributes.Value("db.operation.name")
+				_, failed := dp.Attributes.Value("error.type")
+				if sys.AsString() == "redis" && op.AsString() == "ping" && !failed {
+					n += dp.Count
+				}
+			}
+		}
+	}
+	return n
 }
 
 func openLazy(t *testing.T, addr string) (redis.UniversalClient, error) {
