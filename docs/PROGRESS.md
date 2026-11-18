@@ -22,7 +22,7 @@
   - `load verify` 的限定范围模式（`-scope-skus`、`-orders-jsonl`，`test/load/internal/verify/scope.go`、`internal/ledger/orderlist.go`）。Opus 写，Fable 逐行读过采集的代码；`Check` 没有改。
   - 全量 `make lint test`：lint 11 个模块 0 issues；test 第一次失败 1 项（`services/order/internal/service` 的 `TestSweeperSlotTimeoutSkipsHungDB`，健康的 slot 在 100 毫秒的时限里没关成单；当时本机的六个服务也在跑），原样重跑一次全部通过（`tmp/lint-test-3b-step1.log`、`tmp/lint-test-3b-step1b.log`）。这次没有改 order 的代码，判断是负载下的偶发，没有证实；再出现时要看。
 - 本机的六个服务验证完已停掉；compose 的中间件还在运行。
-- 三个子 Agent 的 worktree 和分支（`worktree-agent-*`）**还没有删**：改动已经提交并推送，可以删了（另有一个没有 worktree 的分支 `worktree-agent-a97714952afd11fa3`，来历没有查）。
+- 三个子 Agent 的 worktree 和分支已删（2026-11-18，删之前核对过：各自提交改到的文件和 `phase-3b` 上的逐字节相同）。还留着一个没有 worktree 的旧分支 `worktree-agent-a97714952afd11fa3`（1b 时期的提交，不在 `phase-3b` 的历史里），没有动，要不要删由主人定。
 - **下一步，新会话从这里开始**：
   1. 请主人过目上面“确认之后改了一处”（不删订单、用户号段 2^39）。提交已做（2026-11-18，分支 `phase-3b`，已推送，没有开 PR，所以没有 CI 结果）。主人说 2026-11-18 15:00 UTC 之后再继续。
   2. 2026-11-18 15:00 UTC 之后：量 3a 最后一次内存、磁盘、etcd 的 fsync，勾掉计划里那一项，3a 收尾；再做 Grafana 的 requests（384 Mi）和 agent 的内存上限。
