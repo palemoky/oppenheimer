@@ -27,11 +27,11 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 export KUBECONFIG="$KUBECONFIG_OUT"
 NS="oppenheimer"
 
-if [[ $# -lt 1 || -z "${RUN_ID:-}" ]]; then
+if [[ $# -lt 1 || ( "$1" != snapshot && -z "${RUN_ID:-}" ) ]]; then
   sed -n '2,20p' "${BASH_SOURCE[0]}" >&2
   exit 2
 fi
-OUT="$ROOT/tmp/k6/$RUN_ID"
+OUT="$ROOT/tmp/k6/${RUN_ID:-}"
 
 pq() { # 查询 → 每条序列一行：标签（去掉名字）<TAB>值
   "$HERE/monitoring.sh" promql "$1" 2>/dev/null |
@@ -39,9 +39,10 @@ pq() { # 查询 → 每条序列一行：标签（去掉名字）<TAB>值
     sort || true
 }
 
-snapshot() { # 窗口秒数
+snapshot() { # 窗口秒数 [往回偏移的秒数，默认 35]
   # R 是带偏移的范围：取数时已经停压 35 秒，往回偏移掉这一段，窗口正好落在发压期间（开头的 30 秒不算）
-  local w="${1}s" R="[${1}s] offset 35s" SR="[${1}s:15s] offset 35s" ns='k8s_namespace_name="oppenheimer"'
+  local w="${1}s" off="${2:-35}s"
+  local R="[${1}s] offset $off" SR="[${1}s:15s] offset $off" ns='k8s_namespace_name="oppenheimer"'
   local q
   section() {
     echo
@@ -49,11 +50,11 @@ snapshot() { # 窗口秒数
     echo "# $2"
     pq "$2"
   }
-  echo "window: $w ending 35s before $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "window: $w ending $off before $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   section "gateway 请求速率（每秒），按接口和状态码" \
     "sum by (http_route,http_request_method,http_response_status_code) (rate(http_server_request_duration_seconds_count{$ns,service_name=\"gateway\"}$R)) > 0"
   for q in 0.5 0.99; do
-    section "gateway 耗时 p$q（秒），按接口" \
+    section "gateway 耗时 p${q}（秒），按接口" \
       "histogram_quantile($q, sum by (le,http_route,http_request_method) (rate(http_server_request_duration_seconds_bucket{$ns,service_name=\"gateway\"}$R)))"
   done
   section "gRPC 服务端速率（每秒），按服务、方法、状态" \
@@ -65,7 +66,7 @@ snapshot() { # 窗口秒数
   section "受理的结果（每秒）" "sum by (outcome) (rate(order_admissions_total{$ns}$R)) > 0"
   section "落库的结果（每秒）" "sum by (outcome) (rate(order_persists_total{$ns}$R)) > 0"
   for q in 0.5 0.99; do
-    section "落库延迟 p$q（秒，受理到落库）" \
+    section "落库延迟 p${q}（秒，受理到落库）" \
       "histogram_quantile($q, sum by (le) (rate(order_persist_delay_seconds_bucket{$ns}$R)))"
   done
   section "订单读（每秒），按方式和来源" "sum by (mode,source,partial) (rate(order_reads_total{$ns}$R)) > 0"
@@ -113,6 +114,12 @@ grab_pprof() { # 抓一个服务的一个 Pod：pprof 只在 Pod 的回环上监
   kill "$pf" 2>/dev/null || true
   echo "$svc $pod" >>"$OUT/pprof/pods.txt"
 }
+
+# 补取：loadtest-round.sh snapshot <窗口秒数> <往回偏移的秒数>，事后按时间把某一轮的服务端指标重新取一遍（标准输出）
+if [[ "$1" == snapshot ]]; then
+  snapshot "${2:?window seconds}" "${3:?offset seconds}"
+  exit 0
+fi
 
 if [[ "${ROUND_SKIP_PREFLIGHT:-}" != 1 ]]; then
   "$HERE/loadtest.sh" preflight

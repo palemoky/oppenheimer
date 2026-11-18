@@ -541,16 +541,44 @@ EOF
 # 经 exec 的标准输入把本机的文件送进 Pod（不依赖镜像里有 tar，kubectl cp 要它），并核对大小：
 # kubectl exec -i 偶尔在输入还没送完时就结束，留下一个空文件或半个文件（冒烟时遇到过），所以送完要量，不对就重送。
 put_file() { # 本机文件 Pod 里的路径
-  local want got try
+  # 小文件直接经 exec 的标准输入送；几 MB 的订单号清单这样送会在几十到几百 KB 处断掉
+  # （"Copying stdin failed ... broken pipe"，2026-11-18 实测，原因没有查），所以先试 kubectl cp（走 tar），
+  # 不行再切成 48 KB 的小块逐块追加。每种办法送完都核对字节数。
+  local want got try dir chunk
   want="$(wc -c <"$1" | tr -d ' ')"
-  for try in 1 2 3; do
-    # shellcheck disable=SC2016 # $0 在 Pod 里展开
-    kubectl -n "$NS" exec -i "$POD" -c tool -- sh -c 'cat >"$0"' "$2" <"$1" || true
-    got="$(pexec wc -c "$2" 2>/dev/null | awk '{print $1}')" || got=""
-    if [[ "$got" == "$want" ]]; then return 0; fi
-    echo "    upload of $1 incomplete ($got of $want bytes), retry $try" >&2
+  size_ok() {
+    got="$(pexec wc -c "$1" 2>/dev/null | awk '{print $1}')" || got=""
+    [[ "$got" == "$want" ]]
+  }
+  if [[ "$want" -le 32768 ]]; then
+    for try in 1 2 3; do
+      # shellcheck disable=SC2016 # $0 在 Pod 里展开
+      kubectl -n "$NS" exec -i "$POD" -c tool -- sh -c 'cat >"$0"' "$2" <"$1" || true
+      if size_ok "$2"; then return 0; fi
+    done
+  fi
+  kubectl -n "$NS" cp -c tool "$1" "$POD:$2" >/dev/null 2>&1 || true
+  if size_ok "$2"; then return 0; fi
+  echo "    kubectl cp of $1 incomplete ($got of $want bytes), sending in chunks" >&2
+  dir="$(mktemp -d)"
+  split -b 48k "$1" "$dir/part."
+  # shellcheck disable=SC2016
+  pexec sh -c ': >"$0"' "$2"
+  for chunk in "$dir"/part.*; do
+    for try in 1 2 3 4 5; do
+      before="$(pexec wc -c "$2" | awk '{print $1}')"
+      # shellcheck disable=SC2016
+      kubectl -n "$NS" exec -i "$POD" -c tool -- sh -c 'cat >"$0.chunk"' "$2" <"$chunk" 2>/dev/null || true
+      if [[ "$(pexec wc -c "$2.chunk" 2>/dev/null | awk '{print $1}')" == "$(wc -c <"$chunk" | tr -d ' ')" ]]; then
+        # shellcheck disable=SC2016
+        pexec sh -c 'cat "$0.chunk" >>"$0" && rm -f "$0.chunk"' "$2"
+        break
+      fi
+      [[ $try -lt 5 ]] || { rm -rf "$dir"; die 1 "could not upload $1 to the pod (chunk $(basename "$chunk"), file at $before bytes)"; }
+    done
   done
-  die 1 "could not upload $1 to the pod"
+  rm -rf "$dir"
+  size_ok "$2" || die 1 "could not upload $1 to the pod ($got of $want bytes after chunked upload)"
 }
 
 # shellcheck disable=SC2329 # EXIT 的 trap 调用
