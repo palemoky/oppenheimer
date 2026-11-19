@@ -122,6 +122,19 @@ const archiveMaxOpenConns = 10
 // 不会让落库自己在连接池上排队。改大之前先看启动时的连接池检查（checkSubmitConcurrency）。
 const defaultSubmitConcurrency = 8
 
+// defaultPaymentEventsConcurrency 是 PAYMENT_EVENTS_CONCURRENCY 的默认值：支付结果（payment.events）的消费者
+// 在一个分区内同时处理的消息数。
+//
+// 原来是分区内串行，理由是“量小”。3b 第 1 轮把支付出结果修通之后量不小了：每秒 100 笔支付结果时
+// 它只处理得了约 70 条（一条一个事务，一次提交约 50 毫秒，4 个分区），积压到 1.4 万条，
+// 用户付了款要等几分钟订单才变成已支付（docs/notes/3b-rounds/）。
+//
+// 可以按 key 并发的依据：消息的 key 是订单号，同一个订单的支付结果仍然串行；处理一条消息碰到的是这个订单的行
+// （先加行锁）、它的 payment_results 和同一个事务里的 outbox。handler 本来就不假设消息之间的先后，
+// 同一笔支付被并发处理两次也只生效一次（TestHandlePaymentConcurrentDuplicates 等）。
+// 它和落库共用订单库的连接池：两者的在途数加起来不要超过连接池（checkSubmitConcurrency 只算了落库）。
+const defaultPaymentEventsConcurrency = 8
+
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
 // 本机所有服务连同一个 MySQL，默认 max_connections 是 151。分片前 order 一个池 50，加上 inventory、
@@ -163,18 +176,20 @@ type config struct {
 	archiveMaxConcurrency int
 	// submitConcurrency 是落库消费者每个分区的并发度，见 defaultSubmitConcurrency。
 	submitConcurrency int
-	workerID          int64
-	inventoryAddr     string
-	paymentTimeout    time.Duration
-	idempotencyTTL    time.Duration
-	sweeper           service.SweeperConfig
-	reaper            service.ReaperConfig
-	backlog           stockgate.BacklogLimit
-	kafkaBrokers      []string
-	kafkaPrefix       string
-	outboxInterval    time.Duration
-	redisAddr         string
-	redisPrefix       string
+	// paymentEventsConcurrency 是支付结果的消费者每个分区的并发度，见 defaultPaymentEventsConcurrency。
+	paymentEventsConcurrency int
+	workerID                 int64
+	inventoryAddr            string
+	paymentTimeout           time.Duration
+	idempotencyTTL           time.Duration
+	sweeper                  service.SweeperConfig
+	reaper                   service.ReaperConfig
+	backlog                  stockgate.BacklogLimit
+	kafkaBrokers             []string
+	kafkaPrefix              string
+	outboxInterval           time.Duration
+	redisAddr                string
+	redisPrefix              string
 	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
 	cacheRedisAddr string
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
@@ -297,6 +312,14 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("SUBMIT_CONCURRENCY must be at least 1")
 	}
 	cfg.submitConcurrency = int(concurrency)
+	concurrency, err = envInt("PAYMENT_EVENTS_CONCURRENCY", defaultPaymentEventsConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if concurrency < 1 {
+		return cfg, errors.New("PAYMENT_EVENTS_CONCURRENCY must be at least 1")
+	}
+	cfg.paymentEventsConcurrency = int(concurrency)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -719,6 +742,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderPaymentEvents),
 		Topics: []string{paymentsTopic},
 		Logger: logger,
+		// 分区内按订单号并发，见 defaultPaymentEventsConcurrency。1 就是原来的分区内串行。
+		Concurrency: cfg.paymentEventsConcurrency,
 		// 支付结果不能因为订单库抖了一下就进死信：钱已经收了，这条消息是订单变成已支付的唯一途径，
 		// 没有任何任务会重发它（设计文档 1b 的 5.4：长期 notified = 0 的支付单没有人扫）。
 		// 默认的 5 次重试合计只有约 1.5 秒，订单库的一次主从切换、扩容时被搬的 slot 的不可用窗口
@@ -738,7 +763,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 由它的行锁保护（1a 起有并发测试），不在这个消费者里。同一个用户的不同订单共用的只有
 	// (user_id, idempotency_key) 唯一键，由数据库保证。
 	// 代价是重启和再平衡后重复投递变成常态（提交的是连续完成的前缀），handler 本来就按至少一次设计。
-	// 支付结果和延迟关单的消费者保持串行：量小，延迟消费者也不允许并发。
+	// 支付结果的消费者也按 key 并发（defaultPaymentEventsConcurrency）；延迟关单的保持串行：延迟消费者不允许并发。
 	checkSubmitConcurrency(logger, cfg)
 	submitConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
 		Config:      kcfg,

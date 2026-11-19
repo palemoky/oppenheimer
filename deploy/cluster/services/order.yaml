@@ -9,6 +9,10 @@ config:
   CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
   # 连 Service 名加 gRPC 端口，出站被自己的边车截获（规则在 deploy/cluster/mesh/inventory.yaml）。
   INVENTORY_ADDR: inventory:9082
+  # 3b 第 2 轮之前的对照（2026-11-20）：落库的并发从每分区 8 提到 24，连接池跟着从每库 25 提到 50
+  # （两个副本合计每个分片 100 个连接，MySQL 的上限是 200）。结果见 docs/notes/3b-rounds/。
+  SUBMIT_CONCURRENCY: "24"
+  MYSQL_MAX_OPEN_CONNS: "50"
 
 # 两个订单分片各有主库和从库（MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应）；冷库在共享实例上。
 secretEnv:

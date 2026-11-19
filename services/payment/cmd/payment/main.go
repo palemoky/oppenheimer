@@ -64,6 +64,16 @@ const (
 	leaderCloseTimeout = 2 * time.Second
 )
 
+// defaultOrderEventsConcurrency 是 ORDER_EVENTS_CONCURRENCY 的默认值：order.events 的消费者在一个分区内同时处理的消息数。
+//
+// 原来是分区内串行：每秒约 150 条就到顶（大部分事件和支付无关、直接跳过，要写库的是订单对支付结果的答复，
+// 一条一次提交），3b 的阶梯到 195 单/秒时积压近 1 万条，后果是该退的款退得晚、已答复的标记打得晚。
+//
+// 可以按 key 并发的依据：消息的 key 是订单号，一个订单只有一笔支付单，同一笔支付的答复仍然按到达的顺序处理
+// （“第一次答复为准”不受影响）；每一步是对这一笔支付单的条件更新，不碰别的行。
+// handler 本来就不依赖消息的先后，同一条答复并发处理多次只生效一次（TestConcurrentDuplicateRepliesRefundOnce 等）。
+const defaultOrderEventsConcurrency = 8
+
 type config struct {
 	httpAddr  string
 	grpcAddr  string
@@ -77,6 +87,8 @@ type config struct {
 	redisPrefix    string
 	outboxInterval time.Duration
 	processor      processor.Config
+	// orderEventsConcurrency 是 order.events 的消费者每个分区的并发度，见 defaultOrderEventsConcurrency。
+	orderEventsConcurrency int
 	// drainDelay 是收到退出信号后摘流的等待，见 app.Options.DrainDelay。
 	drainDelay time.Duration
 }
@@ -135,6 +147,12 @@ func loadConfig() (config, error) {
 	if v := os.Getenv("PROCESSOR_CONCURRENCY"); v != "" {
 		if cfg.processor.Concurrency, err = strconv.Atoi(v); err != nil || cfg.processor.Concurrency <= 0 {
 			return config{}, fmt.Errorf("invalid PROCESSOR_CONCURRENCY %q", v)
+		}
+	}
+	cfg.orderEventsConcurrency = defaultOrderEventsConcurrency
+	if v := os.Getenv("ORDER_EVENTS_CONCURRENCY"); v != "" {
+		if cfg.orderEventsConcurrency, err = strconv.Atoi(v); err != nil || cfg.orderEventsConcurrency <= 0 {
+			return config{}, fmt.Errorf("invalid ORDER_EVENTS_CONCURRENCY %q", v)
 		}
 	}
 	if cfg.drainDelay, err = app.DrainDelayFromEnv(); err != nil {
@@ -268,6 +286,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupPaymentOrderEvents),
 		Topics: []string{eventx.Topic(cfg.kafkaPrefix, eventx.OrderEvents)},
 		Logger: logger,
+		// 分区内按订单号并发，见 defaultOrderEventsConcurrency。1 就是原来的分区内串行。
+		Concurrency: cfg.orderEventsConcurrency,
 		// 普通错误不设重试上限，分区停在这条消息上等依赖恢复（设计文档 1d 的 6.2、6.5，ADR-0021）。
 		// 这里处理的是订单服务对支付结果的答复：接受就标记已答复，要求退款就退款。这条答复是这笔支付
 		// 得到处置的唯一途径，没有任务会重发它；默认的 5 次（合计约 1.5 秒）之后进死信，支付库抖一下

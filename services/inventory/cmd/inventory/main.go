@@ -70,9 +70,27 @@ type config struct {
 	applyInterval time.Duration
 	applyBatch    int
 
+	// eventConcurrency 是 order.events 的消费者每个分区的并发度，见 defaultEventConcurrency。
+	eventConcurrency int
+
 	// drainDelay 是收到退出信号后摘流的等待，见 app.Options.DrainDelay。
 	drainDelay time.Duration
 }
+
+// defaultEventConcurrency 是 ORDER_EVENTS_CONCURRENCY 的默认值：order.events 的消费者在一个分区内同时处理的消息数。
+//
+// 原来是分区内串行。处理一条事件是一个小事务（确认或释放预占）加一次闸门调用，在集群的盘上一次提交约 40 毫秒，
+// 4 个分区合计每秒只能处理约 100 条，和负载无关。3b 第 1 轮把支付出结果修通之后，每单多出一条“已支付”的事件，
+// 这里立刻成了最窄的地方：积压涨到 2 万条（docs/notes/3b-rounds/round-1-replica-flush-and-payment.md 第 5 节）。
+// 支付的处理器是同一类问题、同一种修法。
+//
+// 可以并发的依据（kafkax.ConsumerConfig.Concurrency 的条件）：消息的 key 是订单号，同一个订单的事件仍然串行；
+// 处理一条事件只碰这个订单自己的预占行，对 SKU 的改动是往 stock_pending 里追加增量，不等 sku_stock 的行锁（ADR-0018）；
+// 闸门那一步是 Redis 里的原子脚本。Confirm、Release 以订单号幂等，重复投递变多不影响结果。
+// 不同订单同时确认、释放同一个 SKU 早就会发生（4 个分区、2 个副本，还有 gRPC 的 Release），
+// 有并发测试（TestHandleOrderEventConcurrentWithOnline）。
+// 8 × 4 个分区 = 最多 32 条在途，连接池默认 50 个，还要留给 Reserve。
+const defaultEventConcurrency = 8
 
 func loadConfig() (config, error) {
 	cfg := config{
@@ -92,6 +110,15 @@ func loadConfig() (config, error) {
 
 		applyInterval: apply.DefaultInterval,
 		applyBatch:    apply.DefaultBatch,
+
+		eventConcurrency: defaultEventConcurrency,
+	}
+	if v := os.Getenv("ORDER_EVENTS_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return config{}, fmt.Errorf("ORDER_EVENTS_CONCURRENCY: want a positive integer, got %q", v)
+		}
+		cfg.eventConcurrency = n
 	}
 	if v := os.Getenv("STOCK_APPLY_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -372,6 +399,8 @@ func newOrderEventConsumer(ctx context.Context, logger *slog.Logger, cfg config,
 		Topics:    []string{topic},
 		Logger:    logger,
 		DLQSuffix: eventx.DLQSuffix,
+		// 分区内按订单号并发，见 defaultEventConcurrency。1 就是原来的分区内串行。
+		Concurrency: cfg.eventConcurrency,
 		// 普通错误不设重试上限，分区停在这条消息上等依赖恢复（设计文档 1d 的 6.2、6.5，ADR-0021）。
 		// 处理一条事件要先改 MySQL 再改 Redis（闸门）。闸门那一步失败时 MySQL 那一步已经提交；
 		// 这时放弃、把消息送进死信，闸门里的占用就没人归还或结清了，而且对账看不出来（恒等式两边都没变），
