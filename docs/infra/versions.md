@@ -19,6 +19,7 @@
 | actions/checkout | v7 | 稳定版 | 2026-11-11 | CI |
 | actions/setup-go | v7 | 稳定版 | 2026-11-11 | CI |
 | actions/upload-artifact | v7 | 稳定版 | 2026-11-11 | CI，端到端测试失败时上传服务日志 |
+| codecov/codecov-action | v7（查证时最新 v7.1.1） | 稳定版 | 2026-11-19 | CI，按模块上传测试覆盖率 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | 集群上也是这个版本，server-id：`mysql-order-0` 11、12，`mysql-order-1` 21、22，`mysql-main` 1（和本机 compose 对应）。Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
