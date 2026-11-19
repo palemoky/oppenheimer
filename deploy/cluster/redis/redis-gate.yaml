@@ -2,12 +2,17 @@
 priorityClassName: middleware
 redis:
   replicas: 2
-  maxmemory: 192mb
+  # 2026-11-20 从 192mb（容器 256Mi）提到 768mb（容器 1Gi）：3b 压测到第二天，闸门里攒了 82 万个幂等键
+  # （每单一个，TTL 24 小时，一个约 220 字节）把 192mb 写满了。策略是 noeviction（闸门的数据不能被淘汰），
+  # 写满之后所有写命令报 OOM：受理被拒、落库认领不了占用、回收也做不了，系统停住直到有键过期。
+  # 这不是把问题解决了，只是把上限抬到约 330 万单/24 小时（约 38 单/秒的日均）：
+  # 闸门的内存 = 幂等键的 TTL 内受理的订单数 × 约 220 字节，是一条容量约束，见 docs/notes/3b-rounds/round-2-*.md。
+  maxmemory: 768mb
   maxmemoryPolicy: noeviction
   storage: 2Gi
   resources:
-    requests: {cpu: 100m, memory: 256Mi}
-    limits: {memory: 256Mi}
+    requests: {cpu: 100m, memory: 1Gi}
+    limits: {memory: 1Gi}
 sentinel:
   replicas: 3
   masterName: gate
