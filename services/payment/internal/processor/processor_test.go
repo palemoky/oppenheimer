@@ -345,6 +345,134 @@ func TestBatchSizeLimitsEachRound(t *testing.T) {
 	}
 }
 
+// 一轮里的支付单并发处理：每笔恰好一条事件，状态各自正确，Kick 仍然只有一次、而且在全部提交之后。
+// 并发度比批小，名额要被反复复用；带 -race 跑。
+func TestRoundCompletesBatchConcurrently(t *testing.T) {
+	e := newEnv(t, processor.Config{BatchSize: 64, Concurrency: 8})
+	const n = 50
+	orders := make(map[int64]bool, n)
+	for i := range n {
+		outcome := success
+		if i%4 == 0 {
+			outcome = failure
+		}
+		orders[e.create(t, outcome)] = outcome == success
+	}
+	e.clock.Advance(delay)
+
+	e.round(t)
+
+	evs := e.wantEvents(t, n)
+	seen := make(map[int64]int, n)
+	for _, ev := range evs {
+		seen[ev.ev.GetOrderId()]++
+	}
+	for orderID, wantOK := range orders {
+		if seen[orderID] != 1 {
+			t.Errorf("order %d: %d events, want 1", orderID, seen[orderID])
+		}
+		want := failed
+		if wantOK {
+			want = succeeded
+		}
+		e.want(t, orderID, want)
+	}
+	if got := e.kicker.kicks.Load(); got != 1 {
+		t.Errorf("kicks = %d, want 1 for the whole round", got)
+	}
+	if !e.kicker.visible.Load() {
+		t.Error("Kick ran before the events were committed")
+	}
+}
+
+// 并发的一轮里有一笔写不了事件：只有它留在 PENDING，同批的其他笔不受影响，下一轮它自己补上。
+// 用触发器让某一个订单的 outbox 插入失败，其余的照常。
+func TestOneFailureDoesNotAffectTheRestOfTheBatch(t *testing.T) {
+	e := newEnv(t, processor.Config{Concurrency: 4})
+	orders := make([]int64, 12)
+	for i := range orders {
+		orders[i] = e.create(t, success)
+	}
+	bad := orders[5]
+	testdb.MustExec(t, e.db, "CREATE TRIGGER outbox_reject BEFORE INSERT ON outbox FOR EACH ROW "+
+		"BEGIN IF NEW.msg_key = '"+strconv.FormatInt(bad, 10)+"' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'rejected by test'; END IF; END")
+	e.clock.Advance(delay)
+
+	e.round(t)
+	e.wantEvents(t, len(orders)-1)
+	for _, id := range orders {
+		if id == bad {
+			e.want(t, id, pending)
+		} else {
+			e.want(t, id, succeeded)
+		}
+	}
+
+	testdb.MustExec(t, e.db, "DROP TRIGGER outbox_reject")
+	e.round(t)
+	e.wantEvents(t, len(orders))
+	e.want(t, bad, succeeded)
+}
+
+// 积压超过一批时不等 Interval：取满一批并且出了结果，就紧接着再跑一轮。
+// Interval 设成一小时，除了启动时的那一轮，后面的轮次只可能来自处理器自己的 Kick。
+func TestFullBatchRunsNextRoundWithoutWaiting(t *testing.T) {
+	e := newEnv(t, processor.Config{Interval: time.Hour, BatchSize: 5, Concurrency: 2})
+	const n = 23
+	for range n {
+		e.create(t, success)
+	}
+	e.clock.Advance(delay)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := e.proc.Start(t.Context()); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := e.proc.Stop(context.WithoutCancel(t.Context())); err != nil {
+			t.Error(err)
+		}
+		wg.Wait()
+	})
+
+	waitFor(t, "backlog drained", func() bool { return len(e.events(t)) == n })
+}
+
+// 整批都失败时不能自己接着再跑：那会变成不停打数据库的循环。退回到按 Interval 重试。
+func TestFailedBatchDoesNotSpin(t *testing.T) {
+	g := &guard{}
+	g.allow.Store(true)
+	e := newEnv(t, processor.Config{Interval: time.Hour, BatchSize: 3, Concurrency: 3, Guard: g})
+	for range 3 {
+		e.create(t, success)
+	}
+	testdb.MustExec(t, e.db, "RENAME TABLE outbox TO outbox_away")
+	e.clock.Advance(delay)
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := e.proc.Start(t.Context()); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(func() {
+		if err := e.proc.Stop(context.WithoutCancel(t.Context())); err != nil {
+			t.Error(err)
+		}
+		wg.Wait()
+	})
+
+	// 每一轮都先问 Guard，所以问过的次数就是轮数。启动时那一轮跑完之后留足时间，看有没有第二轮。
+	waitFor(t, "first round", func() bool { return g.calls.Load() >= 1 })
+	time.Sleep(300 * time.Millisecond)
+	if got := g.calls.Load(); got != 1 {
+		t.Errorf("%d rounds ran with every payment failing, want only the first", got)
+	}
+	testdb.MustExec(t, e.db, "RENAME TABLE outbox_away TO outbox")
+}
+
 // guard 是可切换的 worker.Guard，同时记录被问了多少次。
 type guard struct {
 	allow atomic.Bool

@@ -3,12 +3,15 @@ package otelx
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -415,4 +418,48 @@ func TestInstrumentHelpers(t *testing.T) {
 		t.Fatalf("ObserveGauge: %v", err)
 	}
 	unregister()
+}
+
+// 单位是秒的直方图各有一条流：名字以 .delay 结尾的用 WaitBuckets，其余用 DurationBuckets；别的仪表不受影响。
+func TestDurationViewPicksBucketsByName(t *testing.T) {
+	r := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(r), sdkmetric.WithView(DurationView()))
+	t.Cleanup(func() { _ = mp.Shutdown(context.WithoutCancel(t.Context())) })
+	m := mp.Meter("github.com/palemoky/oppenheimer/pkg/otelx/test")
+	Histogram(m, "otelx_test.call.duration", "d").Record(t.Context(), 0.003)
+	Histogram(m, "otelx_test.queue.delay", "d").Record(t.Context(), 700)
+	SizeHistogram(m, "otelx_test.batch.size", "d", 1, 10).Record(t.Context(), 3)
+
+	var rm metricdata.ResourceMetrics
+	if err := r.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]float64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, mt := range sm.Metrics {
+			switch d := mt.Data.(type) {
+			case metricdata.Histogram[float64]:
+				if len(d.DataPoints) != 1 {
+					t.Errorf("%s: %d data points, want 1", mt.Name, len(d.DataPoints))
+					continue
+				}
+				got[mt.Name] = d.DataPoints[0].Bounds
+			case metricdata.Histogram[int64]:
+				got[mt.Name] = d.DataPoints[0].Bounds
+			}
+		}
+	}
+	want := map[string][]float64{
+		"otelx_test.call.duration": DurationBuckets,
+		"otelx_test.queue.delay":   WaitBuckets,
+		"otelx_test.batch.size":    {1, 10},
+	}
+	if len(got) != len(want) {
+		t.Errorf("%d histogram streams, want %d: %v", len(got), len(want), got)
+	}
+	for name, w := range want {
+		if !slices.Equal(got[name], w) {
+			t.Errorf("%s: bounds %v, want %v", name, got[name], w)
+		}
+	}
 }

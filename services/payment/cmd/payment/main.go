@@ -120,7 +120,7 @@ func loadConfig() (config, error) {
 	}
 	cfg.outboxInterval = cmp.Or(cfg.outboxInterval, 100*time.Millisecond)
 	cfg.processor.TopicPrefix = cfg.kafkaPrefix
-	// 以下三项设计文档的配置表没有列出，留空即用 processor 的默认值；端到端测试可借此缩短等待。
+	// 以下四项设计文档的配置表没有列出，留空即用 processor 的默认值；端到端测试可借此缩短等待。
 	if cfg.processor.Interval, err = durationEnv("PROCESSOR_INTERVAL"); err != nil {
 		return config{}, err
 	}
@@ -130,6 +130,11 @@ func loadConfig() (config, error) {
 	if v := os.Getenv("PROCESSOR_BATCH_SIZE"); v != "" {
 		if cfg.processor.BatchSize, err = strconv.Atoi(v); err != nil || cfg.processor.BatchSize <= 0 {
 			return config{}, fmt.Errorf("invalid PROCESSOR_BATCH_SIZE %q", v)
+		}
+	}
+	if v := os.Getenv("PROCESSOR_CONCURRENCY"); v != "" {
+		if cfg.processor.Concurrency, err = strconv.Atoi(v); err != nil || cfg.processor.Concurrency <= 0 {
+			return config{}, fmt.Errorf("invalid PROCESSOR_CONCURRENCY %q", v)
 		}
 	}
 	if cfg.drainDelay, err = app.DrainDelayFromEnv(); err != nil {
