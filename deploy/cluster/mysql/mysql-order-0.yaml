@@ -3,6 +3,10 @@
 replicas: 2
 primaryOrdinal: 0       # 切换后改这里再 helm upgrade（只改 -primary、-replica 两个 Service）
 priorityClassName: middleware
+# 从库提交时不逐次刷盘（2026-11-19，3b 第 1 轮）。原因：这块盘一次刷盘约 5 毫秒，从库回放近似串行，
+# 每秒只能回放约 87 个事务，100 单/秒起就落后；从库和另一个分片的主库又在同一个节点上抢刷盘的额度。
+# 代价和从库所在节点掉电之后要做的事见 ADR-0032。
+replicaDurability: relaxed
 serverIdBase: 11          # 和本机 compose 的 11、12 对应
 preferredNode: k3s-agent-1
 databases:

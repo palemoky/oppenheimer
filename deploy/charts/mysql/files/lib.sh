@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Pod 里各脚本共用的函数。环境变量由 chart 注入：RELEASE、POD_NAMESPACE、CLUSTER_DOMAIN、REPLICAS、
-# SERVER_ID_BASE、MYSQL_ROOT_PASSWORD（以及按需的 REPL_PASSWORD 等）。
+# SERVER_ID_BASE、REPLICA_DURABILITY、MYSQL_ROOT_PASSWORD（以及按需的 REPL_PASSWORD 等）。
 #
 # 密码一律经环境变量 MYSQL_PWD 或标准输入交给 mysql 客户端，不出现在任何进程的命令行参数里。
 
@@ -90,4 +90,20 @@ any_peer_exists() { # <self>
     fi
   done
   return 1
+}
+
+# 某个角色应有的落盘方式，打印 "<innodb_flush_log_at_trx_commit> <sync_binlog>"。
+# 只有“确实在复制别人、而且 values 里写了 relaxed”的实例才放松；主库、说不清角色的一律是 1 1。
+# 方向是故意不对称的：从库多刷了盘只是慢，主库少刷了盘是答复过成功的事务在掉电时丢掉。
+durability_want() { # <role>
+  if [ "$1" = replica ] && [ "${REPLICA_DURABILITY:-strict}" = relaxed ]; then
+    echo "2 0"
+  else
+    echo "1 1"
+  fi
+}
+
+# 实例现在的落盘方式，同样的格式。
+durability_have() { # <host>
+  rsql "$1" -N -B -e "SELECT CONCAT(@@global.innodb_flush_log_at_trx_commit, ' ', @@global.sync_binlog)"
 }

@@ -21,6 +21,9 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 
 {{/* Pod 里的脚本（files/lib.sh）靠这些变量拼出各序号的稳定名字。 */}}
 {{- define "mysql.peerEnv" -}}
+{{- if not (has .Values.replicaDurability (list "strict" "relaxed")) }}
+{{- fail (printf "replicaDurability must be strict or relaxed, got %q" .Values.replicaDurability) }}
+{{- end }}
 - name: RELEASE
   value: {{ .Release.Name | quote }}
 - name: POD_NAMESPACE
@@ -33,6 +36,8 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
   value: {{ .Values.replicas | quote }}
 - name: SERVER_ID_BASE
   value: {{ .Values.serverIdBase | quote }}
+- name: REPLICA_DURABILITY
+  value: {{ .Values.replicaDurability | quote }}
 {{- end -}}
 
 {{- define "mysql.secretEnv" -}}

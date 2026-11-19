@@ -58,3 +58,4 @@
 | [0029](0029-istio-sidecar-mesh.md) | 服务之间的流量治理迁到 Istio，用边车模式；默认的重试必须关 | 已采纳 |
 | [0030](0030-observability-backends.md) | 可观测后端的部署：两层 Collector、单体后端加本地盘、放在 server 节点、头部加尾部采样 | 已采纳 |
 | [0031](0031-load-testing-approach.md) | 压测的做法：k6 开环发压、压长期运行的那一套、号段标记不做影子库表、不从 OpenAPI 生成客户端 | 已采纳 |
+| [0032](0032-replica-relaxed-durability.md) | 订单库的从库提交时不逐次刷盘；落盘方式跟着角色走，主库永远每次落盘；从库的节点掉电后重建 | 已采纳 |

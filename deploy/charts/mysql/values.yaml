@@ -8,6 +8,14 @@ replicas: 2
 # 人工切换的最后一步是改这里再 helm upgrade：只改 Service，不重启 Pod。
 primaryOrdinal: 0
 
+# 从库提交时的落盘方式。主库永远是 strict，不受这里影响；落盘方式跟着实例当前的角色走，不跟着序号
+# （files/durability.sh，决定和取舍见 ADR-0032）。
+#   strict   innodb_flush_log_at_trx_commit=1、sync_binlog=1：每次提交 redo 和 binlog 各刷一次盘。
+#   relaxed  innodb_flush_log_at_trx_commit=2、sync_binlog=0：提交时只写到操作系统，约每秒刷一次。
+#            mysqld 被杀、Pod 被删都不丢（数据在页缓存里）；从库所在的节点掉电或内核崩溃时，
+#            它的数据和它自己的 binlog 可能互相对不上，这个从库必须从主库重建（docs/infra/mysql-switchover.md 第三节）。
+replicaDurability: strict
+
 # 有状态中间件的优先级（deploy/cluster/middleware/priorityclass.yaml，由 middleware.sh 先建好）。
 # 内存 requests 等于 limits 但 CPU 不设 limits，QoS 是 Burstable 而不是 Guaranteed，靠优先级排在业务服务之后被驱逐。
 priorityClassName: ""

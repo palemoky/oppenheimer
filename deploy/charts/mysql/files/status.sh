@@ -7,6 +7,7 @@
 #       - 自己就是它，却不是“可写、没配复制”
 #       - 自己不是它，却可写又没配复制（比如切换后回来的旧主库：Service 不指向它，但直接连还能写）
 #       - 自己不是它，复制源却不是它
+#       - 落盘方式和角色应有的不一样（主库不是 1/1 是最要紧的一种；修：durability.sh apply）
 #     有 ANOMALY 时退出码为 3。
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -19,6 +20,9 @@ show)
   common="$(rsql 127.0.0.1 -N -B -e "SELECT @@global.server_id, @@global.super_read_only, REPLACE(@@global.gtid_executed, '\n', '')")"
   read -r id ro gtid <<<"$common"
   echo "role=$role server_id=$id super_read_only=$ro gtid_executed=${gtid:-<empty>}"
+  dur_have="$(durability_have 127.0.0.1)"
+  dur_want="$(durability_want "$role")"
+  echo "  flush_log_at_trx_commit/sync_binlog=${dur_have/ //}"
   src=""
   if [ "$role" = replica ]; then
     src="$(replication_source 127.0.0.1)"
@@ -38,6 +42,9 @@ show)
   else
     want_host="$(peer_host "${want##*-}")"
     [ "$src" = "$want_host" ] || anomaly="replicating from '$src', expected $want_host"
+  fi
+  if [ -z "$anomaly" ] && [ "$dur_have" != "$dur_want" ]; then
+    anomaly="durability is ${dur_have/ //}, a $role here should have ${dur_want/ //} (fix: /scripts/durability.sh apply)"
   fi
   if [ -n "$anomaly" ]; then
     echo "  ANOMALY: $anomaly"
