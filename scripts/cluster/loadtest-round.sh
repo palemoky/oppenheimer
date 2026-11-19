@@ -103,6 +103,10 @@ snapshot() { # 窗口秒数 [往回偏移的秒数，默认 35]
     "max by (namespace,pod) (max_over_time(container_memory_working_set_bytes{namespace=~\"oppenheimer|mysql\",container!=\"\",container!=\"POD\"}$R)) / 1048576"
   section "节点 CPU 使用率" "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}$R))"
   section "节点磁盘 IO 等待（iowait 占比）" "avg by (instance) (rate(node_cpu_seconds_total{mode=\"iowait\"}$R))"
+  # 宿主机的盘有快慢两档（docs/notes/3b-rounds/round-2-*.md 第 5 节），每一轮、每一档都要知道当时是哪一档
+  section "节点系统盘一次刷盘的平均耗时（毫秒）" \
+    "sum by (instance) (rate(node_disk_flush_requests_time_seconds_total{device=\"vda\"}$R)) / sum by (instance) (rate(node_disk_flush_requests_total{device=\"vda\"}$R)) * 1000"
+  section "节点系统盘的刷盘次数（每秒）" "sum by (instance) (rate(node_disk_flush_requests_total{device=\"vda\"}$R))"
   section "从库延迟的最大值（秒）" "max_over_time(mysql_slave_status_seconds_behind_source$R)"
   section "etcd WAL fsync p99（秒）" "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket$R)))"
   section "副本数（窗口内的最大值）" "max by (deployment) (max_over_time(kube_deployment_status_replicas{namespace=\"oppenheimer\"}$R))"
