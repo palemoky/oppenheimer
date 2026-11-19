@@ -4,6 +4,11 @@
 # 停压之后的等静止、对账（loadtest.sh wait-quiet、recon、verify）不在这里：几轮可以连着跑，最后一起等、一起对。
 #
 #   loadtest-round.sh <场景> [k6 的额外参数]
+#   loadtest-round.sh snapshot <窗口秒数> <往回偏移的秒数>   事后把某一段时间的服务端指标重新取一遍（标准输出）
+#   loadtest-round.sh stages <RUN_ID>                        阶梯那样的一轮：按 conditions.txt 里的 start_utc 和 STAGES，
+#                                                            给每一档各取一份服务端指标，写到 tmp/k6/<RUN_ID>/stages/<速率>.txt。
+#                                                            每档取它最后的“时长减 30 秒”，开头升上去和刚换档的那一段不算。
+#                                                            Prometheus 里要还有那段时间的数据，压完尽早取。
 #
 # k6 的配置和 scripts/cluster/k6.sh 一样走环境变量（RUN_ID、SKUS、RATE、DURATION、STAGES……）。RUN_ID 必须给。
 # 结果都在 tmp/k6/<RUN_ID>/：k6 的那几个文件之外，多出
@@ -27,7 +32,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 export KUBECONFIG="$KUBECONFIG_OUT"
 NS="oppenheimer"
 
-if [[ $# -lt 1 || ( "$1" != snapshot && -z "${RUN_ID:-}" ) ]]; then
+if [[ $# -lt 1 || ( "$1" != snapshot && "$1" != stages && -z "${RUN_ID:-}" ) ]]; then
   sed -n '2,20p' "${BASH_SOURCE[0]}" >&2
   exit 2
 fi
@@ -65,6 +70,11 @@ snapshot() { # 窗口秒数 [往回偏移的秒数，默认 35]
     "histogram_quantile(0.99, sum by (le,service_name,rpc_method) (rate(rpc_client_call_duration_seconds_bucket{$ns}$R)))"
   section "受理的结果（每秒）" "sum by (outcome) (rate(order_admissions_total{$ns}$R)) > 0"
   section "落库的结果（每秒）" "sum by (outcome) (rate(order_persists_total{$ns}$R)) > 0"
+  section "支付出结果（每秒），按结果" "sum by (result) (rate(payment_results_total{$ns}$R)) > 0"
+  for q in 0.5 0.99; do
+    section "支付单从创建到出结果 p${q}（秒）" \
+      "histogram_quantile($q, sum by (le) (rate(payment_result_delay_seconds_bucket{$ns}$R)))"
+  done
   for q in 0.5 0.99; do
     section "落库延迟 p${q}（秒，受理到落库）" \
       "histogram_quantile($q, sum by (le) (rate(order_persist_delay_seconds_bucket{$ns}$R)))"
@@ -118,6 +128,36 @@ grab_pprof() { # 抓一个服务的一个 Pod：pprof 只在 Pod 的回环上监
 # 补取：loadtest-round.sh snapshot <窗口秒数> <往回偏移的秒数>，事后按时间把某一轮的服务端指标重新取一遍（标准输出）
 if [[ "$1" == snapshot ]]; then
   snapshot "${2:?window seconds}" "${3:?offset seconds}"
+  exit 0
+fi
+
+# 按档取：STAGES 是 "速率:时长,速率:时长,..."（test/k6/lib/config.js），时长带单位 s 或 m。短于 60 秒的是换档的斜坡，跳过。
+if [[ "$1" == stages ]]; then
+  run="${2:?RUN_ID}"
+  dir="$ROOT/tmp/k6/$run"
+  start_utc="$(sed -n 's/^start_utc: //p' "$dir/conditions.txt")"
+  stages="$(sed -n 's/^  STAGES=//p' "$dir/conditions.txt")"
+  if [[ -z "$start_utc" || -z "$stages" ]]; then
+    echo "no start_utc or STAGES in $dir/conditions.txt" >&2
+    exit 2
+  fi
+  t="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$start_utc" +%s)"
+  mkdir -p "$dir/stages"
+  IFS=',' read -r -a parts <<<"$stages"
+  for part in "${parts[@]}"; do
+    rate="${part%%:*}"
+    dur="${part#*:}"
+    case "$dur" in
+    *m) dur=$((${dur%m} * 60)) ;;
+    *s) dur="${dur%s}" ;;
+    esac
+    t=$((t + dur))
+    [[ "$dur" -ge 60 ]] || continue
+    echo "stage $rate/s: ${dur}s ending $(date -u -r "$t" +%H:%M:%SZ)" >&2
+    # 偏移每一档现算：取一份要跑几十条查询，前面几档取完时间已经过去了
+    snapshot "$((dur - 30))" "$(($(date +%s) - t))" >"$dir/stages/$rate.txt"
+  done
+  echo "per-stage server metrics: $dir/stages/"
   exit 0
 fi
 
