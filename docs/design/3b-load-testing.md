@@ -311,7 +311,7 @@ scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 20
 
 ### 第 4 步的后一半：备份和恢复的耗时，备份 Job 被 OOMKilled（2026-11-18）
 
-灌完之后做一次手工备份（`make middleware-backup`），这是“回到基准状态”用的那一份：NAS 上 `mysql-order-0/20261118T173525Z`、`mysql-order-1/20261118T173606Z`、`mysql-main/20261118T173407Z`。定时备份只留最近 7 份，**要长期留着的话得在 NAS 上另存一份**（没有做）。
+灌完之后做一次手工备份（`make middleware-backup`），这是“回到基准状态”用的那一份：NAS 上 `mysql-order-0/20261118T173525Z`、`mysql-order-1/20261118T173606Z`、`mysql-main/20261118T173407Z`。定时备份只留最近 7 份，**要长期留着的话得在 NAS 上另存一份**。2026-11-19 做了：这三份钉成了各自实例目录下的 `keep-seed-10m`（`scripts/cluster/middleware.sh mysql-backup-pin seed-10m <实例>=<时间戳>...`）。它是硬链接，不占第二份空间；轮转只删时间戳命名的目录，删到原来那三个目录时数据还在。恢复演练用 `BACKUP=keep-seed-10m make mysql-restore-drill RELEASE=<实例>` 指定它；`mysql-backup-list` 列出 NAS 上所有的备份。同一天另外手工跑了一轮轮转备份（第 1 轮优化之前的状态，含压测留下的约 31 万单）：`mysql-order-0/20261119T151935Z`、`mysql-order-1/20261119T152009Z`、`mysql-main/20261119T152044Z`。
 
 | 实例 | 数据 | 备份（mysqldump 加 zstd，从从库读） | 压缩后 | 恢复到临时实例 |
 |---|---|---|---|---|
