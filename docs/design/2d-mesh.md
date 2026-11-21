@@ -110,7 +110,7 @@ istiod ×1（istio-system）：把 Service、端点和下面的资源翻译成 E
 |---|---|---|---|
 | gateway → order | 3s | 512 | 超时：`VirtualService` 的路由按 `sourceLabels` 匹配调用方；并发和摘除：`DestinationRule` 的 `workloadSelector` 选调用方的 Pod（没有查证，实现时对参考页；不行就退到每个调用方一个 `exportTo` 受限的规则） |
 | gateway → inventory、payment、orderindex | 3s | 128 | |
-| order → inventory | 1s | 128 | |
+| order → inventory | 1s（`Reserve` 是 3s，2026-11-21 起按路径单独一条路由 `from-order-reserve`，ADR-0020 的补充） | 128 | |
 | payment → order | 1s | 128 | |
 
 每条边的 `VirtualService` 路由：`timeout` 写上表的数，**`retries: {attempts: 0}`**。另外在网格配置里把默认的重试策略也设成 0 次（`meshConfig.defaultHttpRetryPolicy`），这样漏写某条路由时的结果是不重试，而不是悄悄重试两次。1.32 新增了入站一侧的默认重试策略（`defaultInboundHttpRetryPolicy`），同样关掉。

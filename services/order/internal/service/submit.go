@@ -177,8 +177,8 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 	return res, nil
 }
 
-// warmUpTimeout 是一次合并后的预热调用的时限。到 inventory 的连接上另有 1 秒的按跳时限
-// （Envoy 边车的路由超时 1 秒，进程里的 inventoryHopTimeout 比它长一截做兜底），实际生效的是其中最短的那个。
+// warmUpTimeout 是一次合并后的预热调用的时限。到 inventory 的连接上 WarmUp 另有 1 秒的按跳时限
+// （Envoy 边车的路由超时 1 秒，进程里的 inventoryHopTimeout 比它长一截做兜底；Reserve 的是 3 秒，见 main.go），实际生效的是其中最短的那个。
 const warmUpTimeout = 3 * time.Second
 
 // warmUp 请库存服务把这些 SKU 装进闸门，同一组 SKU 的并发调用合并成一次。

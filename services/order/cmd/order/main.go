@@ -93,22 +93,32 @@ const (
 const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
 
-// order 调 inventory（Reserve、WarmUp）这一跳的时限（设计文档 1d 的 5.6）。
+// order 调 inventory 这一跳的时限（设计文档 1d 的 5.6，ADR-0020 和它 2026-11-21 的补充）。两个方法两个预算。
 //
-// inventoryHopBudget 是这一跳的预算，写在 deploy/envoy/order.yaml 出站路由 to_inventory 的 timeout 上，由边车执行
-// （有测试核对两处一致）。取 1 秒：Reserve 是一次短事务，正常几毫秒；网关给下游的总预算是 3 秒，
-// order 在 Reserve 超时之后还有时间返回明确的错误。
+// inventoryHopBudget 是默认的预算（现在只有 WarmUp 用它），写在 deploy/envoy/order.yaml 出站路由 to_inventory
+// 的兜底路由和集群上 VirtualService 的 from-order 路由的 timeout 上，由边车执行（有测试核对三处一致）。
+// 取 1 秒：WarmUp 在受理的同步路径上，网关给下游的总预算是 3 秒，order 在它超时之后还有时间返回明确的错误。
 //
-// inventoryHopTimeout 是进程里的时限，比预算多 grpcx.SidecarMargin，只做兜底（边车不在或卡住时 order 仍然放手）。
-// 边车必须先超时，慢的 inventory 才会被摘除，理由见 grpcx.SidecarMargin。所以 inventory 超时时这里正常看到的是
-// 边车返回的 UNAVAILABLE。
+// reserveHopBudget 是 Reserve 的预算，写在同两个文件里按 gRPC 路径匹配的那条路由上。取 3 秒：
+// Reserve 只在落库的消费者里调用，没有用户在等，失败了由消费者重试，所以它的时限不按“用户等不等得起”定，
+// 按“区分慢和坏”定。Reserve 要提交一个事务，这块盘上一次提交偶尔要 1 到 2 秒（3b 第 3 轮的 l5b：12.6 万次里
+// 53 次超过 1 秒、0 次超过 2 秒）。时限是 1 秒时，盘卡一下，几十个在途的 Reserve 同时超时，边车按
+// “连续 5 次 5xx”把 inventory 的全部副本摘除 5 秒：一秒的慢被放大成五秒的断
+// （docs/notes/3b-rounds/round-3-overload-behavior.md 第 4 节）。代价是 inventory 真的卡死时晚 2 秒发现。
+// 上限：它加上落库的两次订单库事务要在消费者处理一条消息的时限（service.DefaultEventTimeout）之内，有测试核对。
 //
-// 落库的消费者没有上游截止时间（它有自己的 DefaultEventTimeout），这个时限对它同样生效：
-// Reserve 超时按“结果未知”原地重试。
+// inventoryHopTimeout、reserveHopTimeout 是进程里的时限，各比预算多 grpcx.SidecarMargin，只做兜底
+// （边车不在或卡住时 order 仍然放手）。边车必须先超时，慢的 inventory 才会被摘除，理由见 grpcx.SidecarMargin。
+// 所以 inventory 超时时这里正常看到的是边车返回的 UNAVAILABLE。Reserve 超时按“结果未知”由消费者重试。
 const (
 	inventoryHopBudget  = time.Second
 	inventoryHopTimeout = inventoryHopBudget + grpcx.SidecarMargin
+	reserveHopBudget    = 3 * time.Second
+	reserveHopTimeout   = reserveHopBudget + grpcx.SidecarMargin
 )
+
+// reserveMethod 是 Reserve 的完整方法名：进程里按它取时限，两份边车配置里按它（HTTP/2 的 :path）匹配路由。
+const reserveMethod = inventoryv1.InventoryService_Reserve_FullMethodName
 
 // archiveMaxOpenConns 是冷库的连接池上限。冷库只承接旧订单的查询，量很小；
 // 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
@@ -607,7 +617,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}()
 	}
 
-	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeout(inventoryHopTimeout))
+	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeouts(inventoryHopTimeout,
+		map[string]time.Duration{reserveMethod: reserveHopTimeout}))
 	if err != nil {
 		return err
 	}
