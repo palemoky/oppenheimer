@@ -55,7 +55,9 @@ export const cfg = {
   peakRate: peak,
   maxVUs: num('MAX_VUS', Math.max(50, Math.ceil(peak * 2))),
   preVUs: num('PRE_VUS', 0), // 0 表示按峰值速率估算
-  pollIntervalMs: num('POLL_INTERVAL_MS', 100),
+  pollIntervalMs: num('POLL_INTERVAL_MS', 200),
+  pollMaxIntervalMs: num('POLL_MAX_INTERVAL_MS', 2000),
+  pollBackoff: Math.max(num('POLL_BACKOFF', 2), 1),
   pollTimeoutMs: num('POLL_TIMEOUT_MS', 10000),
   payRatio: num('PAY_RATIO', 0.5),
   cancelRatio: num('CANCEL_RATIO', 0.2),

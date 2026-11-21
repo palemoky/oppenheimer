@@ -146,11 +146,18 @@ export function placeOrder(user, skuId, quantity, group) {
 }
 
 // 轮询到订单离开 creating。返回最终状态字符串，超时返回 'timeout'。
+//
+// 间隔按接口规范里写给客户端的规则退避（gateway.yaml 的“下单”）：从 POLL_INTERVAL_MS 起，每次乘 POLL_BACKOFF，
+// 最长 POLL_MAX_INTERVAL_MS；收到 429 时至少等 Retry-After。固定 100 毫秒不退避的轮询在落库变慢时
+// 会把查询量放大好几倍（3b 第 0 轮），那量到的是压测脚本自己制造的过载。POLL_BACKOFF=1 是原来的固定间隔。
 export function pollLanded(user, orderId, acceptedAtMs, group) {
   const deadline = acceptedAtMs + cfg.pollTimeoutMs;
   const tags = group ? { load_group: group } : {};
+  let interval = cfg.pollIntervalMs;
+  let wait = interval;
   for (;;) {
-    sleep(cfg.pollIntervalMs / 1000);
+    // 不睡过超时的时刻：最后一次查询落在超时点上，超时的判定不因为退避而推迟。
+    sleep(Math.max(Math.min(wait, deadline - Date.now()), 0) / 1000);
     const { res, order } = getOrder(user, orderId, group);
     if (res.status === 200 && order && order.status !== 'creating') {
       const st = order.status;
@@ -163,6 +170,12 @@ export function pollLanded(user, orderId, acceptedAtMs, group) {
     if (Date.now() >= deadline) {
       m.pollTimeout.add(1, tags);
       return 'timeout';
+    }
+    interval = Math.min(interval * cfg.pollBackoff, cfg.pollMaxIntervalMs);
+    wait = interval;
+    if (res.status === 429) {
+      const ra = Number(res.headers['Retry-After']);
+      if (ra > 0) wait = Math.max(wait, ra * 1000);
     }
   }
 }

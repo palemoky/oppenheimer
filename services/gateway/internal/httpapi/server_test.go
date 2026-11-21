@@ -494,6 +494,7 @@ func TestErrorMapping(t *testing.T) {
 		{"insufficient stock", errx.New(codes.FailedPrecondition, errx.ReasonInsufficientStock, "no stock"), 409, "INSUFFICIENT_STOCK"},
 		{"unavailable", errx.New(codes.Unavailable, "", "down"), 503, "UNAVAILABLE"},
 		{"backlogged", errx.New(codes.ResourceExhausted, errx.ReasonBacklogged, "busy"), 429, "BACKLOGGED"},
+		{"read busy", errx.New(codes.ResourceExhausted, "READ_BUSY", "busy"), 429, "READ_BUSY"},
 		{"deadline", status.Error(codes.DeadlineExceeded, "slow"), 504, "DEADLINE_EXCEEDED"},
 		{"plain failed precondition", status.Error(codes.FailedPrecondition, "x"), 409, "FAILED_PRECONDITION"},
 		{"plain already exists", status.Error(codes.AlreadyExists, "x"), 409, "ALREADY_EXISTS"},
@@ -508,6 +509,10 @@ func TestErrorMapping(t *testing.T) {
 			r := do(t, e.h, "GET", "/api/v1/orders/1", "7", "")
 			if r.status != tt.wantStatus || errCode(t, r) != tt.wantCode {
 				t.Errorf("status = %d code = %s, want %d %s; body %s", r.status, errCode(t, r), tt.wantStatus, tt.wantCode, r.raw)
+			}
+			// 429 一定带 Retry-After（客户端据此退避），别的状态这里不带。
+			if got, want := r.header.Get("Retry-After"), map[bool]string{true: "1"}[tt.wantStatus == 429]; got != want {
+				t.Errorf("Retry-After = %q, want %q", got, want)
 			}
 			if tt.wantStatus == 500 {
 				for _, leak := range []string{"secret", "sql:", "unexpected EOF"} {

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc/codes"
@@ -37,6 +39,14 @@ func writeError(c *gin.Context, status int, code, message string) {
 // 它的意义在访问日志和统计里：把“客户端放弃了”和“服务端出错了”（500）、“服务端超时了”（504）分开，
 // 否则客户端一断开，错误率和告警就跟着涨，而服务端其实没有问题。
 const statusClientClosedRequest = 499
+
+// busyRetryAfter 是下游说“忙”（RESOURCE_EXHAUSTED：下单的 BACKLOGGED、查询的 READ_BUSY）时 429 带的 Retry-After。
+//
+// 这两种拒绝和限流不同，服务端算不出“多久之后就行”：积压什么时候消化完、查询的名额什么时候空出来，
+// 取决于别的请求。给 1 秒，是 Retry-After 能表达的最小值，客户端再被拒绝时自己加倍。
+// 一定要给一个数的理由（3b 第 0 轮）：不给的话客户端按自己的轮询间隔（压测里是 100 毫秒）立刻再来，
+// 落库慢了 25%，查询的量涨了 4 倍，把读路径和同一个节点上的受理一起拖慢。
+const busyRetryAfter = time.Second
 
 // codeClientClosedRequest 是 499 的原因码。
 const codeClientClosedRequest = "CLIENT_CLOSED_REQUEST"
@@ -80,6 +90,9 @@ func (s *server) writeGRPCError(c *gin.Context, err error) {
 		code = codeName(st.Code())
 	}
 	httpStatus := httpStatusOf(st.Code())
+	if httpStatus == http.StatusTooManyRequests {
+		c.Header("Retry-After", strconv.FormatInt(retryAfterSeconds(busyRetryAfter), 10))
+	}
 
 	message := st.Message()
 	if httpStatus == http.StatusInternalServerError {

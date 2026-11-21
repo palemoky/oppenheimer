@@ -273,7 +273,7 @@ func TestEveryOperationDocuments429(t *testing.T) {
 	if resp.Headers["Retry-After"].Ref == "" {
 		t.Error("TooManyRequests has no Retry-After header")
 	}
-	for _, code := range []string{codeRateLimited, "BACKLOGGED"} {
+	for _, code := range []string{codeRateLimited, "BACKLOGGED", "READ_BUSY"} {
 		if !strings.Contains(resp.Description, code) {
 			t.Errorf("TooManyRequests does not describe %s", code)
 		}

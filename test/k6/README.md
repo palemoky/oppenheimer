@@ -53,7 +53,9 @@ SKUS=3001 RATE=30 DURATION=20s make k6 SCENARIO=order     # 等价于 scripts/cl
 | `STAGES` | 空 | 阶梯，如 `100:3m,125:3m,156:3m`（速率:时长）；给了就用 ramping-arrival-rate，`RATE`/`DURATION` 不再起作用 |
 | `MAX_VUS` | 峰值速率 x 2（至少 50） | 虚拟用户上限 |
 | `PRE_VUS` | 峰值速率 / 2（至少 20） | 预分配的虚拟用户数 |
-| `POLL_INTERVAL_MS` | 100 | 轮询订单状态的间隔 |
+| `POLL_INTERVAL_MS` | 200 | 轮询订单状态的第一个间隔 |
+| `POLL_BACKOFF` | 2 | 每次轮询之后间隔乘以它；1 是固定间隔（2026-11-21 之前的轮次是固定 100 毫秒，要和它们比时用 `POLL_INTERVAL_MS=100 POLL_BACKOFF=1`） |
+| `POLL_MAX_INTERVAL_MS` | 2000 | 间隔的上限。收到 429 时另外至少等 `Retry-After` |
 | `POLL_TIMEOUT_MS` | 10000 | 轮询超时，从受理算起 |
 | `PAY_RATIO` | 0.5 | order 场景：落库成功后支付的比例 |
 | `CANCEL_RATIO` | 0.2 | order 场景：取消的比例（其余不动，等超时关单） |
@@ -79,7 +81,7 @@ SKUS=3001 RATE=30 DURATION=20s make k6 SCENARIO=order     # 等价于 scripts/cl
 | 指标 | 含义 |
 |---|---|
 | `lt_accept_ms` | 受理耗时：下单请求本身（只记 202） |
-| `lt_landing_ms` | 落库耗时：从下单返回到轮询看到订单离开 `creating`。精度受 `POLL_INTERVAL_MS` 限制（偏大，平均多约半个间隔） |
+| `lt_landing_ms` | 落库耗时：从下单返回到轮询看到订单离开 `creating`。精度受轮询间隔限制（偏大；间隔退避之后落库越慢偏得越多，最多 2 秒），落库耗时以服务端的指标为准 |
 | `lt_create` | 下单请求总数（不论结果） |
 | `lt_reason{reason}` | 非 2xx 或失败的原因码计数；取值是 `lib/metrics.js` 里 `REASONS` 的有限集合，不认识的记 `OTHER` |
 | `lt_accepted` / `lt_landed` / `lt_order_failed` | 受理 / 落库成功（`pending_payment`）/ 落库失败（`failed`） |
