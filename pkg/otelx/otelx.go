@@ -50,6 +50,17 @@ var DurationBuckets = []float64{
 	0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10,
 }
 
+// WaitBuckets 是“排队等了多久”这类直方图的桶边界，单位秒，给名字以 .delay 结尾的直方图用
+// （order.persist.delay、payment.result.delay）。它们量的不是一次调用的耗时，而是一件事在队列里等的时间，
+// 系统跟不上时是几十秒到十几分钟：3b 的阶梯压测里落库延迟全部落在“超过 10 秒”那一个桶里，
+// 支付单排队超过了 15 分钟的支付超时。上限取 30 分钟，是支付超时的两倍。
+var WaitBuckets = []float64{
+	0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 900, 1800,
+}
+
+// waitSuffix 是用 WaitBuckets 的直方图的名字后缀。
+const waitSuffix = ".delay"
+
 // Setup 建全局的 TracerProvider、MeterProvider 和传播器，返回的 shutdown 在所有组件停止之后调用。
 //
 // 没设 OTEL_EXPORTER_OTLP_ENDPOINT 时：仍然建 TracerProvider，只是不挂导出器。span 照常产生、有 trace id，
@@ -116,12 +127,27 @@ func Setup(ctx context.Context, service string, logger *slog.Logger) (shutdown f
 	}, nil
 }
 
-// DurationView 把 DurationBuckets 套在所有单位是秒的直方图上。导出给测试里自己建 MeterProvider 时用。
+// DurationView 给所有单位是秒的直方图定桶边界：名字以 .delay 结尾的用 WaitBuckets，其余用 DurationBuckets。
+// 导出给测试里自己建 MeterProvider 时用。
+//
+// 写成一个函数而不是两个 NewView：一个仪表匹配上的每个 View 各产生一条流，
+// “单位是秒”和“名字以 .delay 结尾”两个条件同时成立时会导出两份、边界还不一样。
 func DurationView() sdkmetric.View {
-	return sdkmetric.NewView(
-		sdkmetric.Instrument{Kind: sdkmetric.InstrumentKindHistogram, Unit: "s"},
-		sdkmetric.Stream{Aggregation: sdkmetric.AggregationExplicitBucketHistogram{Boundaries: DurationBuckets}},
-	)
+	return func(i sdkmetric.Instrument) (sdkmetric.Stream, bool) {
+		if i.Kind != sdkmetric.InstrumentKindHistogram || i.Unit != "s" {
+			return sdkmetric.Stream{}, false
+		}
+		b := DurationBuckets
+		if strings.HasSuffix(i.Name, waitSuffix) {
+			b = WaitBuckets
+		}
+		return sdkmetric.Stream{
+			Name:        i.Name,
+			Description: i.Description,
+			Unit:        i.Unit,
+			Aggregation: sdkmetric.AggregationExplicitBucketHistogram{Boundaries: b},
+		}, true
+	}
 }
 
 func newResource(ctx context.Context, service string) (*resource.Resource, error) {

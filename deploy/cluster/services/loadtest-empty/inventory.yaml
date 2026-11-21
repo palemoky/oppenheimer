@@ -1,0 +1,4 @@
+# 列表在 Helm 里是整个替换：整条 DSN 重写，只改库名（见 common.yaml）。
+expandEnv:
+  - name: MYSQL_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_inventory_db"

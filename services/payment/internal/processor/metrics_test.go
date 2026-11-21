@@ -107,3 +107,20 @@ func TestResultMetrics(t *testing.T) {
 		t.Errorf("results{failed} increased by %d, want at least 1", got)
 	}
 }
+
+// payment.result.delay 记的是创建到出结果的时间，每完成一次转换记一次。
+func TestResultDelayMetric(t *testing.T) {
+	e := newEnv(t, processor.Config{})
+	ok := attribute.String("result", "succeeded")
+	_, n0 := metricValue(t, "payment.result.delay", ok)
+
+	e.create(t, success)
+	e.create(t, success)
+	e.clock.Advance(7 * time.Minute)
+	e.round(t)
+	e.round(t)
+
+	if _, n := metricValue(t, "payment.result.delay", ok); n-n0 < 2 {
+		t.Errorf("result.delay{succeeded} recorded %d times, want at least 2", n-n0)
+	}
+}

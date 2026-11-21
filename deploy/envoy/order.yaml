@@ -60,10 +60,18 @@ static_resources:
                     - name: to_inventory
                       domains: ["*"]
                       routes:
+                        # Reserve 单独一条路由，时限 3 秒（ADR-0020 的 2026-11-21 补充）：它只在落库的消费者里调用，
+                        # 没有用户在等，时限按“区分慢和坏”定。1 秒时一次盘的停顿会让几十个在途的 Reserve 同时超时，
+                        # 把 inventory 整个摘除 5 秒。和 Go 代码里的 reserveHopBudget 一致。从上到下第一条匹配的生效，
+                        # 所以它必须在兜底路由之前。
+                        - match: { path: "/oppenheimer.inventory.v1.InventoryService/Reserve" }
+                          route:
+                            cluster: to_inventory
+                            timeout: 3s
                         - match: { prefix: "/" }
                           route:
                             cluster: to_inventory
-                            # 这一跳的预算，也是慢下游能被摘除的唯一途径。和 Go 代码里 order 调 inventory 的时限一致。
+                            # 这一跳的预算，也是慢下游能被摘除的唯一途径。和 Go 代码里的 inventoryHopBudget 一致。
                             timeout: 1s
                 http_filters:
                   - name: envoy.filters.http.router

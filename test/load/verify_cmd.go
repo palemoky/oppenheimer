@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -192,6 +193,46 @@ func parseInitial(s string) (map[int64]int64, error) {
 	return out, nil
 }
 
+// parseScopeSKUs 解析 -scope-skus，并要求它和 -initial 列的 SKU 完全相同：限定范围时只读这些 SKU，
+// -initial 多一个会被第 1 条报成“不在 sku_stock 里”，少一个则这个 SKU 的守恒没人检查。
+func parseScopeSKUs(s string, initial map[int64]int64) ([]int64, error) {
+	ids, err := parseIDs(s)
+	if err != nil {
+		return nil, err
+	}
+	set := map[int64]bool{}
+	for _, id := range ids {
+		if set[id] {
+			return nil, fmt.Errorf("sku %d listed twice", id)
+		}
+		set[id] = true
+	}
+	var onlyScope, onlyInitial []int64
+	for _, id := range ids {
+		if _, ok := initial[id]; !ok {
+			onlyScope = append(onlyScope, id)
+		}
+	}
+	for id := range initial {
+		if !set[id] {
+			onlyInitial = append(onlyInitial, id)
+		}
+	}
+	if len(onlyScope) > 0 || len(onlyInitial) > 0 {
+		slices.Sort(onlyScope)
+		slices.Sort(onlyInitial)
+		return nil, fmt.Errorf("must list the same skus as -initial: only in -scope-skus %v, only in -initial %v", onlyScope, onlyInitial)
+	}
+	return slices.Sorted(maps.Keys(set)), nil
+}
+
+func scopedReason(scoped bool) string {
+	if scoped {
+		return "scoped"
+	}
+	return ""
+}
+
 func newLogger(stderr io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
@@ -227,6 +268,7 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 	var (
 		sf                          sourceFlags
 		ledgerPath, initial, invLog string
+		ordersPath, scopeFlag       string
 		timeout                     time.Duration
 		archiveSettled              bool
 	)
@@ -236,7 +278,12 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&archiveSettled, "archive-settled", true,
 		"the archive job has finished: an order id in both the hot and the cold db fails check 21; false only reports the count")
 	fs.StringVar(&ledgerPath, "ledger", "tmp/load/ledger.jsonl", "client ledger written by run")
+	fs.StringVar(&ordersPath, "orders-jsonl", "",
+		"order list written by the k6 load (one line per accepted order), used instead of -ledger")
 	fs.StringVar(&initial, "initial", "", "initial stock of every sku, e.g. 1001=500,1002=500 (required)")
+	fs.StringVar(&scopeFlag, "scope-skus", "",
+		"comma-separated skus used only by this run; when given, verify reads only these skus and the orders of this run "+
+			"(the ledger's order ids and the orders that reserved these skus), and skips checks 18-21; -initial must list exactly these skus")
 	fs.StringVar(&invLog, "inventory-log", "", "inventory service log file, checked for gate corrections")
 	fs.DurationVar(&timeout, "timeout", 2*time.Minute, "overall timeout")
 	if ok, code := parseSourceFlags(fs, args); !ok {
@@ -248,12 +295,31 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "invalid -initial: %v\n", err)
 		return 2
 	}
+	var scopeSKUs []int64
+	if scopeFlag != "" {
+		if scopeSKUs, err = parseScopeSKUs(scopeFlag, initStock); err != nil {
+			fmt.Fprintf(stderr, "invalid -scope-skus: %v\n", err)
+			return 2
+		}
+	}
+	ledgerSet := false
+	fs.Visit(func(f *flag.Flag) { ledgerSet = ledgerSet || f.Name == "ledger" })
+	if ordersPath != "" && ledgerSet {
+		fmt.Fprintln(stderr, "-ledger and -orders-jsonl are mutually exclusive")
+		return 2
+	}
 
-	entries, err := readLedger(ledgerPath, logger)
+	var entries []ledger.Entry
+	if ordersPath != "" {
+		entries, err = ledger.ReadOrderListFile(ordersPath)
+	} else {
+		entries, err = readLedger(ledgerPath, logger)
+	}
 	if err != nil {
 		logger.Error("read ledger failed", "error", err)
 		return 1
 	}
+	scope := verify.NewScope(scopeSKUs, entries)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -267,13 +333,18 @@ func verifyCmd(args []string, stdout, stderr io.Writer) int {
 	defer closeSrc()
 	src.InventoryLog = invLog
 
-	snap, err := verify.Collect(ctx, src, initStock)
+	var snap *verify.Snapshot
+	if scope.Empty() {
+		snap, err = verify.Collect(ctx, src, initStock)
+	} else {
+		snap, err = verify.CollectScoped(ctx, src, initStock, scope)
+	}
 	if err != nil {
 		logger.Error("collect failed", "error", err)
 		return 1
 	}
 	res := verify.Check(verify.Input{Snapshot: snap, Ledger: entries, ArchiveInFlight: !archiveSettled})
-	printResult(stdout, res, snap, len(entries), archiveSettled)
+	printResult(stdout, res, snap, len(entries), archiveSettled, scope)
 	if res.Failed() {
 		return 1
 	}
@@ -298,10 +369,15 @@ func readLedger(path string, logger *slog.Logger) ([]ledger.Entry, error) {
 	return out, nil
 }
 
-func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerLines int, archiveSettled bool) {
+func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerLines int, archiveSettled bool, scope verify.Scope) {
 	c := res.Counts
 	p := func(format string, args ...any) { fmt.Fprintf(w, format+"\n", args...) }
+	scoped := !scope.Empty()
 	p("== verify summary ==")
+	if scoped {
+		p("scope: skus %v, %d order ids and %d flows from the ledger; only these skus and the orders of this run were read",
+			scope.SKUs, len(scope.OrderIDs), len(scope.Flows))
+	}
 	p("ledger lines: %d", ledgerLines)
 	p("orders in the order dbs: %d %v", len(snap.Orders), sortedCounts(c.OrdersByStatus))
 	p("payments: %d", len(snap.Payments))
@@ -311,20 +387,34 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 	p("[16] unknown outcomes: %v; 5xx: %v", sortedCounts(c.Unknown), sortedCounts(c.HTTP5xx))
 	p("submit gave up without an order id (some attempt unknown/5xx): %d, found in the order dbs by (user_id, key): %v",
 		c.GaveUp, sortedCounts(c.GaveUpFound))
-	p("orders whose idempotency key is not in the ledger: %d", c.OrdersWithoutFlow)
-	p("gate reconciliation log: corrected %d, capped %d", c.Corrections, c.Capped)
-	p("dead letter messages: %d", c.DLQ)
+	if scoped {
+		// 范围内但不在账本里的订单只能是经预占明细（买了范围内的 SKU）找到的：受理了但客户端没收到响应的，
+		// 或者别的流量买了本该专用的 SKU。只计数，和不限定范围时一样。
+		p("orders whose idempotency key is not in the ledger: %d (found through the reservations of the scope skus: "+
+			"accepted without the client seeing the response, or other traffic bought a scope sku)", c.OrdersWithoutFlow)
+		p("[17] outbox: counts the whole order and payment dbs, not only this run (other traffic's unpublished rows also fail it)")
+	} else {
+		p("orders whose idempotency key is not in the ledger: %d", c.OrdersWithoutFlow)
+	}
+	var skipped []string
+	if scoped {
+		p("[18] dead letter messages: skipped (scoped)")
+		p("[19] gate reconciliation log: skipped (scoped)")
+		skipped = append(skipped, "18", "19")
+	} else {
+		p("gate reconciliation log: corrected %d, capped %d", c.Corrections, c.Capped)
+		p("dead letter messages: %d", c.DLQ)
+	}
 	for _, sku := range slices.Sorted(maps.Keys(snap.Stock)) {
 		st, g := snap.Stock[sku], snap.Gate[sku]
 		p("sku %d: initial %d available %d reserved %d sold %d | gate avail %d held %d limit %d",
 			sku, snap.Initial[sku], st.Available, st.Reserved, st.Sold, g.Avail, g.Held, g.Limit)
 	}
-	var skipped []string
 	if mi := c.MerchantIndex; mi != nil {
 		p("[20] merchant index: %d orders with a merchant, %d index rows; missing %d, extra %d, mismatched %d, misplaced %d",
 			mi.Orders, mi.Rows, mi.Missing, mi.Extra, mi.Mismatch, mi.Misplaced)
 	} else {
-		p("[20] merchant index: skipped (no -merchant-index-dsns)")
+		p("[20] merchant index: skipped (%s)", cmp.Or(scopedReason(scoped), "no -merchant-index-dsns"))
 		skipped = append(skipped, "20")
 	}
 	if a := snap.Archive; a != nil {
@@ -333,7 +423,7 @@ func printResult(w io.Writer, res *verify.Result, snap *verify.Snapshot, ledgerL
 			a.ColdOrders, a.HotOrders, a.NonFinal.N, a.TooNew.N, a.Both.N, a.NoItems.N,
 			a.ItemOrphans.N, a.PaymentOrphans.N, a.HotItemOrphans.N, a.HotPaymentOrphans.N, archiveSettled)
 	} else {
-		p("[21] cold archive: skipped (no -archive-dsn)")
+		p("[21] cold archive: skipped (%s)", cmp.Or(scopedReason(scoped), "no -archive-dsn"))
 		skipped = append(skipped, "21")
 	}
 	var pendingRows int64

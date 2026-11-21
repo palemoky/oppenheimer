@@ -1,0 +1,21 @@
+# Codecov 的配置。CI 的 test 任务按模块各上传一份 coverage.out，Codecov 把同一个提交的多份报告合并。
+
+coverage:
+  status:
+    # 只展示，不拦合并：这是练习项目，覆盖率是参考数字，不是门槛。
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# 生成代码不计入覆盖率。
+ignore:
+  - "api/gen/**"
+  - "**/*.gen.go"
+
+comment:
+  layout: "diff, flags, files"
+  # 覆盖率没有变化时不在 PR 里留评论
+  require_changes: true

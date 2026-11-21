@@ -10,6 +10,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -33,12 +35,16 @@ func (dropRootClient) Description() string { return "test DropRootClient" }
 // 全局的 TracerProvider 是进程级的，在 TestMain 里设一次：redisotel 在 InstrumentTracing 时取全局的 provider。
 var spans = tracetest.NewSpanRecorder()
 
+// metrics 收全局 MeterProvider 的指标。redisx 的命令耗时直方图建在全局的（代理）meter 上，设了之后生效。
+var metrics = sdkmetric.NewManualReader()
+
 func TestMain(m *testing.M) {
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(dropRootClient{}),
 		sdktrace.WithSpanProcessor(spans),
 	))
 	otel.SetTextMapPropagator(propagation.TraceContext{})
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)))
 	os.Exit(m.Run())
 }
 
@@ -162,14 +168,20 @@ func TestCommandWithoutParentProducesNoSpan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if ended := spans.Ended(); len(ended) != before {
-		t.Errorf("%d spans were recorded for commands without a parent span, want 0", len(ended)-before)
-		// 这个用例在 CI 上偶发失败过一次（多出 2 个 span，2026-11-16，PR #12，本机没有复现）。记录器是进程级的，
-		// 多出来的也可能是别的用例留下、这时候才结束的 span：把它们是谁、父 span 是谁打出来，下次能直接判断。
-		for _, sp := range ended[before:] {
-			t.Logf("extra span %q kind=%s trace=%s parent=%s remote_parent=%t attrs=%v", sp.Name(), sp.SpanKind(),
-				sp.SpanContext().TraceID(), sp.Parent().SpanID(), sp.Parent().IsRemote(), sp.Attributes())
+	// 只数没有父 span 的：这个用例发的命令都没有父 span，漏出来的只可能是根 span。
+	// 记录器是进程级的，别的用例里带着父 span 建的连接，它的握手（hello、client setinfo 的 pipeline）可能到这时候才结束，
+	// 落进这一段里。CI 上偶发失败过两次（2026-11-16 的 PR #12、2026-11-19 的 PR #16），第二次打出来的两个 span
+	// 正是这两个握手的 span，都有父 span，和这个用例发的命令无关。
+	var leaked int
+	for _, sp := range spans.Ended()[before:] {
+		if sp.Parent().IsValid() {
+			continue
 		}
+		leaked++
+		t.Logf("leaked span %q kind=%s trace=%s attrs=%v", sp.Name(), sp.SpanKind(), sp.SpanContext().TraceID(), sp.Attributes())
+	}
+	if leaked != 0 {
+		t.Errorf("%d spans were recorded for commands without a parent span, want 0", leaked)
 	}
 }
 
@@ -193,6 +205,50 @@ func TestOpenLazyClientIsInstrumentedToo(t *testing.T) {
 	if !found {
 		t.Error("no CLIENT span under the request for a client from OpenLazy")
 	}
+}
+
+// OpenLazy 的客户端也记命令耗时。全局的直方图是各个用例共用的，这里只看 ping 的次数有没有增加。
+func TestOpenLazyClientRecordsCommandDuration(t *testing.T) {
+	_, _ = testredis.New(t) // 没有 Redis 时跳过
+	client, err := openLazy(t, os.Getenv(testredis.AddrEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := pingCount(t)
+	for range 3 {
+		if err := client.Ping(t.Context()).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := pingCount(t) - before; got < 3 {
+		t.Errorf("db.client.operation.duration recorded %d successful redis pings, want at least 3", got)
+	}
+}
+
+func pingCount(t *testing.T) uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := metrics.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var n uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if m.Name != "db.client.operation.duration" || !ok {
+				continue
+			}
+			for _, dp := range h.DataPoints {
+				sys, _ := dp.Attributes.Value("db.system.name")
+				op, _ := dp.Attributes.Value("db.operation.name")
+				_, failed := dp.Attributes.Value("error.type")
+				if sys.AsString() == "redis" && op.AsString() == "ping" && !failed {
+					n += dp.Count
+				}
+			}
+		}
+	}
+	return n
 }
 
 func openLazy(t *testing.T, addr string) (redis.UniversalClient, error) {

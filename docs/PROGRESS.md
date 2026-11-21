@@ -6,8 +6,213 @@
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
-- **最后更新**：2026-11-17（阶段 3a 只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
+- **最后更新**：2026-11-21（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
+
+### 3b 空表对照（2026-11-21 晚，这一段最新，新会话先读这里，再读下面“搬到 Mac mini”里“新会话开头先做的一件事”）
+
+记录在 `docs/notes/3b-rounds/round-5-empty-table-comparison.md`。四组都对账通过（`recon` 差异 0，各轮 `verify` 是 `PASS`）。
+
+- **结论：这套负载下数据量不是变量。** 同一套服务指到空库，下单 100 单/秒、混合读写 500 和 1907 请求/秒三轮，延迟、CPU、落库延迟都落在前后两次大库（`e1a`、`e1d`，另有半组 `e1c`）之间的波动里。原因：负载只碰索引的右边缘和一小块热数据（记录第 3 节）。没有量的：随机读旧数据、深翻页、1 亿单。之后的扩容系数、弹性、长稳都直接在大库上做。
+- **做法和原来设想的两条路都不一样**（已记进“计划变更记录”）：不另起 `oppenheimer-e2e`，不清库恢复，把长期运行的那一套临时指到同一批实例上的 `e2e_*` 空库。新东西：`deploy/cluster/services/loadtest-empty/`；`scripts/cluster/loadtest.sh empty-up`、`empty-down`；`loadtest.sh` 的其余子命令按 order 实际连的库选对象（`conditions`、预检里有一行 `dataset:`）；预检的消费延迟一项认带前缀的延迟关单组；`e2e-lib.sh` 在长期运行的那一套占着 `e2e_*` 库时拒绝建库删库。**切之前、切回之前都要先 `wait-quiet`。**
+- **现在已经切回大库，空库和带前缀的 topic、消费者组、Redis 键都清掉了**；cdc 从原来的位点接上了。预检通过（13:30 UTC 前后）。
+- **顺带查清的旧问题**（记录第 4 节）：订单缓存几乎不命中、订单读全走主库都不是缺陷。缓存只存终态订单，压测查的都是刚下的单；读主库是 `ORDER_READ_MODE` 的默认值，读从库的两种模式的定量对比（2c 挪到阶段 3 的那一项）还没有做，读路径的瓶颈是 CPU，这一项现在值得排进来。
+- **PR #15（`phase-3a`）已合并**（2026-11-21，主人要求；合并前从 draft 标成了 ready，合并提交 `a481ec9`，`main` 上的 CI 27 项全部通过，`test (./services/order)` 3 分 12 秒、e2e 3 分 54 秒）。`phase-3a` 分支没有删。PR #16（`phase-3b`）仍是 draft。
+- **这一段的改动都没有提交**（等主人说）：`scripts/cluster/{loadtest,services,e2e-lib}.sh`、`deploy/cluster/services/loadtest-empty/`、`docs/` 下的记录、计划、设计、`hardware.md`、本文件（含上一段没提交的那一条）。三个脚本过了 `shellcheck -x`；没有改 Go 代码，**没有跑 `make lint test`**（k6 在跑的时候不能跑，跑完之后本机的 compose 是停着的）。
+- **操作端的一个坑**（`docs/infra/hardware.md` 的 Mac mini 一节）：会话放在 zellij 里、ssh 断开重连之后，这个会话里的 `kubectl`、`helm` 报 `no route to host`（macOS 的本地网络权限），集群是好的。`e1c` 的第四轮因此没跑成。办法：在新的 ssh 会话里重开 zellij 和 Claude Code；或者把命令包一层 `ssh mini "zsh -lc 'export PATH=/opt/homebrew/bin:\$PATH; cd ~/Workspace/oppenheimer && ...'"`。**新会话开头先 `kubectl get nodes` 试一下。**
+- **集群现在的状态**：六个服务的镜像仍是 `1228d9c-dirty-20261121084655`（今天滚动过两次，内容没变）；压测 SKU 用到 7348（7211 到 7256 只在空库里用过，正式库里没有这一段），**下一批从 7349 起**；库里压测留下的订单约 188 万单；按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本；k3s-server 的系统盘剩 34 GB；闸门 Redis 的主库是 `redis-gate-0`。
+- **本机**：`make down` 过，compose 是停着的，跑测试之前先 `make up`。原始数据在 `tmp/k6/e1{a,b,c,d}-*`、`tmp/loadtest/e1*`（不入库）。
+- **下一步**：
+  1. **扩容系数**（1、2、4 个副本，设计第 2 节第 9 项）。预计接近 1（CPU 在节点上到顶），要用数验证。先定量哪几个服务、用哪个场景（建议混合读写，在 1907 的八成左右，另加普通下单 100 单/秒），以及 1 个副本时分散约束、PDB 会不会挡住；`loadtest.sh pin` 现成。之后定 CPU requests、弹性测试、重定 HPA → 长稳 → 容量结论。
+  2. 读从库的模式对比（`ORDER_READ_MODE` 的 `window`、`gtid` 对 `primary`）：建议排在扩容系数之后、长稳之前，用混合读写 1907 这一档看节点 CPU 和订单主库的 CPU。
+  3. 下面“3b 混合读写和秒杀的阶梯”的“下一步”第 3 项里剩下的（有货的秒杀在更高速率下、`f1` 第一档落库延迟 27 秒、限流的 Redis 超时的告警）和第 4 项（队列上限按分片）仍然留着。
+  4. 这一轮看到、没有查的：带前缀的新 topic 上 Kafka 多用 0.1 到 0.3 核；要量“数据量大了哪里会慢”得加一个随机读历史订单的 k6 场景。
+
+### 3b 混合读写和秒杀的阶梯（2026-11-21，在上一段之前）
+
+记录在 `docs/notes/3b-rounds/round-4-mixed-and-flash-ladders.md`。两轮都对账通过。
+
+- **已提交并推送到 `phase-3b`**（2026-11-21，主人要求；`23379d7` 到 `f437ee8`）。**PR #16 上 `f437ee8` 的 CI 29 项全部通过**（`test (./services/order)` 3 分 52 秒、e2e 4 分 20 秒，都在以往的范围内）。记录这个结果的这一条还在工作区里，没有提交，下次提交时带上。
+
+- **`m1-mixed-ladder`**（500 到 2384 请求/秒共 8 档，SKU 7144 到 7163）：拐点 1907 请求/秒（其中下单 148 单/秒），这一档各接口 p99 在 100 毫秒内、没有 5xx。到顶的是两个 agent 节点的 CPU（87%、95%），不是某个服务。2384 档的 503 是 gateway 到 inventory 的边车并发上限（每个 Pod 128）溢出，inventory 自己没有错。`recon` 差异 0，`verify` 是 `PASS`，140002 单全部落库。
+- **`f1-flash-ladder`**（一个 SKU 7164，库存 8 万，500、1000、2000、4000 次迭代/秒）：零超卖。**库存给少了**，第二档开头就卖完，有货的只有 500 这一档：它已经把入口打满（`503 UO` 每秒 43 个，查订单的轮询占了请求的六成，落库延迟 p99 27 秒）。售罄之后 4000 请求/秒很轻，8000 请求/秒时入口 Envoy（单个 Pod，2.08 核）和 gateway 到顶。只落库不支付时落库到了 287 单/秒。热点限流每个 SKU 实际放行 1000 次/秒（限额 500 乘两个副本，桶在进程里）。`recon` 差异 0，`verify` 是 `PASS`，80000 单全部落库并关单，库存回到 80000。
+- **这一段改的东西**：`test/k6/flash.js` 认 `STAGES`（不给时行为不变）；`scripts/cluster/loadtest.sh` 预检的系统盘下限默认值从 30 改成 15（主人 2026-11-21 同意）；Tempo 和 Loki 的数据清空过一次（主人同意；做法是把两个 StatefulSet 缩到 0、删掉 k3s-server 上 `/var/lib/rancher/k3s/storage/` 里两个卷目录的内容、再扩回 1），所以 **2026-11-21 10:10 UTC 之前的日志和链路都没有了**，指标（Prometheus）还在。
+- **集群现在的状态**：六个服务的镜像 `1228d9c-dirty-20261121084655`（内容等于提交 `23379d7`，下次 `LOADTEST=1 make deploy` 换成干净的 tag）；压测 SKU 用到 7164，**下一批从 7165 起**；库里压测留下的订单约 166 万单；按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本；k3s-server 的系统盘剩 35 GB（清完是 41，两轮用了 6）；闸门 Redis 的主库是 `redis-gate-0`。
+- **本机**：改了 `deploy/envoy/*.yaml` 之后要 `docker restart oppenheimer-envoy-<服务>-1`。`shellcheck -x scripts/fault.sh` 在 Mac mini 上报 SC1124 一类的语法错误，`1228d9c` 的版本同样报，没有处理（可能是 shellcheck 版本的差别，CI 是通过的）。
+- **下一步（主人 2026-11-21 定：空表对照在新会话里做）**：
+  1. （已做，2026-11-21，见最上面“3b 空表对照”；下面是当时写的）**空表对照**（设计第 2 节第 10 项、第 4 节）。先定空表从哪来，记录第 4 节写了两条路：（a）用集群 e2e 那套环境（`oppenheimer-e2e` 命名空间，`scripts/cluster/services.sh e2e-up`，同一批 MySQL 实例上的 `e2e_*` 空库，Kafka、Redis 单独的前缀；`make cluster-bench` 是现成的例子），不动现有数据，局限是和大库共用缓冲池、redo 和盘，而且 `loadtest.sh preflight` 在这个命名空间存在时拒绝运行、k6 的 `BASE_URL`/`HOST_HEADER` 要指到 e2e 的入口，要先读脚本确认怎么接；（b）清库后从 `keep-seed-10m` 恢复，是破坏性操作，**要主人同意**，而且会丢掉压测留下的 166 万单。我的建议是先按（a）做，在记录里写明局限。对照跑什么：普通下单 100 单/秒（对 `b1-order`）和混合读写 500 请求/秒（对 `b1-mixed`），再加混合读写的 1907 档，看大表对读路径的 CPU 有没有影响。注意 `b1` 是 2026-11-18 的代码和快档的盘，直接比不公平：同一天在大库上各重跑一次当对照。
+  2. 扩容系数（1、2、4 个副本）→ 定 CPU requests、弹性测试、重定 HPA → 长稳 → 容量结论。这两轮的结论是 CPU 在节点上到顶，扩容系数预计接近 1，要用数验证。
+  3. 记录第 2.3、第 4 节留下的：有货的秒杀在更高速率下的表现（库存要给到 50 万以上）；`f1` 第一档落库延迟 27 秒的原因；订单缓存几乎不命中、订单读全部走主库是不是缺陷；限流的 Redis 在高负载下超时（3c 的告警）。
+  4. 下面“3b 第 3 轮”的“下一步”第 4 项（队列上限按分片）仍然留着。
+
+### 开发和操作搬到 Mac mini（2026-11-21，这一段最新，新会话先读这里）
+
+主人定的：之后的任务远程连到 Mac mini 上做，MacBook 不再需要开着。规矩和要在仓库之外准备的东西写在 `docs/infra/hardware.md` 的“开发机和操作端（Mac mini）”一节，**先读它**。最要紧的一条：k6 在跑的时候这台机器上不跑测试、lint、构建镜像。
+
+- **做完的**（从 MacBook 经 `ssh mini` 做的）：仓库 clone 到 `~/code/personal/Oppenheimer`（`phase-3b`）；Homebrew 装了 golangci-lint 2.15.0、helm 4.3.2、kubectl 1.37.2、mysql-client、shellcheck，go 升到 1.27.4、gh 升到 2.105.0（`~/go/bin` 里旧的 golangci-lint 2.12.2 改名成了 `golangci-lint.old-2.12.2`，`~/.zshrc` 加了 mysql-client 的 `PATH`）；OrbStack 启动并配了集群仓库的 `insecure-registries`（仓库的 `/v2/` 返回 200）；`~/.ssh/config` 的 `ubt` 改成 192.168.50.7（原来指向它自己，改之前的备份是 `~/.ssh/config.bak-20261121`），加了指向 `127.0.0.1` 的 `mini`；它的公钥加进了三台虚拟机（宿主机上本来就有），宿主机和虚拟机的主机密钥是从 MacBook 的 `known_hosts` 抄过去的；`ssh ubt`（免密 sudo）、三台虚拟机、`ssh mini` 都通；kubeconfig 用 `k3s.sh kubeconfig` 取好了；`make up` 起来了（干净的 2 库环境）；Claude Code 的全局 `CLAUDE.md`、`ci-watcher` 和 `quick-ops` 两个子 Agent、本项目的记忆复制过去了；`tmp/` 里的压测和对账原始数据复制了约 290MB。
+- **验证过了（2026-11-21，都在 Mac mini 上跑的）**：主人关掉了 Little Snitch 的过滤（整个关掉，不是逐个放行；以后又被拦时先看它是不是被重新打开了）。`make tools` 通过；`make lint test` 通过（11 个模块 0 issues，56 个包 ok，`tmp/lint-test-mini.log`）；`make loadtest ARGS="preflight"` 通过；`make images IMAGE_SERVICES=cdc` 构建并推送成功（`cdc:ca83c4d`）；`make k6` 的冒烟通过（`smoke-mini-022054-order`，SKU 3001，10 单/秒 10 秒，101 单全部落库，结果拉回、remote write 都正常，`ssh mini` 连自己这条路是通的）。`gh` 已登录（令牌存在 `~/.config/gh/hosts.yml`，经 ssh 也能用）。屏幕共享已打开（只开了屏幕共享，没有开远程管理）。
+- **会话结束时的状态（2026-11-21 02:50 UTC 前后）**：有线接上了（`en0` 千兆，192.168.50.19，到入口 .51 的路由走 `en0`，经它访问入口 4 毫秒返回 200）；三台设备进了主人的 Tailscale（Mac mini 是 `100.115.188.105`，主人在外面经它连回来；从 MacBook 经这个地址 ssh 和屏幕共享都通）；`gh` 已登录；集群预检通过。
+- **新会话开头先做的一件事**：**看 Mac mini 的桌面有没有登录**（`who` 里有没有 `console`）。它重启之后桌面没有登录时：OrbStack 没起来（0 个容器），Tailscale 是 stopped（经局域网 ssh 执行 `/Applications/Tailscale.app/Contents/MacOS/Tailscale up` 才连上；Tailscale 自己的“登录时启动”是关的，靠系统登录项里的那一条，只在登录桌面后生效）。桌面登录之后 `make up`。kubectl 要带 `KUBECONFIG=~/.kube/oppenheimer.yaml`（`scripts/cluster/` 下的脚本自己会设）。
+- **`ca83c4d` 的 CI 失败的那 1 项 e2e 查清了（2026-11-21），不是限流多放**：`TestRateLimitCreateOrder` 受理 14 个（上限 12）。失败那一次的 gateway 日志里（CI 的 `e2e-logs` 产物）在测试的那 100 毫秒里有一条 `rate limiter primary failed, falling back to the local limiter ... i/o timeout`：30 个并发请求里有一次问 Redis 超过了 20 毫秒的时限，`ratelimit.Fallback` 按设计退回进程内的桶，那个桶是满的，又放行了一批。受理数的真实上限是“Redis 的桶加本地的桶”，测试只算了前者。这是 ADR-0019 里写明的行为（退回时限额变宽），不是缺陷。改法：`scripts/e2e.sh` 给 gateway 设 `RATE_LIMIT_REDIS_TIMEOUT=500ms`，让这条用例测的确实是 Redis 那条路径；断言和生产的默认值都没有动，退回的行为由 `pkg/ratelimit` 和 gateway 的单元测试覆盖。本机 `make e2e` 通过（`tmp/e2e-ratelimit-timeout.log`）。同一份日志里 11 秒后还有一次退回（`context deadline exceeded`），是并行用例把 CI 机器压满的时候；**生产上值得留意的是同一件事：Redis 慢一次就放宽 1 秒**，`gateway.ratelimit.fallbacks` 这个指标已经有，3c 给它配告警。
+- **还没做的**：
+  1. `bin/istio-<版本>/bin/istioctl` 没有取（`scripts/cluster/mesh.sh fetch`），`make cluster-fault`、`make mesh-status` 要用。
+  2. Mac mini 开着 FileVault，断电后不会自动开机。主人不在家时它重启了，从外面就连不上（Tailscale 要有人执行 `up` 或登录桌面）。可选的办法：在宿主机或 R2S 上也装 Tailscale 当跳板。向主人提过，没有定。
+  3. 冒烟在库里多留了 101 单（用户号在压测号段，SKU 3001），没付款的会超时关单。
+  4. Little Snitch 的过滤是整个关着的（主人关的）。
+- 这一段和下面“3b 第 3 轮”的改动是在 Mac mini 的工作区里做的（`/Users/xinyu/Workspace/oppenheimer`），2026-11-21 已提交并推送。
+- 下面“本机开发环境”一节和更早的记录里说的“本机”是 MacBook。
+- 3b 接着做的是第 3 轮，见下一段。
+
+### 3b 第 3 轮：过载时的表现（2026-11-21，新会话读完上一段接着读这里）
+
+记录在 `docs/notes/3b-rounds/round-3-overload-behavior.md`，决定在 ADR-0034 和 ADR-0011 的 2026-11-21 补充。这一轮不提高上限（写入的上限在盘上，主人定了不再推），改的是超过上限之后的表现。
+
+- **改了什么（2026-11-21 已提交并推送）**：
+  1. 闸门内存到 85% 时停止受理（ADR-0034）：`pkg/stockgate` 的 `Gate.Memory`，`services/order/internal/service/gatememory.go`（每个实例每秒采样，受理在 `Hold` 之前读它），环境变量 `GATE_MEMORY_WATERMARK_PERCENT`、`GATE_MEMORY_INTERVAL`。Fable 写的，有测试；压测里触发不了（写不满），只有单元测试。
+  2. 429 一律带 `Retry-After`：下游说忙（`BACKLOGGED`、`READ_BUSY`）时 gateway 给 1 秒。规范先改的（`api/openapi/gateway.yaml`，同时写了轮询要退避的规则），`make openapi` 生成的文件没有变化。
+  3. k6 的轮询按规范退避（200 毫秒起、翻倍、最长 2 秒，429 时听 `Retry-After`）：`POLL_BACKOFF`、`POLL_MAX_INTERVAL_MS`；**和 2026-11-21 以前的轮次比查询量时要用 `POLL_INTERVAL_MS=100 POLL_BACKOFF=1`**。
+  4. 入口的 `BackendTrafficPolicy`（service chart 的新模板，gateway 的 values 里 1024/1024，和默认值相同，写出来是为了有出处）和入口 Envoy 的 PodMonitor（`deploy/cluster/monitoring/ingress-podmonitor.yaml`，`monitoring.sh exporters` 提交，已提交到集群）；`loadtest-round.sh` 的存档里多了入口的五项。
+  5. 集群上 `ADMIT_MAX_QUEUE=2500`（原来用默认的 1 万，是第 1 轮 608 单被回收的原因；算法写在 `deploy/cluster/services/order.yaml`）。
+  6. 落库健康的熔断器加“连续失败至少持续 1 秒”（`service.DefaultLandingFailureSpan`）：压测里发现它被一次停顿打开，每轮白白拒绝一千个上下的下单（`503 ORDER_LANDING_UNAVAILABLE`，前几轮一直有，没人看）。
+  7. `scripts/e2e.sh` 给 gateway 设 `RATE_LIMIT_REDIS_TIMEOUT=500ms`（上一段 CI 的那一条）。
+- **验证**：全部改完之后全量 `make lint test` 通过（2026-11-21 08:10 UTC 前后，11 个模块 0 issues、56 个包 ok，`tmp/lint-test-3b-round3-final.log`）；本机 `make e2e` 通过，但那是在第 7 项之后、其余各项之前跑的，**这一轮的改动没有跑过 e2e**，靠推送后的 CI。
+- **压测**：`l5a-order-overload`（第 1 到 5 项，参数同 `l4a`，盘同样在慢档）对账通过（`recon` 差异 0，`verify` 是 `PASS`，124373 单，受理了没落库的 0 单）。和 `l4a` 比：请求总数 154 万到 73 万，受理 p99 1103 到 217 毫秒，入口的 `503 UO` 21919 到 1，落库没有变（这一轮没碰）。数在记录第 2 节。`l5b-order-landing-span`（加上第 6 项，SKU 7124 到 7133）同样对账通过（123659 单，0 单没落库），数和 `l5a` 在同一个范围，落库健康的熔断器瞬间打开的 14 次没有了。
+- **要主人定的一件事（记录第 4 节）**：两轮各有一次“盘卡了一秒，被放大成 5 秒不受理”。几十个在途的 `Reserve` 同时超过 1 秒的路由时限，order 的边车按“连续 5 次 5xx”把 inventory 的两个副本一起摘除 5 秒，这 5 秒落库真的停了，受理被拒（每轮约 900 个下单，0.7%）。第 6 项只消掉了进程里的那一层。建议给 `Reserve` 单独一条 3 秒的路由（它是异步路径；两轮里 `Reserve` 超过 1 秒的有 53 次，超过 2 秒的 0 次），要改 `deploy/cluster/mesh/inventory.yaml`、`deploy/envoy/`、order 里的按跳时限和核对三处的测试，动的是 ADR-0020 定的数。**主人 2026-11-21 同意：order 调 `Reserve` 的时限从 1 秒放到 3 秒。已做（2026-11-21），见下一条。**
+- **`Reserve` 单独一条 3 秒的路由（2026-11-21 做完，记录 5.1 节，ADR-0020 的“补充：同一个下游按方法分时限”）**：`pkg/grpcx` 新增 `WithHopTimeouts`（按方法分时限）；order 的 `reserveHopBudget` 3 秒、进程里 3.5 秒，`WarmUp` 仍是 1 秒；`deploy/cluster/mesh/inventory.yaml` 加了排在 `from-order` 前面的 `from-order-reserve`，`deploy/envoy/order.yaml` 加了对应的路由；`TestInventoryHopTimeoutMatchesEnvoy`、`TestInventoryHopTimeoutMatchesMesh` 核对三处的两个数、路由的先后，以及 3.5 秒的两倍不超过消费者的 10 秒。验证：全量 `make lint test` 通过（`tmp/lint-test-reserve-route.log`）、`make envoy-validate`、本机 `make e2e`、本机 `FAULT_ONLY="B F L" make fault` 都通过（**本机改了 `deploy/envoy/` 之后要 `docker restart oppenheimer-envoy-<服务>-1`，容器只在启动时读配置**，第一次没重启，量到的是旧配置）。代价：inventory 挂住时熔断打开前受理的订单从 6 单变成 14 单。压测 `l6a-order-reserve-3s`（参数同 `l5b`，SKU 7134 到 7143，盘在慢档）：这一轮 `Reserve` 超过 1 秒的有 128 次（`l5b` 是 53 次），inventory 被摘除 0 次（`l5b` 1 次），`ORDER_LANDING_UNAVAILABLE` 0 个（`l5b` 892 个），其余的数和 `l5b` 在同一个范围；对账通过（`recon` 差异 0，`verify` 是 `PASS`，124344 单全部落库）。
+- **没有做的，和原因**（都记进了“计划变更记录”）：“202 的响应里给轮询建议间隔”不做；**“重定 HPA”挪到扩容系数之后**（记录第 6 节：每个请求的 CPU 随组合变两倍多，CPU requests 只有实际用量的四到六成，放开后会直接扩到上限，而多副本有没有用还不知道）。入口的并发上限没有收紧（两倍过载时在途请求只到 212）。
+- **集群现在的状态**：六个服务的镜像都是 `1228d9c-dirty-20261121084655`（提交 `1228d9c` 加当时没提交的 `Reserve` 路由的改动，内容和之后的提交一致；下次 `LOADTEST=1 make deploy` 换成干净的 tag）；压测 SKU 用到 7143，**下一批从 7144 起**；库里压测留下的订单约 144 万单；按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本。**k3s-server 的系统盘剩 28 GB，低于预检的下限 30，下一轮的预检会失败，要主人定**：盘一共 58 GB、用了 27 GB，其中 Prometheus 的卷约 7 GB、另一个卷约 4 GB、镜像约 6 GB，一轮压测约写 2 到 3 GB。两个办法：`PREFLIGHT_MIN_DISK_GB=15` 调低下限（建议：kubelet 的驱逐线在 10% 上下，约 6 GB，15 还有余量，而且各后端自己有保留期），或者清 Tempo 和 Loki 的数据（破坏性操作，要主人同意）。
+- **下一步**：
+  1. （已做，2026-11-21，见上面“`Reserve` 单独一条 3 秒的路由”；下面是当时写的做法）**给 `Reserve` 单独一条 3 秒的路由**（主人已同意，先读记录第 4 节）。要改的地方：`deploy/cluster/mesh/inventory.yaml`（`from-order` 之前加一条按 gRPC 路径 `/oppenheimer.inventory.v1.InventoryService/Reserve` 匹配、来源是 order 的路由，`timeout: 3s`、`retries: {attempts: 0}`；`from-order` 上同步的预热调用不动）、`deploy/envoy/` 里本机那一套的对应路由、order 里这次调用的按跳时限（路由超时加 `grpcx.SidecarMargin`）、核对三处一致的测试（`TestHopTimeoutMatches*` 一类）；落库的消费者处理一条消息的总时限要盖得住 3.5 秒，先查。在 ADR-0020 里补一段（按路径分时限：异步路径的时限按“区分慢和坏”定，不按用户等不等得起定）。做完部署、重跑同一个阶梯（SKU 7134 起），看 `no healthy upstream` 和 `ORDER_LANDING_UNAVAILABLE` 是不是归零，对账。
+  2. （已做）这一轮的 5 个提交已推送到 `phase-3b`（2026-11-21，主人要求，`0b1d6f1` 到 `1228d9c`）。**PR #16 上 `1228d9c` 的 CI 29 项全部通过**（`test (./services/order)` 4 分 24 秒、e2e 4 分 36 秒，都在以往范围的上沿，没有明显变化；e2e 里包含这一轮没在本机跑过的改动）。`Reserve` 路由的改动连同这条记录在 2026-11-21 对账通过后提交并推送（主人要求），**PR #16 上 `906c9a3` 的 CI 29 项全部通过**（`test (./services/order)` 4 分 32 秒、e2e 3 分 43 秒，都在以往的范围内）；记录这个结果的这一句还在工作区里，没有提交。
+  3. （秒杀和混合读写的阶梯已做，系统盘的事已解决，见最上面“3b 混合读写和秒杀的阶梯”；接下来是空表对照）设计第 4 节剩下的，按这个顺序：秒杀和混合读写的阶梯（入口的上限、gateway 的 CPU、限流在那里看）→ 空表对照 → 扩容系数（1、2、4 个副本）→ 定 CPU requests、弹性测试、重定 HPA → 长稳（慢档上持续 125 单/秒几小时，同时看闸门内存是平的、2500 的队列上限够不够）→ 容量结论。每一轮记下盘当时在哪一档。
+  4. 记录第 2.2 节最后一条留下的：队列上限是全局一个数，而两个分片的落库速率不一样，244 档落库延迟的 p99 是 27.8 秒（按总速率算应该是 12 秒）。长稳之后看要不要按分片各设上限。
+
+### 3b 第 2 轮之后：盘的验证和幂等键（2026-11-21，接着读这里）
+
+**断点（2026-11-20 17:30 UTC）。** 先读 `docs/notes/3b-rounds/round-2-concurrency-and-consumers.md` 的第 10 节和 ADR-0033。下面“3b 第 2 轮”里“三件挡路的事”都有了答复。
+
+- **主人 2026-11-21 的三个答复**：宿主机的管理通道修好了（`ssh ubt` 能登录；宿主机在 2026-11-20 16:23 UTC 重启过）；应用层的组提交先不做；幂等键按建议做（缩短 Redis 里的 TTL）。
+- **宿主机重启之后的集群**：三台虚拟机是正常关机的（所以放松刷盘的从库不用按 ADR-0032 重建），自启后集群自己恢复，`preflight` 通过，Redis 和 MySQL 的复制正常。**闸门 Redis 的主库回到了 `redis-gate-0`。** k3s-server 关机用了 115 秒，`libvirt-guests` 的时限是 120 秒，差 5 秒就会被强制关掉：`SHUTDOWN_TIMEOUT` 已调到 300 秒（2026-11-21，主人同意）：宿主机上直接改了 `/etc/default/libvirt-guests`，同样的改法写进了 `host-setup.sh`（**没有重跑整个 `host-setup.sh`**，它会重新套用网络配置；也没有重启 `libvirt-guests`，它的 stop 会关掉全部虚拟机，文件在 stop 时才读）。
+- **盘变慢的原因查清了一层（记录第 10 节）**：不是我们的写入量触发的。这块消费级的盘在持续的刷盘负载下，几分钟后单次刷盘的耗时自己翻倍（宿主机上 1.8 到 4 毫秒），空闲一两分钟恢复；`fio` 的恒定负载能单独复现。慢的一档是稳态。盘健康、没有热降速。**对照 A 的 239 单/秒只是突发能力，持续的能力是 125 到 150 单/秒；长稳和容量结论都要在慢的一档上量。** 快的一档能撑多久没有规律（2 到 12 分钟）。再往上只有两条路：每单的提交次数减半，或者换有掉电保护的盘。**主人 2026-11-21 定：两条都不走，接受现在的拐点**，容量结论按持续 125 到 150 单/秒写（记录第 10 节末尾、“计划变更记录”）。
+- **幂等键只留 1 小时（ADR-0033）**：`DefaultIdempotencyTTL` 24 小时改成 1 小时；`IDEMPOTENCY_TTL` 比 `PAYMENT_TIMEOUT` 短时 order 拒绝启动（`main.go`，有配置测试）。order 模块 `make lint` 0 issues、`make test` 通过（`tmp/test-3b-idem-ttl.log`）；提交之前全量 `make lint test` 通过（2026-11-21，`tmp/lint-test-3b-close.log`）；**本机没有跑 e2e**，靠推送后的 CI。已部署（只滚动了 order），下了一单核对过键的 TTL 是 3599 秒。`redis-gate` 的 768mb 不降。原来 24 小时的键要到 2026-11-21 17:00 UTC 前后才过期完（2026-11-20 17:30 UTC 闸门里一共约 26 万个键）。
+- **这次跑的一轮**：`l4a-order-hostio`（参数同对照 D），对账通过（125581 单，差异 0，`PASS`），数和 D 接近（125 档 124 单/秒、p99 1.8 秒；156 档 156、4.9 秒；195 档 190、10 秒；244 档 212、29 秒）。宿主机上的 `iostat` 等原始数据在 `tmp/k6/l4a-order-hostio/`。
+- **已提交并推送到 `phase-3b`**（2026-11-21，主人要求；三个提交：幂等键、`host-setup.sh`、文档）。集群上 order 的镜像仍是当时带 `-dirty` 的 tag，内容和提交的一致，下次 `make deploy` 会换成干净的。`361d316` 的 CI：29 项里 28 项通过（`test (./services/order)` 4 分 27 秒、e2e 3 分 18 秒），失败 1 项 `test (./services/payment)`：`TestFullBatchRunsNextRoundWithoutWaiting` 报 `outbox: count pending: context canceled`。和这次的改动无关，是测试自己的竞态（测试里的 `kicker.Kick` 用 `t.Context()`，它在测试函数返回时就取消，早于 Cleanup 里的 `Stop`，还在收尾的 worker 调到它就失败；第 1 轮把支付出结果改成并发之后才可能出现）。已改成 `context.WithoutCancel`，只动了测试，payment 模块 `make lint`、`make test` 通过。**这个修复和搬到 Mac mini 的文档改动（`AGENTS.md`、`docs/infra/hardware.md`、`docs/design/3b-load-testing.md`、`scripts/cluster/cluster.env`、本文件）还在 MacBook 的工作区里，没有提交**，等主人说提交；Mac mini 上的 clone 因此停在 `361d316`，看不到这一段。
+- **集群现在的状态**：order 的镜像 `3470edb-dirty-20261120171654`，其余五个服务仍是 `4c85475`；压测 SKU 用到 7113，**下一批从 7114 起**；库里压测留下的订单约 107 万单；宿主机上多装了 `fio`、`nvme-cli`（没有进 `host-setup.sh`）；按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本；库里多了一单核对用的订单（用户 900777，SKU 3001，会超时关单）。
+- **下一步**：
+  1. （已答复，2026-11-21）提交并推送：做了；`SHUTDOWN_TIMEOUT`：调到 300；盘：接受现在的拐点。
+  2. 第 3 轮（不依赖上面的决定）：读路径的过载表现（入口的 `BackendTrafficPolicy`、`READ_BUSY` 带 `Retry-After`、k6 轮询退避）、背压的水位和回收宽限期的关系（第 1 轮的 608 单）、**闸门内存水位进背压**（ADR-0033 的后果）、重定 HPA。
+  3. 设计第 4 节剩下的：秒杀和混合读写的阶梯、空表对照、扩容系数、弹性测试、长稳、容量结论。每一轮记下盘当时在哪一档。
+
+### 3b 第 2 轮（2026-11-20）
+
+**断点（2026-11-19 17:45 UTC 前后）。** 先读 `docs/notes/3b-rounds/round-2-concurrency-and-consumers.md`，再读下面“3b 第 1 轮”。下面那一段“下一步”的第 1、2 项已经做了。
+
+- **计划变了：没有做应用层的组提交。** 先做了不改代码的对照（`SUBMIT_CONCURRENCY` 8 改 24），落库从约 160 到了 239 单/秒（盘快的时候），说明 MySQL 自己的组提交在并发够的时候就够用。第 0 轮记录第 7 节第 4 条的判断是错的，已在原文加注。**建议不做应用层组提交，等主人确认**（已记进“计划变更记录”）。
+- **做完的**：落库并发 24、连接池 50（只在 `deploy/cluster/services/order.yaml`）；inventory、order、payment 三个串行的消费者改成按订单号并发（默认 8，三个新环境变量），积压从上万条降到几百条；service chart 的分散约束加了 `matchLabelKeys`（**已入库，没有部署**）；`pkg/redisx` 一个偶发失败的测试改了断言；闸门 Redis 的 `maxmemory` 192mb 提到 768mb（**没有事先问主人**，原因见下）。四次缩短的阶梯（A、B、C、D）都对账通过；分散约束的修复已部署并生效。**这一轮之后的结论：下游全部跟上时拐点仍在 125 到 156 单/秒之间（和第 0 轮差不多），变了的是过载时的表现（能落 176 到 215，原来死停在 143；下游不欠活、支付不退款、从库不落后）。A 量到的 239 是下游欠着活时的数，不是整条链路的能力。**
+- **三件挡路的事，都要主人定或帮忙**（记录第 8 节）：
+  1. **节点的盘有快慢两档**（刷盘耗时翻倍、次数减半，三台虚拟机同时）。排了五次运行的时间线之后，读法从“盘随机变慢”改成了“**多半是我们自己的写入量把它打满了**”：每次变慢都在写入量上台阶的时刻（升到 195 档，或者那一档的订单 15 分钟后成批关单）。没有在宿主机上验证（见第 2 件）。记录第 5 节。查看：`scripts/cluster/monitoring.sh promql 'sum by (instance) (rate(node_disk_flush_requests_time_seconds_total{device="vda"}[2m])) / sum by (instance) (rate(node_disk_flush_requests_total{device="vda"}[2m])) * 1000'`（agent-1 在 4 毫秒上下是快，8 毫秒上下是慢）；`loadtest-round.sh` 存档的服务端指标里现在带这一项。
+  2. **宿主机的 Wi-Fi 管理通道 2026-11-19 17:21 UTC 起 `ssh` 超时**（192.168.50.8），集群不受影响。之后没有再试。
+  3. **闸门 Redis 被幂等键写满过一次**（17:19 UTC，82 万个键、TTL 24 小时）：写满后受理被拒、落库停住、不会自己恢复。提到 768mb 只是把上限抬到约 330 万单/24 小时，**按 150 单/秒以上持续压几小时还会满，长稳测试之前必须先定幂等键怎么办**（记录第 6 节的三个选项，建议缩短 Redis 里的 TTL，要写 ADR）。提上限时滚动了 `redis-gate`，**闸门的主库现在是 `redis-gate-1`**。
+- **这一夜我做错的两处**：连着跑 A、B 两轮没有等 A 的订单关完，B 的数因此不能用；分散副本时写的检测条件有错，五个服务各被多删了几次 Pod（当时没有流量，最终状态是对的）。
+- **下一步**：
+  1. 主人答复上面三件。
+  2. （已做）分散约束已部署，对照 D 是在它之后量的干净的一组数。
+  3. 主人同意后在宿主机上验证“盘被打满”的读法；确认的话，下一个方向是减少每单的提交次数（单独写设计）。
+  4. 第 3 轮：读路径的过载表现（入口的 `BackendTrafficPolicy`、`READ_BUSY` 带 `Retry-After`、k6 轮询退避）、背压的水位和回收宽限期的关系（第 1 轮的 608 单）、闸门内存水位进背压、重定 HPA。
+  5. 设计第 4 节剩下的：秒杀和混合读写的阶梯、空表对照、扩容系数、弹性测试、长稳、容量结论。
+- **集群现在的状态**：镜像 tag `4c85475`（干净的提交号）；各服务两个副本分在两个 agent 上；压测 SKU 用到 7103，**下一批从 7104 起**；库里压测留下的订单约 94 万单；Tempo 上限 3 Gi；`redis-gate` 768mb、主库是序号 1。按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本。
+- PR #16（draft）：`229584b` 的 CI 29 项里 28 项通过，失败的是 `test (./pkg)` 里 `pkg/redisx` 的那个偶发用例（已改，见上）。`4c85475` 的 CI 29 项全部通过（`test (./services/order)` 3 分 14 秒、e2e 4 分 05 秒，都在以往的范围内）。那之后只有文档和 `loadtest-round.sh` 多存两项指标的提交，它的 CI 没有再看。全量 `make lint test` 最后一次是在第 1 轮的提交上跑的；第 2 轮只跑了改到的四个模块（order、payment、inventory、pkg），都通过。
+
+### 3b 第 1 轮（2026-11-19 到 20 日）
+
+**断点（2026-11-19 16:20 UTC）。** 先读这一段，再读 `docs/notes/3b-rounds/round-1-replica-flush-and-payment.md`。下面 2026-11-18 那一段里“等主人定第 1 轮做哪几条”已经过时。
+
+- **主人 2026-11-19 定的**：第 0 轮记录第 7 节的七条按建议的顺序做（第 1 轮：从库放松刷盘加支付的串行循环；第 2 轮：落库的应用层组提交；第 3 轮：读路径的过载表现加重定 HPA）；备份“轮转的和基准的都做”；夜间按阶段提交并推送、开 draft PR 让 CI 跑、Tempo 的内存上限可以提；旧分支 `worktree-agent-a97714952afd11fa3` 可以删（去删时本地和远端都已经没有这个分支）。
+- **做完的**：
+  - 备份：灌数后的三份基准备份钉成各自实例目录下的 `keep-seed-10m`（硬链接，轮转删不到）；手工跑了一轮轮转备份（`mysql-order-0/20261119T151935Z`、`mysql-order-1/20261119T152009Z`、`mysql-main/20261119T152044Z`）。新子命令 `scripts/cluster/middleware.sh mysql-backup-list`、`mysql-backup-pin <名字> [<实例>=<时间戳>...]`；恢复演练用 `BACKUP=keep-seed-10m` 指定某一份（**这个入口没有实际跑过恢复**，只过了 `shellcheck`）。
+  - 从库不逐次刷盘（ADR-0032）：已部署，两个订单库从库 2/0，主库和 `mysql-main` 1/1。落盘方式跟着角色走（`deploy/charts/mysql/files/durability.sh`，`middleware.sh mysql` 每次都设一遍并核对）。切换手册改了提升那一步、加了第三节。
+  - 支付出结果改成并发（`services/payment/internal/processor`，`PROCESSOR_CONCURRENCY` 默认 16），新指标 `payment.result.delay`；`.delay` 结尾的直方图用到 30 分钟的桶（`pkg/otelx`）。
+  - 同一个阶梯重跑（`l2-order-ladder`）并对账通过：从库延迟全程 0（原来涨到 553 秒）；支付出结果跟上需求（76 笔/秒，原来上限约 17），退款 0（原来 22351 笔）；落库上限 154 到 171 单/秒（原来约 143）。
+  - Tempo 的内存上限 2 Gi 提到 3 Gi（两轮阶梯都在第 16 分钟前后被 OOMKilled），已滚动。
+  - 全量 `make lint test` 通过（`tmp/lint-test-3b-round1.log`）；之前只跑 payment 和 pkg 时 `pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 失败过一次（`loaded 2 times, want 1`），重跑和全量都通过，没有改过这个包，原因没有查。
+- **这一轮发现、没有处理的**（细节在记录里）：
+  1. 阶梯最后两档（305、381）落库掉到约 100 单/秒：15:47 UTC 起三台虚拟机的刷盘耗时同时翻倍，停压 25 分钟后复测已恢复。原因没有定（Tempo 被杀只差一分钟，但第 0 轮同样被杀而没有掉）。**这两档不能和第 0 轮比。**
+  2. inventory 消费 `order.events` 停在每秒约 105 条，积压到 2 万条。支付通了之后它成了下一个最窄的地方，原因没有查。
+  3. 608 个受理了的订单没有落库（占用等不到落库被回收）。账是对的，用户看到的是订单消失。背压的水位和回收的宽限期是各自定的，要一起看（放在第 3 轮）。
+  4. 两个 order Pod 这一轮都在 k3s-agent-1 上，该节点 CPU 97%，受理 p99 在过载时比第 0 轮差。下一轮开跑前先分开。
+  5. 从库节点掉电后的自动重建没有做，留给阶段 4；3c 要有节点重启的告警（ADR-0032 的后果）。
+- **下一步**：
+  1. 不改代码的对照：把 `SUBMIT_CONCURRENCY` 调大（同时调 `MYSQL_MAX_OPEN_CONNS`），重跑阶梯的前几档。第 0 轮说“单独调大没有用”，但第 1 轮支付的结果说明并发的提交会被组提交合并，要重新量；量完再定第 2 轮（应用层组提交）怎么做、还要不要做。
+  2. 定位 inventory 消费 `order.events` 的上限。
+  3. 第 2 轮、第 3 轮；之后是设计第 4 节剩下的（秒杀和混合读写的阶梯、空表对照、扩容系数、弹性测试和重定 HPA、长稳、容量结论）。
+- **集群现在的状态**（和 2026-11-18 那一段相比变了的）：镜像 tag `7980e19-dirty-20261119152743`；五个 MySQL 实例 2026-11-19 15:2x UTC 滚动过；压测 SKU 用到 7063，**下一批从 7064 起**；库里压测留下的订单约 48 万单。按地址的限流仍然是关的，gateway、order 仍然钉在 2 个副本，做完 3b 要恢复。
+- 压测时原来要记住的两件事变成一件：**支付的速率不用再压在每秒 15 笔以下**；每轮压完仍然要等 15 分钟以上（支付超时关单）才能对账，但不用再等从库。
+- 新的用法：`scripts/cluster/loadtest-round.sh stages <RUN_ID>` 给阶梯的每一档各取一份服务端指标。
+
+### 3b 做到哪（2026-11-18 更新，这一段在最前面，比下面 2026-11-17 写的新）
+
+**断点（2026-11-18 19:50 UTC，夜间那一段做完时写的）。新会话先读这一小段，再读 `docs/notes/3b-rounds/round-0-first-bottleneck.md`。**
+
+- 做完的：3a 收尾；3b 设计第 4 节的第 1 到 6 步（脚本和工具、灌 1000 万单、备份恢复、基线三个场景、可观测开销对照、普通下单场景的阶梯加压、第一个瓶颈的定位）。所有轮次对账通过。全部已提交并推送到 `origin/phase-3b`，没有开 PR，所以没有 CI 结果；**这一夜没有跑过 `make lint test`**（改的是脚本、values 和文档，脚本过了 `shellcheck -x`，没有改 Go 代码）。
+- **等主人定的**：第 1 轮优化做哪几条（记录第 7 节的七条；建议从库放松刷盘加修支付的串行循环）。夜里按约定没有改业务代码。
+- **集群现在的状态（和平时不一样的地方，做完 3b 要恢复）**：
+  - gateway 按地址的限流是关的（`LOADTEST=1` 部署的）。恢复：不带 `LOADTEST=1` 再 `make deploy`。
+  - gateway、order 钉在 2 个副本（KEDA 暂停）。恢复：`scripts/cluster/loadtest.sh unpin gateway order`。
+  - 镜像 tag `61bb6be-dirty-20261118173536`（工作区不干净时构建的，内容等于提交 `61bb6be` 加当时没提交的备份 Job 内存那一行 values，Go 代码没有差别）。
+  - MySQL 五个实例的上限 2560 Mi、缓冲池 1 G；备份 Job 1 Gi。都已入库。
+  - 库里：1000 万造数订单，加压测留下的约 31 万单（用户号 2^39 段）。压测 SKU 用到 7053，**下一批从 7054 起**；`verify` 要的初始库存在本机 `tmp/loadtest/sku-initial.txt`（不入库，丢了就用 `VERIFY_INITIAL` 手工给，库存都是 10 亿，7011 是 1 万）。
+  - 灌数之后的备份（回到基准状态用）：NAS 上 `mysql-order-0/20261118T173525Z`、`mysql-order-1/20261118T173606Z`、`mysql-main/20261118T173407Z`。**定时备份只留 7 份，一周后会被轮掉，要留就在 NAS 上另存。**注意这份 `mysql-main` 的备份是在商家索引追平之后做的，三份之间差几十秒，恢复后要让索引按 CDC 追一下。
+  - server 节点的系统盘剩 42 GB（夜里的压测写了约 5 GB 的日志和链路）。
+- **压测时必须记住的两件事**：支付的速率压在每秒 15 笔以下（`PAY_RATIO`），否则量到的是 payment 的串行循环，而且会产生退款；每轮压完要等 15 分钟以上才能对账，从库追平还要更久（阶梯那一轮追了 36 分钟）。
+- 还没有做的（设计第 4 节）：秒杀和混合读写场景的阶梯；空表上的对照；1、4 个副本的扩容系数；三轮优化；弹性测试和重定 HPA；长稳测试；容量结论、`GOALS.md` 的修正、笔记。夜里发现、没有处理的小事：Tempo 在过载时被 OOMKilled（上限 2 Gi）；落库延迟的直方图只到 10 秒；支付单出结果的时延没有指标；k6 只给下单接口留了客户端的分位数（别的接口要加阈值才有）；入口没有 `BackendTrafficPolicy`；备份写 NFS 的页缓存问题只是把上限抬高了；灌数的 Pod 里订单库的密码出现在进程参数上（`loadtest.sh seed-orders`）；k6 的 remote write 输出已弃用。
+- 用法速查：`make k6 SCENARIO=...`；`RUN_ID=<名字> SKUS=... RATE=... scripts/cluster/loadtest-round.sh <场景>`（预检、条件、k6、pprof、服务端指标存档）；`make loadtest ARGS="preflight|conditions|skus|pin|unpin|wait-quiet|recon|verify|seed-orders"`；`LOADTEST_IMAGE_TAG=42c5fd6` 免去重建 chaos 镜像。结果在 `tmp/k6/<运行号>/`（不入库）。
+
+以下是这一天里按时间写的各段，细节以设计文档 3b 第 6 节为准。
+
+
+- **3a 收尾了**：空转一天后的数量完（设计文档 3a 第 8 节最后一段“空转一天后的数”），阶段计划里最后一项已勾。保留期不改；Grafana 的 requests 调到 384 Mi；agent 没有加内存上限，改的是发送队列（1000 批改成 20 批），改完重做了一次“停 Collector gateway 2 分 30 秒”，日志不丢、agent 的内存峰值从 204 Mi 降到 94 Mi。etcd 的 fsync p99 仍是 16 到 18 毫秒，和负载无关，先接受。**这些改动在 `phase-3b` 的工作区里，不在 `phase-3a` 和 PR #15 里**：PR #15 合并时 3a 的计划那一项还是没勾的样子，等 `phase-3b` 合并才带上。
+- **Mac mini**：`ssh mini` 能登录，k6 v2.4.0 核对过。三件要主人处理的事：
+  1. **它走的是 Wi-Fi，有线口没插线**。量基线之前要插网线，否则客户端的延迟不可信（现在查一次库存 11 到 15 毫秒，大半是无线这一段）。
+  2. 空闲 1 分钟就睡眠（`pmset` 的 `sleep 1`），没有免密的 sudo。脚本用 `caffeinate -i` 顶着；长稳测试之前最好在 Mac mini 上执行 `sudo pmset -a sleep 0`。
+  3. 默认文件描述符上限 256，脚本里调高，不用主人管。
+- **Prometheus 的写入地址已暴露**：入口上 `Host: prom-write.oppenheimer.test`，只放行 `POST /api/v1/write`（`deploy/cluster/monitoring/prometheus-write-route.yaml`，`cluster.env` 的 `PROM_WRITE_HOST`，`monitoring.sh kps` 会应用）。
+- **主人 2026-11-18 确认：压测的订单不删**（设计文档 3b 第 6 节第一条、ADR-0031 第 4 项）。下面 2026-11-17 那段里“主人还没有看过”“请主人过目”两处已经过时。
+- **第 3 步做完了**（2026-11-18，提交 `abb92f3`、`e822c39`、`43f2c26`，后两个之后的没有推送，见 git log）：`make k6 SCENARIO=...`（`scripts/cluster/k6.sh`，在 Mac mini 上原生跑 k6，结果拉回 `tmp/k6/<运行号>/`，指标 remote write 进 Prometheus，标签 `testid=<运行号>`，一轮约 200 条序列；结束后序列带 stale 标记，查的时候用 `last_over_time(...[10m])`）；`scripts/cluster/loadtest.sh`（`make loadtest ARGS=...`：`preflight`、`conditions`、`skus`、`pin`/`unpin`、`seed-orders`、`wait-quiet`、`recon`、`verify`）；`LOADTEST=1 make deploy` 关掉 gateway 按地址的限流（**还没有部署**）。冒烟：order、mixed 从 Mac mini 各跑通一次；`loadtest.sh` 的 `wait-quiet`、`recon`、`verify` 在 300 单上通过（SKU 6901、6902，冒烟用掉了）。chaos 镜像 tag `42c5fd6`（`LOADTEST_IMAGE_TAG=42c5fd6` 可以免去重建）。
+  - Mac mini 上 k6 起初连不上局域网（macOS 的“本地网络”权限），主人在 Mac mini 的终端里跑过一次 k6 并允许之后，经 ssh 启动的也通了。重装 k6 或升级系统后可能要再授权一次。
+  - k6 2.4 的 remote write 输出设不了 Host 头，写入的路由改成了不限 Host（`http://192.168.50.51/api/v1/write`）。这个输出已标弃用（v3 移除），以后换 OpenTelemetry 输出。
+  - 每轮压完要等 15 分钟（没付款的订单等支付超时关单）`wait-quiet` 才过；`preflight` 的消费延迟不算 `order.order-close-delay` 这个组。
+  - `verify` 需要的初始库存记在本机 `tmp/loadtest/sku-initial.txt`（`skus` 子命令写的，不入库）。
+  - 两个子 Agent 的 worktree 和分支已删（2026-11-18，主人同意）。
+- **第 4 步（灌数）停在这里，等主人定**：`LOADTEST_IMAGE_TAG=42c5fd6 scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 2026-11-18`（**参数必须原样**，指纹记在库里，换了会被拒绝；可以另加 `-rate`、`-timeout`）。试跑 30 秒灌进去 1064235 单（约 4.3 万单/秒），**把 `mysql-order-0-0` 打到 1 Gi 的内存上限被 OOMKilled 一次**（16:18:51 UTC），7 秒后自己恢复；两个分片主从的 GTID 一致，`seed_progress` 的合计等于工具报的数，没有丢已提交的数据。另外三个订单库实例当时也在 990 到 1014 Mi。缓冲池是 512 MB。**续灌之前要先定 MySQL 的内存**（建议订单库四个实例的上限提到 2 Gi，并给灌数加 `-rate`）；商家索引的消费者当时积压 35 万条，在追。 **主人同意后已做**：四个订单库实例 2 Gi、缓冲池 1 G（已滚动）；16:54 UTC 起以 `-rate 5000` 续灌（`LOADTEST_OUT=tmp/loadtest/seed-10m`）。灌到 35% 时订单库各实例 1.3 Gi 上下；**`mysql-main-0` 到了 1482 Mi，上限 1536 Mi**，要不要提它的上限在等主人定（见设计文档 3b 第 6 节“第 4 步”）。灌完之后：等从库和商家索引追平（`loadtest.sh preflight`）、`seed-report`、做一次备份并量备份和恢复的耗时。
+- **1000 万历史订单灌完了**（2026-11-18 17:24 UTC，两个分片 5023016 加 4976984，主从 GTID 一致，消费延迟 0，`preflight` 通过）。`mysql-main` 灌数期间也被 OOMKilled 过一次，主人同意后提到 2560 Mi、缓冲池 1 G。**订单库四个实例灌完后在 1854 到 1902 Mi，上限 2048 Mi，又贴着上限**：缓冲池 1 G 之外有约 400 MB 固定开销加约 400 MB 分配器留着的内存（设计文档 3b 第 6 节“续灌和结果”的表）。**等主人定**：订单库也提到 2560 Mi（建议），还是把缓冲池降到 768 M。定了之后再做：备份并量备份和恢复的耗时、`seed-report`、`LOADTEST=1 make deploy`、基线。`mysql-main` 的 values 和这段文档已在本地提交，**没有推送**。
+- **夜间（2026-11-18 到 19 日，主人睡前授权）**：范围是“基线、阶梯加压、定位第一个瓶颈并写记录”，不改业务代码；中间件撞资源上限可以自己调并滚动（改动入库、记文档）；每个阶段提交并推送。
+- 订单库四个实例已提到 2560 Mi（主人同意）。备份 Job 在灌数后的订单库上被 OOMKilled（输出文件在 NFS 上的页缓存），内存提到 1 Gi 后三个实例备份成功，恢复演练 177 秒（设计文档 3b 第 6 节“第 4 步的后一半”）。`LOADTEST=1 make deploy` 已部署（**按地址的限流现在是关的，压测做完要不带它再部署一次**）；gateway、order 用 `loadtest.sh pin` 钉在 2 个副本（**做完要 `unpin`**）。
+- **基线第一批做完并对账通过**（设计文档 3b 第 6 节“第 5 步”）：普通下单 100 单/秒受理 p99 23 毫秒、落库延迟 p99 1.3 秒，但订单库的从库已经追不上（延迟 134 秒）、agent 节点 CPU 七成；混合读写 500 请求/秒各接口 p99 10 到 20 毫秒；秒杀 2000 请求/秒零超卖，但入口 Envoy 的默认熔断上限答了 12 万个 `503 UO`。运行一轮用 `scripts/cluster/loadtest-round.sh`。压测 SKU 用到 7031，下一批从 7032 起。
+- **阶梯加压和第一个瓶颈做完了，对账通过**（2026-11-18 19:11 UTC），记录在 `docs/notes/3b-rounds/round-0-first-bottleneck.md`：落库上限约 143 单/秒，拐点 125；瓶颈是同步提交的刷盘（宿主机的 NVMe 一次同步写 5.3 毫秒，虚拟机里 11 到 13 毫秒）；从库延迟同因；**支付出结果只有每秒约 17 笔（processor 串行、一笔一个事务），阶梯那一轮 22351 笔支付排队超过 15 分钟被退款**；入口默认熔断上限 1024 在过载时答 `503 UO`。七条优化方案在记录第 7 节，**等主人选第 1 轮做哪条**（建议：从库放松刷盘加修支付的串行循环）。阶段计划里“阶梯加压找拐点，定位第一个瓶颈”已勾。Tempo 在阶梯期间被 OOMKilled 一次（上限 2 Gi），没有调。压测 SKU 用到 7041。
+- **Mac mini 已接千兆有线**（2026-11-18）：有线口的地址是 192.168.50.19，到入口的路由走有线（`en0`，1000baseT），`ssh mini` 仍然连 Wi-Fi 的 .14；休眠已关；重启之后“本地网络”的授权还在（经 ssh 的 k6 20 个请求 0 失败，中位数 3.4 毫秒）。重启后要在本机登录一次，否则 ssh 提示 `This system is locked`。
+- 细节在设计文档 3b 第 6 节“第 2、3 步”。
+
+### 3b 做到哪（2026-11-17）
+
+设计文档 [design/3b-load-testing.md](design/3b-load-testing.md)，**主人已确认第 2 节的十项，都按建议**（2026-11-17）；另外确认不实做影子库表、不从 OpenAPI 生成客户端（计划里那一项已勾）。决定在 ADR-0031。实现顺序在设计第 4 节。
+
+- **时间上的约束：2026-11-18 15:00 UTC 之前不往集群上压流量、不滚动监控的组件**（3a 的“空转一天”窗口）。在那之前只做不碰集群的第 1 步。
+- **确认之后改了一处**（设计第 6 节第一条、ADR-0031 第 4 项，已记进“计划变更记录”）：压测的订单**不删**。原因是订单表的 DELETE 在这个系统里只表示归档，CDC 和商家索引按这个约定处理，按号段删会在索引里留下冷库里没有的“已归档”订单。改成每轮用新的 SKU 号、记下数据量、要回到基准状态时从灌数后的备份恢复。**这一处主人还没有看过，要请主人过目。**
+- **Mac mini 已由主人用 brew 装了 k6 2.4.0**（2026-11-18，主人说的，主会话没有核对到）。但从 MacBook `ssh mini` 还登录不了：2026-11-17 是 22 端口超时，2026-11-18 变成 `Connection closed by 192.168.50.14 port 22`（连得上，被对端关掉）。第 3 步之前要先弄清原因（远程登录的开关、允许的用户、密钥），再用 `ssh mini 'k6 version'` 核对版本。
+- **第 1 步（不碰集群的部分）做完了**，三样都由子 Agent 写、主会话读过 diff 后合进工作区，细节在设计第 6 节：
+  - `test/k6/`（四个场景 `order`、`flash`、`mixed`、`ratelimit` 和 `lib/`）、`scripts/k6-local.sh`（用 Docker 镜像 `grafana/k6:2.4.0` 在本机跑，依赖 `jq`）。Sonnet 写；四个场景在本机冒烟通过，主会话自己又跑了一次 `order`。
+  - `pkg/redisx/metrics.go`：Redis 命令耗时进 `db.client.operation.duration`（和 MySQL 同名，`db.system.name=redis`）。Opus 写。
+  - `load verify` 的限定范围模式（`-scope-skus`、`-orders-jsonl`，`test/load/internal/verify/scope.go`、`internal/ledger/orderlist.go`）。Opus 写，Fable 逐行读过采集的代码；`Check` 没有改。
+  - 全量 `make lint test`：lint 11 个模块 0 issues；test 第一次失败 1 项（`services/order/internal/service` 的 `TestSweeperSlotTimeoutSkipsHungDB`，健康的 slot 在 100 毫秒的时限里没关成单；当时本机的六个服务也在跑），原样重跑一次全部通过（`tmp/lint-test-3b-step1.log`、`tmp/lint-test-3b-step1b.log`）。这次没有改 order 的代码，判断是负载下的偶发，没有证实；再出现时要看。
+- 本机的六个服务验证完已停掉；compose 的中间件还在运行。
+- 三个子 Agent 的 worktree 和分支已删（2026-11-18，删之前核对过：各自提交改到的文件和 `phase-3b` 上的逐字节相同）。还留着一个没有 worktree 的旧分支 `worktree-agent-a97714952afd11fa3`（1b 时期的提交，不在 `phase-3b` 的历史里），没有动，要不要删由主人定。
+- **下一步，新会话从这里开始**：
+  1. 请主人过目上面“确认之后改了一处”（不删订单、用户号段 2^39）。提交已做（2026-11-18，分支 `phase-3b`，已推送，没有开 PR，所以没有 CI 结果）。主人说 2026-11-18 15:00 UTC 之后再继续。
+  2. 2026-11-18 15:00 UTC 之后：量 3a 最后一次内存、磁盘、etcd 的 fsync，勾掉计划里那一项，3a 收尾；再做 Grafana 的 requests（384 Mi）和 agent 的内存上限。
+  3. 设计第 4 节的第 3 步：Mac mini 上核对 k6（已装 2.4.0，先要 `ssh mini` 能登录）、把 Prometheus 的写入地址暴露给局域网、`scripts/cluster/loadtest.sh preflight`、`make k6`、对长期运行的那一套跑 `recon` 的入口、压测 SKU（7001 起）的准备脚本、把 gateway 的 `RATE_LIMIT_IP` 关掉的 values。
+  4. 然后灌数（1000 万）、基线。
+- 第 1 步留下、上集群时要看的：k6 里库存不足的 409、`BACKLOGGED`、`READ_BUSY` 三条分支没有触发过；`console.log` 输出订单号清单在上千次/秒时的开销没有量；k6 的落库耗时精度受轮询间隔限制，以服务端的指标为准；超时的错误码 1050 没有核对；Redis 指标在真实的 Cluster、Sentinel 下的测试被跳过了（本机没起 `make redis-modes-up`），上集群后对着指标看一眼有没有重复计数；Redis 指标分不出是哪一个 Redis（闸门、缓存、限流），建议定位瓶颈之前给 `redisx.Config` 加一个固定的名字当标签；限定范围的对账看不到“客户端没收到响应、又在预占之前就失败”的订单，第 17 条（outbox 为空）数的是全库。
+- 这些改动在 2026-11-18 提交到 `phase-3b`（从 `phase-3a` 的 `cc21ae2` 开出）并推送；提交前 `make lint` 11 个模块 0 issues，`make test` 只跑了改到的 `pkg` 和 `test/load`，都通过（是缓存的结果）。`phase-3a` 和 PR #15 没有动。
 
 ### 3a 做到哪（2026-11-17）
 
@@ -357,7 +562,7 @@
                - 新的环境变量（order）：`REDIS_POOL_SIZE`、`READ_GATE_MAX_CONCURRENCY`。
                - 8.17 里仍然没做的：`make fault` 里抽查指标、后端长时间不在时的表现、压测工具用 `X-Trace-Id`、cdc 发 Kafka 没有 span、orderindex 的 `ListMerchantOrders` 错误映射。
                - 收尾的全部改动之后：`make lint` 各模块 0 issues，`make test` 全部通过，`make e2e` 通过，`make fault` 14 个场景全过（`make fault` 是在加指标和改日志之前跑的）。`make chaos` 这一轮没有跑。`pkg/lock` 的 `TestExperimentNaiveDelDeletesOthersLock` 在整仓库的 `make test` 里失败过一次，单独重跑通过，原因没有看。
-               - 2026-11-15 进阶段 2 之前主人定的三件事（都只改了文档，见“计划变更记录”）：链路后端从 SkyWalking 换成 Tempo（ADR-0024）；Agent 的 Kubernetes 只读工具提前到 3d、pprof 工具提前到阶段 4；阶段 5 加 Gemini Decision 的对比实验。
+               - 2026-11-15 进阶段 2 之前主人定的三件事（都只改了文档，见“计划变更记录”）：链路后端从 SkyWalking 换成 Tempo（ADR-0024）；Agent 的 Kubernetes 只读工具提前到 3d、pprof 工具提前到阶段 4；阶段 6 加 Gemini Decision 的对比实验。
                - 下一步：PR #8 已合并进 `main`（见“当前状态”）。阶段 1 的完成标准都满足了，可以进阶段 2（要先请主人开 Ubuntu 3900X 和 DS218+，装 helm）。
              - 动工前量过的数（本机冷库 482 万行）：行读到客户端 276 MB、7.3 秒；库里按 18.6 小时一个桶聚合 SHA-256 是 3115 个桶、8.5 秒；`CRC32` 5.0 秒；只 `COUNT(*)` 3.1 秒。MySQL 9.7 没有 `MD5()` 函数。
    - 步骤四留下、没有做的（都记在设计文档 5.11 末尾）：
@@ -420,18 +625,19 @@
 
 | 设备 | 状态 |
 |---|---|
-| MacBook Pro | 在用 |
+| MacBook Pro | 备用；只用来远程连 Mac mini |
 | Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机各 14 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
-| Mac mini | 开机（2026-11-17），`ssh mini`，还没有装 k6 |
+| Mac mini | 开机，k6 2.4.0，有线接入；2026-11-21 起是开发机和集群操作端（见 `docs/infra/hardware.md`） |
 | DS218+ | 开机（2026-11-17） |
 
 ## 计划变更记录
+
 
 | 日期 | 变更 | 原因 |
 |---|---|---|
 | 2026-11-11 | 监控与压测提前到故障注入之前 | 对应的 ADR 已由主人删除 |
 | 2026-11-11 | 只保留 `AGENTS.md`，不建 `CLAUDE.md` | 主人决定 |
-| 2026-11-11 | 最小诊断 Agent 提前到阶段 3d，阶段 4 同步迭代，阶段 5 改为评测与完善 | 让 Agent 尽早积累真实故障下的运行记录 |
+| 2026-11-11 | 最小诊断 Agent 提前到阶段 3d，阶段 4 同步迭代，阶段 6 改为评测与完善 | 让 Agent 尽早积累真实故障下的运行记录 |
 | 2026-11-11 | 埋点改用 OpenTelemetry，SkyWalking 作为链路后端 | 见 ADR-0004 |
 | 2026-11-11 | 1b 增加分布式锁；1c 增加 binlog CDC 和冷热分离归档；1d 对账改用 Merkle Tree | 主人要求 |
 | 2026-11-11 | 阶段 4 增加 Go 代码缺陷类故障，细化 MySQL 和 Redis 故障 | 覆盖常见生产故障 |
@@ -456,7 +662,7 @@
 | 2026-11-13 | `super_read_only` 改由复制脚本在复制建立后设置，不写在 compose 启动参数里 | 官方镜像首次初始化会失败 |
 | 2026-11-14 | 步骤四新增“按用户列出订单”接口；订单号 Epoch 提前到 2020-01-01 并清空本机开发库；订单库数由 `MYSQL_DSNS` 个数决定（修改 ADR-0012 第 4 条） | 见设计文档 1c 第 5 节、ADR-0015；主人确认 |
 | 2026-11-14 | order 消费支付结果改为无限重试 | 读代码发现默认 5 次重试（约 1.5 秒）后支付结果进死信，订单库短暂不可用就会丢；扩容的围栏窗口必然触发 |
-| 2026-11-14 | 路线图增加阶段 9：eBPF（可选），计划文件只到里程碑粒度 | 主人要求 |
+| 2026-11-14 | 路线图增加阶段 5：eBPF（可选），计划文件只到里程碑粒度 | 主人要求 |
 | 2026-11-14 | 步骤四的三个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 主线的共享改动没有提交 |
 | 2026-11-14 | 步骤五：冷热按订单号里的受理时间划分，不按完结时间；用 Merkle 工具校验归档挪到 1d | 订单号决定冷热时读路径是纯计算，本系统受理到终态只隔一个支付时限；Merkle 工具 1d 才有。见 ADR-0016，主人确认 |
 | 2026-11-14 | order 落库拒绝订单号早于 30 天的受理消息；针对已归档订单的支付结果从冷库推出答复 | 归档引入的两个一致性问题：旧订单号重新插入热库会盖住冷库里的订单；重放的支付结果会对付清的订单要求退款 |
@@ -469,8 +675,8 @@
 | 2026-11-14 | 1d 步骤五：闸门（Redis）和 MySQL 的库存不纳入 Merkle 对账，维持 inventory 现有的 `reconcile`；树的节点摘要用行哈希的和，不是教科书式的 H(子节点) | SKU 很少、数一直在变，逐个比就是对的做法；两边分片方式不同，摘要要能跨分片相加。见设计文档 1d 第 7 节、ADR-0022；主人确认 |
 | 2026-11-14 | 1d 步骤六：`outbox` 表加 `trace_context` 列；本机多一个可选的 `otel-lgtm` 容器（`obs` profile）；步骤六的五个并行任务仍在主工作目录里各改各的目录，没有用 worktree | 链路要穿过 outbox 只能跟着数据走；埋点要被真实的后端收过才算数。见设计文档 1d 第 8 节、ADR-0023，主人确认。主线的共享改动没有提交，worktree 里看不到 |
 | 2026-11-15 | 链路后端从 SkyWalking 换成 Grafana Tempo，不部署 SkyWalking | 本机已经在用 Tempo；三种信号统一成 PromQL、LogQL、TraceQL，Agent 只对接一套；省约 3 GB 内存；去掉 ADR-0004 的待验证项。见 ADR-0024，主人提出并确认 |
-| 2026-11-15 | 阶段 5 增加“封闭式判断交给决策模型（Gemini Decision 1）”的对比实验，挂在模型分层下面；3d 和阶段 4 不接，主循环保持 Claude | 它只做是否、多选、打分，不能做主循环；适合判分、裁剪工具输出、告警分诊，接不接由评测数据决定。主人提出并确认 |
-| 2026-11-15 | 诊断 Agent 的 Kubernetes 只读工具从阶段 5 提前到 3d，pprof 工具提前到阶段 4（Go 代码缺陷实验之前） | 阶段 4 的 Pod 和节点类故障、Go 缺陷类故障没有这两个工具基本诊断不了，运行记录也就没有评测价值。主人提出并确认 |
+| 2026-11-15 | 阶段 6 增加“封闭式判断交给决策模型（Gemini Decision 1）”的对比实验，挂在模型分层下面；3d 和阶段 4 不接，主循环保持 Claude | 它只做是否、多选、打分，不能做主循环；适合判分、裁剪工具输出、告警分诊，接不接由评测数据决定。主人提出并确认 |
+| 2026-11-15 | 诊断 Agent 的 Kubernetes 只读工具从阶段 6 提前到 3d，pprof 工具提前到阶段 4（Go 代码缺陷实验之前） | 阶段 4 的 Pod 和节点类故障、Go 缺陷类故障没有这两个工具基本诊断不了，运行记录也就没有评测价值。主人提出并确认 |
 | 2026-11-15 | 2b 的 Redis 从“Redis Cluster 3 主 3 从”改为按用途分两套；Kafka 用 4.3.2 | 闸门的脚本不能在 Cluster 上运行；Strimzi 还不支持 4.4。见设计文档 2b 第 1、2 节；主人确认 |
 | 2026-11-15 | 2a 的入口控制器不再考虑 ingress-nginx；虚拟机等宿主机换上 1TB 的盘再建 | ingress-nginx 已于 2026 年 3 月停止维护；现有系统盘只剩 170 GB，放不下原规划的 360 GB，主人不想先建小规格再重建 |
 | 2026-11-15 | 2c：按 QPS 的 HPA 挪到阶段 3a；2c 只做按 CPU 的 | 集群上没有 Prometheus，没有自定义指标的来源。主人确认 |
@@ -481,6 +687,17 @@
 | 2026-11-16 | 2d 的 NetworkPolicy 一条改用网格的 mTLS 严格模式加 `AuthorizationPolicy` 实现（只管服务之间的 gRPC）；Argo CD、cert-manager、灰度发布这次不做 | 主人确认（ADR-0029 第 8 项）：网格自带，按身份比按地址准；其余几项留到有需要时 |
 | 2026-11-17 | 三台虚拟机的内存从 10、16、16 改成各 14 GiB；监控的后端优先放在 k3s-server | 阶段 4 关 agent 节点时监控不能跟着没。见 ADR-0030，主人确认 |
 | 2026-11-17 | 2c 留下的“新 order Pod 一就绪就 503”不按“冷连接池”去改，等监控装好后重现再定 | 读代码发现连接池在就绪前已经建满，原推断只有时间上的吻合 |
+| 2026-11-17 | 3b 的“压测数据清理工具”不做成删数据的工具：压测的订单留在库里，每轮用新的 SKU 号，要回到基准状态时恢复备份 | 订单表的 DELETE 在系统里只表示归档（设计文档 1c 的 6.7），按号段删会在商家索引里留下冷库里没有的“已归档”订单。见设计文档 3b 第 6 节、ADR-0031。**主人还没有看过这一处** |
+| 2026-11-17 | 3b 的“从 OpenAPI 规范生成客户端”评估的结论是不生成 | 主人确认。手写的结构是对规范的第二次独立解读，见 ADR-0031 |
+| 2026-11-18 | 路线图增加两个可选阶段：阶段 10 LBS、阶段 7 推荐，计划文件只到里程碑粒度；`GOALS.md` 核心目标加第 8 条 | 主人要求：都是现实系统里比较核心的功能方向。场景和边界（LBS 定为同城配送、推荐只做工程不做算法、数据都是模拟的）是主会话拟的，**主人还没有看过** |
+| 2026-11-18 | 没做的阶段按关联重排并**重新编号**（计划文件跟着改名，文档里的引用全部改成新号）：eBPF 9→5，诊断 Agent 5→6（5a、5b、5c 变成 6a、6b、6c），推荐 11→7，优惠券 6→8，风控 7→9，LBS 仍是 10，Rust 8→11。阶段 0 到 4 不变。推荐拆成 7a 入门和 7b 按需深入；6b 的检索按可复用来设计，推荐接着用；LBS 的场景维持同城配送，不做打车 | 主人要求：推荐先做入门，Agent 和推荐重合的部分复用，关联紧的阶段放在一起，编号和顺序一致。**这一天之前的提交信息、PR 和会话里说的阶段 5 到 11 是旧号**，本文件里更早的记录已经改成新号。理由见 `ROADMAP.md` 的顺序说明、阶段 7 和 10 的计划文件 |
+| 2026-11-20 | 3b 的第 2 轮原定是“落库消费者的应用层组提交”（第 0 轮记录第 7 节第 2 条），改成“调大落库的并发加三个串行消费者改并发”；应用层组提交建议不做，等主人确认 | 不改代码的对照显示 MySQL 的组提交在并发够时已经把提交合并了，第 0 轮“单独调大并发没有用”的判断是错的。见 `docs/notes/3b-rounds/round-2-concurrency-and-consumers.md` 第 1 节 |
+| 2026-11-21 | 应用层的组提交确定不做（主人确认）；3b 多了一项“闸门里的幂等键只留 1 小时”（ADR-0033）；“减少每单的提交次数”成为候选的下一个方向，还没有定 | 在宿主机上验证了盘变慢是这块盘自身的稳态行为，不是负载触发的（第 2 轮记录第 10 节）；压测把闸门 Redis 写满过 |
+| 2026-11-21 | 接受 3b 现在的写入拐点（慢的一档下持续 125 到 150 单/秒）：不做“每单的提交次数减半”，不换盘；容量结论按这个上限写 | 主人确认。瓶颈和再往上的代价已经清楚，再做只是让这块盘上的数字翻倍。见第 2 轮记录第 10 节末尾 |
+| 2026-11-21 | 开发机和集群操作端从 MacBook 换成 Mac mini（它同时还是发压机）；k6 在跑时不在它上面跑测试和构建 | 主人要求：Mac mini 一直开着，可以远程连上去做。见 `docs/infra/hardware.md` |
+| 2026-11-21 | 3b 第 3 轮不做“202 的响应里给轮询的建议间隔”；“重定 HPA”从第 3 轮挪到扩容系数的那几轮之后 | 前者：服务端给不出比文档更准的数（要 order 把当时的积压带回来），改成把退避规则写进接口规范、429 带 `Retry-After`。后者：量到每个请求的 CPU 随请求组合变化两倍多，现在的 CPU requests 只有实际用量的四到六成，放开后两个服务在拐点的负载下会直接扩到上限；先要知道多副本有没有用（节点 CPU 和盘才是限制），再定 requests，最后才是每副本的请求数。见第 3 轮的记录第 1.1、6 节 |
+| 2026-11-21 | 3b 第 3 轮多做了一项：落库健康的熔断器加“连续失败至少持续 1 秒” | 压测里它被一次停顿打开（在途的上百个落库同时超时），每轮白白拒绝一千个上下的下单；闸门的熔断器在 1d 加过同样的条件。见第 3 轮的记录第 4 节 |
+| 2026-11-21 | 3b 的空表对照：不另起一套（`oppenheimer-e2e`），也不清库恢复；把长期运行的那一套临时指到同一批实例上的 `e2e_*` 空库（`loadtest.sh empty-up`、`empty-down`，values 在 `deploy/cluster/services/loadtest-empty/`） | 另起一套时副本数、资源、HPA、监控标签都和平时不同，还和原来那一套抢节点，对照里混进别的变量；清库恢复是破坏性的。指过去只改“数据在哪”，正式库一行不动，切回去就恢复。局限不变：空库和大库共用实例的缓冲池、redo 和盘 |
 
 ## 会话日志
 
@@ -530,7 +747,7 @@
 
 评审后合入。扩容脚本改了三处（等待超时自动撤围栏、建从库移出窗口、校验不怕新写入）。灌了 500 万单并出报告，带流量演练了 2 库扩 4 库：窗口 9.3 秒，8181 个订单全部落库，对账和数据校验通过，结果在设计文档 5.11。做完后分 6 个提交推送（git 操作和看 CI 派给 Haiku），CI 全绿。
 
-同日按主人要求在路线图里加了可选的阶段 9（eBPF），并回答了两个设计问题，要点记进了阶段计划的考点：为什么用 CHECK 而不是 UNSIGNED，`SKIP LOCKED` 适合什么场景。
+同日按主人要求在路线图里加了可选的阶段 5（eBPF），并回答了两个设计问题，要点记进了阶段计划的考点：为什么用 CHECK 而不是 UNSIGNED，`SKIP LOCKED` 适合什么场景。
 
 同日商家索引追平，补了索引这一半的造数报告；按主人要求加了 kafbat-ui（Sonnet 子 Agent）。CI 在一次只改文档的提交上偶发失败过一次（并发迁移用例），重跑通过，根因未找到，记在“下一步”里。
 

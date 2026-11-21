@@ -3,6 +3,10 @@
 replicas: 2
 primaryOrdinal: 0       # 切换后改这里再 helm upgrade（只改 -primary、-replica 两个 Service）
 priorityClassName: middleware
+# 从库提交时不逐次刷盘（2026-11-19，3b 第 1 轮）。原因：这块盘一次刷盘约 5 毫秒，从库回放近似串行，
+# 每秒只能回放约 87 个事务，100 单/秒起就落后；从库和另一个分片的主库又在同一个节点上抢刷盘的额度。
+# 代价和从库所在节点掉电之后要做的事见 ADR-0032。
+replicaDurability: relaxed
 serverIdBase: 21          # 和本机 compose 的 21、22 对应
 preferredNode: k3s-agent-2
 databases:
@@ -11,9 +15,13 @@ cdc:
   enabled: true
 mysqld:
   maxConnections: 200
-  innodbBufferPoolSize: 512M
+  innodbBufferPoolSize: 1G
+# 2026-11-18 从 1Gi（缓冲池 512M）调上来：灌历史订单时（约 4 万单/秒，没有限速）主库被 OOMKilled，
+# 另外三个实例也到了 990 Mi 以上。缓冲池之外的开销（连接、大事务的 binlog 缓存、performance_schema）
+# 在大批量写入时有 500 Mi 上下，是个绝对量，不随缓冲池按比例走。设计文档 3b 第 6 节。
+# 同一天又从 2Gi 提到 2560Mi：灌完 1000 万单后匿名内存 1844 MB（缓冲池 1047、固定开销约 400、分配器留着的约 400），贴着 2Gi。
 resources:
-  memory: 1Gi
+  memory: 2560Mi
   cpu: 250m
 storage:
   size: 20Gi

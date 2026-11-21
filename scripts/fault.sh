@@ -1065,7 +1065,9 @@ fi
 # ---------- 场景 L：inventory 挂住且持续下单 ----------
 
 # 落库要同步调 inventory.Reserve。inventory 挂住后落库持续失败，受理在失败攒够之后拒绝新单（ORDER_LANDING_UNAVAILABLE），
-# 不再出现“202 之后失败”。挂住期间拿到 202 的订单数要有限（这里上限 30，实测个位数到十几个）。
+# 不再出现“202 之后失败”。挂住期间拿到 202 的订单数要有限（这里上限 30）。
+# 受理多少取决于 Reserve 的时限：第一批失败要等满它才出现，之后还要连续失败 5 次并持续 1 秒。
+# 时限 1 秒时实测 6 个，2026-11-21 放到 3 秒之后 14 个（ADR-0020 的补充）。
 LAND_ACCEPT_MAX=30 # 挂住期间允许受理的订单数上限
 if wanted L; then
   begin L "inventory hung while submitting"

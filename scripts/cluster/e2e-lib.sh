@@ -49,6 +49,22 @@ e2e_root_sql() { # pod [mysql 参数...]
 # GRANT 的库名里下划线是通配符，要转义成 \_（同 deploy/charts/mysql/files/accounts.sh）。
 e2e_grant_name() { echo "${1//_/\\_}"; }
 
+# 长期运行的那一套（命名空间 oppenheimer）现在是不是指着 e2e_* 库：空表对照（scripts/cluster/loadtest.sh empty-up）
+# 期间是。以 order 的 Deployment 里实际的 DSN 为准。这期间 e2e_* 库里是那一轮压测的数据，不能被重建或删掉。
+e2e_longrunning_on_e2e_dbs() {
+  kubectl -n oppenheimer get deployment order \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="order")].env[?(@.name=="MYSQL_DSNS")].value}' 2>/dev/null |
+    grep -q '/e2e_order_db_0'
+}
+
+e2e_refuse_if_longrunning() { # 动作的名字
+  if e2e_longrunning_on_e2e_dbs; then
+    echo "refusing to $1 the e2e_* databases: the long-running stack (namespace oppenheimer) is using them (empty-table comparison)." >&2
+    echo "Switch it back first: scripts/cluster/loadtest.sh empty-down" >&2
+    return 1
+  fi
+}
+
 # 每次从干净的库开始（对应本机 scripts/e2e.sh 的开头），并给服务用的账号授权：
 #   app  对 e2e 库的全部权限，和 2b 的 accounts.sh 给 app 的业务库权限一样（迁移要建表、改表）
 #   cdc  订单分片上 e2e_order_db_N 的 SELECT（全量阶段分批读表）；REPLICATION SLAVE、REPLICATION CLIENT
@@ -58,6 +74,7 @@ e2e_grant_name() { echo "${1//_/\\_}"; }
 # 都在主库上做：从库只读，DDL 和授权靠复制到达（在从库上做会造成 GTID 分叉）。
 e2e_create_dbs() {
   local pod sql db i
+  e2e_refuse_if_longrunning recreate || return 1
   pod="$(e2e_mysql_pod mysql-main primary)"
   sql=""
   for db in $E2E_MAIN_DBS; do
@@ -118,6 +135,7 @@ e2e_start_replicas() {
 
 e2e_drop_dbs() {
   local pod sql db i
+  e2e_refuse_if_longrunning drop || return 1
   pod="$(e2e_mysql_pod mysql-main primary)"
   sql=""
   for db in $E2E_MAIN_DBS; do

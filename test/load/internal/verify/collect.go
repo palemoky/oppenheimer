@@ -288,7 +288,12 @@ func collectPayments(ctx context.Context, src Sources, s *Snapshot) error {
 
 // queryEach 执行查询并对每一行调用 scan。
 func queryEach(ctx context.Context, db *sql.DB, query string, scan func(*sql.Rows) error) error {
-	rows, err := db.QueryContext(ctx, query)
+	return queryArgs(ctx, db, query, nil, scan)
+}
+
+// queryArgs 是带占位符参数的 queryEach。错误里只带查询文本，不带参数（批量点查时有几百个）。
+func queryArgs(ctx context.Context, db *sql.DB, query string, args []any, scan func(*sql.Rows) error) error {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("query %q: %w", query, err)
 	}
@@ -321,29 +326,9 @@ func collectGate(ctx context.Context, src Sources, s *Snapshot) error {
 	s.Gate = map[int64]GateStock{}
 	s.Bought = map[int64]map[int64]int64{}
 	for _, sku := range skus {
-		st, ok, err := gate.Stock(ctx, sku)
-		if err != nil {
-			return fmt.Errorf("read gate sku %d: %w", sku, err)
+		if err := readGateSKU(ctx, src, gate, sku, s); err != nil {
+			return err
 		}
-		if !ok {
-			continue
-		}
-		s.Gate[sku] = GateStock{Avail: st.Avail, Held: st.Held, Limit: st.Limit}
-
-		m, err := src.Redis.HGetAll(ctx, src.RedisPrefix+"gate:bought:"+strconv.FormatInt(sku, 10)).Result()
-		if err != nil {
-			return fmt.Errorf("read bought of sku %d: %w", sku, err)
-		}
-		bought := make(map[int64]int64, len(m))
-		for u, q := range m {
-			uid, err1 := strconv.ParseInt(u, 10, 64)
-			qty, err2 := strconv.ParseInt(q, 10, 64)
-			if err := errors.Join(err1, err2); err != nil {
-				return fmt.Errorf("bad bought entry %q=%q of sku %d: %w", u, q, sku, err)
-			}
-			bought[uid] = qty
-		}
-		s.Bought[sku] = bought
 	}
 
 	s.Holds = map[int64]bool{}

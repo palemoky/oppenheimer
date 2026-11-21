@@ -92,6 +92,12 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "service.selectorLabels" . | nindent 14 }}
+          # 只在同一个版本（ReplicaSet）的 Pod 之间算分散。不加这一项时，滚动中新开的 Pod 是和旧 Pod 一起算的：
+          # 旧 Pod 各占一个节点，新 Pod 放哪边都一样“均匀”，等旧的删完，两个新的可能在同一个节点上。
+          # 2c 起就见过（inventory、payment 都在 agent-1），3b 的压测里 order 的两个副本三次部署里有两次挤在一起，
+          # 那个节点的 CPU 到 97%，两轮的数没法比（docs/notes/3b-rounds/）。
+          matchLabelKeys:
+            - pod-template-hash
       {{- end }}
       containers:
         - name: {{ $name }}

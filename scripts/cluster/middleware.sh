@@ -6,6 +6,11 @@
 #   middleware.sh kafka   Strimzi 的 Operator 和 3 节点的 Kafka（含指标：broker 的 JMX exporter 规则、Kafka Exporter；改动指标配置会滚动重启 broker）
 #   middleware.sh all     redis、kafka、mysql 依次执行
 #   middleware.sh mysql-backup [release...]   立刻手工跑一次 MySQL 备份并等它完成（不带参数是三个实例）
+#   middleware.sh mysql-backup-list           列出 NAS 上每个实例的备份（轮转的和钉住的）
+#   middleware.sh mysql-backup-pin <名字> [<release>=<时间戳>...]
+#                                             把备份钉住：在同一个实例目录下建 keep-<名字>（硬链接，不占第二份空间），
+#                                             定时备份的轮转（只留 7 份）不会删它。不给时间戳就钉每个实例最新的一份。
+#                                             恢复演练用 BACKUP=keep-<名字> 指定它。删除要在 NAS 上手工做。
 #
 # 每个子命令之前先执行 common（建 PriorityClass）。
 #
@@ -130,6 +135,18 @@ cmd_mysql() {
     kubectl -n "$MYSQL_NS" rollout status "statefulset/$rel" --timeout=30m
   done
 
+  # 落盘方式跟着角色走（主库 1/1，从库按 values 的 replicaDurability），是运行时的 SET PERSIST，
+  # 不在启动参数里，所以每次部署都对每个 Pod 核对并设一遍（chart 里的 files/durability.sh，可重复执行）。
+  echo "==> mysql durability"
+  local n i
+  for rel in "${MYSQL_RELEASES[@]}"; do
+    n="$(kubectl -n "$MYSQL_NS" get statefulset "$rel" -o jsonpath='{.spec.replicas}')"
+    for ((i = 0; i < n; i++)); do
+      printf '    %s-%s: ' "$rel" "$i"
+      kubectl -n "$MYSQL_NS" exec "$rel-$i" -c mysql -- /scripts/durability.sh apply || failed=1
+    done
+  done
+
   echo "==> mysql status"
   for rel in "${MYSQL_RELEASES[@]}"; do
     mysql_check "$rel" || failed=1
@@ -204,6 +221,110 @@ cmd_mysql_backup() { # [release...]
   return "$failed"
 }
 
+# 在备份的 PVC 上跑一段脚本：拿某个实例 CronJob 的 Job 模板（镜像、999 用户、节点亲和、挂载都现成），
+# 只换掉命令。脚本经环境变量 ADMIN_SCRIPT 交进去，参数是位置参数。跑完打印日志，Job 留 10 分钟后自己消失。
+# 标签和备份的 Job 不同：cmd_mysql_backup 里“有没有备份正在跑”的检查不会把它算进去。
+mysql_backup_admin() { # <脚本> [参数...]
+  local script="$1" job state
+  shift
+  command -v jq >/dev/null || {
+    echo "jq not found (brew install jq)" >&2
+    return 1
+  }
+  job="mysql-backup-admin-$(date -u +%y%m%d%H%M%S)"
+  kubectl -n "$MYSQL_NS" get cronjob "${MYSQL_RELEASES[0]}-backup" -o json |
+    jq --arg name "$job" --arg script "$script" '
+      {apiVersion: "batch/v1", kind: "Job",
+       metadata: {name: $name, labels: {"app.kubernetes.io/name": "mysql-backup-admin"}},
+       spec: .spec.jobTemplate.spec}
+      | .spec.ttlSecondsAfterFinished = 600
+      | .spec.activeDeadlineSeconds = 600
+      | .spec.template.metadata.labels = {"app.kubernetes.io/name": "mysql-backup-admin"}
+      | .spec.template.spec.containers[0].command = (["bash", "-c", $script, "admin"] + $ARGS.positional)
+      | .spec.template.spec.containers[0].env = []' --args "$@" |
+    kubectl -n "$MYSQL_NS" create -f - >/dev/null
+  local deadline=$((SECONDS + 660))
+  state=""
+  while ((SECONDS < deadline)); do
+    state="$(kubectl -n "$MYSQL_NS" get job "$job" -o go-template='{{range .status.conditions}}{{if and (eq .status "True") (or (eq .type "Complete") (eq .type "Failed"))}}{{.type}}{{end}}{{end}}')"
+    [[ "$state" == Complete || "$state" == Failed ]] && break
+    sleep 2
+  done
+  kubectl -n "$MYSQL_NS" logs "job/$job" --tail=200 2>&1 | sed 's/^/    /'
+  if [[ "$state" != Complete ]]; then
+    echo "    FAILED ($job, state: ${state:-timeout})" >&2
+    return 1
+  fi
+}
+
+cmd_mysql_backup_list() {
+  echo "==> mysql backups on the NAS ($NAS_EXPORT/backup/mysql)"
+  # shellcheck disable=SC2016 # 脚本在 Pod 里展开
+  mysql_backup_admin '
+set -euo pipefail
+for rel in "$@"; do
+  echo "$rel:"
+  for d in /backup/"$rel"/*; do
+    [ -d "$d" ] && [ -f "$d/meta" ] || continue
+    printf "  %-28s %14s bytes  links=%s  finished=%s\n" "$(basename "$d")" \
+      "$(sed -n "s/^bytes=//p" "$d/meta")" "$(stat -c %h "$d/dump.sql.zst")" "$(sed -n "s/^finished_at=//p" "$d/meta")"
+  done
+done' "${MYSQL_RELEASES[@]}"
+}
+
+# 钉住备份。定时备份只留最近 KEEP 份，而且只删时间戳命名的目录（backup.sh），所以在同一个实例目录下放一个
+# keep-<名字> 就不会被轮掉。用硬链接而不是复制：备份的三个文件写完就不再改，硬链接不占第二份空间，
+# 也不会像复制大文件那样把 Job 的内存（NFS 的页缓存算在容器头上）撑到上限；轮转删掉原来的时间戳目录时
+# 只是少一个链接，数据还在。建的时候先建 .tmp-keep-<名字>、校验 sha256，再改名，和 backup.sh 同一个道理。
+# 已经存在的 keep-<名字> 不覆盖：钉住的东西只能在 NAS 上手工删。
+cmd_mysql_backup_pin() { # <名字> [<release>=<时间戳>...]
+  local name="${1:-}" spec rel ts known found args=()
+  case "$name" in '' | *[!A-Za-z0-9_-]*)
+    echo "usage: $0 mysql-backup-pin <name: letters, digits, _ and -> [<release>=<timestamp>...]" >&2
+    return 2
+    ;;
+  esac
+  shift
+  if [[ $# -eq 0 ]]; then
+    for rel in "${MYSQL_RELEASES[@]}"; do args+=("$rel="); done
+  fi
+  for spec in "$@"; do
+    rel="${spec%%=*}"
+    ts="${spec#*=}"
+    found=0
+    for known in "${MYSQL_RELEASES[@]}"; do [[ "$known" == "$rel" ]] && found=1; done
+    if [[ "$found" == 0 || "$spec" != *=* || ! "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+      echo "bad argument '$spec': want <release>=<YYYYMMDDTHHMMSSZ>, release one of: ${MYSQL_RELEASES[*]}" >&2
+      return 2
+    fi
+    args+=("$spec")
+  done
+  echo "==> pinning mysql backups as keep-$name"
+  # shellcheck disable=SC2016 # 脚本在 Pod 里展开
+  mysql_backup_admin '
+set -euo pipefail
+export LC_ALL=C
+umask 027
+name="$1"; shift
+for spec in "$@"; do
+  rel="${spec%%=*}"; ts="${spec#*=}"
+  dir="/backup/$rel"
+  if [ -z "$ts" ]; then
+    ts="$(ls -1 "$dir" | grep -E "^[0-9]{8}T[0-9]{6}Z\$" | sort | tail -n 1 || true)"
+    [ -n "$ts" ] || { echo "$rel: no backup to pin"; exit 1; }
+  fi
+  src="$dir/$ts"; dst="$dir/keep-$name"; tmp="$dir/.tmp-keep-$name"
+  [ -d "$src" ] || { echo "$rel: $src does not exist"; exit 1; }
+  [ ! -e "$dst" ] || { echo "$rel: $dst already exists; refusing to overwrite"; exit 1; }
+  rm -rf -- "$tmp"
+  mkdir "$tmp"
+  for f in dump.sql.zst sha256 meta; do ln "$src/$f" "$tmp/$f"; done
+  (cd "$tmp" && sha256sum -c --quiet sha256)
+  mv -T "$tmp" "$dst"
+  echo "$rel: pinned $ts as keep-$name ($(sed -n "s/^bytes=//p" "$dst/meta") bytes, gtid_executed=$(sed -n "s/^gtid_executed=//p" "$dst/meta"))"
+done' "$name" "${args[@]}"
+}
+
 cmd="${1:-}"
 # 新的子命令（redis、kafka）照 mysql 的样子加一个 cmd_xxx，在这里各加一行，并加进 all。
 # Redis：两套（设计文档 2b 第 4 节）。redis-gate 是一主一从加 3 个 Sentinel，给库存闸门和锁用；
@@ -262,6 +383,13 @@ mysql-backup)
   shift
   cmd_mysql_backup "$@"
   ;;
+mysql-backup-list)
+  cmd_mysql_backup_list
+  ;;
+mysql-backup-pin)
+  shift
+  cmd_mysql_backup_pin "$@"
+  ;;
 all)
   common
   cmd_redis
@@ -269,7 +397,7 @@ all)
   cmd_mysql
   ;;
 *)
-  echo "usage: $0 mysql | redis | kafka | all | mysql-backup [release...]" >&2
+  echo "usage: $0 mysql | redis | kafka | all | mysql-backup [release...] | mysql-backup-list | mysql-backup-pin <name> [<release>=<timestamp>...]" >&2
   exit 2
   ;;
 esac

@@ -226,6 +226,15 @@ if virsh net-info default >/dev/null 2>&1; then
   fi
 fi
 
+# 宿主机关机时 libvirt-guests 让虚拟机自己关机，等不到就强制断电。这个时限是所有虚拟机合起来的
+# （它们并行关），Ubuntu 的包默认 120 秒；2026-11-20 那次重启 k3s-server 用了 115 秒，只差 5 秒。
+# 被断电的后果：放松了刷盘的 MySQL 从库要重建（ADR-0032），etcd 可能要从快照恢复。
+# 不要重启这个服务让配置生效：它的 stop 就是把虚拟机全部关掉。文件在 stop 的时候才读，改了就算数。
+echo "==> libvirt-guests shutdown timeout"
+sed -i -E 's/^#?SHUTDOWN_TIMEOUT=.*/SHUTDOWN_TIMEOUT=300/' /etc/default/libvirt-guests
+grep -q '^SHUTDOWN_TIMEOUT=300$' /etc/default/libvirt-guests ||
+  echo 'SHUTDOWN_TIMEOUT=300' >>/etc/default/libvirt-guests
+
 echo "==> done"
 ip -br addr show "$HOST_BRIDGE"
 virsh net-list --all

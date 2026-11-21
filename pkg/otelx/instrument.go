@@ -30,7 +30,8 @@ func Counter(m metric.Meter, name, desc string) metric.Int64Counter {
 	return c
 }
 
-// Histogram 建一个耗时的直方图，单位是秒（记录时用 d.Seconds()）。桶边界由 Setup 统一设成 DurationBuckets。
+// Histogram 建一个耗时的直方图，单位是秒（记录时用 d.Seconds()）。桶边界由 Setup 统一设：
+// 一次调用的耗时用 DurationBuckets（到 10 秒）；名字以 .delay 结尾的是排队等待的时间，用 WaitBuckets（到 30 分钟）。
 func Histogram(m metric.Meter, name, desc string) metric.Float64Histogram {
 	h, err := m.Float64Histogram(name, metric.WithUnit("s"), metric.WithDescription(desc))
 	if err != nil {

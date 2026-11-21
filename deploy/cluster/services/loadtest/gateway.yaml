@@ -1,0 +1,7 @@
+# 压测时 gateway 的覆盖：LOADTEST=1 make deploy 时叠在 deploy/cluster/services/gateway.yaml 之上（scripts/cluster/services.sh）。
+# 只关按客户端地址的限流这一维：压测机的所有请求来自同一个地址，默认的 200/400 会先把它们挡掉，量到的是限流而不是系统。
+# 按用户、按接口、热点参数的限流不动（它们的默认值照常生效），RATE_LIMIT 也不动。
+# 写法见 services/gateway/cmd/gateway/ratelimit.go：RATE_LIMIT_IP 接受 off。
+# 恢复：不带 LOADTEST=1 再 make deploy 一次。
+config:
+  RATE_LIMIT_IP: "off"

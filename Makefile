@@ -317,6 +317,14 @@ cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、�
 cluster-bench: ## 在集群上重做 1a 与 1b 的下单吞吐对比：先 1a（732f9ab，各 1 副本）后 1b（设计副本数），共用 oppenheimer-e2e；BENCH_* 见脚本，结果在 tmp/cluster-bench/，E2E_KEEP=1 保留现场
 	scripts/cluster/bench.sh
 
+.PHONY: k6
+k6: ## 从本机发起，在发压机（Mac mini）上跑 k6 压测集群：make k6 SCENARIO=order|flash|mixed|ratelimit，配置走环境变量（见 test/k6/README.md），K6_PROM=off 不写 Prometheus；结果在 tmp/k6/<RUN_ID>/
+	scripts/cluster/k6.sh $(SCENARIO) $(K6_ARGS)
+
+.PHONY: loadtest
+loadtest: ## 压测的辅助动作（预检、记录条件、准备 SKU、钉副本数、灌历史订单、wait-quiet、recon、verify）：make loadtest ARGS="preflight"，子命令见 scripts/cluster/loadtest.sh 的头部
+	scripts/cluster/loadtest.sh $(ARGS)
+
 .PHONY: deploy-status
 deploy-status: ## 看业务服务在集群里的状态：Pod、Service、HTTPRoute
 	scripts/cluster/services.sh status
@@ -334,11 +342,11 @@ etcd-backup: ## 立刻拍一份 etcd 快照并复制到 NAS（平时由 server �
 	scripts/cluster/k3s.sh etcd-backup run
 
 .PHONY: middleware-backup
-middleware-backup: ## 立刻手工跑一次 MySQL 备份并等它完成（三个实例；只备一个：make middleware-backup RELEASE=mysql-main）
+middleware-backup: ## 立刻手工跑一次 MySQL 备份并等它完成（三个实例；只备一个：make middleware-backup RELEASE=mysql-main）。列出和钉住备份：scripts/cluster/middleware.sh mysql-backup-list、mysql-backup-pin <名字>
 	scripts/cluster/middleware.sh mysql-backup $(RELEASE)
 
 .PHONY: mysql-restore-drill
-mysql-restore-drill: ## 恢复演练：把某个实例的最新备份灌进临时 Pod，和线上从库逐表比对（make mysql-restore-drill RELEASE=mysql-main）
+mysql-restore-drill: ## 恢复演练：把某个实例的最新备份灌进临时 Pod，和线上从库逐表比对（make mysql-restore-drill RELEASE=mysql-main；BACKUP=keep-seed-10m 指定某一份）
 	@test -n "$(RELEASE)" || { echo "usage: make mysql-restore-drill RELEASE=mysql-order-0|mysql-order-1|mysql-main" >&2; exit 2; }
 	scripts/cluster/mysql-restore-drill.sh $(RELEASE)
 
