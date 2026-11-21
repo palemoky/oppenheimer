@@ -92,6 +92,14 @@ snapshot() { # 窗口秒数 [往回偏移的秒数，默认 35]
   section "MySQL 连接池等待（次/秒）" "sum by (service_name,db_namespace) (rate(db_sql_connection_wait_total{$ns}$R)) > 0"
   section "消费者处理速率（每秒），按组、topic、结果" \
     "sum by (messaging_consumer_group_name,messaging_destination_name,outcome) (rate(kafkax_consumer_process_duration_seconds_count{$ns}$R)) > 0"
+  # 入口自己拒绝的请求到不了 gateway，只有入口知道（deploy/cluster/monitoring/ingress-podmonitor.yaml）
+  section "入口到上游的请求（每秒），按状态码的百位" \
+    "sum by (envoy_cluster_name,envoy_response_code_class) (rate(envoy_cluster_upstream_rq_xx{envoy_cluster_name=~\"httproute/oppenheimer/.+\"}$R)) > 0"
+  local ing='envoy_cluster_name=~"httproute/oppenheimer/.+"'
+  section "入口：连接用完、新请求开始排队的次数（每秒）" "sum by (envoy_cluster_name) (rate(envoy_cluster_upstream_cx_overflow{$ing}$R)) > 0"
+  section "入口：排队也满了、答 503 UO 的请求（每秒）" "sum by (envoy_cluster_name) (rate(envoy_cluster_upstream_rq_pending_overflow{$ing}$R)) > 0"
+  section "入口的在途请求数（窗口内的最大值，15 秒采一次）" "max by (envoy_cluster_name) (max_over_time(envoy_cluster_upstream_rq_active{$ing}$SR))"
+  section "入口排队等连接的请求数（窗口内的最大值，15 秒采一次）" "max by (envoy_cluster_name) (max_over_time(envoy_cluster_upstream_rq_pending_active{$ing}$SR))"
   section "消费延迟的最大值（条），按组" "max_over_time(sum by (consumergroup) (kafka_consumergroup_lag)$SR) > 0"
   section "CPU（核），业务服务按 Pod 和容器" \
     "sum by (pod,container) (rate(container_cpu_usage_seconds_total{namespace=\"oppenheimer\",container!=\"\",container!=\"POD\"}$R)) > 0.005"

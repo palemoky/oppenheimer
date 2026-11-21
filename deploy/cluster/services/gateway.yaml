@@ -22,6 +22,13 @@ route:
   enabled: true
   hostnames: [api.oppenheimer.test]
   parentRef: {name: public, namespace: envoy-gateway-system}
+  # 入口到 gateway 的并发上限（3b 第 3 轮的记录）。入口到 gateway 是 HTTP/1.1，在途请求数就是连接数。
+  # 1024 的来历：在途请求数 = 到达速率 × 平均耗时。这套环境压过的最高到达速率是 2000 请求/秒，
+  # 正常时一个请求几毫秒到二十毫秒，在途只有几十个；在途到 1024 相当于平均耗时到了半秒，
+  # 是正常值的几十倍，这时让入口拒绝一部分比让所有请求一起更慢要好。
+  # 排队的 1024 不收紧：连接池是冷的时候（突发流量的头一批请求）每个请求都要先排队等连接建好，
+  # 收得太紧会在最需要接住的时候拒绝请求。两个数现在和 Envoy 的默认值相同，写出来是为了有出处、能调。
+  circuitBreaker: {maxConnections: 1024, maxPendingRequests: 1024}
 
 # 按请求速率伸缩，2 到 4 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
 # 查询数的是 gateway 自己记的 HTTP 请求（SDK 的指标，不含探针）；窗口 1 分钟：指标每 15 秒导出一次，

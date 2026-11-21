@@ -1,0 +1,28 @@
+{{- if and .Values.route.enabled .Values.route.circuitBreaker }}
+# 入口的 Envoy 到这个服务的并发上限（设计文档 3b、3b 第 3 轮的记录）。只有 gateway 开。
+#
+# 不写这个资源时 Envoy Gateway 也有上限，用的是 Envoy 的默认值（连接 1024、排队 1024），3b 第 0 轮撞到过：
+# 系统一慢，在途请求超过上限，入口直接答 503（response flags 是 UO），这些请求没有到达 gateway，
+# gateway 自己的指标和日志里看不到。写出来是为了让这两个数在仓库里有出处、能调；
+# 入口这一侧的计数见 deploy/cluster/monitoring/ingress-podmonitor.yaml。
+#
+# 入口到 gateway 是 HTTP/1.1，一个在途的请求占一条连接，所以管并发的是 maxConnections；
+# 连接用完之后新请求排队等连接，最多 maxPendingRequests 个，再多的被拒绝。
+# maxParallelRequests 只对 HTTP/2 的上游起作用，这里不写。
+#
+# 不配重试：重试只有一层，在客户端（带幂等键），见 AGENTS.md 的重试规则。
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ include "service.name" . }}
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: {{ include "service.name" . }}
+  circuitBreaker:
+    maxConnections: {{ required "route.circuitBreaker.maxConnections is required" .Values.route.circuitBreaker.maxConnections }}
+    maxPendingRequests: {{ required "route.circuitBreaker.maxPendingRequests is required" .Values.route.circuitBreaker.maxPendingRequests }}
+{{- end }}
