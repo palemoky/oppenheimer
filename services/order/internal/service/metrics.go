@@ -63,6 +63,8 @@ const (
 	admissionFeatureDisabled    = "feature_disabled"
 	admissionLandingUnavailable = "order_landing_unavailable"
 	admissionGateUnavailable    = "stock_gate_unavailable"
+	// admissionGateMemoryFull：闸门内存到了水位，停止受理（原因码也是 STOCK_GATE_UNAVAILABLE），见 gatememory.go。
+	admissionGateMemoryFull     = "gate_memory_full"
 	admissionInventoryUnavail   = "inventory_unavailable"
 	admissionKeyReused          = "idempotency_key_reused"
 	admissionSKUNotFound        = "sku_not_found"
@@ -80,7 +82,8 @@ const (
 
 var admissionOpts = optsByValue("outcome",
 	admissionAdmitted, admissionDuplicate, admissionDuplicateAbandoned, admissionInvalidArgument,
-	admissionFeatureDisabled, admissionLandingUnavailable, admissionGateUnavailable, admissionInventoryUnavail,
+	admissionFeatureDisabled, admissionLandingUnavailable, admissionGateUnavailable, admissionGateMemoryFull,
+	admissionInventoryUnavail,
 	admissionKeyReused, admissionSKUNotFound, admissionInsufficientStock, admissionPurchaseLimit,
 	admissionBacklogged, admissionQueueUnavailable, admissionArchiveUnavailable, admissionReadBusy,
 	admissionCanceled, admissionDeadlineExceeded, admissionUnavailable, admissionInternal,

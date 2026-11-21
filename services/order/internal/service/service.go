@@ -115,9 +115,16 @@ type Config struct {
 	// GateFailureSpan 是闸门的熔断器打开之前，连续失败至少要持续的时间（breaker.Config.MinFailureSpan）。
 	// 零值表示只数次数（测试用；cmd/order 给 DefaultGateFailureSpan）。
 	GateFailureSpan time.Duration
+	// LandingFailureSpan 是落库健康的熔断器打开之前，连续失败至少要持续的时间，见 DefaultLandingFailureSpan。
+	// 零值表示只数次数（测试用；cmd/order 给 DefaultLandingFailureSpan）。
+	LandingFailureSpan time.Duration
 	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
 	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
 	Backlog stockgate.BacklogLimit
+	// GateMemoryWatermarkPercent 是闸门已用内存占上限的百分比到多少就停止受理（ADR-0034），取值 0 到 99。
+	// 零值表示不检查（测试用；cmd/order 给 DefaultGateMemoryWatermarkPercent）。
+	// 它只读 GateMemoryWatcher 存下的采样，没有启动那个组件时等于不检查。
+	GateMemoryWatermarkPercent int
 	// ReadMode 决定 GetOrder 能否读从库，见 ReadMode 的说明。零值 ReadPrimary。
 	// 不是 ReadPrimary 时 store 必须配置了从库、Deps.Marks 不能为空，否则 New 返回错误。
 	ReadMode ReadMode
@@ -246,6 +253,11 @@ type Service struct {
 	gateBreaker *breaker.Breaker
 	// gateRecoveredAt 是 gateBreaker 最近一次回到关闭的时刻（UnixNano），0 表示没有打开过。
 	gateRecoveredAt atomic.Int64
+	// 闸门内存的检查，见 gatememory.go。gateMem 是最近一次采样（从没采到过时为 nil），
+	// gateMemProbe 是采样用的函数（Gate.Memory，测试里换掉）。
+	gateMem        atomic.Pointer[gateMemorySample]
+	gateMemPercent int
+	gateMemProbe   func(ctx context.Context) (used, limit int64, err error)
 	// landing 是每个订单库的落库健康（下标是库号），见 admitLanding。
 	landing         []*landingHealth
 	landingCooldown time.Duration
@@ -291,6 +303,9 @@ func New(d Deps, cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.GateMemoryWatermarkPercent < 0 || cfg.GateMemoryWatermarkPercent > 99 {
+		return nil, fmt.Errorf("service: gate memory watermark must be between 0 and 99 percent, got %d", cfg.GateMemoryWatermarkPercent)
+	}
 	if cfg.ReadGateMaxConcurrency < 0 {
 		return nil, fmt.Errorf("service: read gate concurrency limit must not be negative, got %d", cfg.ReadGateMaxConcurrency)
 	}
@@ -331,6 +346,10 @@ func New(d Deps, cfg Config) (*Service, error) {
 		limits:         limits,
 		degrade:        set,
 	}
+	s.gateMemPercent = cfg.GateMemoryWatermarkPercent
+	if s.gate != nil {
+		s.gateMemProbe = s.gate.Memory
+	}
 	cooldown := cmp.Or(cfg.BreakerCooldown, breaker.DefaultCooldown)
 	s.gateBreaker = breaker.New(breaker.Config{
 		Name: gateBreakerName, Failures: cfg.BreakerFailures, Cooldown: cooldown, MinFailureSpan: cfg.GateFailureSpan,
@@ -339,7 +358,10 @@ func New(d Deps, cfg Config) (*Service, error) {
 	s.landingCooldown = cooldown
 	s.landing = make([]*landingHealth, dbs)
 	for i := range s.landing {
-		s.landing[i] = &landingHealth{b: s.newBreaker("landing-db-"+strconv.Itoa(i), cfg.BreakerFailures, cooldown)}
+		s.landing[i] = &landingHealth{b: breaker.New(breaker.Config{
+			Name: "landing-db-" + strconv.Itoa(i), Failures: cfg.BreakerFailures, Cooldown: cooldown,
+			MinFailureSpan: cfg.LandingFailureSpan, Now: s.clock, OnChange: s.breakerChanged,
+		})}
 	}
 	s.swAdmission = set.Switch(SwitchAdmission, "reject new orders (503); queries, cancellation and payment keep working")
 	s.swAdmission.Watch(s.admissionStatus)

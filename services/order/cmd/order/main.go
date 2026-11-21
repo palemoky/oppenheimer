@@ -184,6 +184,8 @@ type config struct {
 	idempotencyTTL           time.Duration
 	sweeper                  service.SweeperConfig
 	reaper                   service.ReaperConfig
+	gateMemoryPercent        int
+	gateMemoryInterval       time.Duration
 	backlog                  stockgate.BacklogLimit
 	kafkaBrokers             []string
 	kafkaPrefix              string
@@ -402,6 +404,19 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
 	}
 	cfg.backlog.MaxStale = stale
+	// 闸门内存的水位（ADR-0034）：已用内存占 maxmemory 的百分比到这个数就停止受理，0 表示不检查。
+	// 闸门没有设 maxmemory（本机）时这项检查不起作用。
+	percent, err := envInt("GATE_MEMORY_WATERMARK_PERCENT", service.DefaultGateMemoryWatermarkPercent)
+	if err != nil {
+		return cfg, err
+	}
+	if percent < 0 || percent > 99 {
+		return cfg, fmt.Errorf("GATE_MEMORY_WATERMARK_PERCENT must be between 0 and 99, got %d", percent)
+	}
+	cfg.gateMemoryPercent = int(percent)
+	if cfg.gateMemoryInterval, err = envDuration("GATE_MEMORY_INTERVAL", service.DefaultGateMemoryInterval); err != nil {
+		return cfg, err
+	}
 	if cfg.readPinTTL, err = envDuration("ORDER_READ_PIN_TTL", service.DefaultReadPinTTL); err != nil {
 		return cfg, err
 	}
@@ -703,14 +718,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 		Backlog:           cfg.backlog,
-		ReadMode:          cfg.readMode,
-		ReadPinTTL:        cfg.readPinTTL,
-		ReadGTIDTTL:       cfg.readGTIDTTL,
-		ReadGTIDWait:      cfg.readGTIDWait,
+		// ADR-0034：闸门内存到水位时停止受理，采样由下面的 gateMemory 组件做。
+		GateMemoryWatermarkPercent: cfg.gateMemoryPercent,
+		ReadMode:                   cfg.readMode,
+		ReadPinTTL:                 cfg.readPinTTL,
+		ReadGTIDTTL:                cfg.readGTIDTTL,
+		ReadGTIDWait:               cfg.readGTIDWait,
 		// 设计文档 1d 的 5.7：展示读对每个订单库、读冷库各有并发上限，满了答 RESOURCE_EXHAUSTED。
 		ReadMaxConcurrency:     cfg.readMaxConcurrency,
 		ReadGateMaxConcurrency: cfg.readGateMaxConcurrency,
 		GateFailureSpan:        service.DefaultGateFailureSpan,
+		LandingFailureSpan:     service.DefaultLandingFailureSpan,
 		ArchiveMaxConcurrency:  cfg.archiveMaxConcurrency,
 	})
 	if err != nil {
@@ -734,6 +752,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	reaper, err := service.NewReaper(svc, cfg.reaper)
+	if err != nil {
+		return err
+	}
+	gateMemory, err := service.NewGateMemoryWatcher(svc, cfg.gateMemoryInterval)
 	if err != nil {
 		return err
 	}
@@ -865,7 +887,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	for _, r := range relays {
 		components = append(components, r)
 	}
-	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
+	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper, gateMemory)
 	components = append(components, background...)
 	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, app.WithDebug(debugServer, components...)...)
 }

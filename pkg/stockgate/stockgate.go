@@ -547,6 +547,38 @@ func (g *Gate) Queued(ctx context.Context) (unclaimed, claimed int64, err error)
 	return u.Val(), c.Val(), nil
 }
 
+// Memory 返回闸门所在的 Redis 实例已用的内存和内存上限（INFO memory 的 used_memory、maxmemory，字节）。
+// limit 为 0 表示这个实例没有设上限。只读，受理端用它在写满之前先停止受理（ADR-0034）。
+//
+// 这两个数是整个实例的，不只是闸门的键：闸门的淘汰策略是 noeviction，实例满了谁的写入都会失败，
+// 所以要看的正是整个实例。主从或 Sentinel 下读到的是主库的值，写入的上限也是按主库算的。
+func (g *Gate) Memory(ctx context.Context) (used, limit int64, err error) {
+	info, err := g.client.Info(ctx, "memory").Result()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stockgate: info memory: %w", err)
+	}
+	var seenUsed, seenLimit bool
+	for line := range strings.Lines(info) {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok || (k != "used_memory" && k != "maxmemory") {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("stockgate: info memory: bad %s %q", k, v)
+		}
+		if k == "used_memory" {
+			used, seenUsed = n, true
+		} else {
+			limit, seenLimit = n, true
+		}
+	}
+	if !seenUsed || !seenLimit {
+		return 0, 0, errors.New("stockgate: info memory: used_memory or maxmemory missing from the reply")
+	}
+	return used, limit, nil
+}
+
 func (g *Gate) listBefore(ctx context.Context, key string, before time.Time, limit int) ([]int64, error) {
 	members, err := g.client.ZRangeByScore(ctx, g.prefix+key, &redis.ZRangeBy{
 		Min:   "-inf",

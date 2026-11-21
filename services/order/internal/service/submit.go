@@ -51,9 +51,12 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	defer cancel()
 
 	userID := req.GetUserId()
-	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。两项检查都在 Hold 之前：被拒绝时什么都没有发生。
+	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。三项检查都在 Hold 之前：被拒绝时什么都没有发生。
 	if s.swAdmission.Off() {
 		return nil, admissionFailed(ctx, errAdmissionOff)
+	}
+	if s.gateMemoryFull() {
+		return nil, admissionFailedAs(ctx, admissionGateMemoryFull, errGateFull)
 	}
 	settle, err := s.admitLanding(userID)
 	if err != nil {
