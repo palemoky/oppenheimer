@@ -6,9 +6,9 @@
 
 | 设备 | 配置 | 架构 | 角色 |
 |---|---|---|---|
-| MacBook Pro | M5，32GB，1TB | arm64 | 开发机；OrbStack 跑本地 compose；集群操作端 |
+| MacBook Pro | M5，32GB，1TB | arm64 | 备用的开发机和操作端（2026-11-21 之前是主要的）；平时只用来远程连到 Mac mini |
 | Ubuntu（3900X） | 12 核 24 线程，MSI MPG X570 GAMING PLUS，48GB，1TB 系统盘加 500GB 的 Windows 盘，GTX 1660 | x86_64 | 集群宿主机：KVM 虚拟机跑 k3s |
-| Mac mini | M4，16GB，256GB（`ssh mini`） | arm64 | 压测发起机（k6）；诊断 Agent 运行机 |
+| Mac mini | M4，16GB，256GB（`ssh mini`） | arm64 | 开发机；OrbStack 跑本地 compose；集群操作端；压测发起机（k6）；诊断 Agent 运行机 |
 | DS218+ | 12TB | x86_64 | NFS、镜像仓库存储、MySQL 备份 |
 | R2S | OpenWrt | — | 网关、DNS、DHCP、出网代理 |
 | RT-AC5300 | — | — | 交换和 Wi-Fi 接入（口是千兆） |
@@ -17,6 +17,7 @@
 
 - **集群放在 Ubuntu**：核心数最多，x86_64 镜像兼容性最好。用虚拟机而不是单机多容器节点，是为了能真实地关掉一个节点、切断节点间网络。
 - **压测机与集群分离**：压测工具和被测系统抢资源会让数据失真。
+- **开发和发压在同一台 Mac mini 上**（2026-11-21 起，主人定的：它一直开着、接有线，可以远程连上去，长时间的压测不用 MacBook 开着盖子陪跑）。代价是开发的负载会和 k6 抢 CPU，所以有一条规矩：**k6 在跑的时候，这台机器上不跑 `make test`、`make e2e`、`make images`、`make lint`；正式的一轮之前先 `make down`**（compose 空闲时也占约 4GB 内存）。长稳测试的几个小时里只做读文档、看监控、写记录这类事。
 - **Mac mini 不加入集群**：混合架构要求每个镜像都多架构构建，和学习目标无关。
 - **GTX 1660 不用于模型推理**：6GB 显存跑不了对诊断有用的模型，Agent 使用 Claude API。
 
@@ -24,9 +25,24 @@
 
 | 阶段 | 需要开机的设备 |
 |---|---|
-| 0、1 | MacBook |
-| 2 | MacBook、Ubuntu、NAS |
-| 3 及以后 | 全部 |
+| 0、1 | 开发机 |
+| 2 | 开发机、Ubuntu、NAS |
+| 3 及以后 | Mac mini、Ubuntu、NAS、R2S（MacBook 不需要） |
+
+## 开发机和操作端（Mac mini）
+
+仓库在 `~/code/personal/Oppenheimer`（和 MacBook 上同一个路径，Claude Code 的项目记忆按路径找）。这些东西在仓库之外，换一台机器要重新准备：
+
+- **工具**：Homebrew 装 go、golangci-lint、helm、kubernetes-cli、mysql-client（要自己加进 `PATH`，见 `~/.zshrc`）、shellcheck、jq、gh、k6；`./bin` 用 `make tools` 生成。版本以 `docs/infra/versions.md` 为准。
+- **OrbStack**：`~/.orbstack/config/docker.json` 的 `insecure-registries` 里要有集群的镜像仓库（`192.168.50.50:5000`，它是 HTTP 的），否则 `make images` 推不上去。内存上限 8GB（OrbStack 的默认，物理内存的一半），留着不调大：剩下的要给 k6。
+- **ssh**：`~/.ssh/config` 里 `ubt` 指向宿主机（192.168.50.7）；这台机器的公钥在宿主机和三台虚拟机的 `authorized_keys` 里。**虚拟机的那一份是手工加的**：`vm.sh create` 只写入发起那台机器的公钥（`on-host.sh` 传过去的），从哪台机器重建集群，另一台就要重新加。
+- **`mini` 这个别名在 Mac mini 上指向 `127.0.0.1`**（自己的公钥在自己的 `authorized_keys` 里）。`scripts/cluster/k6.sh` 固定经 `ssh mini` 跑 k6，这样在哪台机器上发起都是同一条代码路径，脚本不用区分。
+- **kubeconfig**：`scripts/cluster/k3s.sh kubeconfig` 取到 `~/.kube/oppenheimer.yaml`。
+- **`gh`**：要 `gh auth login`（令牌不随机器搬）。
+- **`tmp/`** 不入库。历次压测、对账的原始数据从 MacBook 复制过来了（`tmp/k6`、`tmp/recon`、`tmp/cluster-bench` 等）；1d 的压测、本机 bench 和 chaos 的日志（共约 3.7GB）留在 MacBook 上没有搬。
+- **本地 compose 的数据是新的**：MacBook 上那套扩成 4 个订单库、带 500 万归档订单的环境没有搬（`docs/PROGRESS.md` 的“本机开发环境”一节写的是 MacBook）。Mac mini 上是干净的 2 库环境，`make test`、`make e2e` 不受影响；要重做 1c 的扩容和归档演练，回 MacBook 或者重新灌数。
+- **Mac mini 上有 Little Snitch**，新装或升级过的可执行文件第一次出站要主人在图形界面里放行。没放行时的样子：Go 程序报 `connect: bad file descriptor`，kubectl 报 `read tcp ...: connection reset`，而 `curl` 是通的。用 Homebrew 装或升级 go、kubectl、helm、golangci-lint、k6 之后，以及 `make build`、`make tools` 生成了新的二进制要连局域网或外网时，先想到它。不要换一个已放行的程序去绕。（2026-11-18 记的“macOS 本地网络权限挡住 k6”多半也是它，没有回头核对。）
+- 经 ssh 的非交互命令不读 `~/.zshrc`，`PATH` 里没有 Homebrew。远程执行 make 时用登录的交互 shell，或者先导出 `PATH`。
 
 ## 宿主机
 

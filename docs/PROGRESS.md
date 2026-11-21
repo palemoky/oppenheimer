@@ -9,7 +9,19 @@
 - **最后更新**：2026-11-21（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
-### 3b 第 2 轮之后：盘的验证和幂等键（2026-11-21，这一段最新，新会话先读这里）
+### 开发和操作搬到 Mac mini（2026-11-21，这一段最新，新会话先读这里）
+
+主人定的：之后的任务远程连到 Mac mini 上做，MacBook 不再需要开着。规矩和要在仓库之外准备的东西写在 `docs/infra/hardware.md` 的“开发机和操作端（Mac mini）”一节，**先读它**。最要紧的一条：k6 在跑的时候这台机器上不跑测试、lint、构建镜像。
+
+- **做完的**（从 MacBook 经 `ssh mini` 做的）：仓库 clone 到 `~/code/personal/Oppenheimer`（`phase-3b`）；Homebrew 装了 golangci-lint 2.15.0、helm 4.3.2、kubectl 1.37.2、mysql-client、shellcheck，go 升到 1.27.4、gh 升到 2.105.0（`~/go/bin` 里旧的 golangci-lint 2.12.2 改名成了 `golangci-lint.old-2.12.2`，`~/.zshrc` 加了 mysql-client 的 `PATH`）；OrbStack 启动并配了集群仓库的 `insecure-registries`（仓库的 `/v2/` 返回 200）；`~/.ssh/config` 的 `ubt` 改成 192.168.50.7（原来指向它自己，改之前的备份是 `~/.ssh/config.bak-20261121`），加了指向 `127.0.0.1` 的 `mini`；它的公钥加进了三台虚拟机（宿主机上本来就有），宿主机和虚拟机的主机密钥是从 MacBook 的 `known_hosts` 抄过去的；`ssh ubt`（免密 sudo）、三台虚拟机、`ssh mini` 都通；kubeconfig 用 `k3s.sh kubeconfig` 取好了；`make up` 起来了（干净的 2 库环境）；Claude Code 的全局 `CLAUDE.md`、`ci-watcher` 和 `quick-ops` 两个子 Agent、本项目的记忆复制过去了；`tmp/` 里的压测和对账原始数据复制了约 290MB。
+- **没有做完，卡在主人**：
+  1. **Little Snitch 没有放行新装的 go、kubectl、helm**（现象和原因见 `hardware.md`）。所以 `make tools` 失败（`./bin` 还没有）、`make lint test` 没有跑通（lint 拉不到模块）、`make loadtest ARGS="preflight"` 第一条就失败（“cannot list pods”是 kubectl 连不上，不是集群有问题）。主人在 Mac mini 的屏幕上放行之后，在 Mac mini 上依次验证：`make tools`、`make lint test`、`make loadtest ARGS="preflight"`、`make images IMAGE_SERVICES=cdc`（验证 amd64 构建和推送）、一次很短的 `make k6`（验证 `ssh mini` 连自己这条路）。**这五条都没有在 Mac mini 上通过过。**
+  2. `gh auth login`：Mac mini 上的令牌是失效的。
+  3. `bin/istio-<版本>/bin/istioctl` 没有取（`scripts/cluster/mesh.sh fetch`），`make cluster-fault`、`make mesh-status` 要用。
+- 下面“本机开发环境”一节和更早的记录里说的“本机”是 MacBook。
+- 3b 的下一步没有变：见下一段“下一步”的第 2、3 项（第 3 轮从读路径的过载开始）。
+
+### 3b 第 2 轮之后：盘的验证和幂等键（2026-11-21，接着读这里）
 
 **断点（2026-11-20 17:30 UTC）。** 先读 `docs/notes/3b-rounds/round-2-concurrency-and-consumers.md` 的第 10 节和 ADR-0033。下面“3b 第 2 轮”里“三件挡路的事”都有了答复。
 
@@ -18,7 +30,7 @@
 - **盘变慢的原因查清了一层（记录第 10 节）**：不是我们的写入量触发的。这块消费级的盘在持续的刷盘负载下，几分钟后单次刷盘的耗时自己翻倍（宿主机上 1.8 到 4 毫秒），空闲一两分钟恢复；`fio` 的恒定负载能单独复现。慢的一档是稳态。盘健康、没有热降速。**对照 A 的 239 单/秒只是突发能力，持续的能力是 125 到 150 单/秒；长稳和容量结论都要在慢的一档上量。** 快的一档能撑多久没有规律（2 到 12 分钟）。再往上只有两条路：每单的提交次数减半，或者换有掉电保护的盘。**主人 2026-11-21 定：两条都不走，接受现在的拐点**，容量结论按持续 125 到 150 单/秒写（记录第 10 节末尾、“计划变更记录”）。
 - **幂等键只留 1 小时（ADR-0033）**：`DefaultIdempotencyTTL` 24 小时改成 1 小时；`IDEMPOTENCY_TTL` 比 `PAYMENT_TIMEOUT` 短时 order 拒绝启动（`main.go`，有配置测试）。order 模块 `make lint` 0 issues、`make test` 通过（`tmp/test-3b-idem-ttl.log`）；提交之前全量 `make lint test` 通过（2026-11-21，`tmp/lint-test-3b-close.log`）；**本机没有跑 e2e**，靠推送后的 CI。已部署（只滚动了 order），下了一单核对过键的 TTL 是 3599 秒。`redis-gate` 的 768mb 不降。原来 24 小时的键要到 2026-11-21 17:00 UTC 前后才过期完（2026-11-20 17:30 UTC 闸门里一共约 26 万个键）。
 - **这次跑的一轮**：`l4a-order-hostio`（参数同对照 D），对账通过（125581 单，差异 0，`PASS`），数和 D 接近（125 档 124 单/秒、p99 1.8 秒；156 档 156、4.9 秒；195 档 190、10 秒；244 档 212、29 秒）。宿主机上的 `iostat` 等原始数据在 `tmp/k6/l4a-order-hostio/`。
-- **已提交并推送到 `phase-3b`**（2026-11-21，主人要求；三个提交：幂等键、`host-setup.sh`、文档）。集群上 order 的镜像仍是当时带 `-dirty` 的 tag，内容和提交的一致，下次 `make deploy` 会换成干净的。CI 的结果见本段末尾。
+- **已提交并推送到 `phase-3b`**（2026-11-21，主人要求；三个提交：幂等键、`host-setup.sh`、文档）。集群上 order 的镜像仍是当时带 `-dirty` 的 tag，内容和提交的一致，下次 `make deploy` 会换成干净的。`361d316` 的 CI：29 项里 28 项通过（`test (./services/order)` 4 分 27 秒、e2e 3 分 18 秒），失败 1 项 `test (./services/payment)`：`TestFullBatchRunsNextRoundWithoutWaiting` 报 `outbox: count pending: context canceled`。和这次的改动无关，是测试自己的竞态（测试里的 `kicker.Kick` 用 `t.Context()`，它在测试函数返回时就取消，早于 Cleanup 里的 `Stop`，还在收尾的 worker 调到它就失败；第 1 轮把支付出结果改成并发之后才可能出现）。已改成 `context.WithoutCancel`，只动了测试，payment 模块 `make lint`、`make test` 通过。**这个修复和搬到 Mac mini 的文档改动（`AGENTS.md`、`docs/infra/hardware.md`、`docs/design/3b-load-testing.md`、`scripts/cluster/cluster.env`、本文件）还在 MacBook 的工作区里，没有提交**，等主人说提交；Mac mini 上的 clone 因此停在 `361d316`，看不到这一段。
 - **集群现在的状态**：order 的镜像 `3470edb-dirty-20261120171654`，其余五个服务仍是 `4c85475`；压测 SKU 用到 7113，**下一批从 7114 起**；库里压测留下的订单约 107 万单；宿主机上多装了 `fio`、`nvme-cli`（没有进 `host-setup.sh`）；按地址的限流仍然关着，gateway、order 仍然钉在 2 个副本；库里多了一单核对用的订单（用户 900777，SKU 3001，会超时关单）。
 - **下一步**：
   1. （已答复，2026-11-21）提交并推送：做了；`SHUTDOWN_TIMEOUT`：调到 300；盘：接受现在的拐点。
@@ -547,9 +559,9 @@
 
 | 设备 | 状态 |
 |---|---|
-| MacBook Pro | 在用 |
+| MacBook Pro | 备用；只用来远程连 Mac mini |
 | Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机各 14 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
-| Mac mini | 开机，k6 2.4.0，有线接入，`ssh mini` 能登录（2026-11-21 核对） |
+| Mac mini | 开机，k6 2.4.0，有线接入；2026-11-21 起是开发机和集群操作端（见 `docs/infra/hardware.md`） |
 | DS218+ | 开机（2026-11-17） |
 
 ## 计划变更记录
@@ -616,6 +628,7 @@
 | 2026-11-20 | 3b 的第 2 轮原定是“落库消费者的应用层组提交”（第 0 轮记录第 7 节第 2 条），改成“调大落库的并发加三个串行消费者改并发”；应用层组提交建议不做，等主人确认 | 不改代码的对照显示 MySQL 的组提交在并发够时已经把提交合并了，第 0 轮“单独调大并发没有用”的判断是错的。见 `docs/notes/3b-rounds/round-2-concurrency-and-consumers.md` 第 1 节 |
 | 2026-11-21 | 应用层的组提交确定不做（主人确认）；3b 多了一项“闸门里的幂等键只留 1 小时”（ADR-0033）；“减少每单的提交次数”成为候选的下一个方向，还没有定 | 在宿主机上验证了盘变慢是这块盘自身的稳态行为，不是负载触发的（第 2 轮记录第 10 节）；压测把闸门 Redis 写满过 |
 | 2026-11-21 | 接受 3b 现在的写入拐点（慢的一档下持续 125 到 150 单/秒）：不做“每单的提交次数减半”，不换盘；容量结论按这个上限写 | 主人确认。瓶颈和再往上的代价已经清楚，再做只是让这块盘上的数字翻倍。见第 2 轮记录第 10 节末尾 |
+| 2026-11-21 | 开发机和集群操作端从 MacBook 换成 Mac mini（它同时还是发压机）；k6 在跑时不在它上面跑测试和构建 | 主人要求：Mac mini 一直开着，可以远程连上去做。见 `docs/infra/hardware.md` |
 
 ## 会话日志
 
