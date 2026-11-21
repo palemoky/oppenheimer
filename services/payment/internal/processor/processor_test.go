@@ -51,7 +51,9 @@ type kicker struct {
 
 func (k *kicker) Kick() {
 	k.kicks.Add(1)
-	n, err := outbox.Pending(k.t.Context(), k.db)
+	// t.Context() 在测试函数返回时就取消了，早于 Cleanup 里的 Stop；这时还在收尾的 worker 调到这里，
+	// 查询会以 context canceled 失败，测试就偶发地挂掉（CI 上出现过）。Stop 会等 worker 结束，数据库也还开着。
+	n, err := outbox.Pending(context.WithoutCancel(k.t.Context()), k.db)
 	if err != nil {
 		k.t.Error(err)
 		return
