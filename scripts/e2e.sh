@@ -99,6 +99,10 @@ export LOG_LEVEL=warn
 export RATE_LIMIT=on
 export RATE_LIMIT_IP=off
 unset RATE_LIMIT_USER RATE_LIMIT_ROUTE
+# 问一次限流 Redis 的时限从默认的 20ms 放宽到 500ms。ratelimit_test.go 断言的是 Redis 里那个桶的精确限额；
+# 时限一到 Fallback 就退回进程内的桶（满的，再放行一个桶容量），受理数会超过断言的上限。
+# CI 上出现过：30 个并发请求里一次回复超时，受理了 14 个（上限 12）。退回的行为由 pkg/ratelimit 和 gateway 的单元测试覆盖。
+export RATE_LIMIT_REDIS_TIMEOUT=500ms
 
 export E2E_GATEWAY_URL=http://127.0.0.1:8080
 export E2E_INVENTORY_DSN="root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:${MYSQL_PORT})/e2e_inventory_db"
