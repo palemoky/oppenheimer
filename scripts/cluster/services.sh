@@ -22,6 +22,8 @@
 #                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
 #   LOADTEST       deploy 时设为 1，在 deploy/cluster/services/<服务>.yaml 之上叠 deploy/cluster/services/loadtest/<服务>.yaml
 #                  （压测用：关掉 gateway 按客户端地址的限流 RATE_LIMIT_IP）。不影响 e2e 那一套。压完不带它再 deploy 一次就恢复。
+#   LOADTEST_EMPTY deploy 时设为 1，再叠 deploy/cluster/services/loadtest-empty/（空表对照：DSN 指到 e2e_* 空库，Kafka、Redis 带前缀）。
+#                  不要手工设：库要先建好，由 scripts/cluster/loadtest.sh empty-up、empty-down 成对地做。
 # 服务之间走 Istio 的边车（设计文档 2d）：deploy、e2e-up 要求 istiod 已经装好（make mesh-up），在部署任何 release
 # 之前对目标命名空间 kubectl apply deploy/cluster/mesh/（流量规则先于 Pod 存在），全部滚动完之后再应用
 # deploy/cluster/mesh/security/（mTLS 严格模式和按身份的访问控制）。
@@ -157,6 +159,13 @@ helm_args() { # 服务 tag
   # LOADTEST=1：长期运行的那一套叠压测用的一层（scripts/cluster/loadtest.sh 的 pin、preflight 配合使用）。
   if [[ $E2E_MODE -eq 0 && "${LOADTEST:-0}" == 1 && -f "$VALUES/loadtest/$s.yaml" ]]; then
     HELM_ARGS+=(-f "$VALUES/loadtest/$s.yaml")
+  fi
+  # LOADTEST_EMPTY=1：空表对照，长期运行的那一套指到 e2e_* 空库（只由 scripts/cluster/loadtest.sh empty-up 设）。
+  if [[ $E2E_MODE -eq 0 && "${LOADTEST_EMPTY:-0}" == 1 ]]; then
+    HELM_ARGS+=(-f "$VALUES/loadtest-empty/common.yaml")
+    if [[ -f "$VALUES/loadtest-empty/$s.yaml" ]]; then
+      HELM_ARGS+=(-f "$VALUES/loadtest-empty/$s.yaml")
+    fi
   fi
   if [[ $E2E_MODE -eq 1 ]]; then
     HELM_ARGS+=(-f "$E2E_VALUES/common.yaml")

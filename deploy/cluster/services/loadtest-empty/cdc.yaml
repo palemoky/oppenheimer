@@ -1,0 +1,6 @@
+# 列表在 Helm 里是整个替换：整条 DSN 重写，只改库名（见 common.yaml）。
+# server-id 不改：这不是第二套 cdc，是同一个 cdc 换了库。位点存在带 KAFKA_PREFIX 的 topic 里，所以从空位点开始；
+# 切回去之后正式的 cdc 从它自己的位点接着读，这期间从库 binlog 里 e2e_* 库的事件它会跳过（流水线只认 DSN 里的库）。
+expandEnv:
+  - name: CDC_SOURCE_DSNS
+    value: "cdc:$(MYSQL_ORDER_0_CDC_PASSWORD)@tcp(mysql-order-0-1.mysql-order-0.mysql.svc:3306)/e2e_order_db_0,cdc:$(MYSQL_ORDER_1_CDC_PASSWORD)@tcp(mysql-order-1-1.mysql-order-1.mysql.svc:3306)/e2e_order_db_1"
