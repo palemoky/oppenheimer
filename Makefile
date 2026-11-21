@@ -272,7 +272,7 @@ middleware-up: ## 在集群上部署中间件：Redis（主从加 Sentinel、Clu
 	scripts/cluster/middleware.sh all
 
 .PHONY: mesh-up
-mesh-up: ## 装 Istio 的控制面 istiod；要在 make middleware-up 之后、make deploy 之前；可重复执行
+mesh-up: ## 装 Istio 的控制面 istiod 和全网格的指标配置（Telemetry）；要在 make middleware-up 之后、make deploy 之前；可重复执行
 	scripts/cluster/mesh.sh up
 
 .PHONY: mesh-status
@@ -283,12 +283,20 @@ mesh-status: ## 查看 Istio 控制面的状态（Pod、Helm release、istioctl 
 mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod，确认请求经过两边的边车并且是 mTLS，跑完清掉
 	scripts/cluster/mesh.sh check
 
+.PHONY: monitoring-up
+monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter、Istio 边车和 istiod 的抓取对象），再装 KEDA 到命名空间 keda；要在 make middleware-up 之后、make deploy 之前（exporter 要连 MySQL，gateway 和 order 的 chart 里有 KEDA 的 ScaledObject）；可重复执行
+	scripts/cluster/monitoring.sh up
+
+.PHONY: monitoring-status
+monitoring-status: ## 看可观测后端的状态：Pod 在哪个节点、卷、不健康的抓取目标、连不上的数据库（mysql_up、redis_up 为 0）
+	scripts/cluster/monitoring.sh status
+
 .PHONY: images
 images: ## 构建七个业务服务的 linux/amd64 镜像并推送到集群仓库，tag 是提交号（有未提交改动时带 -dirty-时间）；make images IMAGE_SERVICES="order gateway" 只做部分
 	scripts/cluster/images.sh all $(IMAGE_SERVICES)
 
 .PHONY: deploy
-deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
+deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部署到集群（chart 在 deploy/charts/service）；服务之间走 Istio 的边车，要先 make mesh-up；gateway、order 按请求速率伸缩，要先 make monitoring-up（装 KEDA）；make deploy IMAGE_SERVICES="order gateway" 只做部分，可重复执行
 	@tag="$$(scripts/cluster/images.sh tag)" && \
 	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
 	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)

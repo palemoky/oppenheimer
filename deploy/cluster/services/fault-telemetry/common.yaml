@@ -1,0 +1,7 @@
+# 可选的一层，叠在 deploy/cluster/services/fault/ 之上：FAULT_TELEMETRY=1 make cluster-fault 时生效（scripts/cluster/fault.sh）。
+# fault 那一层把导出关掉了（没有 e2e 的测试 Job 来收）。这里改成导出到集群里的 Collector，
+# 故障注入期间服务自己的指标、链路就进了 Prometheus 和 Tempo（k8s_namespace_name 是 oppenheimer-e2e），
+# 可以拿监控上看到的数和脚本从边车直接读到的数对一遍（设计文档 3a 第 5 节的验证 6）。
+# 要先 make monitoring-up。平时不开：故障注入的断言不依赖监控，监控不在时不应该跑不了。
+config:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-gateway.monitoring:4317

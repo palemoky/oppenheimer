@@ -1,0 +1,131 @@
+# Loki 的 Helm values（chart 和应用版本在 scripts/cluster/cluster.env 的 LOKI_CHART_VERSION、LOKI_VERSION）。
+# 设计文档 3a、ADR-0030。由 scripts/cluster/monitoring.sh loki 安装到命名空间 monitoring，release 名 loki。
+#
+# 单体模式（一个进程里跑全部组件）、一个副本、数据放在 local-path 的卷上。这是学习用的集群，日志量很小；
+# 单体模式的代价是没有高可用：Pod 重启期间写入会失败，Collector 那边要靠重试和队列兜住（见设计文档）。
+
+deploymentMode: SingleBinary
+
+# 单体模式的 Service 叫 loki（不带 -headless 的那个），Collector 和 Grafana 都用 http://loki.monitoring:3100。
+# gateway 是 nginx，只在要多租户鉴权或者把读写路径分开时才需要，这里直接暴露 Loki 本身。
+gateway:
+  enabled: false
+
+loki:
+  # 单租户：不用带 X-Scope-OrgID，Grafana 数据源也就不用配租户头。
+  auth_enabled: false
+
+  commonConfig:
+    # 只有一个副本；默认的 3 会让写入一直等不到足够的副本。
+    replication_factor: 1
+
+  storage:
+    type: filesystem
+    filesystem:
+      chunks_directory: /var/loki/chunks
+      rules_directory: /var/loki/rules
+
+  # tsdb + v13 是当前推荐的组合：v13 才支持结构化元数据，tsdb 取代了 boltdb-shipper。
+  # from 一旦写进去就不能改（改了之前的数据就读不到）；新建集群时它只要早于第一条日志就行。
+  schemaConfig:
+    configs:
+      - from: "2026-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h # tsdb 只支持 24h
+
+  limits_config:
+    # 保留期。光设这个不会删东西，还要打开下面 compactor 的 retention_enabled。
+    retention_period: 168h
+    # 结构化元数据：trace_id、span_id 这类高基数的值放在这里，不进标签，也不会因此多出日志流。
+    # OTLP 写入进来的资源属性里，除了一小批默认提成标签的（service.name、k8s.namespace.name 等），
+    # 其余的和日志记录自己的属性都会变成结构化元数据；Loki 默认不会把它们提成标签，基数是安全的。
+    allow_structured_metadata: true
+    # 日志的时间戳比这个旧、或者比现在新太多的，直接拒绝。保留期是 7 天，没必要接受更旧的。
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+    # 写入限额。默认是每秒 4 MB、突发 6 MB（整个租户），每条流每秒 3 MB、突发 15 MB。
+    # 突发量同时是“单次请求最大能多大”：比它大的请求永远被拒绝（429），重试没有用。
+    # Collector 积压之后补发、或者压测时日志量上来，都会撞上默认值（2026-11-17 实测，设计文档 3a 第 8 节“验证 5”）。
+    # 这里只有一个租户、一个写入方，限额的作用只剩下保护 Loki 自己的内存，放宽到内存受得了的程度。
+    ingestion_rate_mb: 16
+    ingestion_burst_size_mb: 32
+    per_stream_rate_limit: 8MB
+    per_stream_rate_limit_burst: 32MB
+    # 单体模式下一次查询不要把自己撑爆。
+    max_query_parallelism: 4
+
+  # 真正删数据的是 compactor。单体模式里它和其他组件在同一个进程里。
+  compactor:
+    working_directory: /var/loki/compactor
+    retention_enabled: true
+    delete_request_store: filesystem
+    retention_delete_delay: 2h
+
+  # 不往 grafana.com 上报使用统计。
+  analytics:
+    reporting_enabled: false
+
+  # Loki 自己的链路埋点不用（它的 span 没有人看）。
+  tracing:
+    enabled: false
+
+singleBinary:
+  replicas: 1
+  # 只是规则同步用的边车（k8s-sidecar），没有用 ruler，不要。
+  sidecar: false
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 1536Mi}
+  extraEnv:
+    # Go 的内存上限设得比容器上限低一点，GC 会在撞上 cgroup 上限被 OOM 杀掉之前更勤地回收。
+    - name: GOMEMLIMIT
+      value: 1400MiB
+  # 优先放到 k3s-server（和 kube-prometheus-stack.yaml 一样的理由：阶段 4 关的是 agent 节点，监控不能跟着被关）。
+  # 用“优先”而不是“必须”。chart 默认的是“同节点互斥”的硬反亲和，只有一个副本，没有意义，一并替换掉。
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+  persistence:
+    enabled: true
+    storageClass: local-path
+    size: 10Gi
+    accessModes: [ReadWriteOnce]
+
+# 单体模式用不到的部署模式，副本数必须明确写 0（chart 默认值里它们不是 0）。
+backend: {replicas: 0}
+read: {replicas: 0}
+write: {replicas: 0}
+ingester: {replicas: 0}
+querier: {replicas: 0}
+queryFrontend: {replicas: 0}
+queryScheduler: {replicas: 0}
+distributor: {replicas: 0}
+compactor: {replicas: 0}
+indexGateway: {replicas: 0}
+bloomGateway: {replicas: 0}
+
+# 缓存：memcached 吃内存，这点数据没有意义。
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+# canary 和 helm test 要往 Loki 里写测试日志、起测试 Pod，用不到。
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+
+# 指标由 Prometheus 抓（kube-prometheus-stack 认所有命名空间的 ServiceMonitor）。
+# 这个 chart 已经没有 self-monitoring（自带的 Grafana Agent）和 minio 子 chart 了，不用再关。
+monitoring:
+  serviceMonitor:
+    enabled: true

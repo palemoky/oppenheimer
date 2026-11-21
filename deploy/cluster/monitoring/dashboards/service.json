@@ -1,0 +1,2875 @@
+{
+  "id": null,
+  "uid": "opp-service",
+  "title": "Oppenheimer / 单服务",
+  "tags": [
+    "oppenheimer"
+  ],
+  "editable": true,
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "命名空间",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(target_info, k8s_namespace_name)",
+          "refId": "v"
+        },
+        "definition": "label_values(target_info, k8s_namespace_name)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "oppenheimer",
+          "value": "oppenheimer"
+        }
+      },
+      {
+        "name": "service",
+        "label": "服务",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(target_info{k8s_namespace_name=\"$namespace\"}, service_name)",
+          "refId": "v"
+        },
+        "definition": "label_values(target_info{k8s_namespace_name=\"$namespace\"}, service_name)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "order",
+          "value": "order"
+        }
+      },
+      {
+        "name": "pod",
+        "label": "Pod",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(target_info{k8s_namespace_name=\"$namespace\", service_name=\"$service\"}, k8s_pod_name)",
+          "refId": "v"
+        },
+        "definition": "label_values(target_info{k8s_namespace_name=\"$namespace\", service_name=\"$service\"}, k8s_pod_name)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 49,
+      "type": "row",
+      "title": "RED：gRPC 服务端",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "请求量（按方法）",
+      "description": "各 gRPC 方法的 QPS。回答：流量是否正常、是否有某个方法突然掉到 0 或暴涨。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (rpc_method) (rate(rpc_server_call_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{rpc_method}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "服务端故障（按状态码）",
+      "description": "非 OK 且不属于降级/限流的状态码速率（INTERNAL、UNAVAILABLE、DEADLINE_EXCEEDED 等）。持续大于 0 就是真故障；没有数据表示没有故障。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (rpc_method, rpc_response_status_code) (rate(rpc_server_call_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", rpc_response_status_code!~\"OK|FAILED_PRECONDITION|RESOURCE_EXHAUSTED\"}[$__rate_interval]))",
+          "legendFormat": "{{rpc_method}} {{rpc_response_status_code}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "降级与限流（FAILED_PRECONDITION / RESOURCE_EXHAUSTED）",
+      "description": "业务上的正常拒绝：FAILED_PRECONDITION 为降级或前置条件不满足，RESOURCE_EXHAUSTED 为限流或舱壁满。有数据说明服务正在保护自己，比例高要查依赖。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (rpc_method, rpc_response_status_code) (rate(rpc_server_call_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", rpc_response_status_code=~\"FAILED_PRECONDITION|RESOURCE_EXHAUSTED\"}[$__rate_interval]))",
+          "legendFormat": "{{rpc_method}} {{rpc_response_status_code}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "p50 延迟（按方法）",
+      "description": "gRPC 服务端处理耗时中位数。明显高于平时说明整体变慢。点 exemplar 可跳到链路。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{rpc_method}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "p95 延迟（按方法）",
+      "description": "95 分位耗时。p95 接近上游超时预算说明尾部风险；对比 p50 看长尾。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{rpc_method}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "p99 延迟（按方法）",
+      "description": "99 分位耗时。持续逼近超时就会产生 DEADLINE_EXCEEDED；点 exemplar 查慢链路。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{rpc_method}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      }
+    },
+    {
+      "id": 50,
+      "type": "row",
+      "title": "RED：HTTP 服务端（仅 gateway 有数据）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "请求量（按路由）",
+      "description": "HTTP 各路由的 QPS。只有 gateway 有数据，其他服务为空是正常的。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (http_route) (rate(http_server_request_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{http_route}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "状态码分布",
+      "description": "按响应状态码的请求速率。5xx 持续出现、或 404/429 突增都不正常；unmatched 路由有量说明有人在乱打请求。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "p50 延迟（按路由）",
+      "description": "HTTP 中位耗时，仅 gateway。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{http_route}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "p95 延迟（按路由）",
+      "description": "HTTP 95 分位耗时，仅 gateway。高于网关总时限的一半要警惕。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{http_route}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 26
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "p99 延迟（按路由）",
+      "description": "HTTP 99 分位耗时，仅 gateway；点 exemplar 跳链路。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+          "legendFormat": "{{http_route}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 26
+      }
+    },
+    {
+      "id": 51,
+      "type": "row",
+      "title": "出站调用：gRPC 客户端",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "panels": [
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "请求量（按对端方法）",
+          "description": "本服务调用下游 gRPC 方法的 QPS。对不上入口流量说明扇出异常。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (rpc_method) (rate(rpc_client_call_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{rpc_method}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 0,
+            "y": 35
+          }
+        },
+        {
+          "id": 13,
+          "type": "timeseries",
+          "title": "错误（按对端方法与状态码）",
+          "description": "调用下游得到的非 OK 状态码速率。FAILED_PRECONDITION 与 RESOURCE_EXHAUSTED 是下游降级或限流，其余是故障。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (rpc_method, rpc_response_status_code) (rate(rpc_client_call_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", rpc_response_status_code!=\"OK\"}[$__rate_interval]))",
+              "legendFormat": "{{rpc_method}} {{rpc_response_status_code}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 6,
+            "y": 35
+          }
+        },
+        {
+          "id": 14,
+          "type": "timeseries",
+          "title": "p95 延迟（按对端方法）",
+          "description": "调用下游的 95 分位耗时（含网络和边车）。明显高于下游自己的服务端耗时说明问题在链路中间。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, rpc_method) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{rpc_method}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 12,
+            "y": 35
+          }
+        },
+        {
+          "id": 15,
+          "type": "timeseries",
+          "title": "p99 延迟（按对端方法）",
+          "description": "调用下游的 99 分位耗时。逼近这一跳的超时预算就会超时。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le, rpc_method) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{rpc_method}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 35
+          }
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "row",
+      "title": "MySQL",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": [
+        {
+          "id": 16,
+          "type": "timeseries",
+          "title": "语句耗时 p95（按操作）",
+          "description": "database/sql 各操作（query、exec、begin_tx、prepare 等）95 分位耗时；该指标只有 MySQL。exec/query 持续变慢说明库压力大或锁等待。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, db_operation_name) (rate(db_client_operation_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", db_system_name=\"mysql\"}[$__rate_interval])))",
+              "legendFormat": "{{db_operation_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 44
+          }
+        },
+        {
+          "id": 17,
+          "type": "timeseries",
+          "title": "语句耗时 p99（按库）",
+          "description": "按库（db_namespace）的 99 分位耗时，对比分片间是否倾斜。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le, db_namespace) (rate(db_client_operation_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", db_system_name=\"mysql\", db_operation_name=~\"sql.conn.(exec|query|begin_tx)|sql.stmt.exec\"}[$__rate_interval])))",
+              "legendFormat": "{{db_namespace}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 44
+          }
+        },
+        {
+          "id": 18,
+          "type": "timeseries",
+          "title": "操作速率（按操作）",
+          "description": "各类数据库操作的速率。对比请求量看是否出现放大。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (db_operation_name) (rate(db_client_operation_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", db_system_name=\"mysql\"}[$__rate_interval]))",
+              "legendFormat": "{{db_operation_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 44
+          }
+        },
+        {
+          "id": 19,
+          "type": "timeseries",
+          "title": "连接池：在用连接 vs 上限",
+          "description": "每个 Pod 每个库的在用连接数与 MaxOpenConns。在用贴近上限就会排队等连接。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max by (k8s_pod_name, db_namespace) (db_sql_connection_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", status=\"inuse\"})",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} 在用",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max by (k8s_pod_name, db_namespace) (db_sql_connection_max_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} 上限",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 52
+          }
+        },
+        {
+          "id": 20,
+          "type": "timeseries",
+          "title": "连接池：等待次数",
+          "description": "等待获取连接的速率。持续大于 0 说明连接池太小或语句太慢。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 52
+          }
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "连接池：平均等待时长",
+          "description": "每次等待连接的平均时长（毫秒；该指标本身以毫秒为单位）。超过几十毫秒会直接拖慢请求。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_duration_milliseconds_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])) / sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 52
+          }
+        }
+      ]
+    },
+    {
+      "id": 53,
+      "type": "row",
+      "title": "Redis",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panels": [
+        {
+          "id": 22,
+          "type": "timeseries",
+          "title": "命令耗时 p95（连接占用时间）",
+          "description": "Redis 没有单独的命令耗时指标，这里用连接被占用的时间（毫秒）近似一次命令的耗时。p95 超过几毫秒说明 Redis 或网络变慢。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, pool_name) (rate(db_client_connections_use_time_milliseconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{pool_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 61
+          }
+        },
+        {
+          "id": 23,
+          "type": "timeseries",
+          "title": "命令耗时 p99（连接占用时间）",
+          "description": "同上，99 分位。尾部抖动会影响库存闸门等热路径。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le, pool_name) (rate(db_client_connections_use_time_milliseconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{pool_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 61
+          }
+        },
+        {
+          "id": 24,
+          "type": "timeseries",
+          "title": "命令速率（按池）",
+          "description": "按连接池统计的命令速率（连接使用次数）。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name) (rate(db_client_connections_use_time_milliseconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{pool_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 61
+          }
+        },
+        {
+          "id": 25,
+          "type": "timeseries",
+          "title": "连接池：使用中与空闲",
+          "description": "每个池的连接数（used/idle）及上限。used 贴近上限就会等待连接。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name, state) (db_client_connections_usage{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{pool_name}} {{state}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max by (pool_name) (db_client_connections_max{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{pool_name}} 上限",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 69
+          }
+        },
+        {
+          "id": 26,
+          "type": "timeseries",
+          "title": "连接池：等待与超时",
+          "description": "waits 为等待连接的速率，timeouts 为等不到连接而超时的速率。timeouts 大于 0 就是故障。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name) (rate(db_client_connections_waits{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{pool_name}} 等待",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name) (rate(db_client_connections_timeouts{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{pool_name}} 超时",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 69
+          }
+        },
+        {
+          "id": 27,
+          "type": "timeseries",
+          "title": "建连接耗时 p95",
+          "description": "新建 Redis 连接的 95 分位耗时（毫秒）。频繁建连且耗时高说明连接被反复回收或网络抖动。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, pool_name) (rate(db_client_connections_create_time_milliseconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{pool_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 69
+          }
+        },
+        {
+          "id": 28,
+          "type": "timeseries",
+          "title": "连接池命中率",
+          "description": "从池里取到空闲连接（hits）对比没取到需新建（misses）的速率。misses 偏高说明连接池偏小或空闲连接被回收。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name) (rate(db_client_connections_hits{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{pool_name}} 命中",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pool_name) (rate(db_client_connections_misses{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{pool_name}} 未命中",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 77
+          }
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "row",
+      "title": "Kafka",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 85
+      },
+      "panels": [
+        {
+          "id": 29,
+          "type": "timeseries",
+          "title": "生产者发送耗时 p95（按 topic）",
+          "description": "生产者一次发送（含等 ack）的 95 分位耗时。变慢说明 broker 压力或网络问题；仅有生产者的服务有数据。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, messaging_destination_name) (rate(kafkax_producer_send_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{messaging_destination_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 86
+          }
+        },
+        {
+          "id": 30,
+          "type": "timeseries",
+          "title": "生产者发送速率（按结果）",
+          "description": "按 topic 和 outcome 的发送速率。outcome 不是 ok 表示发送失败。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (messaging_destination_name, outcome) (rate(kafkax_producer_send_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{messaging_destination_name}} {{outcome}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 86
+          }
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "消费者投递延迟 p95",
+          "description": "消息从生产到被消费者取到的 95 分位延迟（按 topic/group）。持续上升说明消费跟不上。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, messaging_destination_name, messaging_consumer_group_name) (rate(kafkax_consumer_delivery_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{messaging_destination_name}} / {{messaging_consumer_group_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 86
+          }
+        },
+        {
+          "id": 32,
+          "type": "timeseries",
+          "title": "消费者排队时间 p95",
+          "description": "消息取到后在本地等待处理的 95 分位时间。变长说明处理并发不够。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, messaging_destination_name, messaging_consumer_group_name) (rate(kafkax_consumer_queue_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{messaging_destination_name}} / {{messaging_consumer_group_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 94
+          }
+        },
+        {
+          "id": 33,
+          "type": "timeseries",
+          "title": "消费者处理耗时 p95",
+          "description": "handler 处理一条消息的 95 分位耗时（按 topic/group）。变长往往是下游依赖变慢。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, messaging_destination_name, messaging_consumer_group_name) (rate(kafkax_consumer_process_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])))",
+              "legendFormat": "{{messaging_destination_name}} / {{messaging_consumer_group_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "exemplar": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 94
+          }
+        },
+        {
+          "id": 34,
+          "type": "timeseries",
+          "title": "消费处理结果（按 outcome）",
+          "description": "处理速率按 ok、error、permanent_error 拆分。error 持续出现说明依赖不可用，会让分区停住；permanent_error 会进死信。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (messaging_destination_name, outcome) (rate(kafkax_consumer_process_duration_seconds_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{messaging_destination_name}} {{outcome}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 94
+          }
+        },
+        {
+          "id": 35,
+          "type": "timeseries",
+          "title": "重试速率",
+          "description": "handler 失败后的重试次数速率。计数器首次发生才出现，没有数据代表没发生过重试。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (messaging_destination_name, messaging_consumer_group_name) (rate(kafkax_consumer_retries_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{messaging_destination_name}} / {{messaging_consumer_group_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 102
+          }
+        },
+        {
+          "id": 36,
+          "type": "timeseries",
+          "title": "进死信速率",
+          "description": "进入死信队列的消息速率。任何大于 0 都需要人看：数据本身有问题。没有数据代表没发生。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (messaging_destination_name, messaging_consumer_group_name) (rate(kafkax_consumer_dead_lettered_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{messaging_destination_name}} / {{messaging_consumer_group_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 102
+          }
+        }
+      ]
+    },
+    {
+      "id": 55,
+      "type": "row",
+      "title": "Go 运行时",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 110
+      },
+      "panels": [
+        {
+          "id": 37,
+          "type": "timeseries",
+          "title": "goroutine 数（每 Pod）",
+          "description": "每个 Pod 的 goroutine 数量。只涨不跌是泄漏；突增常对应请求堆积。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (k8s_pod_name) (go_goroutine_count{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 0,
+            "y": 111
+          }
+        },
+        {
+          "id": 38,
+          "type": "timeseries",
+          "title": "内存使用 vs 内存上限（每 Pod）",
+          "description": "Go 运行时内存使用量（堆等 other 加栈）与 GOMEMLIMIT（go_memory_limit_bytes）。贴近上限会让 GC 疯狂回收、吃 CPU。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (k8s_pod_name) (go_memory_used_bytes{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}} 使用",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max by (k8s_pod_name) (go_memory_limit_bytes{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}} 上限",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 6,
+            "y": 111
+          }
+        },
+        {
+          "id": 39,
+          "type": "timeseries",
+          "title": "分配速率（每 Pod）",
+          "description": "堆分配字节速率。很高说明热路径大量产生垃圾，GC 压力大。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (k8s_pod_name) (rate(go_memory_allocated_bytes_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{k8s_pod_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 12,
+            "y": 111
+          }
+        },
+        {
+          "id": 40,
+          "type": "timeseries",
+          "title": "GC 目标（每 Pod）",
+          "description": "下一次 GC 触发的堆大小目标。逼近内存上限时目标被压低，GC 变频繁。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max by (k8s_pod_name) (go_memory_gc_goal_bytes{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 111
+          }
+        }
+      ]
+    },
+    {
+      "id": 56,
+      "type": "row",
+      "title": "容器资源（cAdvisor / kube-state-metrics）",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 119
+      },
+      "panels": [
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "CPU 用量 vs requests",
+          "description": "业务容器的 CPU 核数用量与 requests。长期高于 requests 说明 request 偏小；对比节流看是否被限。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "{{pod}} 用量",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (kube_pod_container_resource_requests{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\", resource=\"cpu\"})",
+              "legendFormat": "{{pod}} requests",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "cores",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 120
+          }
+        },
+        {
+          "id": 42,
+          "type": "timeseries",
+          "title": "内存 working set vs limits",
+          "description": "业务容器 working set 与内存 limit。贴近 limit 会被 OOMKilled。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\"})",
+              "legendFormat": "{{pod}} working set",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (kube_pod_container_resource_limits{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\", resource=\"memory\"})",
+              "legendFormat": "{{pod}} limit",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 120
+          }
+        },
+        {
+          "id": 43,
+          "type": "timeseries",
+          "title": "重启次数",
+          "description": "容器累计重启次数。上升说明在崩溃或被 OOMKilled。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (kube_pod_container_status_restarts_total{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\"})",
+              "legendFormat": "{{pod}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 120
+          }
+        },
+        {
+          "id": 44,
+          "type": "timeseries",
+          "title": "CPU 节流比例",
+          "description": "被 CFS 节流的周期占比。没设 CPU limit 时没有数据属正常；有值且高说明 limit 太小。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\"}[$__rate_interval])) / sum by (pod) (rate(container_cpu_cfs_periods_total{namespace=\"$namespace\", pod=~\"$pod\", container=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "{{pod}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 128
+          }
+        },
+        {
+          "id": 45,
+          "type": "timeseries",
+          "title": "istio-proxy 边车 CPU",
+          "description": "边车（原生 sidecar，requests 在 init container 指标里）的 CPU 核数用量，与 requests 对比。边车吃得多说明流量或连接数大。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", pod=~\"$pod\", container=\"istio-proxy\"}[$__rate_interval]))",
+              "legendFormat": "{{pod}} 用量",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (kube_pod_init_container_resource_requests{namespace=\"$namespace\", pod=~\"$pod\", container=\"istio-proxy\", resource=\"cpu\"})",
+              "legendFormat": "{{pod}} requests",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "cores",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 128
+          }
+        },
+        {
+          "id": 46,
+          "type": "timeseries",
+          "title": "istio-proxy 边车内存",
+          "description": "边车容器 working set 与内存 limit。",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", pod=~\"$pod\", container=\"istio-proxy\"})",
+              "legendFormat": "{{pod}} working set",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (pod) (kube_pod_init_container_resource_limits{namespace=\"$namespace\", pod=~\"$pod\", container=\"istio-proxy\", resource=\"memory\"})",
+              "legendFormat": "{{pod}} limit",
+              "refId": "B",
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 128
+          }
+        }
+      ]
+    },
+    {
+      "id": 57,
+      "type": "row",
+      "title": "日志",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 136
+      },
+      "panels": [
+        {
+          "id": 47,
+          "type": "logs",
+          "title": "WARN / ERROR 日志",
+          "description": "该服务 warn 和 error 级别的日志。出现大量 error 或新类型的 warn 说明有问题；点开日志可看 trace_id 跳链路。",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "expr": "{k8s_namespace_name=\"$namespace\", service_name=\"$service\"} | detected_level=~\"warn|error\"",
+              "refId": "A",
+              "queryType": "range",
+              "maxLines": 200
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none",
+            "prettifyLogMessage": false
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 137
+          }
+        },
+        {
+          "id": 48,
+          "type": "timeseries",
+          "title": "日志条数（按级别）",
+          "description": "各日志级别的条数，对比 info 看 warn/error 占比。error 突增就是出事了。",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "expr": "sum by (detected_level) (count_over_time({k8s_namespace_name=\"$namespace\", service_name=\"$service\"}[$__interval]))",
+              "legendFormat": "{{detected_level}}",
+              "refId": "A",
+              "range": true,
+              "editorMode": "code",
+              "queryType": "range"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 147
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -51,6 +51,31 @@ func TestPublicMuxHidesDegrade(t *testing.T) {
 	}
 }
 
+// TestMuxesHidePprof 钉住：pprof 只在单独的调试端口（DEBUG_ADDR）上。对外的 8080 是 API 端口，
+// 管理端口也不挂；包里导入了 net/http/pprof，它往 DefaultServeMux 上注册的那一份不能经这两个端口漏出来。
+func TestMuxesHidePprof(t *testing.T) {
+	public, admin, _ := muxes(t)
+	for _, path := range []string{
+		"/debug/pprof/",
+		"/debug/pprof/goroutine?debug=1",
+		"/debug/pprof/heap",
+		"/debug/pprof/cmdline",
+		"/debug/pprof/profile?seconds=1",
+		"/debug/pprof/trace?seconds=1",
+	} {
+		if got := statusOf(t, public, http.MethodGet, path); got != http.StatusNotFound {
+			t.Errorf("public GET %s = %d, want 404", path, got)
+		}
+		if got := statusOf(t, admin, http.MethodGet, path); got != http.StatusNotFound {
+			t.Errorf("admin GET %s = %d, want 404", path, got)
+		}
+	}
+	// 对照：同样的路径在调试端口的 mux 上是可达的，上面的 404 不是路径写错了。
+	if got := statusOf(t, app.DebugMux(), http.MethodGet, "/debug/pprof/goroutine?debug=1"); got != http.StatusOK {
+		t.Errorf("debug GET /debug/pprof/goroutine = %d, want 200", got)
+	}
+}
+
 func TestPublicMuxProbes(t *testing.T) {
 	public, _, _ := muxes(t)
 	if got := statusOf(t, public, http.MethodGet, "/healthz"); got != http.StatusOK {

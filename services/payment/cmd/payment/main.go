@@ -291,6 +291,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	grpcServer, err := grpcx.Listen(ctx, logger, "grpc", cfg.grpcAddr, func(s *grpc.Server) {
 		paymentv1.RegisterPaymentServiceServer(s, svc)
 	})
@@ -302,14 +307,15 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// app.RunWith 按相反顺序停止。收到退出信号后先摘流（设计文档 1d 的 6.11）：就绪探测和 gRPC 健康检查
 	// 变成不可用，继续正常服务 DRAIN_DELAY 这么久，让负载均衡把流量挪走（本机默认 0）。然后
 	// 先停 gRPC 不再受理新支付，再停 processor（不再产生新事件），
-	// 再停消费者，然后停中继（它最后一轮会把 processor 刚写的事件发出去），健康检查最后停。
+	// 再停消费者，然后停中继（它最后一轮会把 processor 刚写的事件发出去），健康检查最后停，
+	// 调试端口（开了的话）在它之后停。
 	// 节点号的租约（有的话）紧跟在健康检查之后：gRPC 停了、不再发号之后才让出。
 	components := []app.Component{httpServer}
 	if idLease != nil {
 		components = append(components, idLease)
 	}
 	components = append(components, relay, orderEvents, proc, grpcServer)
-	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, components...)
+	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, app.WithDebug(debugServer, components...)...)
 }
 
 // newLeader 创建一把按 name 竞争的 leader 锁。

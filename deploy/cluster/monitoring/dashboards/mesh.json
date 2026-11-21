@@ -1,0 +1,1264 @@
+{
+  "id": null,
+  "uid": "opp-mesh",
+  "title": "Oppenheimer / 网格",
+  "tags": [
+    "oppenheimer"
+  ],
+  "editable": true,
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "命名空间",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(istio_requests_total, namespace)",
+          "refId": "v"
+        },
+        "definition": "label_values(istio_requests_total, namespace)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "oppenheimer",
+          "value": "oppenheimer"
+        }
+      },
+      {
+        "name": "source",
+        "label": "调用方",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(istio_requests_total{reporter=\"source\", namespace=\"$namespace\"}, source_workload)",
+          "refId": "v"
+        },
+        "definition": "label_values(istio_requests_total{reporter=\"source\", namespace=\"$namespace\"}, source_workload)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "gateway",
+          "value": "gateway"
+        }
+      },
+      {
+        "name": "destination",
+        "label": "被调用方",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(istio_requests_total{reporter=\"source\", namespace=\"$namespace\", source_workload=\"$source\"}, destination_service_name)",
+          "refId": "v"
+        },
+        "definition": "label_values(istio_requests_total{reporter=\"source\", namespace=\"$namespace\", source_workload=\"$source\"}, destination_service_name)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "order",
+          "value": "order"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "调用边：请求量与错误（调用方边车视角）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "请求量（每条边）",
+      "description": "每条调用边（调用方 → 被调用方）经调用方边车的 QPS。回答：流量在哪几条边上、有没有某条边突然掉到 0 或暴涨。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (source_workload, destination_service_name) (rate(istio_requests_total{reporter=\"source\", namespace=\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "{{source_workload}} → {{destination_service_name}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "5xx 比例（每条边）",
+      "description": "边车看到的 5xx（HTTP 状态码）占该边请求的比例。gRPC 业务错误在 HTTP 层是 200，所以这里的 5xx 基本都是边车自己造的：路由超时 504、并发上限或无健康上游 503。持续大于 0 就不正常。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (source_workload, destination_service_name) (rate(istio_requests_total{reporter=\"source\", namespace=\"$namespace\", response_code=~\"5..\"}[$__rate_interval])) / sum by (source_workload, destination_service_name) (rate(istio_requests_total{reporter=\"source\", namespace=\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "{{source_workload}} → {{destination_service_name}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "gRPC 非 OK 状态码（每条边）",
+      "description": "grpc_response_status 不是 0 的请求速率。常见：4 DEADLINE_EXCEEDED、8 RESOURCE_EXHAUSTED（限流或舱壁）、9 FAILED_PRECONDITION（降级）、14 UNAVAILABLE。4、14 持续出现不正常；8、9 是服务在保护自己，看比例。边车自己拒绝的请求没有 grpc 状态，标签是空。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (source_workload, destination_service_name, grpc_response_status) (rate(istio_requests_total{reporter=\"source\", namespace=\"$namespace\", grpc_response_status!=\"0\"}[$__rate_interval]))",
+          "legendFormat": "{{source_workload}} → {{destination_service_name}} 状态 {{grpc_response_status}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "response_flags 非空（每条边）",
+      "description": "Envoy 的响应标志，“-”表示没有异常，这里只画有标志的。UO：上游溢出，并发上限（connectionPool）触发；UF：连不上上游；UH：没有健康的上游，全被摘除；UT：上游请求超时；URX：重试次数用完；UC：上游连接被中断；UR：上游重置；NR：没有路由；DC：下游（调用方）断开；LR：本地重置。UO、UH、UT 出现说明保护机制在起作用。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (source_workload, destination_service_name, response_flags) (rate(istio_requests_total{reporter=\"source\", namespace=\"$namespace\", response_flags!=\"-\"}[$__rate_interval]))",
+          "legendFormat": "{{source_workload}} → {{destination_service_name}} {{response_flags}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "调用边：延迟（边车视角，毫秒）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "延迟 p50（source 与 destination 两个视角）",
+      "description": "每条边的 p50 延迟，分别由调用方边车（source）和被调用方边车（destination）记录；两条线的差是网络加两个边车之间的开销。直方图的桶很粗（…、10、25、50、100、250 毫秒），分位数是桶内插值，只看量级和变化。source 线持续高于 destination 线很多说明边车或网络有排队。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, reporter, source_workload, destination_service_name) (rate(istio_request_duration_milliseconds_bucket{namespace=\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "{{reporter}} {{source_workload}} → {{destination_service_name}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "延迟 p99（source 与 destination 两个视角）",
+      "description": "每条边的 p99 延迟，分别由调用方边车（source）和被调用方边车（destination）记录；两条线的差是网络加两个边车之间的开销。直方图的桶很粗（…、10、25、50、100、250 毫秒），分位数是桶内插值，只看量级和变化。source 线持续高于 destination 线很多说明边车或网络有排队。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, reporter, source_workload, destination_service_name) (rate(istio_request_duration_milliseconds_bucket{namespace=\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "{{reporter}} {{source_workload}} → {{destination_service_name}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "边车加出来的延迟（选一条边）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "同一条边的四段耗时 p50",
+      "description": "顶部变量选一条边。四条线从外到内：调用方进程认为的耗时、调用方边车、被调用方边车、被调用方进程自己处理的耗时（单位统一成秒）。相邻两条线的差就是中间那一段（边车、网络）花的时间。被调用方进程一线是该服务这个接口收到的全部调用，不区分调用方；一个服务有多个调用方时只作量级参考。外层线比内层线低说明时间范围或桶的粗细造成了误差，不是负耗时。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$source\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "调用方进程",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(istio_request_duration_milliseconds_bucket{reporter=\"source\", namespace=\"$namespace\", source_workload=\"$source\", destination_service_name=\"$destination\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "调用方边车（source）",
+          "refId": "B",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(istio_request_duration_milliseconds_bucket{reporter=\"destination\", namespace=\"$namespace\", source_workload=\"$source\", destination_service_name=\"$destination\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "被调用方边车（destination）",
+          "refId": "C",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$destination\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "被调用方进程",
+          "refId": "D",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "同一条边的四段耗时 p99",
+      "description": "顶部变量选一条边。四条线从外到内：调用方进程认为的耗时、调用方边车、被调用方边车、被调用方进程自己处理的耗时（单位统一成秒）。相邻两条线的差就是中间那一段（边车、网络）花的时间。被调用方进程一线是该服务这个接口收到的全部调用，不区分调用方；一个服务有多个调用方时只作量级参考。外层线比内层线低说明时间范围或桶的粗细造成了误差，不是负耗时。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$source\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "调用方进程",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(istio_request_duration_milliseconds_bucket{reporter=\"source\", namespace=\"$namespace\", source_workload=\"$source\", destination_service_name=\"$destination\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "调用方边车（source）",
+          "refId": "B",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(istio_request_duration_milliseconds_bucket{reporter=\"destination\", namespace=\"$namespace\", source_workload=\"$source\", destination_service_name=\"$destination\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "被调用方边车（destination）",
+          "refId": "C",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$destination\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "被调用方进程",
+          "refId": "D",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "调用方进程比被调用方进程多出的耗时",
+      "description": "调用方进程的耗时减去被调用方进程的耗时，约等于两个边车加网络的开销。回答：“进程以为调用花了 15 毫秒，其中多少在两个边车上”。持续增大说明边车在排队（CPU 被节流、并发上限附近）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$source\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval]))) - histogram_quantile(0.5, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$destination\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "p50 差",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(rpc_client_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$source\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval]))) - histogram_quantile(0.99, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{k8s_namespace_name=\"$namespace\", service_name=\"$destination\", rpc_method=~\"oppenheimer\\\\.$destination\\\\.v1\\\\..*\"}[$__rate_interval])))",
+          "legendFormat": "p99 差",
+          "refId": "B",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "保护机制：摘除与并发上限",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "摘除次数（每个 Pod 到每个下游）",
+      "description": "outlierDetection 实际摘除下游实例的次数（连续 5 次 5xx 触发）。回答：哪个调用方 Pod 把哪个下游摘掉了。大于 0 说明下游有实例在报错或超时；成片出现要查下游。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (pod, cluster_name) (increase(envoy_cluster_outlier_detection_ejections_enforced_total{namespace=\"$namespace\"}[$__rate_interval])), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
+          "legendFormat": "{{pod}} → {{to}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "当前被摘除的实例数",
+      "description": "此刻在摘除状态（5 秒起，逐次加长）的下游实例数。长时间大于 0 说明下游实例一直没恢复。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(max by (pod, cluster_name) (envoy_cluster_outlier_detection_ejections_active{namespace=\"$namespace\"}), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
+          "legendFormat": "{{pod}} → {{to}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "并发上限溢出（请求和连接）",
+      "description": "connectionPool 的并发上限被顶满：rq 是在途请求（upstream_rq_active_overflow，gRPC 走的是这一项）或排队（upstream_rq_pending_overflow）超过上限，响应标志 UO；cx 是连接数超过上限。大于 0 说明下游慢了、请求在边车堆积，被边车直接拒绝。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (pod, cluster_name) (increase({__name__=~\"envoy_cluster_upstream_rq_(active|pending)_overflow\",namespace=\"$namespace\"}[$__rate_interval])), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
+          "legendFormat": "请求 {{pod}} → {{to}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(sum by (pod, cluster_name) (increase(envoy_cluster_upstream_cx_overflow{namespace=\"$namespace\"}[$__rate_interval])), \"to\", \"$1\", \"cluster_name\", \"outbound\\\\|[0-9]+\\\\|\\\\|([^.]+)\\\\..*\")",
+          "legendFormat": "连接 {{pod}} → {{to}}",
+          "refId": "B",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      }
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "istiod（控制面）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "连着的代理数",
+      "description": "连到 istiod 的 xDS 客户端数（边车加网关）。回答：边车是不是都连着。突然掉下来说明 istiod 重启或边车失联。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(pilot_xds)",
+          "legendFormat": "代理数",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 53
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "xDS 推送速率（按类型）",
+      "description": "istiod 向边车推送配置的次数，类型 cds、eds、lds、rds。回答：配置变化有多频繁。Pod 滚动或扩缩时会升高，平时应当很低。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (type) (rate(pilot_xds_pushes[$__rate_interval]))",
+          "legendFormat": "{{type}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 53
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "xDS 推送失败",
+      "description": "类型里带 err 的推送（发送失败、构建失败）速率。持续大于 0 说明有边车收不到配置，或配置生成出错。没有数据表示没有失败。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (type) (rate(pilot_xds_pushes{type=~\".*err.*\"}[$__rate_interval]))",
+          "legendFormat": "{{type}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 53
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "xDS 推送耗时 p99",
+      "description": "istiod 生成并发送一次推送的耗时（按类型）。持续上升说明控制面吃紧（它只有一个副本和 512 Mi 内存）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, type) (rate(pilot_xds_push_time_bucket[$__rate_interval])))",
+          "legendFormat": "{{type}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "配置收敛耗时 p99",
+      "description": "从配置变更到边车收到的耗时。回答：改了规则之后多久生效。超过几秒不正常。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pilot_proxy_convergence_time_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "边车资源（istio-proxy 容器）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "边车 CPU",
+      "description": "每个 Pod 里 istio-proxy 容器的 CPU 用量（核）。回答：边车占了多少 CPU。没有 CPU 上限，但节点紧张时会被挤；明显高于业务容器说明流量或统计项太多。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", container=\"istio-proxy\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "边车内存",
+      "description": "每个 Pod 里 istio-proxy 容器的工作集内存。内存上限是 192 Mi，接近上限会被 OOM 杀掉；标签组合和统计项增加会让它缓慢上涨。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"$namespace\", container=\"istio-proxy\"})",
+          "legendFormat": "{{pod}}",
+          "refId": "A",
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      }
+    }
+  ]
+}

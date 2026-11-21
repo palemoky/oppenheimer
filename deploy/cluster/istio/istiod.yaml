@@ -38,6 +38,24 @@ meshConfig:
     mode: ALLOW_ANY
   # 边车的访问日志先不开（阶段 3 接入日志系统时再定格式和去向）。
   accessLogFile: ""
+  # 边车默认导出的统计里没有集群级的摘除和并发上限溢出（设计文档 3a、ADR-0030 第 7 项），这里全网格常开，只开这几项：
+  #   upstream_rq_active_overflow、upstream_rq_pending_overflow、upstream_cx_overflow
+  #                                                        并发上限（connectionPool）触发的次数，请求被边车直接拒绝（响应标志 UO）。
+  #                                                        gRPC（HTTP/2）在途请求数超过 http2MaxRequests 记的是 active 那一项：
+  #                                                        2026-11-17 的故障注入里 144 个被拒绝的请求全在它上面，另外两项是 0
+  #                                                        （一开始没有留 active，大盘上那一格在真的溢出时是空的，设计文档 3a 第 8 节“验证 6”）
+  #   outlier_detection.ejections_*                        outlierDetection 摘除的次数、当前被摘除的主机数
+  # 名字是 Envoy 的原始统计名，形如 cluster.outbound|9082||inventory.oppenheimer.svc.cluster.local.<统计项>，
+  # 正则必须匹配整个名字；只匹配出站的集群（outbound|），入站的集群没有这些限制。每个边车每个出站集群约 7 条。
+  # 它写进 Pod 的启动配置，已经在跑的边车要重启（重新注入）才生效；Pod 上自己写了 proxyStatsMatcher 注解的（fault/gateway.yaml）以注解为准，
+  # 这里的不再起作用（是覆盖，不是合并：实测带注解的 gateway 只有注解匹配的那一个集群有这些统计）。
+  defaultConfig:
+    proxyStatsMatcher:
+      inclusionRegexps:
+        - 'cluster\.outbound\|.*\.upstream_rq_active_overflow'
+        - 'cluster\.outbound\|.*\.upstream_rq_pending_overflow'
+        - 'cluster\.outbound\|.*\.upstream_cx_overflow'
+        - 'cluster\.outbound\|.*\.outlier_detection\.ejections_(active|total|enforced_total|enforced_consecutive_5xx|overflow)'
 
 global:
   proxy:

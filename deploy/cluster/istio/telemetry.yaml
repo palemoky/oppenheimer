@@ -1,0 +1,55 @@
+# 全网格默认的边车指标配置（设计文档 3a、ADR-0030 第 7 项）。由 scripts/cluster/mesh.sh up 在 istiod 就绪之后提交。
+# 放在根命名空间 istio-system，对所有命名空间的边车生效；不改 Pod，配置经 xDS 推给边车，边车不需要重启。
+#
+# 在源头裁，不在 Prometheus 的 metricRelabelings 里 labeldrop：
+#   - 边车自己少记几个维度，每个标签组合在 Envoy 里是一个独立的统计项，省边车的内存和 /stats/prometheus 的传输量；
+#     Prometheus 一侧的 labeldrop 只省存储，边车该占的内存一点没少。
+#   - labeldrop 掉的标签如果是区分两条序列的唯一标签，同一次抓取里会出现重复序列，整次抓取报错；源头去掉没有这个问题。
+#   - 代价：已经被边车记过的旧标签组合，在边车重启之前还留在 /stats/prometheus 里（Envoy 的统计项不回收）。
+#     所以先提交本文件和 istiod.yaml，再滚动重启业务 Pod（脚本里的顺序见 scripts/cluster/monitoring.sh istio 的说明）。
+#
+# 要留的标签：reporter、source_workload、destination_workload、destination_service_name、request_protocol、
+# response_code、grpc_response_status、response_flags、connection_security_policy。
+#   - 目的地两个名字都留：边车在选不到上游的时候（UH、UO，正是要看的情形）拿不到对端的元数据，
+#     destination_workload 会是 unknown，destination_service_name 来自路由，一直有。两者在这里一一对应，不增加序列。
+#   - 去掉的 *_namespace、*_cluster：网格只有一个集群，命名空间由抓取时的 namespace 标签区分。
+#   - 去掉的 *_principal、*_canonical_*、*_app、*_version：和 workload 重复，或者这里永远是同一个值。
+#   - destination_service（全名）和 destination_service_name 重复。
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  metrics:
+    - providers:
+        - name: prometheus
+      overrides:
+        # 请求和响应大小的两个直方图（各 20 个桶）没有要回答的问题，整个关掉。
+        - match: {metric: REQUEST_SIZE}
+          disabled: true
+        - match: {metric: RESPONSE_SIZE}
+          disabled: true
+        # gRPC 的消息数（istio_request_messages_total、istio_response_messages_total）：unary 调用里和请求数一样，关掉。
+        - match: {metric: GRPC_REQUEST_MESSAGES}
+          disabled: true
+        - match: {metric: GRPC_RESPONSE_MESSAGES}
+          disabled: true
+        - match: {metric: ALL_METRICS}
+          tagOverrides:
+            source_canonical_service: {operation: REMOVE}
+            source_canonical_revision: {operation: REMOVE}
+            source_workload_namespace: {operation: REMOVE}
+            source_principal: {operation: REMOVE}
+            source_app: {operation: REMOVE}
+            source_version: {operation: REMOVE}
+            source_cluster: {operation: REMOVE}
+            destination_workload_namespace: {operation: REMOVE}
+            destination_principal: {operation: REMOVE}
+            destination_app: {operation: REMOVE}
+            destination_version: {operation: REMOVE}
+            destination_service: {operation: REMOVE}
+            destination_canonical_service: {operation: REMOVE}
+            destination_canonical_revision: {operation: REMOVE}
+            destination_service_namespace: {operation: REMOVE}
+            destination_cluster: {operation: REMOVE}

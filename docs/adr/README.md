@@ -56,3 +56,4 @@
 | [0027](0027-mysql-statefulset-not-operator.md) | 集群上的 MySQL 用手写的 StatefulSet，不用 Operator | 已采纳 |
 | [0028](0028-worker-id-lease.md) | 发号器的节点号从 MySQL 租，唯一性靠互不重叠的时间区间 | 已采纳 |
 | [0029](0029-istio-sidecar-mesh.md) | 服务之间的流量治理迁到 Istio，用边车模式；默认的重试必须关 | 已采纳 |
+| [0030](0030-observability-backends.md) | 可观测后端的部署：两层 Collector、单体后端加本地盘、放在 server 节点、头部加尾部采样 | 已采纳 |

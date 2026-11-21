@@ -1,0 +1,66 @@
+# Tempo 的 Helm values（chart 和应用版本在 scripts/cluster/cluster.env 的 TEMPO_CHART_VERSION、TEMPO_VERSION）。
+# 设计文档 3a、ADR-0030。由 scripts/cluster/monitoring.sh tempo 安装到命名空间 monitoring，release 名 tempo。
+#
+# chart 是 grafana-community 的 tempo（单体模式）。Tempo 3.x 的单体模式不要 Kafka：分发器直接把数据交给
+# live-store 和 metrics-generator（上游 CHANGELOG：Single-binary mode: push distributor local ingest directly to
+# live-store and metrics-generator without Kafka），所以 metrics-generator 在这里可用。
+# 一个副本、本地盘；Pod 重启期间 OTLP 写入会失败，靠 Collector 的重试和队列兜住。
+
+replicas: 1
+
+tempo:
+  # 保留期 3 天。chart 把它同时写进 backend_scheduler 和 backend_worker 的 compaction.block_retention。
+  retention: 72h
+  reportingEnabled: false
+
+  # 要的是 OTLP 的 gRPC（4317）和 HTTP（4318）。chart 的默认值里还有 jaeger，模板（_ports.tpl）直接引用
+  # receivers.jaeger，把它删掉会渲染失败，所以保留；没有人往那几个端口发，只是多开了几个监听。
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  # metrics-generator 从收到的链路里生成指标，remote write 到 Prometheus：
+  #   service-graphs：服务之间的调用关系和延迟（Grafana 的 service map）
+  #   span-metrics：每个服务、每个 span 名的请求数、错误数、延迟直方图（RED 指标）
+  # 要打开的是下面 overrides 里的 processors，这里的 metricsGenerator 只是配置它们怎么运行。
+  # Prometheus 那边要开 remote write receiver（kube-prometheus-stack 的 enableRemoteWriteReceiver），否则写入会 404。
+  metricsGenerator:
+    enabled: true
+    # 生成器的 WAL 默认在 /tmp（emptyDir）。放到卷上，重启时没发出去的点不会丢。
+    storage:
+      path: /var/tempo/generator/wal
+      remote_write:
+        - url: http://kps-prometheus.monitoring:9090/api/v1/write
+          # exemplar：直方图的点上带 trace id，Grafana 里从延迟图跳到链路。
+          send_exemplars: true
+
+  overrides:
+    defaults:
+      metrics_generator:
+        processors: [service-graphs, span-metrics]
+
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+# 本地盘。卷里放块（/var/tempo/traces）、WAL 和生成器的 WAL。
+persistence:
+  enabled: true
+  storageClassName: local-path
+  size: 10Gi
+
+# 优先放到 k3s-server，理由同 kube-prometheus-stack.yaml：阶段 4 关 agent 节点，监控不能跟着被关。
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+
+serviceMonitor:
+  enabled: true

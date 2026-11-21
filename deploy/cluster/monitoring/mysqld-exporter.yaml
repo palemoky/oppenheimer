@@ -1,0 +1,145 @@
+# MySQL 的 Prometheus exporter（mysqld_exporter），多目标模式。设计文档 3a、ADR-0030 第 8 项。
+# 由 scripts/cluster/monitoring.sh exporters 安装到命名空间 monitoring；__MYSQLD_EXPORTER_TAG__ 来自 cluster.env。
+#
+# 为什么是一个 Deployment 抓全部实例，而不是每个 MySQL Pod 里加一个边车：边车要改 StatefulSet，MySQL 就得滚动重启
+# （主从切换、CLONE 全量都是代价），而且每个 Pod 多占一份内存。多目标模式下 exporter 自己不知道要连谁，
+# Prometheus 每次抓取时在 URL 里带 ?target=<主机:端口>，它现连、现查、现关，没有状态，一个副本就够。
+# 目标是每个 Pod（不是 Service）：主从要分开看，-primary、-replica 这两个 Service 在切换后指向会变，不能当“实例”用。
+#
+# 没有用 prometheus-community 的 mysql-exporter chart：它为单目标设计，多目标要靠额外的清单补，
+# 最后写的东西比这份清单还多，还多一层 chart 版本要跟。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysqld-exporter
+  namespace: monitoring
+data:
+  # 凭据放在配置文件里，URL 里只有 target（密码不进 URL，也就不进 Prometheus 的目标页和访问日志）。
+  # ${MYSQL_EXPORTER_PASSWORD} 由 exporter 自己从环境变量展开；密码在 Secret mysql-exporter-auth，
+  # 由 monitoring.sh 随机生成，不入库。五个实例共用这一个账号和密码，账号在各自的主库上建、复制到从库。
+  my.cnf: |
+    [client]
+    user = exporter
+    password = ${MYSQL_EXPORTER_PASSWORD}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysqld-exporter
+  namespace: monitoring
+  labels: &labels
+    app.kubernetes.io/name: mysqld-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysqld-exporter
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      # 优先放到 k3s-server（理由同 loki.yaml）。用“优先”不是“必须”。
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: mysqld-exporter
+          image: quay.io/prometheus/mysqld-exporter:__MYSQLD_EXPORTER_TAG__
+          args:
+            - --config.my-cnf=/etc/mysqld-exporter/my.cnf
+            # 采集器只留三个：全局状态（连接数、InnoDB 缓冲池和行操作、QPS……都在这里面）、全局变量（max_connections、
+            # read_only 判断主从角色）、主从复制状态（延迟）。默认还开着的三个 information_schema 采集器
+            # （innodb_cmp、innodb_cmpmem、query_response_time）用不上，关掉。
+            # 不开 perf_schema.*、info_schema.tables、processlist 的按用户和主机分组：它们的标签值是表名、用户名、SQL 文本，
+            # 不是有限的枚举（见 AGENTS.md 的可观测规范）。
+            - --no-collect.info_schema.innodb_cmp
+            - --no-collect.info_schema.innodb_cmpmem
+            - --no-collect.info_schema.query_response_time
+            # 每个目标每次抓取最多开一个连接，查询最长 5 秒：一个卡住的实例不能拖住整次抓取，更不能占满它的连接数。
+            # 账号本身也限了 MAX_USER_CONNECTIONS（monitoring.sh 建账号时）。
+            - --exporter.max_open_connections=1
+            - --exporter.query_timeout=5
+          env:
+            - name: MYSQL_EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: mysql-exporter-auth, key: password}
+          ports:
+            - {name: http, containerPort: 9104}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          readinessProbe:
+            tcpSocket: {port: http}
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/mysqld-exporter, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: mysqld-exporter}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysqld-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mysqld-exporter
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: mysqld-exporter
+  ports:
+    - {name: http, port: 9104, targetPort: http}
+---
+# 抓取对象用 ScrapeConfig（operator 的自定义资源，Prometheus 认所有命名空间的）：它能写 params 和 relabel，
+# 把“目标是 MySQL 的 Pod、请求发给 exporter”表达出来。Probe 资源也能做多目标，但没有地方写 auth_module 这类参数。
+# 目标是 Pod 的稳定域名（StatefulSet 的无头 Service 给的）。写死在这里：实例是 values 里定的，加实例时这里加一行。
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: mysql
+  namespace: monitoring
+spec:
+  jobName: mysql
+  metricsPath: /probe
+  params:
+    auth_module: [client]
+  # 抓取超时要大于 exporter 里的查询超时（5 秒）。
+  scrapeTimeout: 10s
+  staticConfigs:
+    # cluster 标签是实例（一主一从或单实例）的名字，instance 标签是 Pod 的名字。
+    - labels: {cluster: mysql-order-0}
+      targets:
+        - mysql-order-0-0.mysql-order-0.mysql.svc:3306
+        - mysql-order-0-1.mysql-order-0.mysql.svc:3306
+    - labels: {cluster: mysql-order-1}
+      targets:
+        - mysql-order-1-0.mysql-order-1.mysql.svc:3306
+        - mysql-order-1-1.mysql-order-1.mysql.svc:3306
+    - labels: {cluster: mysql-main}
+      targets:
+        - mysql-main-0.mysql-main.mysql.svc:3306
+  relabelings:
+    # 三步，顺序不能换：先把目标地址存进 ?target=，再取出 Pod 名当 instance，最后把真正要请求的地址换成 exporter。
+    - sourceLabels: [__address__]
+      targetLabel: __param_target
+    - sourceLabels: [__address__]
+      regex: ([^.]+)\..*
+      targetLabel: instance
+    - targetLabel: __address__
+      replacement: mysqld-exporter.monitoring.svc:9104

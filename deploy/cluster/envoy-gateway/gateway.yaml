@@ -42,6 +42,25 @@ spec:
         externalTrafficPolicy: Local
         annotations:
           metallb.io/loadBalancerIPs: "__LB_GATEWAY_IP__"
+  # 访问日志只留出问题的请求（设计文档 3a 第 8 节“第 8 步的前一半”）。默认是每个请求一行：
+  # 那一行和 gateway 自己记的访问日志内容重复，却占了 Loki 里全部日志的 60%，压测时一小时一个多 GB。
+  # 留下的两类正好是 gateway 的日志里没有的：
+  #   - 5xx：包括根本没有到达 gateway 的（没有健康的上游、连接失败），这种请求只有入口知道
+  #   - 带 response flags 的：Envoy 自己判定出了状况（NR 没有匹配的路由、UF 上游连接失败、DC 客户端中途断开……）
+  # “或”要写在一条表达式里：CRD 的文档说多条 matches 满足一条就记，但 Envoy Gateway v1.10.0 实际生成的是
+  # and_filter（看过 Envoy 的 config_dump），分成两条写的话 404 加 NR 这种就不记了（2026-11-17 实测）。
+  # 写错的 CEL 表达式会被悄悄忽略（等于没有这条），改了之后要实测：
+  # 发一个正常请求确认不记，发一个 Host 不存在的请求（404、NR）确认记了。
+  # 正常请求的量和延迟看指标，单个请求看链路，都不靠这份日志。
+  telemetry:
+    accessLog:
+      settings:
+        - matches:
+            - "response.code >= 500 || response.flags != 0"
+          sinks:
+            - type: File
+              file:
+                path: /dev/stdout
 ---
 # GatewayClass：这一类入口由哪个控制器实现，用哪份参数。
 apiVersion: gateway.networking.k8s.io/v1

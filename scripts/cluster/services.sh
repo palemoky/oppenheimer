@@ -149,7 +149,9 @@ apply_mesh_security() {
 helm_args() { # 服务 tag
   local s="$1" tag="$2"
   HELM_ARGS=(-n "$NS" -f "$VALUES/$s.yaml")
-  HELM_ARGS+=(--set "image.repository=$REGISTRY_ADDR/oppenheimer/$s" --set "image.tag=$tag")
+  # tag 用 --set-string：tag 是提交号的前 7 位，碰上全是数字的（7390796）时 --set 会把它当成整数，
+  # 模板里的 printf "%s" 渲染出 %!s(int64=7390796)，Pod 报 InvalidImageName（2026-11-17 重建时遇到）。
+  HELM_ARGS+=(--set "image.repository=$REGISTRY_ADDR/oppenheimer/$s" --set-string "image.tag=$tag")
   if [[ $E2E_MODE -eq 1 ]]; then
     HELM_ARGS+=(-f "$E2E_VALUES/common.yaml")
     if [[ -f "$E2E_VALUES/$s.yaml" ]]; then

@@ -1,0 +1,47 @@
+{{- if and .Values.autoscaling.enabled .Values.autoscaling.requestRate.query }}
+# 按请求速率的水平伸缩（设计文档 3a 的 3.8）。只有 gateway 和 order 开。和 templates/hpa.yaml 二选一。
+#
+# ScaledObject 不是另一套伸缩器：KEDA 的 operator 照着它建一个普通的 HPA（名字 keda-hpa-<服务>），
+# 请求速率这一项在那个 HPA 里是 External 类型的指标，HPA 控制器经聚合 API external.metrics.k8s.io 向 KEDA 取数，
+# KEDA 再去 Prometheus 执行下面的查询。算副本数、稳定窗口、改 Deployment 的仍然是 HPA 控制器。
+#
+# 两个触发器，HPA 对每个指标各算一个期望副本数，取最大的：
+#   request-rate  期望副本数 = ceil(查询结果 ÷ perReplica)。查询返回的是整个服务的请求速率，
+#                 AverageValue 的意思是“每个副本摊到的值不超过阈值”，除以副本数这一步是 HPA 做的。
+#   cpu           和原来的 HPA 一样，按 requests 的百分比。留着兜底：请求速率只数了同步的请求，
+#                 order 消费 Kafka 落库、gateway 上某类请求突然变贵时，速率不涨而 CPU 涨。
+# 任何一个指标取不到数时 HPA 不缩容（它不知道那一项要不要更多副本），只按取得到的那些扩容。
+# 所以 Prometheus 或 KEDA 不在时副本数不会掉，CPU 这一项还能扩（实测见设计文档第 8 节“第 7 步”）。
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "service.name" . }}
+  labels:
+    {{- include "service.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "service.name" . }}
+  # 不缩到 0：minReplicaCount 大于 0 时 KEDA 自己不改副本数（它只负责 0 和 1 之间），全交给 HPA。
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  triggers:
+    - type: prometheus
+      name: request-rate
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ .Values.autoscaling.requestRate.prometheusAddress | quote }}
+        query: {{ .Values.autoscaling.requestRate.query | quote }}
+        threshold: {{ .Values.autoscaling.requestRate.perReplica | quote }}
+        # 查询没有结果时当成 0（默认行为，写出来）：服务刚部署、还没有任何请求时就是没有序列，这时请求速率确实是 0。
+        # Prometheus 连不上是另一回事，那是报错，不会被当成 0。
+        ignoreNullValues: "true"
+    - type: cpu
+      name: cpu
+      metricType: Utilization
+      metadata:
+        value: {{ .Values.autoscaling.targetCPUUtilization | quote }}
+  # advanced.horizontalPodAutoscalerConfig.behavior 不写，用 HPA 的默认值：扩容不设稳定窗口
+  #（每 15 秒最多翻倍或加 4 个，取大的），缩容取过去 5 分钟里算出的最大期望值。
+{{- end }}

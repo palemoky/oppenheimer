@@ -9,14 +9,24 @@ image:
   pullPolicy: IfNotPresent
 
 replicas: 1
-# 按 CPU 的 HPA（templates/hpa.yaml）。开了之后 Deployment 不再写 replicas：副本数归 HPA 管，
+# 水平伸缩。开了之后 Deployment 不再写 replicas：副本数归 HPA 管，
 # 否则每次 helm upgrade 都会把它改回 values 里的数，和 HPA 打架。上面的 replicas 这时不起作用。
-# targetCPUUtilization 是对 CPU requests 的百分比。
+# targetCPUUtilization 是对 CPU requests 的百分比（Pod 里所有容器合起来算，边车也在内）。
+# 两种形态，二选一：
+#   requestRate.query 为空  按 CPU 的 HPA（templates/hpa.yaml），只依赖 metrics-server
+#   requestRate.query 非空  KEDA 的 ScaledObject（templates/scaledobject.yaml）：按请求速率，CPU 兜底。
+#                           要求集群里装了 KEDA（scripts/cluster/monitoring.sh keda），否则 helm 因为没有这个 CRD 直接失败。
 autoscaling:
   enabled: false
   minReplicas: 2
   maxReplicas: 4
   targetCPUUtilization: 70
+  requestRate:
+    # 一条 PromQL，返回一个数：整个服务（所有副本合计）每秒的请求数。不要在查询里除以副本数，那一步 HPA 做。
+    query: ""
+    # 每个副本承担多少请求每秒；合计超过 perReplica × 当前副本数就扩。
+    perReplica: 0
+    prometheusAddress: http://kps-prometheus.monitoring.svc:9090
 # 滚动：maxSurge 1、maxUnavailable 0（设计文档 8.2）。cdc 换成 Recreate：同一时刻只能有一个读 binlog 的实例。
 strategy: RollingUpdate
 minReadySeconds: 5
@@ -40,7 +50,21 @@ resources:
 
 # 普通环境变量，进 ConfigMap，envFrom 整个注入。内容变了 Pod 模板上的校验和就变，触发滚动。
 # 注意：envFrom 来的变量不能被 $(...) 引用。
-config: {}
+#
+# 这里的默认值对所有服务生效，每个服务的 values 里写的 config 是合并进来，不是整个替换（Helm 对 map 逐键合并）。
+config:
+  # 链路和指标用 OTLP gRPC 推给 Collector 的 gateway（设计文档 3a 的 3.2；http:// 表示不用 TLS）。
+  # 设成空字符串就不导出（pkg/otelx）；e2e 那一套指向测试 Job 里的接收端，chaos、bench 关掉，都在各自的叠加层里。
+  # Collector 不在时不影响服务：导出器惰性连接，队列满了丢 span，不阻塞业务。
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-gateway.monitoring:4317
+  # 指标的导出间隔（毫秒）。SDK 默认 60 秒，对 rate() 的常用窗口太稀；15 秒和抓取来的指标是一个量级。
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  # pprof（pkg/app 的 ListenDebug）。只监听回环地址：不进 Service、不声明 containerPort，集群里别的 Pod 连不到，
+  # 只能 kubectl port-forward（要 pods/portforward 权限）。常开而不是要用时再加：改它会重启 Pod，
+  # 想看的泄漏现场就没了。用法：
+  #   kubectl -n oppenheimer port-forward deploy/order 6060:6060
+  #   go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+  DEBUG_ADDR: "127.0.0.1:6060"
 
 # 密码：从 Secret 取。secretName 是本命名空间里的 Secret（services.sh 从 mysql 命名空间复制）。
 # 这些变量排在 env 列表的最前面，expandEnv 里的 $(变量名) 才能引用它们（被引用的必须在前面）。
@@ -68,9 +92,11 @@ istio:
   # 注入边车。只有服务之间的 gRPC 要过边车：有 gRPC 入站的服务（ports.grpc > 0）和只有出站的 gateway 注入，
   # 没有任何 gRPC 的 cdc 关掉（它的 values 叠加层里设 false）。关掉时 Pod 上显式写 inject: "false"。
   inject: true
-  # 不过边车的出站端口：MySQL、Redis、Redis Cluster 总线、Sentinel、Kafka。它们不是 HTTP/gRPC，
+  # 不过边车的出站端口：MySQL、Redis、Redis Cluster 总线、Sentinel、Kafka、OTLP。前五个不是 HTTP/gRPC，
   # 边车除了多一跳什么也不做；Redis Cluster、Kafka 还会按节点地址直连，经边车只会多出一层要排查的东西。
-  excludeOutboundPorts: "3306,6379,16379,26379,9092"
+  # 最后的 4317 是 OTLP：Collector 不在网格里，可观测的流量不过边车（设计文档 3a 的 3.1），
+  # 边车出问题时链路和指标照样出得去。
+  excludeOutboundPorts: "3306,6379,16379,26379,9092,4317"
   # 边车的资源。默认不设，用网格的全局默认值（deploy/cluster/istio/：requests 50m / 64Mi，上限 192Mi）。
   # 设了哪一项才渲染哪一项的注解：cpu -> proxyCPU，memory -> proxyMemory，memoryLimit -> proxyMemoryLimit（如 "256Mi"）。
   proxy:

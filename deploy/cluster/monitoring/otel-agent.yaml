@@ -1,0 +1,128 @@
+# OpenTelemetry Collector（agent）的 Helm values（chart 和镜像版本在 scripts/cluster/cluster.env 的
+# OTELCOL_CHART_VERSION、OTELCOL_VERSION）。设计文档 3a、ADR-0030。
+# 由 scripts/cluster/monitoring.sh collector 安装到命名空间 monitoring，release 名 otel-agent。
+#
+# 每个节点一个 Pod，只做一件事：读本节点 /var/log/pods/ 下的容器日志，发给 gateway。
+# 不收任何东西（没有接收器、没有 Service）。节点和 kubelet 的指标 kube-prometheus-stack 已经在抓，这里不重复，
+# 所以不开 kubeletMetrics、hostMetrics、kubernetesAttributes（也就不需要 ClusterRole）。
+
+mode: daemonset
+fullnameOverride: otel-agent
+
+image:
+  repository: otel/opentelemetry-collector-contrib # tag 由 monitoring.sh 用 --set 传入（cluster.env 的 OTELCOL_VERSION）
+
+resources:
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {memory: 256Mi}
+
+presets:
+  logsCollection:
+    enabled: true
+    # 不读自己的日志：读了会产生新的日志，自己喂自己。
+    includeCollectorLogs: false
+    # 读到哪里了记在节点的 /var/lib/otelcol。重启后接着读；没有它，重启期间写的日志会丢（start_at: end）。
+    # chart 因此把容器改成 root 运行（要写宿主机目录）。
+    storeCheckpoints: true
+
+# agent 不接收数据，不需要任何端口；只有自身指标的 8888。
+ports:
+  otlp: {enabled: false}
+  otlp-http: {enabled: false}
+  jaeger-compact: {enabled: false}
+  jaeger-thrift: {enabled: false}
+  jaeger-grpc: {enabled: false}
+  zipkin: {enabled: false}
+  metrics: {enabled: true}
+
+# DaemonSet 没有 Service，Prometheus 用 PodMonitor 直接抓每个 Pod 的 8888。
+podMonitor:
+  enabled: true
+
+config:
+  receivers:
+    otlp: null
+    jaeger: null
+    zipkin: null
+    prometheus: null
+
+  processors:
+    memory_limiter:
+      check_interval: 1s
+      limit_percentage: 80
+      spike_limit_percentage: 20
+    # 每批最多 2000 条（约 1.7 MB）。默认没有上限：gateway 回来之后 filelog 一口气追读积压的日志，
+    # batch 会合出 7000 多条的一批，超过 gateway 的 gRPC 接收上限（4 MiB），这是不可重试的错误，整批被丢（2026-11-17 实测）。
+    batch:
+      send_batch_size: 2000
+      send_batch_max_size: 2000
+
+    # 业务服务的日志是一行一个 JSON：{"time":..., "level":"INFO", "msg":..., "trace_id":..., "span_id":...}。
+    # 这里只取三样：level 作为日志的 severity，trace_id、span_id 作为 LogRecord 自己的 trace 上下文
+    # （Loki 会把它存成结构化元数据 trace_id，Grafana 从日志跳到链路靠它）。
+    # 正文保持原来的那一行 JSON，其余字段不变成属性：Loki 把每个属性都存成结构化元数据，不需要。
+    # 非 JSON 的行（中间件、系统组件）和不带这些字段的 JSON 原样通过。
+    # 用 transform 而不是 filelog 的 operators：preset 生成的 operators 列表（container 解析器）
+    # 在 Helm 合并时会被整体覆盖，再追加就得把它抄一份；放在处理器里不碰 preset。
+    transform/json:
+      error_mode: ignore
+      log_statements:
+        - context: log
+          conditions:
+            - IsString(log.body) and IsMatch(log.body, "^\\s*\\{")
+          statements:
+            # 解析失败（看着像 JSON 其实不是）时 ParseJSON 报错，error_mode: ignore 跳过这条语句，cache 保持为空。
+            - set(log.cache, ParseJSON(log.body))
+            - set(log.severity_number, SEVERITY_NUMBER_DEBUG) where log.cache["level"] == "DEBUG"
+            - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.cache["level"] == "INFO"
+            - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.cache["level"] == "WARN"
+            - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.cache["level"] == "ERROR"
+            - set(log.severity_text, log.cache["level"]) where IsString(log.cache["level"])
+            - set(log.trace_id.string, log.cache["trace_id"]) where IsString(log.cache["trace_id"]) and Len(log.cache["trace_id"]) == 32
+            - set(log.span_id.string, log.cache["span_id"]) where IsString(log.cache["span_id"]) and Len(log.cache["span_id"]) == 16
+    # container 解析器还会给每条日志留下 logtag（containerd 的 F/P 分片标记）和 log.file.path（容器日志文件的路径，
+    # 里面的命名空间、Pod、容器已经在资源属性里了），没有查询价值，却都会变成 Loki 的结构化元数据，删掉。
+    # log.iostream（stdout 或 stderr）保留。
+    transform/drop_attrs:
+      error_mode: ignore
+      log_statements:
+        - context: log
+          statements:
+            - delete_key(log.attributes, "logtag")
+            - delete_key(log.attributes, "log.file.path")
+    # Loki 用 service.name 生成 service_name 标签，Grafana 从链路跳日志靠它；
+    # 日志的资源上没有这个属性（只有 container 解析器给的 k8s.*），用容器名（等于服务名）补上。
+    transform/service_name:
+      error_mode: ignore
+      log_statements:
+        - context: resource
+          statements:
+            - set(resource.attributes["service.name"], resource.attributes["k8s.container.name"]) where resource.attributes["service.name"] == nil
+
+  exporters:
+    debug: null
+    # 发给 gateway，由它转发 Loki。gateway 不可用时的目标是“不丢，只是延迟”：日志文件还在磁盘上，agent 等得起。
+    # 默认值做不到这一点（2026-11-17 停掉 gateway 5 分钟实测丢了约 4700 行，设计文档 3a 第 8 节“验证 5”）：
+    #   - 重试默认最多 300 秒（max_elapsed_time），超过就丢掉这一批。改成 0：一直重试。
+    #   - 队列（默认 1000 批）满了默认是拒绝新数据，而前面的 batch 处理器是异步的，不会把这个错误传回 filelog，
+    #     数据就在 batch 那里被丢掉了。改成 block_on_overflow：队列满了就堵住 batch，batch 再堵住 filelog，
+    #     filelog 停止读文件，读到哪里的检查点不前进；gateway 回来之后从停下的地方接着读。
+    # 代价：gateway 长时间不在、而日志文件被 kubelet 轮转掉（单个文件 10 Mi、每个容器留 5 个）时，轮转掉的部分还是丢。
+    otlp_grpc:
+      endpoint: otel-gateway.monitoring:4317
+      tls:
+        insecure: true
+      retry_on_failure:
+        max_elapsed_time: 0
+      sending_queue:
+        block_on_overflow: true
+
+  service:
+    pipelines:
+      traces: null
+      metrics: null
+      logs:
+        # receivers 写空：chart 默认的 [otlp] 会被保留，preset 只往后追加 file_log。
+        receivers: []
+        processors: [memory_limiter, transform/json, transform/drop_attrs, transform/service_name, batch]
+        exporters: [otlp_grpc]

@@ -1,5 +1,6 @@
-{{- if .Values.autoscaling.enabled }}
-# 按 CPU 的水平伸缩（设计文档 2c 第 9 节）。只有 gateway 和 order 开。
+{{- if and .Values.autoscaling.enabled (not .Values.autoscaling.requestRate.query) }}
+# 按 CPU 的水平伸缩（设计文档 2c 第 9 节）。autoscaling.requestRate.query 设了就不渲染这个，
+# 换成 templates/scaledobject.yaml（KEDA 照着它建 HPA，CPU 是其中一个触发器）。
 # 期望副本数 = ceil(当前副本数 × 当前利用率 ÷ 目标利用率)，偏差在 10% 以内不动。
 # 利用率 = Pod 里所有容器的 CPU 用量之和 ÷ 所有容器的 CPU requests 之和（边车也算在内），
 # 所以 requests 写错了这个数就失真。用量来自 metrics-server，有十几秒到一分钟的滞后。

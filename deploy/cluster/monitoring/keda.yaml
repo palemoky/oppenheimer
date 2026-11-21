@@ -1,0 +1,48 @@
+# KEDA（设计文档 3a 的 3.8、ADR-0030 第 10 项）。命名空间 keda，release 名 keda。
+# 版本由 scripts/cluster/monitoring.sh 用 --version 传入（cluster.env 的 KEDA_VERSION，chart 和应用同一个版本号）。
+#
+# 三个 Deployment，各做一件事：
+#   keda-operator                   看 ScaledObject，替每一个建一个普通的 HPA（名字 keda-hpa-<名字>），自己去问 Prometheus
+#   keda-operator-metrics-apiserver 注册成 external.metrics.k8s.io 这个聚合 API；HPA 控制器每 15 秒来这里取数，它转问 operator
+#   keda-admission-webhooks         校验 ScaledObject（比如同一个 Deployment 不能被两个 HPA 管）
+# 真正改副本数的仍然是 kube-controller-manager 里的 HPA 控制器，KEDA 只提供数。
+# 所以 KEDA 不在时不会有人乱改副本数：HPA 取不到数，副本数停在原地（实测见设计文档第 8 节“第 7 步”）。
+#
+# 各 1 个副本：operator 多开也只有一个是主，metrics-apiserver 多开只是缩短重启时取不到数的那几十秒，不值那份内存。
+
+# 不上控制面节点，和业务服务、istiod 一样（设计文档 2c 第 13 节）。
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node-role.kubernetes.io/control-plane
+              operator: DoesNotExist
+
+# chart 默认每个组件 requests 100m、100Mi，limits 1 核、1000Mi。只有两个 ScaledObject，用不了这么多；
+# requests 按装完实测的用量调过（设计文档第 8 节“第 7 步”），limits 留宽。
+resources:
+  operator:
+    requests: {cpu: 20m, memory: 96Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  metricServer:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  webhooks:
+    requests: {cpu: 10m, memory: 48Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+
+logging:
+  operator: {format: json}
+  metricServer: {format: json}
+  webhooks: {format: json}
+
+# KEDA 自己的指标：每个 scaler 取数的耗时和失败次数（keda_scaler_errors_total 是 3c 要告警的：
+# Prometheus 查不到时 HPA 不动，没有别的地方会报出来）。
+prometheus:
+  operator:
+    enabled: true
+    serviceMonitor: {enabled: true}
+  metricServer:
+    enabled: true
+    serviceMonitor: {enabled: true}

@@ -231,6 +231,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	grpcServer, err := grpcx.Listen(ctx, logger, "grpc", cfg.grpcAddr, func(s *grpc.Server) {
 		orderindexv1.RegisterOrderIndexServiceServer(s, svc)
 	})
@@ -241,9 +246,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	// 收到退出信号后先摘流：就绪探测和 gRPC 健康检查变成不可用，继续正常服务 DRAIN_DELAY 这么久（本机默认 0），
 	// 然后按与列出的顺序相反的顺序停止：先停 gRPC（等在途查询做完），再停消费者（处理完在途消息、提交位点），
-	// 然后汇总日志输出最后一段，健康检查最后停。数据库连接由 defer 在 app.RunWith 返回后关闭。
+	// 然后汇总日志输出最后一段，健康检查最后停，调试端口（开了的话）在它之后停。数据库连接由 defer 在 app.RunWith 返回后关闭。
 	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: drainDelay},
-		httpServer, reporter, consumer, grpcServer)
+		app.WithDebug(debugServer, httpServer, reporter, consumer, grpcServer)...)
 }
 
 // ensureTopics 创建本服务消费的 topic 及其死信 topic。broker 关闭了自动建 topic，消费者要求死信 topic 已存在。

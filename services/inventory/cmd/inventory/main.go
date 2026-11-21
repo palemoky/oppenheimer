@@ -254,6 +254,11 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	if err != nil {
 		return err
 	}
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
 	grpcServer, err := grpcx.Listen(ctx, logger, "grpc", cfg.grpcAddr, func(s *grpc.Server) {
 		inventoryv1.RegisterInventoryServiceServer(s, svc)
 	})
@@ -272,9 +277,10 @@ func run(ctx context.Context, logger *slog.Logger, cfg config) error {
 	//   4. 库存增量的应用最后停：gRPC 的预占、消费者的确认和释放在收尾时还在写增量。
 	//      它停了之后再收一次尾（下面的 Drain），尽量不把没应用的增量留到下次启动。留下了也没有错：
 	//      读库存的地方都会把它们加上，下次启动接着应用。
+	//   5. 调试端口（开了的话）最后停。
 	// Redis 和 MySQL 的连接在 app.RunWith 返回、所有组件都停了之后才关（见上面的 defer）。
 	runErr := app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay},
-		applyLoop, httpServer, grpcServer, consumer, reconciler)
+		app.WithDebug(debugServer, applyLoop, httpServer, grpcServer, consumer, reconciler)...)
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := applier.Drain(dctx); err != nil {

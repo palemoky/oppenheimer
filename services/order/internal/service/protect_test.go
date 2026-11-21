@@ -656,7 +656,8 @@ func TestSubmitHandlerCanceledMidwayIsRetried(t *testing.T) {
 	wantStatus(t, e.load(t, o2.GetOrderId()), orderv1.OrderStatus_ORDER_STATUS_PENDING_PAYMENT)
 }
 
-// 展示读读闸门的名额占满时：已经落库的订单照常查得到（只读订单行），不存在或还没落库的答“稍后再试”，
+// 展示读读闸门的名额占满时：已经落库的订单照常查得到（只读订单行），不存在或还没落库的答 READ_BUSY
+// （查询太多，稍后再试；不是 STOCK_GATE_UNAVAILABLE，闸门没有坏，设计文档 3a 第 8 节），
 // 而且这些都不经过闸门的熔断器。查询太多不是 Redis 坏了，不能因此把熔断器打开、让落库停摆
 // （设计文档 1d 的 8.18：压测时查询把连接池占满，排队超时被算成闸门失败）。
 func TestDisplayReadGateLimitDoesNotTripBreaker(t *testing.T) {
@@ -681,9 +682,7 @@ func TestDisplayReadGateLimitDoesNotTripBreaker(t *testing.T) {
 			t.Fatalf("status = %v, want PENDING_PAYMENT", got)
 		}
 		_, err = svc.GetOrder(t.Context(), &orderv1.GetOrderRequest{OrderId: landed.GetOrderId() + 1, UserId: user})
-		if got := errx.Reason(err); got != errx.ReasonStockGateUnavailable {
-			t.Fatalf("missing order with the gate slot taken: reason = %q (err %v), want %q", got, err, errx.ReasonStockGateUnavailable)
-		}
+		wantErr(t, err, codes.ResourceExhausted, ReasonReadBusy)
 	}
 	if st := svc.gateBreaker.State(); st != breaker.Closed {
 		t.Errorf("gate breaker is %v after %d rejected reads, want closed", st, 2*tries)

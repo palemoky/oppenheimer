@@ -10,6 +10,7 @@ import (
 
 	"github.com/XSAM/otelsql"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -241,5 +242,35 @@ func TestSpanNameMultilineQuery(t *testing.T) {
 	// 以注释开头、或者不认识的动词：落到固定的名字上。
 	if got := mysqlx.SpanName(context.Background(), otelsql.MethodConnQuery, "/* hint */ SELECT 1"); got != "mysql query" {
 		t.Errorf("span name = %q, want %q", got, "mysql query")
+	}
+}
+
+// 带参数的语句：go-sql-driver 在没开 interpolateParams 时对它返回 driver.ErrSkip，让 database/sql 改走
+// “预处理再执行”。这是驱动和标准库之间的约定，不是失败，span 不能因此被标成 Error
+// （集群上第一次接后端时，三分之一的 mysql span 是这样的假错误，设计文档 3a 第 8 节）。
+func TestParameterizedStatementSpansAreNotErrors(t *testing.T) {
+	db := testdb.New(t, migrations, migrationsDir)
+
+	ctx, parent := otel.Tracer("test").Start(t.Context(), "request")
+	if _, err := db.ExecContext(ctx, "INSERT INTO counter (id, value) VALUES (?, ?)", 7, 1); err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	if err := db.QueryRowContext(ctx, "SELECT value FROM counter WHERE id = ?", 7).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	parent.End()
+
+	got := spansOf(parent.SpanContext().TraceID())
+	if len(got) < 3 {
+		t.Fatalf("got %d spans, want the request span and at least one per statement", len(got))
+	}
+	for _, s := range got {
+		if s.Status().Code == codes.Error {
+			t.Errorf("span %q has status Error (%s); a successful statement must not", s.Name(), s.Status().Description)
+		}
+		if len(s.Events()) != 0 {
+			t.Errorf("span %q has %d events (first: %s); want none", s.Name(), len(s.Events()), s.Events()[0].Name)
+		}
 	}
 }

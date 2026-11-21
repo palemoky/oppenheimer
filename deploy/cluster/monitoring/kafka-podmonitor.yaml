@@ -1,0 +1,31 @@
+# Kafka 的抓取对象（设计文档 3a、ADR-0030 第 8 项）。由 scripts/cluster/monitoring.sh exporters 提交；
+# Kafka 一侧的配置（metricsConfig、kafkaExporter）在 deploy/cluster/kafka/kafka.yaml。
+#
+# 一个 PodMonitor 覆盖两种 Pod：三个 broker（JMX exporter 的指标）和 Kafka Exporter（消费延迟），它们都带
+# strimzi.io/kind=Kafka，端口名都是 tcp-prometheus（9404）。选 PodMonitor 不选 ServiceMonitor：
+# Strimzi 不给这个端口建 Service，直接抓 Pod。写法取自 Strimzi 1.3.1 的 examples/metrics/prometheus-install/pod-monitors/
+# kafka-resources-metrics.yaml，去掉了 KafkaConnect、MirrorMaker2（没有部署），并把 Pod 名、节点名并进标准的标签。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kafka
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: Kafka
+      strimzi.io/cluster: kafka
+  namespaceSelector:
+    matchNames: [kafka]
+  podMetricsEndpoints:
+    - port: tcp-prometheus
+      path: /metrics
+      relabelings:
+        # instance 用 Pod 名（kafka-dual-0、kafka-kafka-exporter-xxx），不用默认的 IP:端口，重启后 IP 变了也认得出。
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
+        # Strimzi 给 Pod 打的标签里有 strimzi.io/name、pool-name 等，留下来，用来区分 broker 和 exporter。
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(strimzi_io_(name|pool_name))

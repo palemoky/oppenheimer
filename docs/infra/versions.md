@@ -50,6 +50,14 @@
 | Envoy Gateway | v1.10.0 | 稳定版 | 2026-11-15 | chart `oci://docker.io/envoyproxy/gateway-helm`。兼容性表：Envoy v1.40.x、Gateway API v1.6.1、Kubernetes v1.34 到 v1.37，支持到 2027-05-05。实际用的 Gateway API CRD 是 k3s 自带的 v1.6.3（设计文档 2a 第 11 节） |
 | Strimzi | 1.3.1 | 稳定版 | 2026-11-15 | Kafka 的 Operator，chart `oci://quay.io/strimzi-helm/strimzi-kafka-operator`。支持 Kafka 4.2.0 到 4.3.2、Kubernetes 1.32 到 1.37 |
 | Istio | 1.32.0 | 稳定版 | 2026-11-15 | 服务网格（设计文档 2d）；2026-11-09 发布，没有 LTS，支持到约 2027-06，支持 Kubernetes 1.33 到 1.37，Envoy 分支 v1.40。chart（`base`、`istiod`）和 istioctl 取自 GitHub 发布包（官方 Helm 仓库当天还没有 1.31 以后的版本），镜像 `docker.io/istio/pilot:1.32.0`、`docker.io/istio/proxyv2:1.32.0` |
+| kube-prometheus-stack（chart） | 93.3.1 | 稳定版 | 2026-11-17 | 可观测（设计文档 3a、ADR-0030），命名空间 `monitoring`，release 名 `kps`。chart 默认带 prometheus-operator v0.95.2、Grafana 13.3.1、Alertmanager v0.35.0、node-exporter v1.12.1、kube-state-metrics v2.20.0（都是渲染 chart 看到的镜像 tag），这几样用默认的。没有 LTS |
+| Prometheus | v3.13.5 | LTS | 2026-11-17 | 3.13 是当前的 LTS（支持到 2027-07-31）；chart 默认的是 v3.16.0，在 values 里换掉（`cluster.env` 的 `PROMETHEUS_VERSION`，镜像 tag `v3.13.5-distroless`）。补丁号是从 quay.io 的 tag 列表查的；打开了 OTLP 接收端和 exemplar 存储 |
+| Grafana Loki | 3.7.10 | 稳定版 | 2026-11-17 | 日志（设计文档 3a）。GitHub releases 的最新正式版（4.0 只有 rc），没有 LTS。chart 是 `grafana-community/loki` 21.3.1（仓库 `https://grafana-community.github.io/helm-charts`），单体模式、文件系统存储 |
+| Grafana Tempo | 3.1.1 | 稳定版 | 2026-11-17 | 链路（ADR-0024）。GitHub releases 的最新正式版，没有 LTS。chart 是 `grafana-community/tempo` 3.2.1（单体模式；旧仓库 `grafana/helm-charts` 里的 `tempo`、`tempo-distributed` 已标弃用）。3.x 的单体模式不需要 Kafka |
+| OpenTelemetry Collector contrib | 0.165.0 | 稳定版 | 2026-11-17 | 链路、指标、日志的汇聚和转发（设计文档 3a），命名空间 `monitoring`，两个 release：`otel-gateway`（Deployment）和 `otel-agent`（DaemonSet，读容器日志）。GitHub releases 的最新正式版，没有 LTS；镜像 `otel/opentelemetry-collector-contrib:0.165.0`（要 contrib 的 transform、filelog、otlphttp）。chart 是 `open-telemetry/opentelemetry-collector` 0.178.3（仓库 `https://open-telemetry.github.io/opentelemetry-helm-charts`），默认的应用版本是 0.163.2，用 `--set image.tag` 覆盖 |
+| mysqld_exporter | v0.21.0 | 稳定版 | 2026-11-17 | MySQL 的指标（设计文档 3a、ADR-0030 第 8 项），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-10-22），没有 LTS；镜像 `quay.io/prometheus/mysqld-exporter:v0.21.0`。在 MySQL 9.7.4 上实测：`SHOW REPLICA STATUS` 能用（它依次试 `SHOW ALL SLAVES STATUS`、`SHOW SLAVE STATUS`、`SHOW REPLICA STATUS`），指标名仍带 `slave_status`，但 9.x 的字段名是新的（`seconds_behind_source`、`replica_io_running`） |
+| redis_exporter | v1.97.0 | 稳定版 | 2026-11-17 | Redis 的指标（同上），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-11-04），没有 LTS；镜像 `oliver006/redis_exporter:v1.97.0-alpine`（Docker Hub 的 tag 带 `v`） |
+| KEDA | 2.21.1 | 稳定版 | 2026-11-17 | 按 Prometheus 里的请求速率伸缩 gateway、order（设计文档 3a 的 3.8、ADR-0030 第 10 项），命名空间 `keda`，release 名 `keda`。GitHub releases 的最新正式版（2026-11-15），没有 LTS；chart `kedacore/keda` 2.21.1（仓库 `https://kedacore.github.io/charts`），chart 和应用同一个版本号，镜像在 `ghcr.io/kedacore/`。官方测试的 Kubernetes 是 1.34 到 1.36；在我们的 1.37.2 上实测：三个组件就绪，`external.metrics.k8s.io` 可用，`prometheus` 和 `cpu` 两种触发器扩缩正常 |
 | Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
@@ -128,9 +136,7 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 |---|---|---|
 | Strimzi、MySQL Operator | 2 | 无 |
 | OpenTelemetry Collector 与 Go SDK | 1d / 3 | 无 |
-| Prometheus | 3 | 有 |
 | Grafana、Loki、Alertmanager | 3 | 无 |
-| Tempo | 3 | 无 |
 | k6 | 3 | 无 |
 | Chaos Mesh | 4 | 无 |
 | Rust | 8 | 无，选最新 stable |

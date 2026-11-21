@@ -2,7 +2,8 @@
 # 在 MacBook 上给集群装 Istio 的控制面（设计文档 2d）。up 可以重复运行。
 #
 #   mesh.sh fetch             下载 Istio 发布包到 bin/istio-<版本>/（核对 sha256；已经有了就跳过）
-#   mesh.sh up                fetch，再装 istio-base 和 istiod，等 istiod 就绪，最后打印 status
+#   mesh.sh up                fetch，再装 istio-base 和 istiod，等 istiod 就绪，提交全网格的指标配置
+#                             （deploy/cluster/istio/telemetry.yaml），最后打印 status
 #   mesh.sh status            只读：Pod、Helm release、istioctl 版本
 #   mesh.sh check             在临时命名空间 mesh-check 里起一对注入了边车的 Pod，发一个请求，确认它经过了
 #                             两边的边车并且是 mTLS；跑完删掉命名空间。装完或重建集群之后跑一次
@@ -101,6 +102,9 @@ cmd_up() {
   helm upgrade --install istiod "$ISTIO_DIR/manifests/charts/istio-control/istio-discovery" \
     -n "$ISTIO_NS" -f "$ISTIOD_VALUES" --wait --timeout 5m
   kubectl -n "$ISTIO_NS" rollout status deploy/istiod --timeout=300s
+  # 边车指标裁标签、关掉大小直方图（设计文档 3a）。配置经 xDS 推给边车，不重启 Pod；CRD 在 istio-base 里，上面已装。
+  kubectl apply -f "$ROOT/deploy/cluster/istio/telemetry.yaml" >/dev/null
+  echo "==> mesh-wide Telemetry applied (metric labels trimmed)"
   cmd_status
 }
 

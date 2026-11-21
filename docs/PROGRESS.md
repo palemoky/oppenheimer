@@ -5,9 +5,74 @@
 ## 当前状态
 
 - **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
-- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。主人说 CI 过了就合并；之后追加了一次文档提交，等它的 CI 过了由主会话合并。**新会话先 `gh pr view 14` 确认它已经合并，阶段 3 从合并后的 `main` 开新分支。** 工作区是干净的。
-- **最后更新**：2026-11-17（宿主机加内存、换网卡、挪插槽、改地址、启动菜单，见会话日志）
+- **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
+- **最后更新**：2026-11-17（阶段 3a 只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
+
+### 3a 做到哪（2026-11-17）
+
+设计文档 [design/3a-observability.md](design/3a-observability.md)，**主人已确认第 2 节的十项，都按建议**（2026-11-17），决定在 ADR-0030。实现顺序在设计第 6 节，每一步的结果和量到的数在第 8 节。分支 `phase-3a`（从 `phase-2d` 开出，带着那个不在 `main` 里的文档提交）。前三步已提交，**第 4 步的改动没有提交，也没有推送**。
+
+**做完的：**
+
+- 三台虚拟机的内存改成各 14 GiB（ADR-0030 第 5 项），逐台重启，集群自己恢复。重启时 Sentinel 切了一次，**闸门 Redis 的主库现在是 `redis-gate-1`**。`cluster.env`、`hardware.md` 已改。
+- 设计第 6 节的第 2 步，kube-prometheus-stack：`make monitoring-up`（`scripts/cluster/monitoring.sh`，values 在 `deploy/cluster/monitoring/`），命名空间 `monitoring`，release 名 `kps`。Prometheus 是 LTS 的 v3.13.5，OTLP 接收端和 exemplar 已打开；全部 Pod 和三个卷在 k3s-server 上；没有不健康的抓取目标。Grafana 经入口访问（`Host: grafana.oppenheimer.test`，地址 192.168.50.51；密码 `scripts/cluster/monitoring.sh password`）。`scripts/cluster/monitoring.sh promql '<查询>'` 直接查 Prometheus。版本已登记到 `versions.md`。
+- k3s 的 scheduler、controller-manager、kube-proxy 的指标只监听本机，抓不到，先关了（设计第 8 节）。
+- 设计第 6 节的第 3 步，Loki 3.7.10 和 Tempo 3.1.1（单体模式、本地盘，都在 k3s-server 上）：`scripts/cluster/monitoring.sh loki|tempo`，`make monitoring-up` 现在依次装三样。Grafana 里 Loki、Tempo、Prometheus 三个数据源健康检查通过，互相跳转已配（`deploy/cluster/monitoring/datasources.yaml`）。Tempo 的 metrics-generator 已打开，写 Prometheus 的 remote write。**还没有任何日志和链路进来**：跳转、metrics-generator 生成的指标都要等第 4 步接上 Collector 才能验证。版本已登记。
+
+- 设计第 6 节的第 4 步，Collector 和服务接入（细节和量到的数在设计第 8 节“第 4 步”）：
+  - `scripts/cluster/monitoring.sh collector`（`make monitoring-up` 现在依次装四样）。Collector contrib 0.165.0，两个 release：`otel-gateway`（Deployment，在 k3s-server 上，收 OTLP 分发到 Tempo、Prometheus、Loki）和 `otel-agent`（DaemonSet，只读容器日志）。**尾部采样、`spanmetrics`、`servicegraph` 还没有加**（第 6 步）；agent 不开 `kubeletstats`（和设计 3.3 不一致，设计已改）。
+  - service chart：默认导出到 `http://otel-gateway.monitoring:4317`，指标 15 秒导出一次，资源属性里有命名空间、Pod、节点和 `service.version`（镜像 tag），出站排除加了 4317。
+  - 验证 1 到 3 用接口查过，都成立：六个服务的指标在 Prometheus 里；一单的三条链路在 Tempo 里（按订单号查要写成数字，不加引号）；按 `trace_id` 在 Loki 里查到同一条链路三个服务的日志；exemplar 查得到。**Grafana 界面上点一遍（大盘到链路到日志）还没有做，要主人或下个会话在浏览器里看一次。**
+  - **查出并修了一个埋点缺陷**：三分之一的 MySQL span 被标成 Error（`driver.ErrSkip`）。改了 `pkg/mysqlx`（两个 otelsql 选项）加一个用例。全量 `make lint test` 通过（输出在 `tmp/lint-test-3a-step4.log`）。
+  - 集群现状：六个服务的镜像 tag 是 `69030ff-dirty-20261117101712`（含上面的修复）；两次滚动期间探针 0 失败；没有不正常的 Pod。本机的 compose 中间件这次 `make up` 起来了，还在运行。
+
+**要回头看的：**
+
+- etcd 的 WAL fsync p99 在服务接上之后是 15.9 毫秒（装完时的 29.6 是启动期间的）。仍然**空转一天后再量**：`histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))`。
+- `local-path` 不限制卷的大小，PVC 上写的容量不起作用；server 的系统盘只有 60 GB，靠保留期兜着，3c 的磁盘告警要盖住它。
+- 序列数 16.5 万（业务服务只占 4600，kubelet 7.2 万、apiserver 4.7 万），比设计第 4 节估的多。
+- 第 4 步留下的小事（设计第 8 节末尾）：metrics-generator 的 exemplar 标签名是 `traceID`，数据源里配的是 `trace_id`，从它的图上跳不到链路；`evalsha` 遇到 `NOSCRIPT` 的 span 被标成 Error；Tempo 的搜索接口带时间范围时查不到刚写入的数据；旧的一个 gateway Pod 滚动前重启过 26 次，原因没有查；本机 `pkg/cache` 的 `TestHitDoesNotLoad` 在 `make up` 刚起来时连 Redis 超时失败过两次，之后三次通过。
+
+**下一步，新会话从这里开始**（设计第 6 节）：
+
+1. 到 exporter 和 pprof 为止的改动都已提交并推送到 `origin/phase-3a`（最后一个是 `4ff3ca0`），**还没有开 PR，所以 CI 没有跑**。之后的大盘（`deploy/cluster/monitoring/dashboards/` 四个 JSON、`monitoring.sh` 的 `dashboards` 子命令）和文档已提交，**没有推送**。
+2. `redis-cache-5` 的复制断过约 3 小时（连的是主库重启前的旧地址），主人确认后已用 `cluster replicate` 修好（设计第 8 节最后一段）。根因没有查，主库下次换地址多半还会断，记给了阶段 4；3c 要加告警。
+3. 四个大盘已加载到 Grafana 的文件夹 Oppenheimer（业务总览、单服务、中间件、Collector，设计第 8 节有表）。**界面上的样子没有人看过，要主人在浏览器里看一遍**，顺便走一次“大盘上的 exemplar → 链路 → 日志”。地址 `http://grafana.oppenheimer.test/d/opp-business`（`/etc/hosts` 要有 `192.168.50.51 grafana.oppenheimer.test`）。
+4. “新 order Pod 一就绪就 503”已解决（改答 `429 READ_BUSY`，设计第 8 节）。
+5. **尾部采样已上线，对比做完**（设计第 8 节“第 6 步”有表）：同样的故障，出错的链路头部 10% 只留下 10%，尾部全留；Collector 多 100 Mi 内存。“慢的全留”没有验证到。尾部采样之后 Tempo 的 metrics-generator 的指标是偏的，只用来看拓扑，RED 用 SDK 的指标。
+   **Istio 的指标已接上**（设计第 8 节最后一段）：标签在源头从 25 个裁到 9 个，新增 532 条序列；网格大盘 `opp-mesh` 已加载；gateway 到 order 一次调用 6.5 毫秒里有 2.7 毫秒在边车和网络上。
+   这一批（尾部采样、Istio 的指标和网格大盘、文档）已提交，**没有推送**（`origin/phase-3a` 停在 `ea3db7c`，还没有开 PR，CI 没有跑过）。新会话从“3a 剩下的”第一项（KEDA）开始。
+   **3a 剩下的**：按 QPS 的 HPA（第 7 步，KEDA，装上先验证它在 Kubernetes 1.37 上能用）；实测内存和磁盘定保留期（Tempo 的内存在压测里涨到 1.2 Gi，上限 2 Gi，要看）、从空集群重建一次、ADR 的补充、笔记（第 8 步）；验证 5（停掉 Collector gateway）、6（`make cluster-fault` 抽几个场景对指标）、7（停从库复制、停消费者看图）没有做；五个大盘在界面上的样子、“大盘 → 链路 → 日志”仍然要主人在浏览器里看一遍。做大盘时发现的指标缺口在设计第 8 节，其中“Redis 没有命令耗时的指标”建议在 3b 之前补（`pkg/redisx`）。
+6. **第 7 步，按请求速率的 HPA，做完了（2026-11-17 晚）**，细节和数在设计第 8 节“第 7 步”、ADR-0030 的补充：
+   - KEDA 2.21.1 装在命名空间 `keda`（`scripts/cluster/monitoring.sh keda`，已并入 `make monitoring-up`），在 Kubernetes 1.37 上实测可用。版本主会话在 GitHub 的发布页核对过，已登记。
+   - service chart：`autoscaling.requestRate.query` 非空就渲染 `ScaledObject`（请求速率加 CPU 两个触发器），gateway 每副本 180 请求/秒、order 100，是用 CPU 70% 反推的初值，**3b 压测后重定**。集群上现在是 `keda-hpa-gateway`、`keda-hpa-order` 两个 HPA，旧的两个已手工删掉（旧 HPA 在时 KEDA 的 webhook 会拒绝，`helm upgrade` 过不去）。
+   - 验证过：507 请求/秒下两个服务各扩到 3（gateway 48 秒、order 79 秒，order 是请求速率触发的），122025 个请求 0 失败，停压 5 分 19 秒后缩回 2；Prometheus 连不上时不缩容、CPU 仍然能扩。
+   - **一键部署的顺序变了**：`make cluster-up && make middleware-up && make mesh-up && make monitoring-up && make deploy && make deploy-seed`（KEDA 要先于业务服务）。没有从空集群走过，重建时验证。
+   - 顺带的发现：405 请求/秒时 gateway、order 的 CPU 已到 71% 到 75%（2c 是约 810 请求/秒才扩容），3b 做基线时要拆开看多出来的 CPU 花在哪。
+   - 这一步的改动**没有提交**：`deploy/cluster/monitoring/keda.yaml`、`deploy/charts/service/`（新模板 `scaledobject.yaml`、`hpa.yaml`、`values.yaml`）、`deploy/cluster/services/gateway.yaml` 和 `order.yaml`、`scripts/cluster/monitoring.sh`、`cluster.env`、`Makefile`、文档。没有改 Go 代码；脚本过了 `shellcheck -x`，chart 过了 `helm lint`，没有跑 `make lint test`。
+   - 记给 3c 的：KEDA 取数失败的告警（`keda_scaler_detail_errors_total`、HPA 的 `ScalingActive`）。记给阶段 4 的：KEDA 不在时的行为、聚合 API 不可用时删命名空间会不会卡住。没有做的：按 Kafka 消费延迟伸缩 order；大盘上的副本数图；扩到 4 个副本没有压到。
+   - **同一个会话接着做的（都没有提交）**：
+     - 实测内存和磁盘（设计第 8 节“第 8 步的前一半”，`hardware.md` 的预算表已改）：保留期不改；盘是被压测写满的，不是被保留期（2000 请求/秒压一小时，Tempo 和 Loki 各约 1.5 GB）；**日志的 60% 是入口 Envoy 的访问日志，3b 之前定要不要关**；活跃序列 21.8 万；etcd 的 fsync p99 是 19.1 毫秒。空转一天后的数没有量。
+     - 验证 5（停 Collector gateway 5 分钟，做了三轮）：业务 0 影响、内存不涨；指标断图但累计值不丢；链路丢；**日志原来会丢约 6 万行，查出三处并修了**（`otel-agent.yaml` 的重试、队列、批次上限，`otel-gateway.yaml` 的 `batch/logs`，`loki.yaml` 的写入限额），第三轮不丢。已应用到集群（Loki、Collector 都滚动过）。
+     - 验证 7（停 `mysql-order-0-1` 的 SQL 线程、把 orderindex 缩到 0，各 2 分钟）：都已恢复；消费延迟的图有反应；**复制停掉时主从延迟的指标是断掉而不是变大**，3c 的告警要按运行状态写。
+     - 没有解释的：验证 5 第三轮有 15 个查库存请求同时超时，入口和 gateway 都没有收到过它们，卡在 MacBook 到入口之间，原因没有查到；入口的两个 Envoy Pod 各重启过 26 次（43 小时里），原因没有查。
+     - 留给 3b 之前的小事：Grafana 主容器的内存（峰值 357 Mi）超过 requests（256 Mi），调到 384；agent 的内存在队列堵满时到过 204 Mi（上限 256 Mi）。
+     - **主人 2026-11-17 的四个答复**：同意从空集群重建；五个大盘和“大盘 → 链路 → 日志”在浏览器里看过，没有问题（“互相跳转”已勾）；提交并推送；同意降入口的访问日志，已改成只留 5xx 和带 response flags 的（`deploy/cluster/envoy-gateway/gateway.yaml`，已应用并实测）。全量 `make lint test` 通过（输出在 `tmp/lint-test-3a-step7.log`）。
+     - **从空集群重建做完了（2026-11-17 14:00 到 14:45 UTC）**，设计第 8 节“第 8 步：从空集群重建”：新的一键顺序走通，约 35 分钟；探针 0 失败，`make cluster-e2e` 通过，三种信号、Istio 的指标、KEDA、大盘都在。中途 `make deploy` 失败一次：提交号 `7390796` 全是数字，`helm --set` 把镜像 tag 当成整数，`services.sh` 已改成 `--set-string`。
+     - **集群现状（重建之后）**：全新的集群，六个服务的镜像 tag 是 `7390796`；库里只有示例 SKU 和验收时探针、e2e 留下的几千单；MySQL 的密码、Grafana 的密码都是新生成的；主库都是序号 0；监控的数据从重建时重新开始攒；没有不正常的 Pod。上面“集群现状”那一段写的是重建之前的。
+     - PR #15 第二次推送（`c0fcda1`）的 CI 27 项全部通过（`test (./services/order)` 4 分 15 秒、e2e 3 分 36 秒，没有变慢）。
+     - **验证 6 和笔记做完了（2026-11-17，已提交并推送：`ac2e357`、`e58ef3c`、`18d6c41`）**：
+       - 验证 6：`FAULT_TELEMETRY=1 E2E_KEEP=1 FAULT_SCENARIOS="A B D E" make cluster-fault` 通过，脚本、Istio 的指标、服务自己的指标三边对得上（设计第 8 节“验证 6”）。`FAULT_TELEMETRY` 和 `deploy/cluster/services/fault-telemetry/` 是新加的。**查出并修了**：并发上限的拒绝记在 `upstream_rq_active_overflow` 上，全网格保留的和网格大盘画的是另外两项（`istiod.yaml`、`istio-monitors.yaml`、`mesh.json`、`fault.sh` 已改，五个带边车的服务滚动过，Pod 模板上多了 `restartedAt` 注解，无害）。Pod 注解里的 `proxyStatsMatcher` 是覆盖不是合并。熔断器和降级开关的指标没有对（要对中间件做故障注入，阶段 4）。
+       - 尾部采样之后 exemplar 大半跳不到链路（40 个里查得到 14 个），没有改，记在设计第 8 节最后一段和 ADR-0030 的补充里。
+       - 笔记 `docs/notes/3a-observability.md`（Sonnet 写，640 行上下；主会话抽查了数字、补了 14a 一节、按它报的不一致改了 ADR 和设计）。它提的、没有处理的质疑：`READ_BUSY` 那件事的样本很小、16 个读名额为什么会满只是推断；etcd 的 fsync 三次都高于 10 毫秒却一直没有查；“监控自己看不见的故障”（推送的指标没有 `up`、KEDA 取数失败、复制停了延迟指标消失）在 3c 之前没有任何告警兜着。
+       - 没有改 Go 代码；脚本过了 `shellcheck -x`，没有重新跑 `make lint test`。`oppenheimer-e2e` 命名空间已清掉，没有不正常的 Pod。
+   **3a 现在剩下的（新会话从这里开始）**：空转一天后（从重建算起，即 2026-11-18 15:00 UTC 之后；注意重建之后又做过一轮故障注入和两次短的探针）再量一次内存、磁盘和 etcd 的 fsync，量完勾掉“监控数据保留策略与资源占用评估”，3a 就收尾了；PR #15 还是 draft，3a 收尾后请主人转成正式的并决定合并。3a 收尾后是 3b（压测，需要 Mac mini，还没有装 k6）。3b 之前的小事：Grafana 主容器的 requests 调到 384 Mi；agent 的内存上限；拆开看 405 请求/秒时 CPU 就到 70% 的原因。
+7. 记给阶段 4 的：滚动重启 Kafka 的 broker 期间有 31 个下单超时；Redis Cluster 的从库在主库换地址之后不会自己重连。
+
+集群现状：六个服务的镜像 tag 是 `c79f81c-dirty-20261117110013`；命名空间 `keda` 里有 KEDA 的三个 Pod；Loki、Collector（gateway 和三个 agent）按新配置滚动过；gateway、order 的伸缩由 `ScaledObject` 管（各 2 个副本）；`monitoring` 里多了 Collector（gateway 加三个 agent）、mysqld-exporter、redis-exporter，`kafka` 里多了 kafka-exporter，三个 broker 滚动过一次；MySQL 三个实例上多了账号 `exporter`；没有不正常的 Pod。本机的 compose 中间件在运行。
+
+没有查证的（设计 1.3）：除 kube-prometheus-stack、Prometheus、Loki、Tempo 之外的版本都是 Haiku 子 Agent 查的，主会话没有核对；mysqld_exporter 对 MySQL 9.x 的支持（`versions.md` 里记了实测可用）。KEDA 的版本和在 1.37 上能用已经核对过。
 
 ### 2c 做到哪（2026-11-15）
 
@@ -122,12 +187,12 @@
 - Ubuntu 26.04 的 cloud image 已下到宿主机的 `/var/lib/libvirt/images/base/`，SHA256 核对过。
 - 换盘方案写在 `tmp/disk-migration.md`（本地文档，不入库）。
 
-- 宿主机整机备份在 NAS 的 `/volume1/homes/me/backups/ubt-20261115/`（2026-11-15）：`metadata.tar`（分区表、LVM 元数据、fstab、启动项、软件包清单）和 `rootfs.tar.zst`（`/`、`/boot`、`/boot/efi`，16.8 GB，两端 SHA256 一致；没有做过恢复演练）。
+- **（2026-11-17 已按主人的要求删除，宿主机现在没有整机备份；重建靠仓库的脚本。）** 宿主机整机备份曾在 NAS 的 `/volume1/homes/me/backups/ubt-20261115/`（2026-11-15）：`metadata.tar`（分区表、LVM 元数据、fstab、启动项、软件包清单）和 `rootfs.tar.zst`（`/`、`/boot`、`/boot/efi`，16.8 GB，两端 SHA256 一致；没有做过恢复演练）。
 - **网线拔掉时宿主机从 IPv4 连不上的问题已修**：`br0` 是静态地址，没有载波时路由还在而且比 Wi-Fi 的优先。修法是 `ignore_routes_with_linkdown=1`（已写进 `host-setup.sh`）。再遇到 IPv4 连不上时可以走 Wi-Fi 网卡的 IPv6 链路本地地址（在 MacBook 上 `ping6 ff02::1%en0` 找邻居）。
 - 板载网口确认是硬件坏了（只通告千兆时链路起不来，别的电脑接同一个路由器口是千兆）。主人已把网线拔掉，现在只走 Wi-Fi；长期方案是加一块 PCIe 网卡，显示器（U2723QX）的 USB 网口可以临时顶替。**网线没插时 `host-setup.sh` 会因为没有链路而退出**（`ALLOW_NO_LINK=1` 可以跳过）。
 - 换盘定了走方案 A（没有硬盘盒）：主人拔 Windows 盘装 1TB，主会话经 ssh 做迁移，主人再换回。
 
-- **换盘（方案 A）的软件步骤已做完并重启验证过**（2026-11-15）：1TB 分成 EFI 1G、`/boot` 2G、LVM 928G；根分区用 `pvmove` 在线搬到新盘，旧盘已移出卷组；`/boot`、EFI 复制过去，`/etc/fstab` 换了两个 UUID（原件在 `/etc/fstab.before-migration`）；GRUB 装到新盘，主板启动项 `Boot0001` 指向新盘的 EFI 分区。卷组里还有约 698G 没分配。250GB 的旧盘按主人要求已清空（分区表和签名都抹掉，整盘 discard），指向它的启动项已删。虚拟机磁盘的卷已建：`/dev/ubuntu-vg/vmpool`，600G，ext4，挂在 `/var/lib/libvirt/images`（fstab 里带 `nofail`），cloud image 已挪进去并重新核对过；卷组还剩约 98G 没分配。**剩下的**：主人关机拔掉 250GB、把 Windows 盘装回 `M2_1`，开机后主会话确认启动顺序和 Windows 的启动项。
+- **换盘（方案 A）的软件步骤已做完并重启验证过**（2026-11-15）：1TB 分成 EFI 1G、`/boot` 2G、LVM 928G；根分区用 `pvmove` 在线搬到新盘，旧盘已移出卷组；`/boot`、EFI 复制过去，`/etc/fstab` 换了两个 UUID（原件 `/etc/fstab.before-migration` 2026-11-17 已删）；GRUB 装到新盘，主板启动项 `Boot0001` 指向新盘的 EFI 分区。卷组里还有约 698G 没分配。250GB 的旧盘按主人要求已清空（分区表和签名都抹掉，整盘 discard），指向它的启动项已删。虚拟机磁盘的卷已建：`/dev/ubuntu-vg/vmpool`，600G，ext4，挂在 `/var/lib/libvirt/images`（fstab 里带 `nofail`），cloud image 已挪进去并重新核对过；卷组还剩约 98G 没分配。**剩下的**：主人关机拔掉 250GB、把 Windows 盘装回 `M2_1`，开机后主会话确认启动顺序和 Windows 的启动项。
 - `br0` 在 netplan 里加了 `optional: true`：没插网线时开机不再等 2 分钟（等待期间 ssh 会以 pam_nologin 拒绝登录）。
 
 - **换盘全部完成**：Windows 盘已装回 `M2_1`，开机自动进 Ubuntu，启动顺序是 Ubuntu、Windows Boot Manager（Windows 没有实际启动验证过）。
@@ -356,7 +421,7 @@
 | 设备 | 状态 |
 |---|---|
 | MacBook Pro | 在用 |
-| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机 10、16、16 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
+| Ubuntu 3900X | 开机（2026-11-17），内存 48GB（虚拟机各 14 GiB），k3s 三个节点 Ready，Ubuntu 26.04.1，有线经 PCIe 网卡 `enp41s0` 接在网桥 `br0` 上（千兆，192.168.50.7），Wi-Fi（.8，`ssh ubt`）和板载口（.6，插着一根线）是管理通道；三台虚拟机在运行并设了自启 |
 | Mac mini | 开机（2026-11-17），`ssh mini`，还没有装 k6 |
 | DS218+ | 开机（2026-11-17） |
 
@@ -414,6 +479,8 @@
 | 2026-11-11 | inventory 不建 outbox 表 | 步骤二里它只消费不发布，空表加没有中继容易误导；主人决定去掉 |
 | 2026-11-11 | 设计修正：订单不存在且支付失败时答复 `ACCEPTED` 而不是 `REFUND_REQUIRED` | 没有收钱，不应要求退款 |
 | 2026-11-16 | 2d 的 NetworkPolicy 一条改用网格的 mTLS 严格模式加 `AuthorizationPolicy` 实现（只管服务之间的 gRPC）；Argo CD、cert-manager、灰度发布这次不做 | 主人确认（ADR-0029 第 8 项）：网格自带，按身份比按地址准；其余几项留到有需要时 |
+| 2026-11-17 | 三台虚拟机的内存从 10、16、16 改成各 14 GiB；监控的后端优先放在 k3s-server | 阶段 4 关 agent 节点时监控不能跟着没。见 ADR-0030，主人确认 |
+| 2026-11-17 | 2c 留下的“新 order Pod 一就绪就 503”不按“冷连接池”去改，等监控装好后重现再定 | 读代码发现连接池在就绪前已经建满，原推断只有时间上的吻合 |
 
 ## 会话日志
 
@@ -577,4 +644,4 @@
 - **`redis-gate-1` 又坏了一次，又修好了**。这次的经过：上午修好之后它在关 agent-2 时被切成了主库；下午主人搬机器、宿主机断电，它的 `appendonly.aof.4.incr.aof` 尾部又是 142 字节的 0（文件 70503 字节，从 70361 起；最后修改 14:56 北京时间），起不来；Sentinel 把主库切回了 `redis-gate-0`。修法和上午一样：在 k3s-agent-1 上把 `appendonlydir` 和 `dump.rdb` 移到 `/home/ubuntu/redis-gate-1-appendonlydir.bad-20261117-2`、`/home/ubuntu/redis-gate-1-dump.rdb.20261117-2`，删 Pod 重建，它作为从库全量同步，主从各 17 个键，三个 Sentinel 都报 `master-link-status ok`。它坏的时候是主库，断电前最后那一点没有同步出去的写入丢了（内容是限流和租约这类会过期的键，没有去比对）。`/home/ubuntu` 下的四份备份已经按主人的要求删了。
 - **同一天坏了两次，说明宿主机每次断电都可能让某个 Redis 起不来，要人工处理。** 没有修，留给阶段 4（故障恢复）定：可选的做法是启动前用 init 容器跑 `redis-check-aof --fix`，或者从库起不来时自动清空数据重新同步；主库不能这样做，会丢数据。面试考点仍然没有写进阶段计划。
 - 主人说明了断电的原因：调试内存和网卡时没有接显示器，只能强制关机；现在硬件都就绪了，以后不太会再发生。所以上一条说的“每次断电都要人工处理”不急，仍然留给阶段 4。
-- 清理备份（主人要求）：宿主机 `/root` 下 Wi-Fi 配置的备份和上午那两份 GRUB 备份删了。**留着的**：`/root/grub.cfg.bak-20261117-menu` 和 `/root/40_custom.bak-20261117-menu`（改启动菜单之后宿主机还没有重启过，重启一次能正常进 Ubuntu 就可以删）；`/etc/fstab.before-migration` 和 NAS 上的整机备份 `ubt-20261115`（16G，换盘之前的）没有动，等主人定。
+- 清理备份（主人要求）：宿主机 `/root` 下 Wi-Fi 配置的备份和上午那两份 GRUB 备份删了。**留着的**：`/root/grub.cfg.bak-20261117-menu` 和 `/root/40_custom.bak-20261117-menu`（改启动菜单之后宿主机还没有重启过，重启一次能正常进 Ubuntu 就可以删）；`/etc/fstab.before-migration` 和 NAS 上的整机备份 `ubt-20261115`（16G，换盘之前的）随后主人确认，也删了。

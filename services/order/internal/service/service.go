@@ -808,7 +808,8 @@ func (s *Service) lookup(ctx context.Context, orderID, userID int64) (*orderv1.O
 // 而从库还没复制到的订单会被答成 CREATING（状态往回退）或者不存在（还可能把不存在写进缓存）。
 //
 // 读占用失败（Redis 不可用）时退回到只读订单行：已经落库的订单照常能查到，只有行不存在时才报不可用，
-// 因为这时分不清它是在排队还是不存在。闸门的熔断器打开之后，读占用立刻返回、不再等满时限（设计文档 1d 的 6.4）。
+// 因为这时分不清它是在排队还是不存在。展示读的名额满了（fetchHold 返回 errReadBusy）也走这条路，
+// 只是行不存在时答的是 READ_BUSY。闸门的熔断器打开之后，读占用立刻返回、不再等满时限（设计文档 1d 的 6.4）。
 //
 // 配置了冷库时，主库确认没有之后再按 loadCold 的规则查冷库（已归档的订单）。
 func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orderv1.Order, bool, error) {
@@ -823,8 +824,14 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 		if !isBreakerOpen(err) && !errors.Is(err, errReadBusy) {
 			s.logger.WarnContext(ctx, "read hold failed, reading the order row only", "order_id", orderID, "error", err)
 		}
-		if o, ok, err := s.loadConfirmed(ctx, orderID, display); err != nil || ok {
-			return o, ok, err
+		if o, ok, loadErr := s.loadConfirmed(ctx, orderID, display); loadErr != nil || ok {
+			return o, ok, loadErr
+		}
+		if errors.Is(err, errReadBusy) {
+			// 没读闸门是因为展示读的名额满了，不是闸门坏了：按“查询太多”作答（429 READ_BUSY），
+			// 不答 STOCK_GATE_UNAVAILABLE。后者会让人去查 Redis，而 Redis 一点事没有（设计文档 3a 第 8 节：
+			// 扩容时的 503 就是这样被当成“冷连接池”查错了方向）。
+			return nil, false, errReadBusy
 		}
 		return nil, false, errHoldPending
 	}
@@ -854,7 +861,7 @@ func (s *Service) fetch(ctx context.Context, orderID int64, display bool) (*orde
 }
 
 // fetchHold 读订单在闸门里的占用。展示读（display）先占一个名额，占不到就不读，返回 errReadBusy，
-// fetch 按“读占用失败”处理：已经落库的订单照常查得到，还没落库的答“稍后再试”。
+// fetch 按“读占用失败”处理：已经落库的订单照常查得到，还没落库的答 READ_BUSY（稍后再试）。
 //
 // 为什么要这个名额（设计文档 1d 的 8.18）：闸门的 Redis 连接池是受理、落库、回收和查询共用的。
 // 查询的量不受控（客户端在轮询），一拥而上时把连接池占满，别的调用在池子上排队；排队的时间也算在

@@ -54,9 +54,9 @@
 
 | 虚拟机 | 地址 | vCPU | 内存 | 磁盘 | 角色 |
 |---|---|---|---|---|---|
-| k3s-server | 192.168.50.40 | 4 | 10GB | 60GB | 控制面，也承载部分工作负载 |
-| k3s-agent-1 | 192.168.50.41 | 8 | 16GB | 150GB | 工作节点 |
-| k3s-agent-2 | 192.168.50.42 | 8 | 16GB | 150GB | 工作节点 |
+| k3s-server | 192.168.50.40 | 4 | 14GB | 60GB | 控制面，监控的后端（ADR-0030） |
+| k3s-agent-1 | 192.168.50.41 | 8 | 14GB | 150GB | 工作节点 |
+| k3s-agent-2 | 192.168.50.42 | 8 | 14GB | 150GB | 工作节点 |
 
 系统是 Ubuntu 26.04.1 的 cloud image，用户 `ubuntu`（免密 sudo，只能用 MacBook 的 ssh 密钥登录）。磁盘是按需增长的 qcow2。vCPU 合计 20，没有超分；内存合计 42GB，宿主机留约 5GB，KVM 不预占。
 
@@ -70,13 +70,16 @@
 | MySQL：2 分片 × 一主一从 | 4GB |
 | Redis Cluster：6 节点 | 1.5GB |
 | Kafka：3 broker | 4.5GB |
-| Prometheus、Grafana、Alertmanager、Loki | 4GB |
-| Tempo（单体模式） | 1GB（阶段 3a 实测） |
-| OpenTelemetry Collector | 0.5GB |
+| Prometheus、Grafana、Alertmanager、Loki | 4GB（3a 实测：空闲时约 2 GB，压测时的峰值约 2.4 GB） |
+| Tempo（单体模式） | 1GB（3a 实测：空闲 0.2 GB，不采样压测时峰值 1.55 GB，上限 2 GB） |
+| OpenTelemetry Collector | 0.5GB（3a 实测：gateway 加三个 agent 空闲 0.4 GB，压测时 0.6 GB） |
+| KEDA | 0.1GB（3a 实测） |
 | Chaos Mesh | 0.5GB |
 | 业务服务（多副本，含 CDC） | 3GB |
 | 归档 MySQL 实例 | 1GB |
 | 余量 | 约 20GB |
+
+监控各组件实测的内存、磁盘和保留期见设计文档 3a 第 8 节“第 8 步的前一半”。
 
 中间件实际的 requests 见设计文档 2b 的 6.1（比这里多一个 `mysql-main` 和 Sentinel）。
 
