@@ -415,3 +415,7 @@ scripts/cluster/loadtest.sh seed-orders -orders 10000000 -from 2026-08-20 -to 20
 - 每种设置只跑了一轮、3 分钟，请求数因为轮询有 ±4% 的出入，所以上面的差别小于 5% 的都不能算数。全量那一轮用的是经历过阶梯加压的旧 Pod，另外三轮是刚滚动出来的新 Pod，内存没有可比性（505 Mi 对 280 到 310 Mi），没有列。
 - 做完已恢复成平时的配置（`LOADTEST=1` 重新部署，采样器未设、导出地址在；`preflight` 核对过）。
 - 四轮都对账通过（`recon` 差异 0，`verify` 四个 `PASS`）。支付压在每秒 10 笔时，受理的支付全部成功（1778、1846、1790、1801 笔，和已付的订单数逐一相等），和“支付出结果的上限约每秒 17 笔”的判断一致。
+
+### 空表对照（2026-11-21）
+
+第 2 节第 10 项留的那一轮做了，记录在 [notes/3b-rounds/round-5-empty-table-comparison.md](../notes/3b-rounds/round-5-empty-table-comparison.md)。做法和第 2 节第 2 项、第 4 项设想的都不一样：没有另起一套，也没有清库恢复，而是把长期运行的那一套临时指到同一批 MySQL 实例上的 `e2e_*` 空库（`scripts/cluster/loadtest.sh empty-up`、`empty-down`，values 在 `deploy/cluster/services/loadtest-empty/`）。结果：下单 100 单/秒、混合读写 500 和 1907 请求/秒三轮，空库和前后两次大库量不出差别。“空表上量出来的数偏乐观”这句话对这套负载不成立：它只碰索引的右边缘和一小块热数据。随机读旧数据、深翻页、1 亿单没有量。

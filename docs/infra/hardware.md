@@ -44,6 +44,8 @@
 - **Mac mini 上有 Little Snitch**，新装或升级过的可执行文件第一次出站要主人在图形界面里放行。没放行时的样子：Go 程序报 `connect: bad file descriptor`，kubectl 报 `read tcp ...: connection reset`，而 `curl` 是通的。用 Homebrew 装或升级 go、kubectl、helm、golangci-lint、k6 之后，以及 `make build`、`make tools` 生成了新的二进制要连局域网或外网时，先想到它。不要换一个已放行的程序去绕。（2026-11-18 记的“macOS 本地网络权限挡住 k6”多半也是它，没有回头核对。）
 - 经 ssh 的非交互命令不读 `~/.zshrc`，`PATH` 里没有 Homebrew。远程执行 make 时用登录的交互 shell，或者先导出 `PATH`。
 
+- **会话放在 zellij 里、ssh 断开重连之后，这个会话里的 kubectl、helm 连不上局域网**（2026-11-21 遇到）。样子：`dial tcp 192.168.50.40:6443: connect: no route to host`，而同一时刻 `curl`、`nc`、`ping` 是通的，集群也是好的；从一条新的 ssh 会话里跑同一个 `/opt/homebrew/bin/kubectl` 正常。和上一条的 Little Snitch 不是一回事（那个是按可执行文件拦，报的错也不一样）：这是 macOS 的本地网络权限，按“谁启动的”算，启动 zellij 的那条 ssh 连接没了之后，它里面的非系统程序就没有了访问局域网的权限。正在跑的压测脚本会在下一次调 kubectl 时失败（k6 自己经 `ssh mini` 跑，不受影响）。办法：在新的 ssh 会话里重开 zellij 和 Claude Code；来不及时把命令包一层 `ssh mini "zsh -lc 'export PATH=/opt/homebrew/bin:\$PATH; cd ~/Workspace/oppenheimer && ...'"`（非交互的 ssh 里 `PATH` 没有 Homebrew）。
+
 ## 宿主机
 
 - **内存**：金士顿 16GB×2 加威刚 8GB×2，XMP 关闭，2400MHz。memtest86+ 完整跑过两轮没有错误。
