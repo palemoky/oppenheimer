@@ -334,7 +334,7 @@ gRPC 的 Confirm、Release 保留（测试和排障用），订单服务不再�
 | `gate:hold:<order_id>` | hash | 一笔占用：`user`、`items`（`sku:qty,sku:qty`）、`claimed`、`ts` |
 | `gate:holds` | zset | `order_id → 受理时间`，**尚未被认领**的占用，回收任务按时间找旧的 |
 | `gate:claimed` | zset | `order_id → 受理时间`，已被认领、订单还没结束的占用，用来发现认领后卡住的 |
-| `gate:idem:<user_id>:<幂等键>` | string | `order_id:请求哈希`，带过期时间（默认 24 小时） |
+| `gate:idem:<user_id>:<幂等键>` | string | `order_id:请求哈希`，带过期时间（默认 1 小时，原来是 24 小时，见 ADR-0033） |
 
 **占用（hold）是整套设计的核心。** 它是一条以订单号为主键的记录，表示“闸门为这个订单扣过这些数量”。它存在，归还才生效；归还时删除它。所以归还天然幂等：同一个订单的归还执行多少次，只有第一次加回数量。占用从受理一直活到订单进入终态，而不是在 MySQL 预占成功后就删除，原因是之后的取消和关单还要靠它做幂等归还和限购回退。
 
@@ -501,7 +501,7 @@ Redis 丢数据的另一个后果：已受理但还没落库的订单，占用�
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `IDEMPOTENCY_TTL` | 幂等键在 Redis 里的保留时长 | `24h` |
+| `IDEMPOTENCY_TTL` | 幂等键在 Redis 里的保留时长，不能比 `PAYMENT_TIMEOUT` 短（ADR-0033） | `1h` |
 | `HOLD_REAP_GRACE` | 占用多久没被认领就回收 | `1m` |
 | `HOLD_REAP_INTERVAL` | 回收任务的间隔 | `10s` |
 | `GATE_RECONCILE_INTERVAL` | 对账任务的间隔 | `5s` |

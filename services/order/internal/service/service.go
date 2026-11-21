@@ -54,8 +54,15 @@ const ReasonCreateTimeout = errx.ReasonCreateTimeout
 // DefaultPaymentTimeout 是下单后等待支付的默认时限。
 const DefaultPaymentTimeout = 15 * time.Minute
 
-// DefaultIdempotencyTTL 是幂等键在 Redis 里的默认保留时长。
-const DefaultIdempotencyTTL = 24 * time.Hour
+// DefaultIdempotencyTTL 是幂等键在 Redis 里的默认保留时长（ADR-0033）。
+//
+// 它不是幂等的保证期：订单库的唯一键 (user_id, idempotency_key) 才是最终依据，Redis 里的键过期后的重放
+// 在落库时被 dropReplay 挡住。这个键只是让重放在受理这一步就得到原订单的捷径，所以按“客户端还会重试的
+// 时间”定，不按“订单保留多久”定。它也是闸门的一条容量公式：闸门不淘汰键（noeviction），
+// 内存 ≈ 这段时间内受理的订单数 × 约 220 字节。24 小时的时候压测把闸门写满过。
+//
+// 下限是支付时限（装配时检查）：订单还能支付的时候，重放必须直接得到它。
+const DefaultIdempotencyTTL = time.Hour
 
 // DefaultSubmitTimeout 是受理一个下单请求的时限（闸门、按需预热、发消息合计）。
 // 调用方给的 deadline 更短时以调用方为准。

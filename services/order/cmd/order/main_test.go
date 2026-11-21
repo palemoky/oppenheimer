@@ -302,3 +302,39 @@ func TestInventoryHopTimeoutMatchesMesh(t *testing.T) {
 		checkMeshRoute(t, path, r, inventoryHopBudget)
 	}
 }
+
+// IDEMPOTENCY_TTL：默认值不短于默认的支付时限；比支付时限短时拒绝启动（ADR-0033）。
+func TestIdempotencyTTLConfig(t *testing.T) {
+	for _, c := range []struct {
+		name, ttl, payment string
+		want               time.Duration // 0 表示应当拒绝
+	}{
+		{"default", "", "", service.DefaultIdempotencyTTL},
+		{"explicit", "2h", "", 2 * time.Hour},
+		{"equal to the payment timeout", "15m", "15m", 15 * time.Minute},
+		{"shorter than the default payment timeout", "10m", "", 0},
+		{"default shorter than a long payment timeout", "", "2h", 0},
+		{"shorter than a short payment timeout", "2s", "3s", 0},
+		{"short but not shorter", "5s", "3s", 5 * time.Second},
+		{"not a duration", "soon", "", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("MYSQL_DSN", "")
+			t.Setenv("IDEMPOTENCY_TTL", c.ttl)
+			t.Setenv("PAYMENT_TIMEOUT", c.payment)
+			cfg, err := loadConfig()
+			if c.want == 0 {
+				if err == nil {
+					t.Fatalf("IDEMPOTENCY_TTL=%q PAYMENT_TIMEOUT=%q accepted (%s), want error", c.ttl, c.payment, cfg.idempotencyTTL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.idempotencyTTL != c.want {
+				t.Fatalf("idempotencyTTL = %s, want %s", cfg.idempotencyTTL, c.want)
+			}
+		})
+	}
+}

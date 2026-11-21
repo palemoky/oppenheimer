@@ -364,6 +364,13 @@ func loadConfig() (config, error) {
 	if cfg.idempotencyTTL, err = envDuration("IDEMPOTENCY_TTL", service.DefaultIdempotencyTTL); err != nil {
 		return cfg, err
 	}
+	// 幂等键在闸门里至少要留到订单的支付时限（ADR-0033）。比它短的话，订单还等着支付时重放同一个请求，
+	// 用户拿到的是一个新订单号，随后这个订单在落库时被丢弃、查不到，而原订单其实还能支付。
+	// 账不会错（订单库的唯一键挡着），错的是用户看到的东西，所以在启动时拒绝。
+	if cfg.idempotencyTTL < cfg.paymentTimeout {
+		return cfg, fmt.Errorf("IDEMPOTENCY_TTL (%s) must not be shorter than PAYMENT_TIMEOUT (%s)",
+			cfg.idempotencyTTL, cfg.paymentTimeout)
+	}
 	if cfg.reaper.Grace, err = envDuration("HOLD_REAP_GRACE", service.DefaultReapGrace); err != nil {
 		return cfg, err
 	}
