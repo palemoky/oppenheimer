@@ -61,7 +61,7 @@ SKUS=3001 RATE=30 DURATION=20s make k6 SCENARIO=order     # 等价于 scripts/cl
 | `CANCEL_RATIO` | 0.2 | order 场景：取消的比例（其余不动，等超时关单） |
 | `REQ_TIMEOUT` | 10s | 单个请求的超时，超时算失败 |
 | `FLASH_SKU` | 必填 | flash 场景抢的 SKU |
-| `RAMP` | 5s | flash 场景速率从 0 升到 `RATE` 的时间 |
+| `RAMP` | 5s | flash 场景速率从 0 升到 `RATE` 的时间（给了 `STAGES` 时不起作用，按阶梯走） |
 | `ZIPF_S` | 1.1 | mixed 场景的 Zipf 指数 |
 | `A_USERS` / `A_RATE` / `B_RATE` | 10 / 500 / 50 | ratelimit 场景：A 组用户数、A 组合计速率、B 组速率 |
 

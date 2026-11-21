@@ -1,5 +1,5 @@
 // 场景“秒杀”：所有人抢同一个 SKU（FLASH_SKU，必填）。
-// 到达速率在 RAMP（默认 5s）内从 0 升到 RATE，保持 DURATION。
+// 到达速率在 RAMP（默认 5s）内从 0 升到 RATE，保持 DURATION；给了 STAGES 时按阶梯走（RAMP、RATE、DURATION 不起作用）。
 // 一次迭代：查一次库存 -> 下单；被受理的轮询到落库，不支付。库存不足（409）是预期结果，单独计数。
 import { arrival, bindRun, cfg, setupRun } from './lib/config.js';
 import * as api from './lib/api.js';
@@ -11,13 +11,17 @@ if (!FLASH_SKU) throw new Error('FLASH_SKU 必填，例如 FLASH_SKU=1001');
 const RAMP = __ENV.RAMP || '5s';
 
 export const options = m.baseOptions({
-  flash: arrival({
-    stages: [
-      { target: cfg.rate, duration: RAMP },
-      { target: cfg.rate, duration: cfg.duration },
-    ],
-    startRate: 0,
-  }),
+  // 给了 STAGES 就按阶梯走（和别的场景一样，从第一档的速率起）；没给时是原来的“升到 RATE 后保持”。
+  flash:
+    cfg.stages.length > 0
+      ? arrival({})
+      : arrival({
+          stages: [
+            { target: cfg.rate, duration: RAMP },
+            { target: cfg.rate, duration: cfg.duration },
+          ],
+          startRate: 0,
+        }),
 });
 
 export function setup() {

@@ -20,7 +20,7 @@
 #   loadtest.sh image                  只构建并推送 chaos 镜像（load、recon），打印 tag
 #
 # 环境变量：
-#   PREFLIGHT_MIN_DISK_GB   k3s-server 系统盘剩余空间的下限，默认 30
+#   PREFLIGHT_MIN_DISK_GB   k3s-server 系统盘剩余空间的下限，默认 15（盘 58 GB，kubelet 的驱逐线约 6 GB；2026-11-21 以前是 30）
 #   EXPECT_RATE_LIMIT_IP    期望的 gateway RATE_LIMIT_IP（例如 off 或 200/400）；没给就只打印不核对
 #   EXPECT_REPLICAS         期望的副本数，例如 "gateway=2,order=2"；没给就只打印不核对
 #   EXPECT_PAUSED           期望处于暂停的 ScaledObject，例如 "gateway,order"；没给就只打印不核对
@@ -64,7 +64,7 @@ SERVICES="gateway order inventory payment orderindex cdc"
 KEDA_SERVICES="gateway order"
 PAUSE_ANN="autoscaling.keda.sh/paused-replicas"
 PAUSE_ANN2="autoscaling.keda.sh/paused"
-MIN_DISK_GB="${PREFLIGHT_MIN_DISK_GB:-30}"
+MIN_DISK_GB="${PREFLIGHT_MIN_DISK_GB:-15}"
 SKU_INITIAL_FILE="$ROOT/tmp/loadtest/sku-initial.txt"
 # 和服务一样的固定地址（deploy/cluster/services/*.yaml）。长期运行的那一套没有 REDIS_PREFIX、KAFKA_PREFIX，前缀是空的。
 GATE_REDIS="sentinel://gate@redis-gate-sentinel.redis.svc:26379"
