@@ -182,3 +182,14 @@ jobs:
             echo "::error::生成代码与 api/openapi/gateway.yaml 不一致，请运行 make openapi 并提交"
             exit 1
           fi
+
+  # Prometheus 的 SLO 规则（deploy/cluster/monitoring/rules/，设计 3c）：promtool 检查语法，再跑 rules/tests/ 下的单元测试。
+  # promtool 和 yq 由 make 装进 ./bin，版本和 sha256 校验见 Makefile、scripts/install-bin.sh。
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install promtool and yq
+        run: make promtool yq
+      - name: Check and test the rules
+        run: make rules-test

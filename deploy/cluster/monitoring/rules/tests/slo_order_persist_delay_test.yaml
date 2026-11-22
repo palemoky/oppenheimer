@@ -1,0 +1,72 @@
+# 落库时延 SLO 的单元测试（用例 l、m、n）。目标 99%，预算 0.01：快 > 14.4%，中 > 6%，慢 > 3%。
+# 从受理到落库超过 10 秒（le="10" 的桶之外）的订单的比例；没有 status 之类的标签，只按命名空间 oppenheimer 过滤。
+# 输入同时给 _bucket{le="10"} 和 _count，桶是累计的；每步 +30、间隔 30s 是 1 个订单/秒。
+# 数据从 t=0 开始，只断言快的一档（原因见 slo_order_create_availability_test.yaml 的头注释）。
+rule_files:
+  - ../slo.yaml
+evaluation_interval: 30s
+
+tests:
+  # l. 全部在 10 秒内：错误比例 0，不响。
+  - name: l_all_within_threshold
+    interval: 30s
+    input_series:
+      - series: 'order_persist_delay_seconds_count{service_name="order",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_persist_delay_seconds_bucket{service_name="order",k8s_namespace_name="oppenheimer",le="10"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_persist_delay:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_persist_delay:error_ratio_rate5m"}'
+            value: 0
+      - expr: count_over_time(ALERTS{slo="order_persist_delay"}[2h])
+        eval_time: 2h
+        exp_samples: []
+
+  # m. 1 小时正常之后（T0 = 1h）20% 的订单超过 10 秒（高于 14.4%）。
+  #    1h 窗口：0.2 × t/60min > 0.144，t > 43.2 分钟；再 for 2m，约 T0+45 分钟起 firing。T0+30m 不响，T0+50m、T0+60m 响。
+  - name: m_twenty_percent_slow_fast_fires
+    interval: 30s
+    input_series:
+      - series: 'order_persist_delay_seconds_count{service_name="order",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_persist_delay_seconds_bucket{service_name="order",k8s_namespace_name="oppenheimer",le="10"}'
+        values: '0+30x120 3624+24x119'
+    promql_expr_test:
+      - expr: sum by (burn) (ALERTS{slo="order_persist_delay",burn="fast",alertstate="firing"})
+        eval_time: 1h30m
+        exp_samples: []
+      - expr: sum by (burn, severity) (ALERTS{slo="order_persist_delay",burn="fast",alertstate="firing"})
+        eval_time: 1h50m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_persist_delay",burn="fast",alertstate="firing"})
+        eval_time: 2h
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+
+  # n. 有 _count、没有 le="10" 的桶（只有 le="30"）：分子被 or vector(0) 补成 0，错误比例 = 1，快的一档 firing。
+  #    现实里意味着：落库时延的直方图桶边界改了（新边界里没有 10 秒）、le 的写法变了或 _bucket 没采上来时，
+  #    会报“全部落库超时”的误报，而不是静默。先查 le 的值，再查落库链路。
+  - name: n_count_without_the_le_bucket_means_ratio_one
+    interval: 30s
+    input_series:
+      - series: 'order_persist_delay_seconds_count{service_name="order",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_persist_delay_seconds_bucket{service_name="order",k8s_namespace_name="oppenheimer",le="30"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_persist_delay:error_ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{__name__="slo:order_persist_delay:error_ratio_rate5m"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_persist_delay",burn="fast",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1

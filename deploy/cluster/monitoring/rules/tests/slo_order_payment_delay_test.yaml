@@ -1,0 +1,72 @@
+# 支付处理时延 SLO 的单元测试（用例 l、m、n）。目标 99%，预算 0.01：快 > 14.4%，中 > 6%，慢 > 3%。
+# 从支付出结果到订单变成已支付超过 5 秒（le="5" 的桶之外）的订单的比例（阈值是暂定的，等有了基线再定）。
+# 输入同时给 _bucket{le="5"} 和 _count，桶是累计的；每步 +30、间隔 30s 是 1 个订单/秒。
+# 数据从 t=0 开始，只断言快的一档（原因见 slo_order_create_availability_test.yaml 的头注释）。
+rule_files:
+  - ../slo.yaml
+evaluation_interval: 30s
+
+tests:
+  # l. 全部在 5 秒内：错误比例 0，不响。
+  - name: l_all_within_threshold
+    interval: 30s
+    input_series:
+      - series: 'order_payment_delay_seconds_count{service_name="payment",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_payment_delay_seconds_bucket{service_name="payment",k8s_namespace_name="oppenheimer",le="5"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_payment_delay:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_payment_delay:error_ratio_rate5m"}'
+            value: 0
+      - expr: count_over_time(ALERTS{slo="order_payment_delay"}[2h])
+        eval_time: 2h
+        exp_samples: []
+
+  # m. 1 小时正常之后（T0 = 1h）20% 的订单超过 5 秒（高于 14.4%）。
+  #    1h 窗口：0.2 × t/60min > 0.144，t > 43.2 分钟；再 for 2m，约 T0+45 分钟起 firing。T0+30m 不响，T0+50m、T0+60m 响。
+  - name: m_twenty_percent_slow_fast_fires
+    interval: 30s
+    input_series:
+      - series: 'order_payment_delay_seconds_count{service_name="payment",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_payment_delay_seconds_bucket{service_name="payment",k8s_namespace_name="oppenheimer",le="5"}'
+        values: '0+30x120 3624+24x119'
+    promql_expr_test:
+      - expr: sum by (burn) (ALERTS{slo="order_payment_delay",burn="fast",alertstate="firing"})
+        eval_time: 1h30m
+        exp_samples: []
+      - expr: sum by (burn, severity) (ALERTS{slo="order_payment_delay",burn="fast",alertstate="firing"})
+        eval_time: 1h50m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_payment_delay",burn="fast",alertstate="firing"})
+        eval_time: 2h
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+
+  # n. 有 _count、没有 le="5" 的桶（只有 le="10"）：分子被 or vector(0) 补成 0，错误比例 = 1，快的一档 firing。
+  #    现实里意味着：支付处理时延的直方图桶边界改了（阈值是暂定的，等有了基线再定——改阈值时要同时改桶边界，
+  #    否则规则读不到新阈值对应的桶，会变成全部超时的误报）、le 的写法变了或 _bucket 没采上来时同样会误报。
+  - name: n_count_without_the_le_bucket_means_ratio_one
+    interval: 30s
+    input_series:
+      - series: 'order_payment_delay_seconds_count{service_name="payment",k8s_namespace_name="oppenheimer"}'
+        values: '0+30x240'
+      - series: 'order_payment_delay_seconds_bucket{service_name="payment",k8s_namespace_name="oppenheimer",le="10"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_payment_delay:error_ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{__name__="slo:order_payment_delay:error_ratio_rate5m"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_payment_delay",burn="fast",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1

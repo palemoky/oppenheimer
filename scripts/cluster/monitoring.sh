@@ -10,6 +10,9 @@
 #   monitoring.sh keda              KEDA（命名空间 keda）：按 Prometheus 里的请求速率伸缩 gateway、order 用的；要在 services.sh deploy 之前装（chart 里有 ScaledObject）
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
 #   monitoring.sh dashboards        把 deploy/cluster/monitoring/dashboards/*.json 做成 ConfigMap，Grafana 自动加载到文件夹 Oppenheimer
+#   monitoring.sh rules             把 deploy/cluster/monitoring/rules/*.yaml（PrometheusRule，SLO 的记录规则和告警）服务端 apply 到集群，
+#                                   删掉仓库里已经没有的；下发前先 promtool check rules（要 make promtool yq 装好 ./bin）；
+#                                   规则的单元测试是 make rules-test，这里不跑
 #   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
@@ -276,6 +279,45 @@ cmd_dashboards() {
   done
 }
 
+# 规则（设计文档 3c 的 3.2、3.3）在 deploy/cluster/monitoring/rules/，一个文件一个 PrometheusRule，带标签 oppenheimer.rules=1，
+# kps 的 Prometheus 按 ruleSelector 自动加载（operator 把它们转成规则文件，不用重启）。
+# 下发前先用 promtool 检查：先把每个清单的 .spec.groups 抽成纯规则文件（scripts/rules-test.sh --extract），再 promtool check rules。
+# 服务端 apply，字段管理者名同大盘；仓库里删掉的规则文件，集群上对应的 PrometheusRule 也删掉（按标签认）。
+# 依赖：kps 已装（PrometheusRule 的 CRD）。
+cmd_rules() {
+  local dir="$DEPLOY/rules" f name keep=" " tmp
+  if ! command -v promtool >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/promtool" ]]; then
+    echo "promtool not found; run 'make promtool yq' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  if ! command -v yq >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/yq" ]]; then
+    echo "yq not found; run 'make promtool yq' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  tmp="$(mktemp -d)"
+  PATH="$ROOT/bin:$PATH"
+  "$ROOT/scripts/rules-test.sh" --extract "$tmp"
+  if ! promtool check rules "$tmp"/*.yaml; then
+    rm -rf "${tmp:?}"
+    return 1
+  fi
+  rm -rf "${tmp:?}"
+  ensure_ns
+  for f in "$dir"/*.yaml; do
+    [[ -e "$f" ]] || continue
+    name="$(yq '.metadata.name' "$f")"
+    keep="$keep$name "
+    kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f "$f" >/dev/null
+    echo "    $name"
+  done
+  for name in $(kubectl -n "$NS" get prometheusrule -l oppenheimer.rules=1 -o jsonpath='{.items[*].metadata.name}'); do
+    if [[ "$keep" != *" $name "* ]]; then
+      kubectl -n "$NS" delete prometheusrule "$name" >/dev/null
+      echo "    removed $name"
+    fi
+  done
+}
+
 cmd_status() {
   kubectl -n "$NS" get pods -o wide
   kubectl -n "$NS" get pvc
@@ -334,6 +376,7 @@ exporters) cmd_exporters ;;
 istio) cmd_istio ;;
 keda) cmd_keda ;;
 dashboards) cmd_dashboards ;;
+rules) cmd_rules ;;
 up)
   cmd_kps
   cmd_loki
@@ -349,7 +392,7 @@ password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

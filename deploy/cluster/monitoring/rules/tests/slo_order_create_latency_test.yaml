@@ -1,0 +1,114 @@
+# 下单延迟 SLO 的单元测试（用例 l、m、n、o）。目标 99%，预算 0.01：快 > 14.4 × 0.01 = 14.4%，中 > 6%，慢 > 3%。
+# 受理成功（202）的下单请求里，超过 200 毫秒（le="0.2" 的桶之外）的比例。
+# 错误比例 = 1 − (le="0.2" 的桶的速率 or vector(0)) ÷ _count 的速率，两边都只数 status=202。
+#
+# 直方图的输入同时给 _bucket{le=...} 和 _count，桶是累计的（le="0.2" 的值不超过 _count）。
+# 间隔 30s，每步 +30 是 1 个请求/秒。判断哪些档在响用 sum by (burn) (ALERTS{...,alertstate="firing"})。
+# 数据从 t=0 开始，6h、1d 窗口里没有更早的数据，长窗口不会被冲淡（详见可用性那个文件的头注释），
+# 所以这里只断言快的一档。
+rule_files:
+  - ../slo.yaml
+evaluation_interval: 30s
+
+tests:
+  # l. 全部在阈值内：le="0.2" 的桶和 _count 同步增长，错误比例 = 1 − r ÷ r = 0，不响，连 pending 都不进。
+  - name: l_all_within_threshold
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_bucket{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202",le="0.2"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_create_latency:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_latency:error_ratio_rate5m"}'
+            value: 0
+      - expr: count_over_time(ALERTS{slo="order_create_latency"}[2h])
+        eval_time: 2h
+        exp_samples: []
+
+  # m. 20% 的请求超过 200 毫秒（高于 14.4 倍预算 14.4%），先 1 小时全部在阈值内，之后（T0 = 1h）持续。
+  #    5m 窗口马上是 20%；1h 窗口：0.2 × t/60min > 0.144，t > 43.2 分钟；再 for 2m，约 T0+45 分钟起 firing。
+  #    断言：T0+30m（1h 窗口 10%）不响；T0+50m、T0+60m 在响，severity=critical。
+  - name: m_twenty_percent_slow_fast_fires
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_bucket{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202",le="0.2"}'
+        values: '0+30x120 3624+24x119'
+    promql_expr_test:
+      - expr: sum by (burn) (ALERTS{slo="order_create_latency",burn="fast",alertstate="firing"})
+        eval_time: 1h30m
+        exp_samples: []
+      - expr: round(slo:order_create_latency:error_ratio_rate5m * 10)
+        eval_time: 1h50m
+        exp_samples:
+          - labels: '{}'
+            value: 2
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_latency",burn="fast",alertstate="firing"})
+        eval_time: 1h50m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_latency",burn="fast",alertstate="firing"})
+        eval_time: 2h
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+
+  # n. 有 _count、但没有 le="0.2" 的桶序列（这里只有 le="0.5" 的桶）：分子 sum(rate(...)) 没有值，or vector(0) 补成 0，
+  #    错误比例 = 1 − 0 ÷ r = 1，即 100% 超时，快的一档约 2 分钟（for）之后 firing。
+  #    现实里这意味着：规则和指标对不上时不是“没有数据”，而是“全部算坏”，会误报，而且是大声地误报（比悄悄漏报好）。
+  #    会这样发生：有人改了 OTel 直方图的桶边界、新的边界里没有 0.2；SDK 或管道把 le 标签改了写法（比如 0.2 变成 0.20）；
+  #    采集链路丢了 _bucket 只剩 _count；gateway 的指标换了名字或单位，_bucket 没跟上。
+  #    处理时先查 le 的值，而不是先去查延迟。落库时延和支付处理时延的规则（le="10"、le="5"）有同样的行为。
+  - name: n_count_without_the_le_bucket_means_ratio_one
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_bucket{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202",le="0.5"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_create_latency:error_ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: '{__name__="slo:order_create_latency:error_ratio_rate5m"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_latency",burn="fast",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{burn="fast", severity="critical"}'
+            value: 1
+
+  # o. 下单延迟只数 202：409 的请求很慢（每个都超过 200 毫秒，le="0.2" 的桶不增长）也不影响它。
+  #    202：_count 和 le="0.2" 的桶都 +30（全部很快）；409：_count +30、le="0.2" 的桶不动。
+  #    只数 202，错误比例 = 0；如果 409 被算进来会是 30 ÷ 60 = 50%。有效事件速率 1 个/秒（只有 202 那一条）。
+  - name: o_slow_409_does_not_count
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_bucket{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202",le="0.2"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="409"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_bucket{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="409",le="0.2"}'
+        values: '0x240'
+    promql_expr_test:
+      - expr: slo:order_create_latency:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_latency:error_ratio_rate5m"}'
+            value: 0
+      - expr: round(slo:order_create_latency:valid_rate5m)
+        eval_time: 2h
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count_over_time(ALERTS{slo="order_create_latency"}[2h])
+        eval_time: 2h
+        exp_samples: []
