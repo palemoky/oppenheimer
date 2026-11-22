@@ -60,7 +60,9 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
   --end="$(date -u -v+4M +%Y-%m-%dT%H:%M:%SZ)" --annotation=summary='"synthetic test"'
 ```
 
-注意 `severity=critical` 的合成告警会真的发到 Telegram。
+注意 `severity=critical` 的合成告警会真的发到 Telegram。要避开就先加静默（`monitoring.sh silence 'synthetic=true severity=critical' 7m '<原因>'`），并且让静默比告警活得久：告警还在的时候撤掉静默，它下一次分组刷新就发出去了。
+
+抑制规则有现成的整套检查：`scripts/cluster/monitoring.sh inhibit-test`（核对表 `deploy/cluster/monitoring/alertmanager/tests/inhibit.txt`，自己加静默，不发 Telegram）。
 
 ## 索引
 

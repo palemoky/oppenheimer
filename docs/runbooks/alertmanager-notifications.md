@@ -42,6 +42,8 @@
    scripts/cluster/monitoring.sh promql 'time() - max(alertsink_watchdog_last_received)'
    ```
 
+   第三条返回空说明 alertsink 的指标没有了（它自己不在，或者指标送不出来），直接看第 3 步。
+
 3. alertsink 在不在、有没有收到 Watchdog（它每 5 分钟一次，日志是每条告警一行 JSON）：
 
    ```sh

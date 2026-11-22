@@ -50,6 +50,8 @@ SLI：gateway 上 `POST /api/v1/orders` 的 5xx 占全部请求的比例。499�
 
 ## 怎么确认恢复了
 
+- **快档恢复之后紧跟着来一条中档（或慢档）的 critical，先看是不是尾巴。** 快档在响的时候中、慢档被抑制；快档的 5 分钟窗口一干净它就恢复，抑制撤掉，而中档的 30 分钟窗口里还装着刚才的失败，于是这时才发出来，再响到窗口滑过去（中档约 30 分钟，慢档约 2 小时）。判断：`slo:order_create_availability:error_ratio_rate5m` 是 0 就是尾巴，不用处理；不是 0 才是故障还在。2026-11-23 的故障注入里就是这样（设计第 8 节“第 8 步”第 3 项）。
+
 - 告警恢复的条件：短窗口（5m、30m、2h）的比例掉回阈值以下，或者有效请求速率低于 0.2。故障停了之后快的一档约 5 分钟恢复（单元测试钉下来的行为，设计 8“第 3 步的后一半”）。长窗口要几小时才降下来，但告警要两个窗口同时超过才响，所以不影响。
 - `scripts/cluster/monitoring.sh promql 'slo:order_create_availability:error_ratio_rate5m'` 回到 0 附近。
 - 下单真的通：`scripts/cluster/monitoring.sh promql 'sum by (outcome) (rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m]))'` 里 `ok` 占满。
@@ -67,4 +69,4 @@ SLI：gateway 上 `POST /api/v1/orders` 的 5xx 占全部请求的比例。499�
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-22 21:33 到 21:40 UTC：故障注入（inventory 缩到 0，7 分钟）。快档 21:37 响、21:47 恢复；中档 21:46 才发出来（被快档压着），约 22:10 恢复。381 个 5xx，全是 `503 ORDER_LANDING_UNAVAILABLE`。7 天的预算因此是负的。

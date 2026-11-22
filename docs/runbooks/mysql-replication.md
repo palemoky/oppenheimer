@@ -38,6 +38,7 @@
    echo "SELECT LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker; SELECT LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status;" | \
      KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n mysql exec -i mysql-order-0-1 -c mysql -- bash -c '. /scripts/lib.sh; rsql 127.0.0.1 -N -B'
    ```
+   错误号是 0、信息是空的，说明线程不是出错停的，是被人停的（`STOP REPLICA`）：2026-11-23 的故障注入里就是这样。
 3. 集群上的核对，有无 `ANOMALY`、落盘方式是不是 2/0：`scripts/cluster/middleware.sh mysql`。
 4. 从库 Pod 和日志，最近有没有重启、节点有没有断过电：
 

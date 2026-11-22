@@ -9,7 +9,7 @@
 `pkg/breaker` 是进程里的熔断器，保护边车看不到的依赖（Redis、MySQL 的从库和冷库）：连续失败 5 次（`BreakerFailures`）打开，冷却 5 秒后半开，半开只放一个探测。指标 `breaker_state`：0 闭合、1 打开、2 半开。闸门和落库健康的熔断器还要求失败持续至少 1 秒才打开（`MinFailureSpan`），免得一次停顿被放大成 5 秒不可用（ADR-0021 的补充、round-3 第 4 节）。服务之间的熔断和并发上限在 Envoy 边车里，不在这里（见 `MeshEndpointEjected`、`MeshConcurrencyLimitOverflow`）。
 
 - **`BreakerOpen`**：`breaker_state >= 1` 且名字不是 `landing-db-*`，持续 2 分钟。写成 `>= 1`，打开和半开来回切时“等于 1”会不断重新计时。熔断器名字有：`stock-gate`（order 的闸门 Redis）、`archive`（冷库）、`order-cache`（order 的缓存 Redis）、`stock-cache`（inventory 的缓存）、`cache_<名字>`（`pkg/cache` 的缓存）。
-- **`OrderLandingBreakerOpen`**（critical）：名字是 `landing-db-<分片号>` 的，持续 2 分钟。它打开说明 order 判定这个订单库不能落库（inventory 调不通、订单库写不进去持续失败），落到这个分片上的下单在受理时就被拒绝（`503 ORDER_LANDING_UNAVAILABLE`）。两个分片，所以约一半用户下不了单。
+- **`OrderLandingBreakerOpen`**（critical）：名字是 `landing-db-<分片号>` 的，持续 2 分钟。它打开说明 order 判定这个订单库不能落库（inventory 调不通、订单库写不进去持续失败），落到这个分片上的下单在受理时就被拒绝（`503 ORDER_LANDING_UNAVAILABLE`）。两个分片，所以约一半用户下不了单。**两个分片的同时打开，先看 inventory 在不在**：通知的文字说的是“落库健康检查”，容易往数据库上想，但两个库同时坏的可能远小于它们共同依赖的 inventory 坏（2026-11-23 把 inventory 缩到 0，两条在 2.8 分钟后一起响，比 SLO 的快档早一分钟，那时全部下单被拒）。只有一个分片打开才先看那个订单库。
 
 ## 影响
 

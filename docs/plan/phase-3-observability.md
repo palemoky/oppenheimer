@@ -85,19 +85,19 @@
   - **故障注入登记（2026-11-23 登记，都还没有做）**。都在长期运行的那一套上做，除了标明 e2e 的；每一项做之前加对应的静默只限于“不是这次要看的”那几条，做完撤掉故障、确认告警恢复、跑一次 `recon-hourly` 差异为 0。一次只做一项。不删 PVC、不清数据、不重置节点。
     | # | 做什么 | 预期响的 | 怎么撤 |
     |---|---|---|---|
-    | 1 | 合成告警（`amtool alert add`，不动组件）逐条试其余的抑制 | 无（验证抑制和路由） | 自己过期 |
-    | 2 | 探针缩到 0（`services.sh probe-stop`）15 分钟 | 不该响 `ProbeNoData`（人为停的不报）；SLO 不该响 | `probe-start` |
-    | 3 | inventory 缩到 0 约 10 分钟（3a 做过） | `ProbeFailing`、可用性的快档、`MeshEndpointEjected` 或网格溢出、`ServiceMetricsMissing{inventory}`、`KedaHPAScalingInactive` 不该响 | 缩回 2 |
-    | 4 | payment 缩到 0 约 15 分钟 | `PaymentReplyOverdue`、`PaidOrdersNotLanding`、支付时延的 SLO、`ConsumerNotConsuming`、`PaymentTotalsCheckStalled` 不该响 | 缩回 2 |
-    | 5 | orderindex 缩到 0 约 15 分钟（3a 做过） | `ConsumerNotConsuming`、`ServiceMetricsMissing{orderindex}` | 缩回 2 |
-    | 6 | cdc 缩到 0 约 15 分钟（3a 做过） | `CDCPipelineMissing`、`ServiceMetricsMissing{cdc}`；恢复后短暂的 `CDCLagging` | 缩回 1 |
-    | 7 | 一个订单从库 `STOP REPLICA SQL_THREAD` 约 10 分钟（3a 验证 7 做过） | `MySQLReplicaSQLThreadStopped`；之后 `MySQLReplicaLagHigh` | `START REPLICA` |
-    | 8 | 同一个从库 `STOP REPLICA IO_THREAD` 约 5 分钟 | `MySQLReplicaIOThreadStopped` | `START REPLICA` |
-    | 9 | 闸门 Redis 临时把 `maxmemory` 调到当前用量的 1.3 倍、再到 1.15 倍（`CONFIG SET`，不灌数据） | `RedisGateMemoryHigh`、`RedisGateMemoryCritical`（后者压住前者） | `CONFIG SET` 改回原值，核对和清单一致 |
-    | 10 | 删一个 Sentinel 的 Pod 不够（会自己回来）：把 Sentinel 的 StatefulSet 缩到 1 约 5 分钟 | `RedisSentinelBelowQuorum` | 缩回 3 |
-    | 11 | otel-gateway 缩到 0 约 12 分钟 | `OtelGatewayDown`；各条“没有数据”应当被抑制；`AlertDeliveryStalled` 被抑制 | 缩回原值。这段时间的指标、日志、链路会丢 |
-    | 12 | alertsink 缩到 0 约 30 分钟 | `AlertmanagerNotificationsFailing{webhook}`、`AlertDeliveryStalled`（Telegram 配好之后才看得到送达） | 缩回 1 |
-    | 13 | Strimzi operator 缩到 0 约 25 分钟（不动 broker） | `KafkaOperatorMetricsMissing` | 缩回 1，确认一次调和成功 |
+    | 1 | 合成告警（`amtool alert add`，不动组件）逐条试其余的抑制。**做了（2026-11-23）**：`monitoring.sh inhibit-test`，14 条规则 47 条用例全部符合；结果在设计第 8 节“第 8 步” | 无（验证抑制和路由） | 自己过期 |
+    | 2 | 探针缩到 0（`services.sh probe-stop`）15 分钟。**做了（2026-11-23）**：17 分钟里没有任何告警进 `pending` | 不该响 `ProbeNoData`（人为停的不报）；SLO 不该响 | `probe-start` |
+    | 3 | inventory 缩到 0 约 10 分钟（3a 做过）。**做了（2026-11-23）**：7 分钟，快档、探针、熔断器、入口的都响了并恢复；`MeshEndpointEjected` 这样触发不了（没有端点可摘），中档在恢复之后才发出来（设计第 8 节） | `ProbeFailing`、可用性的快档、`MeshEndpointEjected` 或网格溢出、`ServiceMetricsMissing{inventory}`、`KedaHPAScalingInactive` 不该响 | 缩回 2 |
+    | 4 | payment 缩到 0 约 15 分钟。**没有做，做之前要重新设计（2026-11-23）**：`PaidOrdersNotLanding` 要“支付成功了而订单不变已支付”，payment 整个不在时没有支付成功，它不会响（要停的是 order 消费 `payment.events` 的那一侧）；`PaymentReplyOverdue` 要 20 分钟加 2 分钟、`ConsumerNotConsuming` 约 21 分钟，15 分钟都不够；超过 15 分钟探针的订单会走关单和退款的路，恢复后要对账 | `PaymentReplyOverdue`、`PaidOrdersNotLanding`、支付时延的 SLO、`ConsumerNotConsuming`、`PaymentTotalsCheckStalled` 不该响 | 缩回 2 |
+    | 5 | orderindex 缩到 0 约 15 分钟（3a 做过）。**做了（2026-11-23）**：要 27 分钟才够（`ConsumerNotConsuming` 约 21 分钟才响），两条都响了并恢复 | `ConsumerNotConsuming`、`ServiceMetricsMissing{orderindex}` | 缩回 2 |
+    | 6 | cdc 缩到 0 约 15 分钟（3a 做过）。**做了（2026-11-23）**：19 分钟，两种都响了并恢复；恢复后的 `CDCLagging` 没有出现（一分钟内追平） | `CDCPipelineMissing`、`ServiceMetricsMissing{cdc}`；恢复后短暂的 `CDCLagging` | 缩回 1 |
+    | 7 | 一个订单从库 `STOP REPLICA SQL_THREAD` 约 10 分钟（3a 验证 7 做过）。**做了（2026-11-23）**：SQL 线程和 `CDCLagging` 响了并恢复；`MySQLReplicaLagHigh` 这样触发不了（延迟的序列会消失），归到第 16 项 | `MySQLReplicaSQLThreadStopped`；之后 `MySQLReplicaLagHigh` | `START REPLICA` |
+    | 8 | 同一个从库 `STOP REPLICA IO_THREAD` 约 5 分钟。**做了（2026-11-23）**：响了并恢复；压在了 19:07 的 `recon-hourly` 上，引出一条 `ReconFoundDifferences` 的误报（设计第 8 节）。以后避开每小时的第 5 到 9 分钟 | `MySQLReplicaIOThreadStopped` | `START REPLICA` |
+    | 9 | 闸门 Redis 临时把 `maxmemory` 调到当前用量除以 0.75、再到除以 0.82（`CONFIG SET`，只改主库，不灌数据）。2026-11-23 改：原来写的 1.15 倍是 87%，越过了 order 停止受理的 85%（ADR-0034），探针在跑，会真的拒单；动手前先看用量的波动（3 小时里不到 0.3%）。**做了（2026-11-23）**：两条先后响了并恢复，没有拒单 | `RedisGateMemoryHigh`、`RedisGateMemoryCritical`（后者压住前者） | `CONFIG SET` 改回原值，核对和清单一致 |
+    | 10 | 删一个 Sentinel 的 Pod 不够（会自己回来）：把 Sentinel 的 StatefulSet 缩到 1 约 5 分钟。**做了（2026-11-23）**：响了并恢复；另外多响了两条 critical 的 `RedisDown`（Sentinel 也被算成 Redis，设计第 8 节） | `RedisSentinelBelowQuorum` | 缩回 3 |
+    | 11 | otel-gateway 缩到 0 约 12 分钟。**做了（2026-11-23）**：17 分钟，11 条“没有数据”全部被压住；恢复时漏出来两条，给 `OtelGatewayDown` 加了 `keep_firing_for` | `OtelGatewayDown`；各条“没有数据”应当被抑制；`AlertDeliveryStalled` 被抑制 | 缩回原值。这段时间的指标、日志、链路会丢 |
+    | 12 | alertsink 缩到 0 约 30 分钟。**做了（2026-11-23）**：28 分钟，两条都响了，critical 的经 Telegram 送到；自带的两条也响了（重复，设计第 8 节） | `AlertmanagerNotificationsFailing{webhook}`、`AlertDeliveryStalled`（Telegram 配好之后才看得到送达） | 缩回 1 |
+    | 13 | Strimzi operator 缩到 0 约 25 分钟（不动 broker）。**做了（2026-11-23）**：18 分钟，响了并恢复，调和恢复正常 | `KafkaOperatorMetricsMissing` | 缩回 1，确认一次调和成功 |
     | 14 | 压测：普通下单阶梯打过写入的拐点（3b 的脚本；先 `LOADTEST=1 make deploy`、`pin`，本机 `make down`，探针和对账按 3b 的规矩） | `OrderBackpressureRejecting`、`OrderQueueNearWaitLimit`、落库时延的 SLO、`NodeCPUHigh`、`OutboxRelaySlow`、`RateLimitFallingBack` 可能 | 停压，恢复平时的配置 |
     | 15 | 对账差异：在 `oppenheimer-e2e` 里手工改一行（不动长期运行的库）；这只验证 `recon` 报得出来，长期运行那一套的 `ReconFoundDifferences` 用临时改阈值代替 | `recon` 退出码 1 | e2e 的命名空间用完即弃 |
     | 16 | 不方便真做的（磁盘、内存、OOM、超卖、死信、钱对不上、节点重启、Kafka 分区离线、broker 少一个、MySQL 连不上、备份过期、对账过慢）：临时把规则的阈值改到当前值以下（只改集群上的 PrometheusRule，仓库不动），响了再 `monitoring.sh rules` 改回来 | 对应的那一条 | 重新下发规则。**这只验证了路是通的，结果里单列，不算真实触发** |
@@ -158,3 +158,5 @@ OpenTelemetry 的架构（API、SDK、Collector、OTLP）与上下文传播；Co
 3b 长稳补的（[记录](../notes/3b-rounds/round-9-soak.md)第 5 节）：长稳找的是“没有稳态的东西”，看斜率不看数值；短的压测为什么量不出磁盘的问题；压缩保留和按时间保留的 topic 各由什么决定大小；保留期的下限由什么定（CDC 断点续传、消费者停机再回来）。
 
 3b 定 CPU requests 和弹性测试补的（[记录](../notes/3b-rounds/round-8-cpu-requests.md)第 7 节）：requests 的三个用处（调度器记账、HPA 百分比的分母、节点满了之后分 CPU 的权重），它不是预留也不是上限；只调一部分 Pod 的 requests 为什么会改变所有 Pod 的相对权重（服务调准、中间件不动，过载时等于让服务优先于数据库）；全部按实测写时调度器为什么会拒绝再扩一个副本；HPA 用请求速率和 CPU 两个信号各自防什么；Istio 的边车资源注解为什么要三项一起写；扩容期间不丢请求靠哪几件事；滚动更新为什么要占容量（`maxSurge`）；控制器调和失败而它管的东西照常运行时怎么发现。
+
+3c 告警质量检查补的（[设计](../design/3c-slo-alerting.md)第 8 节“第 8 步”）：Alertmanager 一条告警从进来到发出去经过哪几步（分组、抑制、静默、去重），各自解决什么；抑制的 `equal` 为什么“两边都没有这个标签也算相同”、怎么核对一条抑制不是靠这个才成立的；抑制为什么不连锁、被抑制的告警为什么仍然能当源；被静默的告警为什么仍然能抑制别的（抑制看源在不在，不看它通知出去没有）；为什么会收到没有“触发”在前的“恢复”通知（一直被抑制或者在 `group_interval` 里就过期的告警，和已通知的告警同组），消费 webhook 的程序因此不能假设什么；`group_wait`、`group_interval`、`repeat_interval` 各管哪一段时间；抑制和分组为什么只能在真的 Alertmanager 上测（`amtool` 只测得了路由树）。

@@ -545,3 +545,143 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - `ReconFoundDifferences` 的恢复靠 CronJob 的 `lastSuccessfulTime`；手工 `create job --from=cronjob` 跑成功的 Job 会不会更新它没有核对（`MySQLBackupStale` 同理）。
 - `MeshEndpointEjected`、`MeshConcurrencyLimitOverflow` 只看 `oppenheimer` 命名空间，`make cluster-fault`（在 e2e 的命名空间里）验证不了它们。
 - server 的根分区剩 22 到 24 GiB，长稳时每小时掉约 1.5 GiB：一次长稳约 5 小时碰 `ServerDiskLow`，压测前看一眼。
+
+### 第 8 步：告警质量检查（2026-11-23 起，按计划文件登记表的编号）
+
+每一项记：做了什么、响了什么、和预期不一样的、runbook 走不走得通。“真实触发”和“只验证了路是通的”分开写。
+
+**第 1 项：合成告警逐条试抑制（2026-11-22 17:23 到 17:30 UTC，没有动任何组件）**
+
+- **做成了可以重跑的检查**：`scripts/cluster/monitoring.sh inhibit-test`，核对表是 `deploy/cluster/monitoring/alertmanager/tests/inhibit.txt`（每行“期望 | 标签”，47 条）。它把表里的告警一次塞进 Alertmanager，等 10 秒，从 API 读每一条的 `inhibitedBy`，把指纹换成源告警的名字打出来。改了 `inhibit_rules` 或者这些规则的标签之后跑一遍。它不进 CI（要集群）。
+- **结果：14 条抑制规则都按预期生效，47 条里 0 条不符**。每条规则至少有一条被压住的和一条对照（`equal` 里的标签对不上的那一个不被压）。第一遍有 1 条不符，是核对表写错了，不是配置的问题：`InfoInhibitor` 自己是被“任何告警”压住的（chart 的第四条规则没有源的条件），而它被压住的同时仍然压住了同命名空间的 `info`。这正是“抑制不连锁”的另一面：被抑制的告警仍然是有效的源。
+- **标签是照真实的写的，不是照规则里匹配的那几个凑的**。动手前从 Prometheus 里取了每对告警背后的指标实际带的标签：`mysql_up` 和复制的指标都带 `cluster` 和 `instance`（实例是 Pod 名），所以“主库连不上压同一套从库的 IO 线程”的 `equal: [cluster]` 两边都有值；`MySQLReplicaMetricsMissing` 是 `absent()` 出来的，只带 `instance`，和 `MySQLDown` 的 `instance` 对得上。`equal` 的坑是两边都没有某个标签也算相同，这一步核对的就是 14 条规则里没有哪一条是靠“都没有”才成立的。
+- **静默第一次用上了，并且踩了一个坑**：critical 的合成告警会发到 Telegram，所以脚本先加一条 `synthetic=true severity=critical` 的静默。被静默的告警照样能当抑制的源（抑制看的是源告警在不在，不看它通知出去没有），所以不影响结果。第一版在脚本退出时把静默撤掉，而告警还要活 4 分钟，撤掉之后下一次分组刷新就会发出去；当场补了一条静默，Telegram 的发送计数前后都是 2，没有漏出去。现在静默比告警多活 3 分钟，自己到期。
+- **alertsink 一侧对上了**：不被抑制的 9 条 warning 都在 30 秒（`group_wait`）后送到，被抑制的一条都没有；critical 的被静默，没有送。
+- **一个事先没想到的行为：一直被抑制的告警，恢复时会收到一条“恢复”通知，而它从来没有发过“触发”。** 第一遍 alertsink 收到 9 条触发、14 条恢复，多出来的 5 条正是和某条已通知的告警同组、自己一直被压着的那几条（例如 `redis-gate-0` 的 `RedisGateMemoryHigh`，和没被压的 `redis-gate-1` 同组）。原因（按 Alertmanager 的流程推断，没有读源码核对）：源和目标同时恢复，分组刷新时源已经不在，抑制不再拦它；这一组之前发过通知，组里的内容变了就要再发一次，恢复的告警全都带上。第二遍的 14 条同理：它们加进了第一遍已经存在的组，要等 `group_interval`（5 分钟）才轮到，那时已经过期，于是只发了恢复。**对 3d 的诊断 Agent 的要求：webhook 的消费方不能假设“恢复”之前一定见过“触发”。** Telegram 一侧同样会出现（critical 的两档阈值、MySQL 的那几条），没有处理，放一周看的时候留意。
+- 顺带看到的：`amtool alert add --end=T` 不带 `--start` 时，alertsink 记下的 `starts_at` 等于 `T`（未来的时刻）。只影响合成告警的日志，没有查是 amtool 还是 Alertmanager 填的。
+- **仍然没有验证的**：`repeat_interval` 到点重发（要等 1 小时和 12 小时，放一周看的时候看）；“节点不在”的抑制没有做。
+
+**第 2 项：探针缩到 0（真实操作；2026-11-22 17:30:26 到 17:47:37 UTC，17 分钟）**
+
+- 预期是什么都不响，结果是什么都没响：每分钟查一次 `ALERTS`（`pending` 的也算），17 次全是空的（`tmp/3c-inject-02-probe-stop.log`）。周期速率 17:35 掉到 0，之后停了 12 分钟，超过 `ProbeNoData` 的 `for`（10 分钟）；它连 `pending` 都没有进，说明副本数那个条件在起作用。SLO 的四组、`PaymentTotalsCheckStalled`、CDC 的几条也都没有动。
+- 这一项只验证了“人为停的不报”。`ProbeNoData` 该响的时候会不会响（探针活着但没有数据）还没有验证，在第 11 项（停 Collector）里它应当被抑制，所以真实触发要另想办法；没有办法就在第 16 项里单列。
+
+**第 5 项：orderindex 缩到 0（真实触发；2026-11-22 17:47:50 到 18:15:08 UTC，27 分钟）**
+
+| 告警 | 进 `pending` | `firing` | alertsink 收到 | 从停掉算起 |
+|---|---|---|---|---|
+| `ServiceMetricsMissing{orderindex}` | 约 17:53 | 约 17:58 | 17:58:46 | 约 11 分钟 |
+| `ConsumerNotConsuming{orderindex.cdc-orders}` | 约 17:58 | 约 18:08 | 18:08:35 | 约 21 分钟 |
+
+- 该响的两条都响了，没有别的告警跟着响（`tmp/3c-inject-05-orderindex.log`）。恢复：缩回 2 之后 3 分钟内两条都不在了，积压从 4854 回到 0。
+- **两条都比规则里写的 `for` 慢一截，原因不同。** `ServiceMetricsMissing` 的 `for` 是 5 分钟，但服务停了之后它的序列还要 5 分钟才从查询结果里消失（Prometheus 对不再更新的序列默认回看 5 分钟），`absent()` 那时才成立；通知里的“已经 10 分钟没有报任何指标”是对的。`ConsumerNotConsuming` 是 10 分钟的 `delta` 等于 0（位点停下 10 分钟后才成立）再加 `for` 10 分钟；通知里写的“位点 10 分钟没有动”实际是 20 分钟，没有改。计划的登记表里写的“约 15 分钟”不够，这次按 27 分钟做的。
+- 分组各自一组（`alertname` 不同），各发一条，都走 webhook，没有 critical。
+- **runbook 走通了**：`service-metrics-missing.md` 和 `consumer-blocked.md` 的“先看什么”在故障现场逐条执行过，命令都能跑，并且走得到原因（六个服务里只少 orderindex、Deployment 是 0/0；积压 3324 而位点的 `delta` 是 0；`kafka-consumer-groups.sh --describe` 显示 `no active members`）。子 Agent 没核对的“broker Pod 里 Kafka 脚本的路径”是对的（`/opt/kafka/bin/`，Pod 选出来是 `kafka-dual-0`）。
+- **对账的一个要记住的地方**：恢复后手工跑的 `recon-hourly` 差异 0，但它的上界是“现在往前 30 分钟”（这次是 17:48），故障那 27 分钟里的订单不在这次的窗口里。故障注入之后的对账要等故障结束 30 分钟以后跑的那一次才算数；这一项以 19:07 UTC 那次为准。
+- 顺带看到的：第 2 项恢复探针之后 `ProbeNoData` 进过一次 `pending`（17:49，不到 1 分钟）：副本数先变成 1，周期速率要再等两次采集才不是 0。`for` 10 分钟挡得住，不用改。
+
+**第 6 项：cdc 缩到 0（真实触发；2026-11-22 18:18:44 到 18:37:47 UTC，19 分钟）**
+
+| 告警 | 进 `pending` | `firing` | alertsink 收到 | 从停掉算起 |
+|---|---|---|---|---|
+| `ServiceMetricsMissing{cdc}` | 约 18:24 | 约 18:28 | 18:29:16 | 约 10.5 分钟 |
+| `CDCPipelineMissing`（order-0、order-1 各一条） | 约 18:24 | 约 18:34 | 18:34:35（一条通知里两条） | 约 16 分钟 |
+
+- 该响的都响了，没有别的跟着响（`tmp/3c-inject-06-cdc.log`）。两条 `CDCPipelineMissing` 同组，合成一条通知。恢复的通知在 18:39 到了。通知里写的“10 分钟没有报延迟”实际是 15 分钟（同第 5 项的原因：序列消失要 5 分钟），没有改。
+- **预期里“恢复后短暂的 `CDCLagging`”没有出现**：cdc 回来之后不到一分钟就追平了（19 分钟、每秒约 1 单的量），`cdc_lag_ms` 回到平时的几十到几百毫秒，`CDCLagging`（超过 60 秒并持续 5 分钟）连 `pending` 都没进。所以 **`CDCLagging`、`CDCLaggingTooLong` 还没有被真实触发过**，放到第 7 项（从库的 SQL 线程停了，cdc 读的就是从库）里看，不行就归到第 16 项。
+- cdc 停着的时候 `orderindex.cdc-orders` 的积压是 0（上游没东西来），所以 `ConsumerNotConsuming` 不响，这是对的。
+- **runbook（`cdc.md`）走通了**：五步的命令都能跑。第 1 步在 `CDCPipelineMissing` 响的时候返回空（指标没了），第 2 步看到 Deployment 是 0/0，就是原因。
+
+**第 7 项：订单从库 `mysql-order-0-1` 停 SQL 线程（真实触发；2026-11-22 18:46:28 到 18:57:43 UTC，11 分钟）**
+
+| 告警 | `firing` | alertsink 收到 | 从停掉算起 |
+|---|---|---|---|
+| `MySQLReplicaSQLThreadStopped`（critical） | 约 18:49 | 18:49:43，Telegram 也发了（发送计数加 1） | 约 3 分钟 |
+| `CDCLagging{order-0}`（warning） | 约 18:52 | 18:53:05 | 约 6.5 分钟 |
+
+- 两条都响了；`START REPLICA` 之后一分钟内两条都不在了，`cdc_lag_ms` 从 665 秒回到 0。**`CDCLagging` 到这里算真实触发过了**（cdc 读的是从库的 binlog，从库不回放它就没有新东西，延迟每分钟涨 60 秒）。`CDCLaggingTooLong`（1 小时）没有等，归到第 16 项。
+- **预期里“之后 `MySQLReplicaLagHigh`”没有出现，也不会出现**：SQL 线程停着的时候 `Seconds_Behind_Source` 是 NULL，序列直接消失；恢复之后不到一分钟就追平，够不到“超过 30 秒并持续 5 分钟”。`MySQLReplicaMetricsMissing` 没有响，这是对的（线程状态的序列还在，两条是互补的）。`MySQLReplicaLagHigh` 归到第 16 项。
+- **事先没想到的：从库的 Pod 变成了 NotReady**（就绪探针查复制状态），于是 chart 自带的 `KubePodNotReady`、`KubeStatefulSetReplicasMismatch` 进了 `pending`（它们的 `for` 是 15 分钟，这次 11 分钟没有响）。停得再久一点会是三条告警说同一件事，没有配抑制；放一周看的时候再定。
+- 从库被摘掉的好处也看到了：故障的 8 分钟里探针 480 个周期全部 ok，读回到了主库。
+- 通知里 `CDCLagging` 的文字是“落后 365.4k 毫秒”，不好读，该换成秒或者用 `humanizeDuration`；没有改。
+- runbook（`mysql-replication.md`）第 1、2 步在现场执行过，能跑；人为停的线程错误号是 0、信息是空的（没有错误），这一点 runbook 里没有写，补了。
+
+**第 8 项：同一个从库停 IO 线程（真实触发；19:06:01 到 19:12:02 UTC，6 分钟）**
+
+- `MySQLReplicaIOThreadStopped`（critical）约 19:09 响，19:09:13 送到（Telegram 也发了），恢复的通知 19:14:13。`CDCLagging` 进了 `pending` 没到 5 分钟。
+- **这一项出了一个事故，是排时间的失误：19:06 动手，正好压在 19:07 的 `recon-hourly` 上。** 从库 NotReady 之后被从 `mysql-order-0-replica` 这个 Service 里摘掉，对账连它被拒绝，退出码 2，Job 失败，`ReconFoundDifferences`（critical）19:08:52 发到了 Telegram。19:15 手工复跑：窗口 17:15 到 18:45，六对差异 0，告警一分多钟后恢复。失败的 Job `recon-hourly-29922907` 还留着（删除被权限拦下了，由主人定），所以自带的 `KubeJobFailed` 约 19:23 会响（warning，只到 alertsink）。
+- 从这个事故里得到的：
+  1. **`ReconFoundDifferences` 分不清“有差异”（退出码 1）和“没跑成”（退出码 2）**，名字和级别都是按前一种定的。没跑成也该有人知道（对账没在跑），但“一个从库有一分钟不可用”就按钱对不上的级别叫人，是误报。两个改法：规则按退出码拆成两条（要先确认 kube-state-metrics 有容器退出码的指标）；或者 `recon` 连不上从库时等一会儿重试、Job 的 `backoffLimit` 给 1。**没有改，等主人定**（涉及资金的对账，怎么报由主人定）。
+  2. 手工 `create job --from=cronjob` 跑成功**会**更新 CronJob 的 `lastSuccessfulTime`，告警因此恢复。runbook 里原来写的是“没有核对”，改了。
+  3. 手工复跑的上界是 30 分钟前；这次的窗口盖住了第 5、6 项的故障时段（差异 0），第 7、8 项的要看 20:07 那一次。
+  4. 以后的故障注入避开每小时的第 5 到 9 分钟，或者先 `recon-cron-suspend`。已写进 `recon.md` 的“历史”。
+
+**第 9 项：闸门 Redis 的 `maxmemory` 临时调低（真实触发；2026-11-22 19:17:56 到 19:31:39 UTC，只改主库 `redis-gate-0`）**
+
+- 做法按 runbook 的，不按登记表原来写的：表里的“1.15 倍”是 87%，越过了 order 停止受理的 85%（ADR-0034），探针一直在下单，会真的拒单。改成用量除以 0.75（约 106.5 MB）和除以 0.82（约 97.4 MB）。动手前看了用量的波动：3 小时里 79.66 到 79.90 MB，不到 0.3%，离 85% 的 3 个百分点够用。脚本每 20 秒读一次比例，到 83.8% 就自动恢复，退出时也恢复。
+- `RedisGateMemoryHigh`：19:17:56 调低，约 19:23 响，19:23:57 送到（约 6 分钟）。`RedisGateMemoryCritical`：19:25:31 调到 82%，19:28:27 送到，Telegram 也发了。期间 `gate_memory_full` 的受理拒绝是 0，探针没有受影响。
+- 抑制在真的告警上也对：Critical 响着的时候 High 没有再发通知；恢复时两条各发了一条恢复。
+- 恢复：`CONFIG SET maxmemory 805306368`，`CONFIG GET` 核对过，等于清单里的 768mb。两条告警 2 分半之内都不在了。
+- 中间出过一次脚本的毛病：第一版的越线保护在 zsh 里取数写错了，调到 82% 之后 45 秒就退出并恢复了（退出时恢复起了作用），Critical 只到 `pending`；换成 bash 脚本重做了这一段。
+- runbook（`redis-gate-memory.md`）的“先看什么”在现场执行过，都能跑：`redis-cli` 不用密码，`redis_instance_info` 有 `role` 标签（子 Agent 没核对的两处都是对的）。
+
+**第 10 项：闸门的 Sentinel 缩到 1（真实触发；2026-11-22 19:34:34 到 19:40:26 UTC，6 分钟）**
+
+- `RedisSentinelBelowQuorum`（warning）19:37:27 送到（约 3 分钟），缩回 3 之后一分钟内恢复，`sentinel ckquorum gate` 回到 `OK 3 usable Sentinels`。
+- **事先没想到的：同时响了两条 critical 的 `RedisDown`**（`redis-gate-sentinel-1`、`-2`），发到了 Telegram，文字是“Redis redis-gate-sentinel-1（redis-gate）连不上”。exporter 的目标里 Sentinel 和数据节点是一样的，`redis_up == 0` 不分。少两个 Sentinel 的后果是“主库坏了切不了”，数据面没有受影响，不该和“闸门 Redis 连不上”一个级别、一个名字。**建议改**：`RedisDown` 排除 Sentinel 的实例，Sentinel 不在由 `RedisSentinelBelowQuorum` 管（三个全不在时这条不响，要另加一条 `absent`）。没有改，和本节其余几条规则的改动一起等主人定。
+- runbook（`redis-sentinel.md`）的第 1 到 3 步在现场执行过，能跑；`ckquorum` 直接说出了原因（`NOQUORUM 1 usable Sentinels`）。
+
+**第 13 项：Strimzi operator 缩到 0（真实触发；2026-11-22 19:43:59 到 20:02:04 UTC，18 分钟，没有动 broker）**
+
+- `KafkaOperatorMetricsMissing`（warning）19:45 进 `pending`，19:55:44 送到（约 12 分钟），operator 回来之后 20:05:44 恢复。三个 broker 全程都在，`kafka_brokers` 一直是 3。
+- **拉和推的差别在这里看得见**：这条是 Prometheus 自己去抓的指标，目标从服务发现里消失，序列立刻失效，不到 2 分钟就进了 `pending`；第 5、6 项那几条是服务经 Collector 推上来的，序列要过 5 分钟才从查询结果里消失。所以同样是“`absent()` 加 `for` 10 分钟”，一个 12 分钟响，一个 16 分钟响。
+- **印证了当初不按 `Kafka` 资源的 `Ready` 写规则的取舍**：operator 不在的 18 分钟里 `kubectl -n kafka get kafka kafka` 一直显示 `READY True`（状态是 operator 写的，它不在就没人改）。
+- operator 重启之后 `KafkaOperatorNotReconciling` 进过 2 分钟的 `pending`（成功的计数器还没出现，就是为 round-8 那种情形写的那一半），第一次调和成功后自己消了；`for` 10 分钟挡得住。调和计数每 2 分钟涨 1，恢复正常。自带的 `CPUThrottlingHigh`（info）也进过 `pending`，是 operator 启动时的 CPU。
+- runbook（`kafka-operator.md`）的五步在现场执行过，能跑，第 3 步看到 Deployment 是 0/0。
+- **20:07 的 `recon-hourly`**：窗口 18:07 到 19:37，差异 0。到这里第 5 到 9 项的故障时段都被一次差异为 0 的对账盖住了。
+
+**第 12 项：alertsink 缩到 0（真实触发；2026-11-22 20:08:59 到 20:37:17 UTC，28 分钟）**
+
+| 告警 | `firing` | 从停掉算起 | 去向 |
+|---|---|---|---|
+| 自带的 `AlertmanagerFailedToSendAlerts`（warning）、`AlertmanagerClusterFailedToSendAlerts`（critical） | 约 20:18 | 约 9 分钟 | critical 的一条 Telegram 发出去了 |
+| `AlertmanagerNotificationsFailing{webhook}`（warning） | 约 20:22 | 约 13 分钟 | webhook 不通，发不出去 |
+| `AlertDeliveryStalled`（critical） | 约 20:24 | 约 15 分钟 | Telegram 发出去了 |
+
+- **要验证的那一点成立：webhook 不通的时候，critical 照样经 Telegram 到了。** `critical` 接收端里 webhook 和 Telegram 是两种独立的通知方式，一个失败不拖累另一个（Telegram 的发送计数在 20:18 和 20:25 各加 1，失败是 0）。
+- `AlertDeliveryStalled` 是从 `absent()` 那一半响的（alertsink 的指标没了），不是“15 分钟没更新”那一半；所以是 5 分钟（序列消失）加 `for` 10 分钟。alertsink 回来 2 分钟后它就恢复了。
+- alertsink 回来之后 16 秒，积着的几条告警一起送到（Alertmanager 一直在重试）。发送失败的计数停在 37。三条“发送失败”的告警要等 15 分钟的窗口滑过去才恢复（约 20:52），这是规则写法决定的。
+- **重复**：同一件事四条告警，我们的 `AlertmanagerNotificationsFailing` 和自带的两条说的是一回事，而且自带的更快、有一条是 critical。放一周看的时候定留哪边（倾向于删我们这条，或者把自带的那两条关掉只留我们的：自带的 critical 那条在 webhook 这种“只是日志”的接收端失败时级别偏高）。
+- runbook（`alertmanager-notifications.md`）的前四步在现场执行过，能跑；Alertmanager 的日志里直接有 `Notify for alerts failed ... dial tcp`。补了一句：第 2 步的第三条查询在 alertsink 不在时返回空。
+
+**第 11 项：Collector 的 gateway（otel-gateway）缩到 0（真实触发；2026-11-22 20:53:20 到 21:10:24 UTC，17 分钟；这段时间服务的指标、日志、链路丢了）**
+
+- `OtelGatewayDown`（critical）20:56:47 送到（约 3.5 分钟），Telegram 也发了。它确实比各条“没有数据”先响：`PaymentTotalsCheckStalled` 21:02、六条 `ServiceMetricsMissing` 21:03 到 21:04、`ProbeNoData` 21:07、两条 `CDCPipelineMissing` 和 `AlertDeliveryStalled` 21:09 才到 `firing`。
+- **抑制在真的告警上成立**：故障期间 Alertmanager 里这 11 条全部是 `suppressed`，各有一个抑制源；alertsink 在这 17 分钟里除了 `OtelGatewayDown` 一条都没有收到。`ProbeNoData` 到这里算真实触发过了（响了，被压住）。
+- **查出一个漏洞：恢复的时候抑制先撤了，被压着的告警漏出来两条。** gateway 回来的那一刻 `OtelGatewayDown` 就恢复了，而“没有数据”的那几条要等指标重新攒够一个窗口才恢复，慢 1 到 4 分钟。这中间谁的分组正好轮到刷新，谁就发出去：`ProbeNoData`（21:12:12）和 `PaymentTotalsCheckStalled`（21:12:50）各发了一条触发，5 分钟后又各发一条恢复。critical 的 `AlertDeliveryStalled` 那时也还在响（到 21:13），这次没轮到，是运气。**改了**：给 `OtelGatewayDown` 加 `keep_firing_for: 5m`（条件不成立之后再多响 5 分钟，Prometheus 的规则自带这个字段），让源比目标晚走。代价是 Collector 恢复后这条 critical 的“恢复”通知晚 5 分钟到。
+- 同样的毛病别的“上游压下游”也可能有（`MySQLDown` 压复制的几条、`KafkaBrokerMissing` 压副本不足），没有验证，没有改；等真的见到再说。
+- Collector 不在的时候 KEDA 从 Prometheus 查到的请求速率是 0（`keda-hpa-gateway` 的目标显示 `0/450`），`KedaHPAScalingInactive` 不响。现在上下限都是 2 所以没有后果；以后放开伸缩，Collector 不在会让它按“没有流量”缩到下限。记给放开伸缩的时候。
+- 恢复：gateway 回来 4 分钟后所有告警都不在了。21:07 的 `recon-hourly`（窗口 19:07 到 20:37）差异 0。
+- runbook（`otel-collector.md`）第 1 到 3 步在现场执行过，能跑；agent 的日志里是 `Exporting failed. Will retry`。
+
+**第 3 项：inventory 缩到 0（真实触发；2026-11-22 21:33:22 到 21:40:11 UTC，7 分钟）**
+
+按 7 分钟做，不是登记的 10 分钟：每秒 1 单全失败，每分钟烧掉的预算不小，够让要看的告警响就停。
+
+| 告警（都是 critical，都发了 Telegram） | alertsink 收到 | 从停掉算起 | 恢复的通知 |
+|---|---|---|---|
+| `OrderLandingBreakerOpen`（`landing-db-0`、`-1` 两条） | 21:36:09 | 2.8 分钟 | 21:41:09 |
+| `SLOOrderCreateAvailabilityBurnFast` | 21:37:10 | 3.8 分钟 | 21:47:10 |
+| `ProbeFailing` | 21:39:12 | 5.8 分钟 | 21:44:12 |
+| `IngressGateway5xxHigh` | 21:39:35 | 6.2 分钟 | 21:49:35 |
+| `SLOOrderCreateAvailabilityBurnMedium` | **21:46:10** | 故障结束之后 6 分钟才发 | 约 22:10（30 分钟的窗口滑过去） |
+
+- 快档的时间和单元测试钉的一致（3 到 4 分钟）。`ServiceMetricsMissing{inventory}`、`OrderAdmitRateDropped` 只到 `pending`（7 分钟不够）。`KedaHPAScalingInactive` 没有响，是对的。
+- **没有响的：`MeshEndpointEjected` 和网格的溢出。** inventory 一个端点都没有的时候边车没有东西可摘，请求直接失败（“没有健康的上游”），不走异常点摘除。这两条用“缩到 0”触发不了，要用“一个副本坏、一个副本好”的办法（`make cluster-fault` 是这么做的，但它在 e2e 的命名空间里，规则不看那里）。归到第 16 项，或者另登记一项“杀掉一个副本的进程但不让它退出”。
+- **`OrderLandingBreakerOpen` 最先响，而且文字指向数据库**（“落库健康检查的熔断器 landing-db-0 打开了”），实际坏的是 inventory：落库的健康检查走的是整条落库的路，里面有 `Reserve`。runbook（`breaker.md`）里要写明“这个熔断器开了先看 inventory 在不在”；补了。它比 SLO 快一分钟，作为“原因一级”的告警是有用的。
+- **中档在故障结束之后才发出来，这是多窗口燃烧率加抑制的固有行为，不是毛病，但要知道**：中档 21:40:40 就成立了，那时快档在响，它被压着；21:46 快档恢复（5 分钟的短窗口干净了），抑制撤掉，中档的 30 分钟短窗口里还装着那 7 分钟的失败，于是手机上是“快档恢复”之后紧跟着一条新的 critical，再响 25 分钟。看到它要先看 `error_ratio_rate5m`：是 0 就是尾巴，不是新的故障。写进了 runbook。要不要处理（例如中档再加一个 5 分钟窗口的条件）放一周看的时候定。
+- **慢档没有响，原因是 1 天的窗口被早上的长稳稀释了**：1 天的错误比例是 0.016%（分母里有 03:55 到 07:55 那 180 万单），到不了 0.3%。平时只有探针的流量时，同样 7 分钟的故障会让慢档响约 2 小时。
+- **预算**：这 7 分钟里 381 个 5xx。7 天窗口的预算现在是 -93%（超支了将近一倍）。分母只有约 20 万个请求（探针 9 个多小时加上还在窗口里的压测），所以预算只有约 200 个失败。**这说明一件设计上的事：按请求数算的 SLO，在流量很小的系统上一次几分钟的故障就烧完一周的预算**，“预算烧完就停实验”这条规矩在练习环境里没法照字面执行；这一周里后面几项照做，预算的数只当读数看。
+- 503 里带降级原因码的（`ORDER_LANDING_UNAVAILABLE`）也算进了 5xx，烧预算，和设计第 2 节第 2 项一致（只有 429 不算坏）。
+- 恢复：inventory 回来 2 分钟后探针全部 ok。
+- runbook（`slo-order-create-availability.md`、`probe.md`）在现场走过：状态码的查询显示 503 占 93%，受理结局是 `order_landing_unavailable`，探针的步骤里 `stock` 是 `error`，三步就指到 inventory。7 天预算的那条查询能跑（约 1 秒）。

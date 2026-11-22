@@ -43,7 +43,9 @@
 
 ## 怎么确认恢复了
 
-- `ReconFoundDifferences`：下一次成功的 Job 让 `kube_cronjob_status_last_successful_time` 晚于失败的开始时间，告警恢复。**手工用 `--from=cronjob/...` 创建的成功 Job 能不能让它恢复没有核对**，保险的做法是等下一个整点，或确认后看 `scripts/cluster/monitoring.sh promql 'oppenheimer:recon_cronjob:last_failed_start_time'` 是否仍大于 `kube_cronjob_status_last_successful_time{namespace="oppenheimer"}`。
+- `ReconFoundDifferences`：下一次成功的 Job 让 `kube_cronjob_status_last_successful_time` 晚于失败的开始时间，告警恢复。手工用 `--from=cronjob/...` 创建的 Job 成功了也算（2026-11-23 实测：它带着 CronJob 的属主引用，`lastSuccessfulTime` 会更新，一分多钟后告警恢复），不用等下一个整点。
+- 失败的那个 Job 留着的话，chart 自带的 `KubeJobFailed`（warning）15 分钟后会响，直到它被删掉或者被 `failedJobsHistoryLimit`（5）挤掉。看完、把日志和退出码记到下面的“历史”里之后，由主人决定删不删（`kubectl -n oppenheimer delete job <名字>`）。
+- 手工复跑的窗口上界是“现在往前 30 分钟”：故障刚结束就跑，故障那一段的订单不在窗口里。要盖住故障时段，等故障结束 30 分钟以后再跑。
 - 手工跑一遍，退出码 0、差异 0：`KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer logs job/<名字>`。全量：`RECON_FULL=1 RECON_SETTLE=30m scripts/cluster/loadtest.sh recon`（要读 1470 万单，约 2 分钟，数据库会有两分钟的聚合负载）。
 - `ReconNotRunning`：`scripts/cluster/monitoring.sh promql 'time() - kube_cronjob_status_last_successful_time{namespace="oppenheimer"}'` 小于 2.5 小时（hourly）、50 小时（daily）。
 - 这是涉及订单、库存、钱的所有告警的收尾标准：对账差异为 0。
@@ -56,4 +58,4 @@
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-22 19:07 UTC，`ReconFoundDifferences`（critical，发到了 Telegram）：**不是差异，是连不上库**。告警质量检查的第 8 项在 19:06 停了 `mysql-order-0-1` 的 IO 线程，从库的就绪探针失败、被从 `mysql-order-0-replica` 这个 Service 里摘掉，19:07 的 `recon-hourly`（Job `recon-hourly-29922907`）连它被拒绝，退出码 2（`connect order_replica_0: ... connection refused`）。19:12 恢复复制，19:15 手工复跑差异 0，告警一分多钟后恢复。教训两条：故障注入不要压在每小时的第 7 分钟上；这条告警的名字说的是“有差异”，但退出码 2（没跑成）也会让它响，看到它先看退出码。
