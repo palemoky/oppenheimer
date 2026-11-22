@@ -326,3 +326,43 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - 拿最近两天的数据（含 3b 的过载轮次）试算过四条错误比例的表达式：都有值；可用性的 1 小时窗口最高到过 3.5%，下单延迟到过 45%，落库时延到过 75%，都出在有意打过拐点的轮次里。也就是说这几轮重跑的话快的一档会响，这是想要的。
 - 只算命名空间 `oppenheimer`：`oppenheimer-e2e` 里的失败是测试故意制造的。
 
+### 第 2 步的一半：`recon` 的 CronJob（2026-11-22）
+
+- 清单 `deploy/cluster/recon/cronjob.yaml`，`make recon-cron`（`services.sh recon-cron`）装；`services.sh recon-cron-suspend`、`recon-cron-resume` 暂停和恢复。Sonnet 子 Agent 写的，主会话读过全部 diff。**已经装到集群上**：`recon-hourly`（每小时第 7 分钟，`-since 2h`）、`recon-daily`（UTC 21:30，`-since 26h`），镜像是服务镜像 `recon:daac679`。
+- 用的是 `recon` 自己的 `-settle` 默认值 30 分钟：只比 30 分钟之前创建的订单。每小时那次的窗口是“2 小时前到 30 分钟前”，相邻两次重叠 30 分钟，没有缝。`-recheck 30s`，不重试（`backoffLimit: 0`：重跑一次在途的状态可能就变了，失败被盖住）。
+- **手工触发了一次**（`kubectl create job --from=cronjob/recon-hourly`）：20 秒跑完，退出码 0，差异 0。**窗口里一单都没有**（冒烟是在它的上界之后下的），所以这一次只验证了“连得上四个库、参数对、能跑完”，没有验证它在有订单时的耗时和内存。一个没查的现象：窗口里 0 行时 `index` 这一对的第一遍用了 16.7 秒，其余几对是几毫秒。
+- **两种失败在指标上分不开**：有差异（退出码 1）和运行出错（退出码 2，例如连不上库）都是 Job 失败；kube-state-metrics 里没有能用的退出码指标（`restartPolicy: Never` 的容器没有“上一次终止”）。两种都按 `critical` 报，runbook 里教人看日志分。“上次成功距今太久”那条规则要排除 `kube_cronjob_spec_suspend == 1`，否则压测前暂停了它就响。
+- **子 Agent 指出的、还没有处理的问题**：
+  1. **增量对账看不到“很久以前的订单后来被改错”**：两个 CronJob 都只比创建时间在窗口里的订单。1d 的设计（7.17）说增量要配周期性的全量，这里没有。全量要读全部 1470 万单，耗时没有量过。要不要加一个每周的全量，等主人定。
+  2. 消费者停住、从库落后超过 30 秒时，`recon` 会把“还没追上”报成差异。这时报出来不算错，但 runbook 要写“先看积压和主从延迟，再怀疑数据坏了”。
+  3. CronJob 的镜像 tag 是装的时候定的：`make deploy` 之后要再 `make recon-cron`，否则它一直跑旧的。
+  4. 暂停只挡新的一次，已经在跑的不停。空表对照（`loadtest.sh empty-up`）期间 order 指到 `e2e_*` 库而 CronJob 仍对着正式的库，那段时间也要先暂停。
+  5. 它读两个订单主库（不只是从库），正式压测前要暂停。
+
+### 第 2 步的另一半：常驻探针的程序（2026-11-22）
+
+- **做成了压测工具的一个子命令 `load probe`**（`test/load/probe_cmd.go`、`test/load/internal/probe/`），没有另开模块：下单、轮询、解析响应的代码 `load run` 里本来就有，提到了 `test/load/internal/gwapi` 里两边共用，`load run` 发出的请求不变。Opus 子 Agent 写的，主会话读过周期和轮询的全部逻辑；`test/load` 的 lint 0 issues，`make test MODULES=$PWD/test/load` 通过。
+- **一个周期**：查库存 → 下单 → 轮询到待支付 → 支付（每 10 个周期改成取消）→ 轮询到已支付；每 5 个周期查一次订单列表。开环的节拍（上一轮没完不推迟下一轮），在途的周期最多 20 个，超过就跳过并计数。不重试，轮询尊重 429 的 `Retry-After`。只走 HTTP 入口，不碰数据库。
+- **它报的指标**（服务名 `probe`）：
+  - `probe.steps{step, outcome}`：`step` 是 stock、create、land、pay、paid、cancel、list；`outcome` 是 `ok`、`rejected`（429）、`sold_out`（库存不足或超出限购）、`degraded`（带降级原因码的 503）、`error`、`timeout`。
+  - `probe.cycles{outcome}`：`ok`、`incomplete`（被拒、售罄、降级）、`failed`（有一步是 error 或 timeout）、`skipped`。
+  - `probe.step.duration{step}`（请求的耗时）和 `probe.step.delay{step=land|paid}`（等待的两步，用到 30 分钟的那组桶），都只记结果是 ok 的。
+- **订单怎么认**：用户号在 [2^40 − 2^20, 2^40)，和 k6 默认的号段不重叠；幂等键前缀 `probe-`；请求带 `X-Load-Run: probe`。
+- **SKU 的要求**：限购必须是 0（探针的用户号是轮流的，同一个用户约 12 天回来一次，有限购会被记成 `sold_out`）；每天约消耗 7.8 万件。
+- **写告警时要按它的 `outcome` 分开的几种情况**（子 Agent 提的，都成立）：
+  1. SKU 卖完、没建、没装进闸门时是 `sold_out` 或 `error`：这是探针自己的配置坏了，不是下单的路断了。“探针连续失败”只看 `failed` 里的 create、land、pay、paid；`sold_out` 另配一条。
+  2. 探针的 Pod 不在了、卡住了，指标是断掉：用“周期数的速率是 0 或者没有序列”报；`skipped` 持续增长说明探针或入口卡住了。
+  3. 探针和六个服务共用 Collector：Collector 挂了它的指标也没有，要靠抑制。
+  4. 压测时如果发压机和探针出口是同一个地址，会共用按地址的限流；被 429 拒掉记成 `rejected`、周期 `incomplete`，不报警，但那段时间探针也就没有数据。（探针在集群里，发压机在外面，出口地址本来不同；入口看到的各是什么地址没有核对。）
+- **它带来的偏差，定 SLO 时要记着**：平时探针就是全部的流量，SLI 反映的是“空系统上每秒 1 单”的表现，比真实负载下好看；它只下 1 件、单 SKU 的订单，不覆盖商家列表、查支付单、归档、超时关单、退款、多件商品；每秒 1 次，低于约 1% 的错误率要很久才看得出来；单个分片坏了只造成一半的周期失败。
+- 没有做的：探针的请求不带链路（日志里没有 trace id）；计时类的测试用的是真实的短时长，没有用 `testing/synctest`。
+
+### 探针上线（2026-11-22，12:24 UTC 起）
+
+- 清单 `deploy/cluster/probe/deployment.yaml`，`make probe`（`services.sh probe`）装，`services.sh probe-stop`、`probe-start` 停和启。Sonnet 子 Agent 写的，主会话读过。镜像是带 `load` 的 chaos 镜像；放在 k3s-server 上（软性的偏好：阶段 4 关的是工作节点，探针不能跟着被关掉，也不和被测的服务抢 CPU）；不进网格，从入口的地址进来（`-addr http://192.168.50.51 -host api.oppenheimer.test`）。
+- **主会话改的一处**：子 Agent 让镜像的 tag 默认沿用 order 的，而镜像是从工作区构建的，会把没提交的代码装进一个指向别的提交的名字里（它自己在报告里指出了这个问题）。改成和 `make deploy` 一样按工作区算。现在跑的是 `chaos:daac679-dirty-20261122122350`，**提交之后要再 `make probe` 一次换成干净的 tag**。
+- 探针专用的 SKU：9001 到 9010（`loadtest.sh skus 9001 10`，各 10 亿库存，限购 0）。按每天 7.8 万件算够用几十年，不需要补库存的机制。装之前脚本会检查这些 SKU 存在且限购是 0。
+- **上线后的头几分钟**：每分钟 60 个周期全部 `ok`，没有 `failed`、`skipped`。Prometheus 里探针的指标带着 `service_name="probe"`、命名空间、节点。四条 SLI 的表达式都有值了：下单的有效事件速率 0.99 次/秒，可用性和延迟的错误比例是 0。探针的 Pod 用 3 毫核、6 Mi。
+- **头几分钟的读数（不是基线，基线等跑满一两个小时）**：下单 p99 约 17 毫秒，落库延迟 p99 约 0.09 秒，支付处理时延 p50 约 0.08 秒。探针自己量的“等落库”p99 约 0.5 秒、“等已支付”约 1 秒，比服务端量的大得多：它是轮询出来的，第一次问在 200 毫秒之后、之后翻倍，量到的是“下一次轮询时已经好了”。所以**落库和支付的 SLO 用服务端的直方图，探针的这两个数只用来发现“等不到”**。
+- 没有验证的：`probe-stop`、`probe-start`；探针在入口看来是什么来源地址（和发压机会不会共用按地址的限流）。
+

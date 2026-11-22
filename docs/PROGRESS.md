@@ -17,11 +17,22 @@
   - 第 3 步的前一半：`deploy/cluster/monitoring/rules/slo.yaml` 写了（40 条），**没有下发到集群**。
 - **验证到哪**：order 模块 `golangci-lint` 0 issues；`make test MODULES=$PWD/services/order` 跑过一次，只有 `TestLandingHealthProbe` 失败（连 Redis 超时，当时子 Agent 也在跑测试），单独重跑它和支付的用例都通过。**合并 kafkax 的改动之后 `make lint test` 通过**（11 个模块 0 issues，56 个包 ok，没有被跳过的，`tmp/3c-lint-test.log`、`tmp/3c-test.log`）。第一次跑时子 Agent 写的 `TestOldestPendingAgeWithLanesReportsTheBlockingKey` 失败：它等 `b`、`c` 两个 key 做完，而 key 到 lane 的哈希种子每个进程随机，它们有四成多的概率和被挡住的 key 同一条 lane、排在后面出不来。主会话改成只等位点在前面的 `a`，连跑 8 遍通过。 注意：直接 `go test` 不带 Makefile 的环境变量时集成测试全部被跳过、显示 `ok`，要用 `make test`（指定模块用 `MODULES=`，指定用例用 `GOFLAGS='-run=...'`）。
 - **本机 compose 是起着的**（子 Agent `make up` 的）。下次正式压测前要 `make down`。
-- **都没有提交**（主人没有说）。集群上除了删那两个 Job 没有别的改动：新指标要重新 `make deploy` 才有，规则没有下发。
+- **已提交并推送**（2026-11-22，主人要求）：`phase-3c` 上 `d20b999`（三个指标）、`7a49245`（SLO 规则）、`daac679`（文档）。开了 **PR #17（draft）**，CI 派给了 `ci-watcher`；本段最后没有 CI 结果的那一条就是还没看。子 Agent 的 worktree 和分支已删。
+- **`make deploy` 做了**（主人要求；日志 `tmp/deploy-3c-daac679.log`）：六个服务的镜像是 `daac679`，五个服务各 2 个副本、两个节点各一个，cdc 1 个，没有不正常的 Pod。规则仍然没有下发。
+- **三个新指标在集群上验证过**：`kafkax_consumer_oldest_pending_age_seconds` 六个消费组都在报 0。跑了一次冒烟（`smoke-3c-*`，普通下单 10 单/秒 20 秒，SKU 3001，201 次迭代，`http_req_failed` 通过）：`order_payment_delay_seconds` 记了 92 次（支付出结果 100 笔，差的 8 笔没有查是哪一类，可能是取消在先被要求退款的），p50 约 0.12 秒、p99 约 0.36 秒；`outbox_relay_delay_seconds` 按 topic 有数，`order.events` 的 p99 约 0.2 秒、`payment.events` 约 0.4 秒。**这只是 10 单/秒 20 秒的数，不是基线**；支付处理时延那条 SLO 的阈值（暂定 5 秒）等探针跑起来再定。
+- **PR #17 上 `daac679` 的 CI 29 项全部通过**（`ci-watcher` 报的，核对过运行对应的提交）：`test (./services/order)` 4 分 32 秒（以往 3 到 4 分半，在上沿），`test (./services/recon)` 1 分 59 秒，`test (./pkg)` 2 分 42 秒，e2e 3 分 47 秒。
+- **第 2 步派出去了两个子 Agent**（各自的 worktree，基于 `origin/phase-3c`）：Opus 写 `load probe`（常驻探针，只改 `test/load/`）；Sonnet 写 `recon` 的两个 CronJob（`deploy/cluster/recon/`、`services.sh` 的 `recon-cron` 子命令、Makefile 目标；不许碰集群）。回来之后主会话读 diff、`cherry-pick`、跑 `make lint test`；探针的清单（Deployment、SKU 和库存的准备、镜像）还没有人写，等探针的 flag 定了再做。
+- **`recon` 的 CronJob 做完并装上了**（Sonnet 子 Agent 写，主会话读过 diff，`cherry-pick -n` 拿进工作区，worktree 和分支已删；`shellcheck` 通过）：集群上 `oppenheimer` 命名空间里有 `recon-hourly`、`recon-daily`。手工触发的一次 20 秒跑完、差异 0，但窗口里没有订单，有订单时的耗时没有量。细节和没处理的五个问题在设计第 8 节“第 2 步的一半”。**以后 `make deploy` 之后要再 `make recon-cron`；正式压测和空表对照之前要 `services.sh recon-cron-suspend`。** 计划文件里这一项还没有勾（告警规则和 runbook 没有做，有订单时没有验证过）。
+- **等主人定的一件事**：要不要加每周一次的全量对账（增量看不到旧订单后来被改错；全量读 1470 万单，耗时没有量过）。
+- **探针的程序做完了**（`load probe`，Opus 子 Agent 写，主会话读过核心逻辑，已拿进工作区，worktree 和分支已删；`test/load` lint 0 issues、`make test MODULES=$PWD/test/load` 通过）。用法、指标、对告警的要求在设计第 8 节“第 2 步的另一半”。**探针的集群清单（`deploy/cluster/probe/`、`services.sh probe`、Makefile 目标）派给了 Sonnet 子 Agent，直接在工作区里改、不许碰集群，还没回来。** 回来之后：读 diff → `loadtest.sh skus 9001 10` 建探针专用的 SKU（先确认建出来的限购是 0）→ 构建 chaos 镜像 → 装探针 → 看它的指标和六个服务的 SLI 有没有数 → 一两小时后量支付处理时延的基线。
+- **探针上线了（12:24 UTC）**：清单和 `make probe` 做完（Sonnet 子 Agent，主会话读过并改了镜像 tag 的默认值）；建了 SKU 9001 到 9010；集群上 `oppenheimer` 命名空间里 Deployment `probe` 1 个副本在 k3s-server 上，镜像 `chaos:daac679-dirty-20261122122350`（**提交之后再 `make probe` 换成干净的 tag**）。头几分钟每分钟 60 个周期全部 ok，四条 SLI 都有数了。计划文件里“补指标”“常驻探针”两项已勾。细节在设计第 8 节“探针上线”。**从现在起集群上一直有每秒约 1 单的流量，每天约 8.6 万单留在库里；正式压测前 `services.sh probe-stop` 和 `recon-cron-suspend`。**
+- **接下来要看的两个时刻**：13:07 UTC `recon-hourly` 第一次自己跑（窗口里第一次有订单：冒烟的约 200 单和探针的几百单），看它成功没有、多久；探针跑满一两个小时后量支付处理时延和落库的基线，定支付那条 SLO 的阈值（现在暂定 5 秒，头几分钟的 p50 是 0.08 秒）。
+- 注意：子 Agent 的 worktree 是从 `main` 的合并提交开的，快进不到 `phase-3c`（两边内容相同但不是祖先关系），它们各自做了一次普通合并；收回时只 `cherry-pick` 它自己的那个提交。以后派任务时直接写“`git merge origin/phase-3c`”，不要写 `--ff-only`。
+- **Telegram**：和主人约定 token 和会话号写在仓库根目录的 `.env` 里（已被 `.gitignore` 排除），变量名 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，主人自己写。**还没有脚本读它**，做 Alertmanager 那一步时让 `monitoring.sh` 读出来生成 Secret；主会话不要去读这个文件的内容，只检查两个变量在不在。
 - **下一步**：
   1. （已做）验收、合并子 Agent 的两个提交，`make lint test`。
-  2. 问主人要不要提交；`make deploy` 把带新指标的镜像部署上去（要主人点头：会滚动六个服务）。
-  3. 设计第 6 节第 2 步：常驻探针（Opus 写程序、Sonnet 写清单）和 `recon` 的 CronJob（Sonnet），可以并行。探针上线、有了一两小时的数据之后，量支付处理时延的基线，定那条 SLO 的阈值（现在暂定 5 秒）。
+  2. （已做）提交、推送、`make deploy`。这一段之后对本文件的修改（记录部署和冒烟）没有提交，下次提交时带上。
+  3. （已做，未提交）探针和 `recon` 的 CronJob。工作区里没提交的：`Makefile`、`scripts/cluster/services.sh`、`deploy/cluster/{recon,probe}/`、`test/load/`（探针的程序）、`docs/`。等主人说提交；提交、推送之后派 `ci-watcher`，再 `make probe` 换干净的 tag。
   4. 第 3 步的后一半：`promtool` 的单元测试和 CI（Sonnet，主会话给用例表；`promtool` 的版本跟 Prometheus 3.13.5，登记到 `versions.md`）；`monitoring.sh` 加 `rules` 子命令，下发规则。
   5. 之后按设计第 6 节的第 4 到 9 步。
 
