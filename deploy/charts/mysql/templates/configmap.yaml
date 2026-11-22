@@ -24,6 +24,7 @@ data:
     relay-log-recovery=ON
     max-connections={{ .Values.mysqld.maxConnections }}
     innodb-buffer-pool-size={{ .Values.mysqld.innodbBufferPoolSize }}
+    binlog-expire-logs-seconds={{ .Values.mysqld.binlogExpireLogsSeconds }}
     # 从库用 CLONE 从主库拉全量，两端都要加载这个插件。写在启动参数里，不用 INSTALL PLUGIN：
     # 后者是写进系统表的状态，要想清楚它会不会被复制、被 CLONE 带走；启动参数每次都一样。
     plugin-load-add=mysql_clone.so

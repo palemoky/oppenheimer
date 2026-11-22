@@ -73,6 +73,19 @@ spec:
       transaction.state.log.min.isr: 2
       # topic 由服务启动时自己建（kafkax），不靠自动创建：写错 topic 名时应该报错而不是悄悄建一个。
       auto.create.topics.enable: false
+      # 保留期（2026-11-22，3b 的记录 round-9-soak.md 第 3 节）。原来没配，用的是默认的 7 天、不限大小：
+      # 长稳 125 单/秒时每个 broker 每小时写 0.78 GiB，7 天是 131 GiB，节点的盘放不下。
+      # 消费者都是实时消费的（积压最多几百条），保留期只要长过“消费者停了、人来处理”的时间，定 24 小时。
+      # 代价：一个分区被挡住超过 24 小时，挡在后面的消息会被删掉（order.submit 上就是已受理的订单），
+      # 所以消费延迟要有告警（3c）。
+      # 对压缩保留的 topic（cdc.order.orders、cdc.checkpoint）不起作用，它们按 key 留最新的一条，大小跟着订单数走。
+      # 死信 topic 留 7 天，是 topic 自己的配置，由 scripts/cluster/middleware.sh kafka 设。
+      log.retention.hours: 24
+      # 按大小兜底，每个分区 4 GiB：写入比预期快时先按大小删。24 小时、125 单/秒时最大的非压缩分区不到 1 GiB。
+      log.retention.bytes: 4294967296
+      # 段文件从默认的 1 GiB 改成 256 MiB：保留期只删已经关闭的段，段越大，实际留的就比保留期多越多；
+      # 压缩也只处理关闭的段。只对新建的段生效。
+      log.segment.bytes: 268435456
     # 指标：每个 broker 里带一个 JMX Prometheus Exporter（Java agent），在 9404 端口（端口名 tcp-prometheus）输出。
     # 规则在 ConfigMap kafka-metrics（kafka-metrics.yaml，由 middleware.sh 先于本文件提交）。
     # 加上或改动这一段，Strimzi 会滚动重启 broker，一次一个；min.insync.replicas 是 2，滚动期间照常读写。

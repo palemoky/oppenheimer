@@ -39,6 +39,8 @@
 #   VERIFY_INITIAL          verify 的 -initial（"7001=1000,7002=1000"）；没给就读 skus 记下的 tmp/loadtest/sku-initial.txt
 #   LOADTEST_IMAGE_TAG      chaos 镜像的 tag；没给就用 images.sh tag（工作区干净时是短提交号，不干净时每次都不同）。
 #                           仓库里已经有这个 tag 就不再构建
+#   VERIFY_TIMEOUT          等 verify 跑完的时限（秒），默认 1800。长稳那样上百万单的一轮要调大（2026-11-22 的 180 万单 30 分钟没跑完）
+#   LOADTEST_MEMORY_LIMIT   一次性 Pod 的内存上限，默认 1Gi。verify 把这一轮的订单全读进内存，上百万单时要调大
 #   SEED_TIMEOUT            等 seed-orders 跑完的时限（秒），默认 21600。超时或 MacBook 这边中断时 Pod 被删，重跑同样的命令接着灌
 #   LOADTEST_OUT            输出目录，默认 tmp/loadtest/<时间>
 #
@@ -556,7 +558,7 @@ spec:
         - {name: INVENTORY_DSN, value: "app:$mm@tcp($hm)/${p}inventory_db"}
       resources:
         requests: {cpu: 200m, memory: 128Mi}
-        limits: {memory: 1Gi}
+        limits: {memory: ${LOADTEST_MEMORY_LIMIT:-1Gi}}
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -741,7 +743,7 @@ cmd_verify() { # SKU 列表 orders.jsonl
   echo "==> sending $(wc -l <"$orders" | tr -d ' ') order lines ($(wc -c <"$orders" | tr -d ' ') bytes) to the pod"
   # 经 exec 的标准输入送进去：不依赖镜像里有 tar（kubectl cp 要它）
   put_file "$orders" /work/orders.jsonl
-  run_phase verify 1800 load verify -redis-addr "$GATE_REDIS" -redis-prefix "$REDIS_PREFIX" \
+  run_phase verify "${VERIFY_TIMEOUT:-1800}" load verify -redis-addr "$GATE_REDIS" -redis-prefix "$REDIS_PREFIX" \
     -kafka-brokers "$KAFKA_BROKERS" -kafka-prefix "$KAFKA_PREFIX" \
     -scope-skus "$skus" -orders-jsonl /work/orders.jsonl -initial "$initial"
   phase_result

@@ -351,6 +351,22 @@ cmd_redis() {
 
 # Kafka：Strimzi 的 Operator 加一个 3 节点的 KRaft 集群（设计文档 2b 第 5 节）。
 # Operator 用 Helm 装；Kafka 和 KafkaNodePool 是它的自定义资源，提交之后由 Operator 去创建 Pod。
+# 死信 topic 留 7 天：broker 的默认保留期是 24 小时（kafka.yaml），死信要等人来看，一天不够。
+# topic 是服务启动时自己建的（kafkax.EnsureTopics，用 broker 的默认值），这里对已经存在的 *.dlq 设 topic 自己的
+# retention.ms，可重复执行。新集群上要等服务第一次启动、建出 topic 之后再跑一次 middleware.sh kafka 才设得上。
+kafka_dlq_retention() {
+  local pod topics t
+  pod="$(kubectl -n kafka get pods -l strimzi.io/broker-role=true -o jsonpath='{.items[0].metadata.name}')"
+  topics="$(kubectl -n kafka exec "$pod" -- env KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --list | grep '\.dlq$' || true)"
+  for t in $topics; do
+    kubectl -n kafka exec "$pod" -- env KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-configs.sh \
+      --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name "$t" \
+      --add-config retention.ms=604800000 >/dev/null
+    echo "    $t: retention.ms=604800000"
+  done
+}
+
 cmd_kafka() {
   echo "==> kafka (namespace kafka): strimzi $STRIMZI_VERSION"
   ensure_namespace kafka
@@ -368,6 +384,7 @@ cmd_kafka() {
   kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka-metrics.yaml"
   kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka.yaml"
   kubectl -n kafka wait kafka/kafka --for=condition=Ready --timeout=15m
+  kafka_dlq_retention
   kubectl -n kafka get pods -o wide
   kubectl -n kafka get kafka kafka \
     -o jsonpath='{"    version "}{.status.kafkaVersion}{", bootstrap "}{.status.listeners[0].bootstrapServers}{"\n"}'
