@@ -305,6 +305,10 @@ deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部�
 recon-cron: ## 装或更新对账的两个 CronJob（recon-hourly、recon-daily，命名空间 oppenheimer，镜像 tag 取现在部署的 order，RECON_IMAGE_TAG 可覆盖）；正式压测前后用 scripts/cluster/services.sh recon-cron-suspend、recon-cron-resume；可重复执行
 	scripts/cluster/services.sh recon-cron
 
+.PHONY: probe
+probe: ## 装或更新常驻探针（Deployment probe，命名空间 oppenheimer）：从入口走下单、落库、支付、已支付，用 OTLP 报指标；PROBE_SKUS（默认 9001-9010，要先 scripts/cluster/loadtest.sh skus 9001 10 建好）、PROBE_IMAGE_TAG（默认取 order 的 tag，仓库里没有 chaos 镜像会构建推送）；压测前后用 scripts/cluster/services.sh probe-stop、probe-start；可重复执行
+	scripts/cluster/services.sh probe
+
 .PHONY: cluster-e2e
 cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
 	scripts/cluster/e2e.sh $(E2E_ARGS)

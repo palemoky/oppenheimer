@@ -1,0 +1,117 @@
+# 常驻探针：从入口走一遍“下单 → 等落库 → 支付 → 等已支付”，每秒约一次，把每一步的成败和耗时用 OTLP 报出去
+# （设计文档 3c 的 3.6 节）。代码在 test/load/probe_cmd.go 和 test/load/internal/probe/。
+# 由 scripts/cluster/services.sh probe 把 __IMAGE__、__PROBE_SKUS__、__LB_GATEWAY_IP__ 填上后 apply，可重复执行；
+# 正式压测前后用 probe-stop、probe-start（把副本数改成 0、改回 1）。
+#
+# 探针的默认值（不在命令行里重复写，改默认值要同时改这里的说明）：
+#   -interval 1s            每秒启动一个周期（开环：慢的周期不拖后面的）
+#   -max-in-flight 20       同时在途的周期最多 20 个，到了上限的那一拍跳过并计数
+#   -request-timeout 2s     单个 HTTP 请求的超时
+#   -land-timeout 30s       等订单离开 creating（落库）最多 30 秒
+#   -pay-timeout 30s        等订单变成 paid 最多 30 秒
+#   -cancel-every 10        每 10 个周期取消一次而不是支付
+#   -list-every 5           每 5 个周期顺带查一次用户的订单列表
+#   -user-base / -user-count 压测号段 [2^39, 2^40) 里的一小段用户，轮流用
+#   -drain 10s              停止时最多等 10 秒让在途的周期做完
+#   -summary 1m             每分钟一行汇总日志
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe
+  labels:
+    app.kubernetes.io/name: probe
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  # 1 个副本：两个探针同时跑，流量翻倍，指标也分不清谁是谁。
+  replicas: 1
+  # Recreate：先停旧的再起新的，更新期间不会有两个探针同时在跑（RollingUpdate 默认先起新的）。
+  # 代价是更新时探针的指标断十几秒，"探针没有数据"的告警要有足够长的 for 盖住它。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: probe
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: probe
+        app.kubernetes.io/part-of: oppenheimer
+      annotations:
+        # 不进网格：探针要像外部用户一样从入口进来，走入口的 Envoy 和限流，不走边车。
+        # （命名空间没有打注入标签，Pod 默认也不注入，写明是免得以后改成全命名空间注入时它被带进去。）
+        sidecar.istio.io/inject: "false"
+    spec:
+      # 探针停止时最多等在途的周期 10 秒（-drain），再加 OTel 关闭时把最后一批指标发出去，30 秒（默认值）够，
+      # 写出来是为了让这个数和 -drain 的关系看得见：改 -drain 时要一起看。
+      terminationGracePeriodSeconds: 30
+      # 不碰 Kubernetes 的 API，不挂令牌。
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          # 软的，偏好控制面节点 k3s-server（写法同 monitoring 的 preferServer）。理由：
+          #   1. 阶段 4 的故障实验要关的是工作节点。探针是“眼睛”的一部分，眼睛不能跟着被关掉，
+          #      不然关节点的那段时间恰好看不见；
+          #   2. 它不该和被测的服务抢同一个工作节点的 CPU（探针的耗时是 SLO 的数据，被抢 CPU 会让它自己的
+          #      延迟失真）。
+          # 软的原因：控制面节点放不下时宁可去别的节点也不要让探针排不上。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          # chaos 镜像（deploy/docker/chaos.Dockerfile）：load 和 recon 在 /app，ENTRYPOINT 是 /busybox/sh，
+          # 所以这里用 command 覆盖成 load，不能只给 args。
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          command: ["/app/load", "probe"]
+          args:
+            # 从入口的地址进（Envoy Gateway 的 LoadBalancer，cluster.env 的 LB_GATEWAY_IP），Host 头指到 gateway 的路由主机名
+            # （deploy/cluster/services/gateway.yaml 的 hostnames）。比 chaos 的 Job 用 hostAliases 简单：不用解析主机名，
+            # 只在 Host 头上写一次。
+            - -addr=http://__LB_GATEWAY_IP__
+            - -host=api.oppenheimer.test
+            # 探针轮流用的 SKU（范围或逗号分隔），由 services.sh probe 填，并在装之前核对过它们在库存里存在。
+            # SKU 的限购必须是 0（不限）：同一个用户号会轮流重复下同一个 SKU，有限购就会被拒。
+            - -skus=__PROBE_SKUS__
+          env:
+            # OTLP 接收端：monitoring 命名空间的 Collector（Service otel-gateway，gRPC 4317），和六个服务一样
+            # （deploy/charts/service/values.yaml）。
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-gateway.monitoring:4317
+            # Pod 的身份放进每个指标的资源属性（Downward API），写法同 deploy/charts/service：
+            # Prometheus 把 k8s.namespace.name、k8s.pod.name、k8s.node.name、service.instance.id 提成标签。
+            # 服务名 probe 是程序里定的（probe_cmd.go 的 probeServiceName），不在这里设。
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              # service.version 用镜像的 tag（__IMAGE_TAG__）。
+              value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"
+            # 内存上限（256Mi）的 90%：Go 的垃圾回收不知道容器的上限。
+            - name: GOMEMLIMIT
+              value: 230MiB
+          # 没有就绪和存活探针：它没有 HTTP 端口，不接收请求，没有“就绪”的概念；存活探针要么加端口（要改程序，
+          # 不为探针改），要么用 exec（镜像里有 busybox 但进程自己的状态它也看不到），收益很小。
+          # 进程退出时 Deployment 会重启它，卡死则由“探针没有数据”的告警发现。
+          resources:
+            # 估的，没有实测：每秒一个周期，几个并发请求，应当很小。节点的 requests 已经很满，所以只给 50m、64Mi。
+            # 上线后按实测的用量改。不设 CPU limit，免得被限流让探针自己的延迟失真；内存 limit 256Mi 是兜底。
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

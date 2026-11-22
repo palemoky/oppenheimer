@@ -12,6 +12,9 @@
 #   services.sh recon-cron         装或更新对账的两个 CronJob（recon-hourly、recon-daily，deploy/cluster/recon/），可重复执行
 #   services.sh recon-cron-suspend 暂停这两个 CronJob（正式压测之前；已经在跑的 Job 不受影响）
 #   services.sh recon-cron-resume  恢复它们（压测之后）
+#   services.sh probe              装或更新常驻探针（Deployment probe，deploy/cluster/probe/），可重复执行；装之前核对 PROBE_SKUS 在库存里都存在
+#   services.sh probe-stop         把探针的副本数改成 0（正式压测之前）
+#   services.sh probe-start        改回 1（压测之后）
 #
 # 不带服务名就是六个，按依赖顺序：inventory、order、payment、orderindex、cdc、gateway。
 # 环境变量：
@@ -27,6 +30,10 @@
 #                  （压测用：关掉 gateway 按客户端地址的限流 RATE_LIMIT_IP）。不影响 e2e 那一套。压完不带它再 deploy 一次就恢复。
 #   RECON_IMAGE_TAG recon-cron 用的 recon 镜像的 tag，默认取现在部署的 order Deployment 的 tag（make deploy 把七个镜像推成同一个 tag）。
 #                  镜像要已经在仓库里，没有的话 Job 起不来（ImagePullBackOff）；脚本会先问仓库，没有就报错。
+#   PROBE_SKUS     probe 用的 SKU，范围或逗号分隔，默认 9001-9010。要先建好（loadtest.sh skus 9001 10），脚本只检查、不替你建；
+#                  探针要求它们的限购是 0（loadtest.sh skus 建出来的就是 0）。
+#   PROBE_IMAGE_TAG probe 用的 chaos 镜像的 tag，默认按当前工作区算（images.sh tag，和 make deploy 一样）。仓库里没有就用 images.sh 构建并推送。
+#                  探针和六个服务不必是同一个 tag：它只走对外的 HTTP 接口。
 #   LOADTEST_EMPTY deploy 时设为 1，再叠 deploy/cluster/services/loadtest-empty/（空表对照：DSN 指到 e2e_* 空库，Kafka、Redis 带前缀）。
 #                  不要手工设：库要先建好，由 scripts/cluster/loadtest.sh empty-up、empty-down 成对地做。
 # 服务之间走 Istio 的边车（设计文档 2d）：deploy、e2e-up 要求 istiod 已经装好（make mesh-up），在部署任何 release
@@ -80,7 +87,7 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 E2E_ROOT_SECRET_KEYS=(root-password)
 
 usage() {
-  sed -n '2,36p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,45p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -406,6 +413,97 @@ recon_cron_suspend() { # true|false
   fi
 }
 
+# ---------- 常驻探针（设计文档 3c 的 3.6 节） ----------
+
+PROBE_MANIFEST="$ROOT/deploy/cluster/probe/deployment.yaml"
+
+# 把 "9001-9010,9020" 展开成每行一个 SKU。
+expand_skus() {
+  local part lo hi
+  for part in ${1//,/ }; do
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      lo="${BASH_REMATCH[1]}"
+      hi="${BASH_REMATCH[2]}"
+      [[ "$hi" -ge "$lo" && $((hi - lo)) -lt 10000 ]] || return 1
+      seq "$lo" "$hi"
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      echo "$part"
+    else
+      return 1
+    fi
+  done
+}
+
+# 只读：核对 SKU 在库存里都存在。库名前缀和 loadtest.sh 的 detect_dataset 一样（空表对照期间是 e2e_）。
+# 不存在不替用户建：建 SKU 要选库存和商家，是压测准备的一部分。
+probe_check_skus() { # SKU 列表
+  local ids prefix="" pod found missing="" id
+  ids="$(expand_skus "$1")" || {
+    echo "invalid PROBE_SKUS '$1' (comma-separated ids and inclusive ranges, e.g. 9001-9010)" >&2
+    return 1
+  }
+  [[ -n "$ids" ]] || {
+    echo "PROBE_SKUS is empty" >&2
+    return 1
+  }
+  if e2e_longrunning_on_e2e_dbs; then prefix="e2e_"; fi
+  pod="$(e2e_mysql_pod mysql-main primary)"
+  found="$(printf '%s\n' "SELECT sku_id, purchase_limit FROM ${prefix}inventory_db.sku_stock WHERE sku_id IN ($(echo "$ids" | paste -sd, -)) ORDER BY sku_id;" |
+    e2e_root_sql "$pod" -N -B)"
+  for id in $ids; do
+    if ! echo "$found" | awk -F'\t' -v id="$id" '$1 == id {ok=1} END {exit !ok}'; then
+      missing="$missing $id"
+    fi
+  done
+  if [[ -n "$missing" ]]; then
+    echo "skus not in ${prefix}inventory_db.sku_stock:$missing" >&2
+    echo "create them first, e.g.: scripts/cluster/loadtest.sh skus 9001 10   (or set PROBE_SKUS)" >&2
+    return 1
+  fi
+  # 限购不是 0 的 SKU：同一个用户号轮流重复下同一个 SKU，会被限购拒掉，探针会一直失败。
+  if echo "$found" | awk -F'\t' '$2 != 0 {bad=1} END {exit !bad}'; then
+    echo "some skus have purchase_limit != 0 (the probe needs 0, it reuses user ids):" >&2
+    echo "$found" | awk -F'\t' '$2 != 0 {print "  sku " $1 " purchase_limit " $2}' >&2
+    return 1
+  fi
+}
+
+cmd_probe() {
+  local tag="${PROBE_IMAGE_TAG:-}" skus="${PROBE_SKUS:-9001-9010}" image
+  if [[ -z "$tag" ]]; then
+    # 和 make deploy 一样按当前工作区算（有没提交的改动时带 -dirty-时间）。不沿用 order 的 tag：
+    # 镜像是从工作区构建的，沿用的话会把工作区里的代码装进一个指向别的提交的名字里，
+    # 而仓库里已经有同名镜像时又会跳过构建、跑的是旧代码。
+    tag="$("$HERE/images.sh" tag)"
+  fi
+  echo "==> skus $skus"
+  probe_check_skus "$skus" || exit 1
+  # 同 loadtest.sh 的 ensure_image：仓库里没有这个 tag 才构建并推送。make deploy 默认不构建 chaos 镜像。
+  if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/chaos/manifests/$tag" >/dev/null 2>&1; then
+    echo "==> chaos image $tag already in the registry"
+  else
+    echo "==> building chaos image $tag (from the working tree)"
+    IMAGE_TAG="$tag" "$HERE/images.sh" all chaos
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/chaos:$tag"
+  echo "==> probe (image $image)"
+  # 不用 sed 的 / 做分隔符：镜像名里有 /。
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" -e "s|__PROBE_SKUS__|$skus|g" \
+    -e "s|__LB_GATEWAY_IP__|$LB_GATEWAY_IP|g" "$PROBE_MANIFEST" | kubectl -n "$NS" apply -f - >/dev/null
+  kubectl -n "$NS" get deployment probe
+}
+
+# 停和启：只改副本数。Deployment 的 replicas 写在清单里，下一次 probe（apply）会改回 1。
+probe_scale() { # 副本数
+  kubectl -n "$NS" scale deployment probe --replicas="$1" >/dev/null ||
+    {
+      echo "deployment $NS/probe not found; run services.sh probe first" >&2
+      exit 1
+    }
+  kubectl -n "$NS" get deployment probe
+}
+
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
 shift
@@ -432,5 +530,8 @@ e2e-render)
 recon-cron) cmd_recon_cron ;;
 recon-cron-suspend) recon_cron_suspend true ;;
 recon-cron-resume) recon_cron_suspend false ;;
+probe) cmd_probe ;;
+probe-stop) probe_scale 0 ;;
+probe-start) probe_scale 1 ;;
 *) usage ;;
 esac
