@@ -34,9 +34,11 @@ spec:
         #   现在有多少在途、多少在排队  upstream_rq_active、upstream_cx_active、upstream_rq_pending_active
         #   被并发上限拒绝了多少        upstream_cx_overflow（连接用完，新请求开始排队）、
         #                               upstream_rq_pending_overflow（排队也满了，这才是答出去的 503 UO）
+        #                               upstream_rq_active_overflow（在途请求到了上限 maxParallelRequests，也是 503 UO；
+        #                               round-6 的 7.3 量到过载时主要是这一条，3c 补进来的）
         #   上游超时、连不上            upstream_rq_timeout、upstream_cx_connect_fail
         # 只要路由对应的集群（名字是 httproute/<命名空间>/<路由>/rule/<序号>），Envoy 自己的集群（xds_cluster 等）不要。
         # 两列用 ; 连起来匹配，第二列是 envoy_cluster_name。
         - action: keep
           sourceLabels: [__name__, envoy_cluster_name]
-          regex: 'envoy_cluster_upstream_(rq_total|rq_xx|rq_active|rq_pending_active|rq_pending_overflow|rq_timeout|cx_active|cx_overflow|cx_connect_fail);httproute/.+'
+          regex: 'envoy_cluster_upstream_(rq_total|rq_xx|rq_active|rq_pending_active|rq_pending_overflow|rq_active_overflow|rq_timeout|cx_active|cx_overflow|cx_connect_fail);httproute/.+'

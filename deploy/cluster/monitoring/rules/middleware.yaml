@@ -95,7 +95,9 @@ spec:
             description: "该有主从延迟指标的从库 5 分钟没有延迟的序列，SQL 线程的状态也没有。可能是复制被拆了、从库没了，或者 exporter 读不到复制状态。“延迟大”的阈值规则在这种情况下不会响。出处：设计 1.3 第 3 条。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-replication.md
 
-        # 连接数超过 max_connections 的 80%。round-6 4.3 里连接数被打满过。
+        # 连接数超过 max_connections 的 80%。出处：round-6 4.3（没有撞上，但配置上没有东西保证不撞：order 的连接池按副本数乘上去
+        # 能到订单库的上限，所以把池从 50 改成了 40）；真的报过 1040 的是本机的 compose（设计 1d：各服务的池加起来超过默认的 151）。
+        # 注意 order 扩到上限且池用满时（4 个 Pod × 40 = 160）正好压在这条线上，那时响是对的：余量确实没有了。
         - alert: MySQLConnectionsHigh
           expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
           for: 5m
@@ -260,9 +262,60 @@ spec:
             description: "三个 broker 才有三副本；少一个就没有余量，再掉一个就写不进（min.insync.replicas）。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-brokers.md
 
+        # Strimzi 的 operator 调和 Kafka 资源一直不成功。出处：3b round-8 记录 6.3 节（宿主机重启后 operator 从启动起每次调和都失败，
+        # broker 一直正常，两天没人发现；这期间改 Kafka 的配置不生效，证书到期也不会续）。
+        # 计划里写的是“Kafka 资源的 Ready 条件”，那要给 kube-state-metrics 配自定义资源的状态；这里直接看 operator 自己的调和计数
+        # （抓取对象在 kafka-podmonitor.yaml），量的就是出过事的那件事。operator 每 2 分钟定时调和一次。
+        # 两半：成功的计数 20 分钟没有涨；或者 operator 看得到 Kafka 资源而成功的计数根本不存在
+        # （round-8 就是这种：重启之后一次都没成功过，计数器从未出现，increase() 没有结果）。
+        # 滚动三个 broker 的一次调和要几分钟，窗口 20 分钟加 for 10 分钟留出了余量。
+        - alert: KafkaOperatorNotReconciling
+          expr: |
+            sum by (namespace) (increase(strimzi_reconciliations_successful_total{kind="Kafka"}[20m])) < 1
+            or
+            (
+              sum by (namespace) (strimzi_resources{kind="Kafka"}) > 0
+              unless
+              sum by (namespace) (strimzi_reconciliations_successful_total{kind="Kafka"})
+            )
+          for: 10m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Strimzi 的 operator 已经 30 分钟没有成功调和过 Kafka 资源"
+            description: "broker 不受影响、照常收发；但 Kafka 资源的改动（配置、保留期、扩容）不会生效，证书到期不会续，broker 掉了之后的恢复可能不完整。出处：3b round-8 记录 6.3 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-operator.md
+
+        # operator 的指标没有了（Pod 不在、抓不到）。上一条靠这些指标，没有了它就不响，所以单独写（设计 1.3）。
+        - alert: KafkaOperatorMetricsMissing
+          expr: absent(strimzi_resources{kind="Kafka"})
+          for: 10m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Strimzi operator 的指标没有了"
+            description: "operator 不在或者抓不到。broker 不受影响；但这期间 KafkaOperatorNotReconciling 不会响，Kafka 资源的改动不生效。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-operator.md
+
     - name: middleware.otel
       interval: 30s
       rules:
+        # Collector 的 gateway 不在了（没有一个就绪的抓取目标）。六个服务、探针、对账的指标都经它写进 Prometheus（ADR-0030），
+        # 它不在时这些序列一起消失，按阈值写的业务规则和 SLO 全部不响（设计 1.3 第 2 条）：这是“监控瞎了”，所以是 critical。
+        # for 比各条“没有数据”（5 到 10 分钟）短：它先响，Alertmanager 里用它抑制那几条（alertmanager.yaml）。
+        - alert: OtelGatewayDown
+          expr: absent(up{job="monitoring/otel-gateway-agent"} == 1)
+          for: 2m
+          labels:
+            severity: critical
+            component: otel
+          annotations:
+            summary: "OpenTelemetry Collector 的 gateway 不在了，服务的指标进不来"
+            description: "六个服务、探针、对账的指标、日志和链路都经它转发。它不在时业务告警和 SLO 的燃烧率没有数据、不会响；服务本身不受影响（导出失败只丢遥测）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
+
         # Collector 拒收：receiver 的 refused_* 有增长（spans、metric_points、log_records 三种取最大）。
         # 拒收一般是内存限制器（memory_limiter）在起作用，被拒的数据客户端会重试或丢弃。出处：3a 的 3.3。
         # 窗口 10m、for 2m。注意 Collector 是推送模式，指标推不上来时服务一侧没有 up（ADR-0030）。

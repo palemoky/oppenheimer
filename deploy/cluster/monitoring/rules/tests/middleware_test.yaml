@@ -615,6 +615,137 @@ tests:
         eval_time: 30m
         exp_samples: []
 
+  # operator 每 2 分钟调和成功一次，t=20m 起不再成功（计数停住）：窗口 20 分钟里的增量要到 t=40m 才掉到 0，再过 for 10m。
+  # 45m 不响，52m 在响。
+  - name: kafka_operator_stops_reconciling_fires
+    interval: 1m
+    input_series:
+      - series: 'strimzi_reconciliations_successful_total{kind="Kafka",namespace="kafka",selector=""}'
+        values: '0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10x50'
+      - series: 'strimzi_resources{kind="Kafka",namespace="kafka",selector=""}'
+        values: '1x70'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 45m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 52m
+        exp_samples:
+          - labels: '{alertname="KafkaOperatorNotReconciling"}'
+            value: 1
+
+  # round-8 的情形：operator 重启后一次都没成功过，成功的计数器从未出现，只有 strimzi_resources：15m 在响。
+  - name: kafka_operator_never_reconciled_fires
+    interval: 1m
+    input_series:
+      - series: 'strimzi_resources{kind="Kafka",namespace="kafka",selector=""}'
+        values: '1x40'
+      - series: 'strimzi_reconciliations_total{kind="Kafka",namespace="kafka",selector=""}'
+        values: '0+1x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="KafkaOperatorNotReconciling"}'
+            value: 1
+
+  # 正常：每 2 分钟成功一次，中间有一次 8 分钟的调和（滚动 broker）：不响。
+  - name: kafka_operator_reconciling_silent
+    interval: 1m
+    input_series:
+      - series: 'strimzi_reconciliations_successful_total{kind="Kafka",namespace="kafka",selector=""}'
+        values: '0 0 1 1 2 2 3 3 4 4 5x8 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16 17 17 18 18 19 19 20 20'
+      - series: 'strimzi_resources{kind="Kafka",namespace="kafka",selector=""}'
+        values: '1x60'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname=~"KafkaOperator.*"})
+        eval_time: 30m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname=~"KafkaOperator.*"})
+        eval_time: 50m
+        exp_samples: []
+
+  # operator 刚重启：成功的计数器在 t=3m 才出现（第一次调和成功），之后正常：不响（等待中也不该转成 firing）。
+  - name: kafka_operator_restart_silent
+    interval: 1m
+    input_series:
+      - series: 'strimzi_reconciliations_successful_total{kind="Kafka",namespace="kafka",selector=""}'
+        values: '_ _ _ 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 14'
+      - series: 'strimzi_resources{kind="Kafka",namespace="kafka",selector=""}'
+        values: '1x30'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorNotReconciling",alertstate="firing"})
+        eval_time: 28m
+        exp_samples: []
+
+  # operator 的指标在 t=10m 之后没有了：absent 在响，25m 在响；NotReconciling 这时没有数据、不响（所以才要这一条）。
+  - name: kafka_operator_metrics_gone_fires
+    interval: 1m
+    input_series:
+      - series: 'strimzi_reconciliations_successful_total{kind="Kafka",namespace="kafka",selector=""}'
+        values: '0 0 1 1 2 2 3 3 4 4 5'
+      - series: 'strimzi_resources{kind="Kafka",namespace="kafka",selector=""}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorMetricsMissing",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaOperatorMetricsMissing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{alertname="KafkaOperatorMetricsMissing"}'
+            value: 1
+
+  # Collector 的 gateway：t=10m 起抓取失败（up=0）：11m 不响，13m 在响。
+  - name: otel_gateway_down_fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="monitoring/otel-gateway-agent",pod="otel-gateway-a"}'
+        values: '1x10 0x20'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 11m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 13m
+        exp_samples:
+          - labels: '{alertname="OtelGatewayDown"}'
+            value: 1
+
+  # Pod 整个没有了（目标消失，up 的序列断掉）：同样在响。
+  - name: otel_gateway_target_gone_fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="monitoring/otel-gateway-agent",pod="otel-gateway-a"}'
+        values: '1x10'
+      - series: 'up{job="monitoring/otel-agent-agent",pod="otel-agent-x"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="OtelGatewayDown"}'
+            value: 1
+
+  # 滚动更新：旧 Pod 的目标没了，新 Pod 一分钟后就绪：不响。
+  - name: otel_gateway_rolling_silent
+    interval: 1m
+    input_series:
+      - series: 'up{job="monitoring/otel-gateway-agent",pod="otel-gateway-a"}'
+        values: '1x10'
+      - series: 'up{job="monitoring/otel-gateway-agent",pod="otel-gateway-b"}'
+        values: '_x11 1x30'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
   # Collector 拒收 spans：refused_spans 从 t=10m 起每分钟涨 5，15m 在响（signal=spans）。
   - name: otel_refusing_fires
     interval: 1m

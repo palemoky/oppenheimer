@@ -30,12 +30,15 @@ spec:
     # ---- 探针：下单到支付这条路现在通不通 ----
     - name: business.probe
       rules:
-        # 一半以上的周期不成功，持续 3 分钟。分母含 skipped：周期卡住不结束时，新的周期因为在途上限被跳过，
-        # 这时 failed 很少而 skipped 很多，同样是“路不通”。平时 90 分钟 5399 个周期全部是 ok（设计第 8 节的基线）。
+        # 一半以上的周期失败或被跳过，持续 3 分钟。分子是 failed（有一步出错或超时）加 skipped：周期卡住不结束时，
+        # 新的周期因为在途上限被跳过，这时 failed 很少而 skipped 很多，同样是“路不通”。
+        # incomplete（被 429 拒绝、售罄、降级）不算在这里：背压的 429 按 SLO 的定义不是坏的（过载的压测里探针会被大量拒绝），
+        # 售罄是探针自己的 SKU 配置坏了，都不是“下单的路断了”；它们由下面的 ProbeIncomplete 报成 warning（2026-11-23 改的，
+        # 原来分子是 outcome!="ok"）。平时 90 分钟 5399 个周期全部是 ok（设计第 8 节的基线）。
         # 阈值取一半而不是“有失败就响”：单个周期失败由 SLO 的燃烧率管，这条只管“断了”。
         - alert: ProbeFailing
           expr: |
-            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer",outcome!="ok"}[5m])) or vector(0))
+            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer",outcome=~"failed|skipped"}[5m])) or vector(0))
               /
             sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m]))
               > 0.5
@@ -44,9 +47,27 @@ spec:
             severity: critical
             service: probe
           annotations:
-            summary: "探针的下单到支付周期有 {{ $value | humanizePercentage }} 不成功"
+            summary: "探针的下单到支付周期有 {{ $value | humanizePercentage }} 失败或被跳过"
             description: "常驻探针每秒从入口走一次“下单、落库、支付、已支付”。一半以上不成功说明这条路对真实用户也是断的，即使 SLO 的规则因为没有流量而算不出来。看 probe_steps_total 的 step 和 outcome 定位断在哪一步。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/probe.md
+        # 一半以上的周期没走完但也没出错：被 429 拒绝（限流或背压）、售罄、带降级原因码的 503。持续 10 分钟。
+        # 三种情况的处理完全不同，看 probe_steps_total 的 outcome（rejected、sold_out、degraded）分清。
+        # 这段时间探针走不到落库和支付，那两条 SLO 实际上没有数据。
+        - alert: ProbeIncomplete
+          expr: |
+            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="incomplete"}[5m])) or vector(0))
+              /
+            sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m]))
+              > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            service: probe
+          annotations:
+            summary: "探针的周期有 {{ $value | humanizePercentage }} 没走完（被拒绝、售罄或降级）"
+            description: "探针的下单被 429 拒绝（限流或背压）、SKU 售罄，或者接口在降级。不是出错，但探针走不到落库和支付，那两条 SLO 这段时间没有数据。压测打过拐点时响是预期的；平时响先看是不是探针的 SKU 卖完了。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/probe.md
+
         # 探针该在跑（Deployment 的副本数大于 0）却 10 分钟没有任何周期。正式压测前 probe-stop 把副本数缩到 0，这条不响。
         # 探针停了的后果：没有流量时 SLO 的规则算不出来，CDC 的延迟指标也没有源库写入可量，几条规则同时变瞎。
         - alert: ProbeNoData
@@ -114,10 +135,17 @@ spec:
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
         # 每天的全量对账耗时随总量线性增长：2026-11-22 是 1474.9 万单 1 分 57 秒，时限是 55 分钟。
         # 超过 20 分钟就该换成按场景的对账（阶段计划的 3e），不要等到它撞上时限才知道。
+        # 只看最近开始的那一个 Job：做完的 Job 会留几天，取所有 Job 里最长的话，慢过一次之后下一次变快了也不恢复。
         - alert: ReconDailySlow
           expr: |
             max by (namespace) (
               (kube_job_status_completion_time{namespace="oppenheimer",job_name=~"recon-daily-.*"} - kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"})
+              and on (namespace, job_name)
+              (
+                kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"}
+                == on (namespace) group_left ()
+                max by (namespace) (kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"})
+              )
             ) > 20 * 60
           for: 5m
           labels:
@@ -356,20 +384,22 @@ spec:
             summary: "{{ $labels.service_name }} 的 outbox 发到 {{ $labels.messaging_destination_name }} 的等待时间 p99 是 {{ $value | humanizeDuration }}"
             description: "本地消息表里的事件要等很久才发到 Kafka。下游（支付、库存落账、订单变成已支付）都跟着晚。看中继的批量和轮询间隔、库的写入压力、Kafka 的生产延迟。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/outbox.md
-        # 支付一直在出成功的结果，而订单 10 分钟没有一单变成已支付：两者之间的链路（payment 的 outbox、payment.events、
+        # 窗口 5 分钟加 for 2 分钟：链路断了之后约 7 分钟响。不能更长：待支付的订单 15 分钟后被关单并退款，
+        # 要给人留出处理的时间（原来是 10 分钟加 5 分钟，响的时候第一批订单已经到关单的时限了，2026-11-23 改）。
+        # 支付一直在出成功的结果，而订单 5 分钟没有一单变成已支付：两者之间的链路（payment 的 outbox、payment.events、
         # order 的消费者）整个断了。支付处理时延的 SLO 这时没有观测值、算不出来，所以单独写。
         - alert: PaidOrdersNotLanding
           expr: |
-            sum(increase(payment_results_total{k8s_namespace_name="oppenheimer",result="succeeded"}[10m])) > 20
+            sum(increase(payment_results_total{k8s_namespace_name="oppenheimer",result="succeeded"}[5m])) > 10
             and
-            (sum(increase(order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}[10m])) or vector(0)) < 1
-          for: 5m
+            (sum(increase(order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}[5m])) or vector(0)) < 1
+          for: 2m
           labels:
             severity: critical
             service: order
           annotations:
-            summary: "最近 10 分钟有 {{ $value | humanize }} 笔支付成功，没有一个订单变成已支付"
-            description: "用户付了钱而订单停在待支付。支付结果到订单的链路断了：payment 的 outbox 发不出去、payment.events 不可用，或者 order 的 payment.events 消费者停了。15 分钟后关单任务会把这些订单关掉并触发退款，所以要在那之前恢复。"
+            summary: "最近 5 分钟有 {{ $value | humanize }} 笔支付成功，没有一个订单变成已支付"
+            description: "用户付了钱而订单停在待支付。支付结果到订单的链路断了：payment 的 outbox 发不出去、payment.events 不可用，或者 order 的 payment.events 消费者停了。下单 15 分钟后关单任务会把这些订单关掉并触发退款；这条在断了约 7 分钟时响，最早的一批订单离关单还有几分钟。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/outbox.md
         # 支付单从创建到出结果的时间。模拟的支付渠道是秒级的；p99 到 60 秒说明处理支付单的进程跟不上（round-1）。
         # 支付的时限是 15 分钟，到了时限订单会被关掉。
@@ -460,7 +490,8 @@ spec:
             description: "这个功能处在降级状态：对应的读走不了缓存或从库，或者接口直接返回降级的响应。是有意的就加静默并写明原因。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/degrade.md
         # 限流的 Redis 不可用，gateway 退回每个进程各算各的：限额实际变宽（副本数倍）。
-        # 每秒 1 次以上持续 5 分钟才报：节点 CPU 打满时偶发的超时会带来零星的退回（round-4、round-8）。
+        # 每秒 1 次以上持续 5 分钟才报，滤掉零星的超时。注意 Redis 没坏时它也会响：压测打过拐点、节点 CPU 满了的几档里，
+        # 问 Redis 的超时是每秒 8.6 到 12 次（round-4、round-8）。那时响是对的（限额确实变宽了），原因在节点而不在 Redis。
         - alert: RateLimitFallingBack
           expr: sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m])) > 1
           for: 5m

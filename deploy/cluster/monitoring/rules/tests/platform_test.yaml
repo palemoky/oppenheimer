@@ -350,3 +350,49 @@ tests:
       - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
         eval_time: 45m
         exp_samples: []
+
+  # Watchdog 每 5 分钟送到一次（时间戳跟着走），t=30m 之后不再更新（指标还在，值停住）：
+  # 停住的值是 1800，15 分钟后（45m）超过阈值，再过 for 10m。50m 不响，57m 在响。
+  - name: alert_delivery_stalled_fires
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink"}'
+        values: '0x4 300x4 600x4 900x4 1200x4 1500x4 1800x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 50m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 57m
+        exp_samples:
+          - labels: '{alertname="AlertDeliveryStalled"}'
+            value: 1
+
+  # alertsink 不在了（序列在 t=10m 之后消失）：absent 那一半，30m 在响。
+  - name: alert_delivery_sink_gone_fires
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink"}'
+        values: '0x4 300x4 600'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{alertname="AlertDeliveryStalled"}'
+            value: 1
+
+  # 正常：每 5 分钟更新一次；中间 alertsink 重启（旧 Pod 的序列在 20m 断掉，新 Pod 的在 26m 出现）：不响。
+  - name: alert_delivery_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink",k8s_pod_name="a"}'
+        values: '0x4 300x4 600x4 900x4 1200'
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink",k8s_pod_name="b"}'
+        values: '_x25 1500x3 1800x4 2100x4 2400x4 2700x4 3000x4'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 27m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 45m
+        exp_samples: []

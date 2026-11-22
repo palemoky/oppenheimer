@@ -181,7 +181,7 @@ tests:
             value: 1
 
   # h. 探针正常 10 分钟之后卡住：ok 不再涨，周期不结束，新的周期被在途上限跳过（skipped 每秒 1 个）。
-  #    没有一个 failed，但这条路是不通的：分子算 outcome!="ok"，响。
+  #    没有一个 failed，但这条路是不通的：分子算 failed 加 skipped，响。
   - name: h_probe_stuck_cycles_count_as_failing
     interval: 30s
     input_series:
@@ -307,7 +307,7 @@ tests:
           - labels: '{severity="warning"}'
             value: 1
 
-  # n. 支付每秒出 1 个成功的结果，订单变成已支付的计数 t=10m 起不动了：过了 10 分钟的窗口再加 for 5m 之后响。
+  # n. 支付每秒出 1 个成功的结果，订单变成已支付的计数 t=10m 起不动了：过了 5 分钟的窗口再加 for 2m 之后响（约 17m）。
   - name: n_paid_orders_not_landing
     interval: 30s
     input_series:
@@ -317,10 +317,10 @@ tests:
         values: '0+30x20 600x60'
     promql_expr_test:
       - expr: count(ALERTS{alertname="PaidOrdersNotLanding",alertstate="firing"})
-        eval_time: 15m
+        eval_time: 14m
         exp_samples: []
       - expr: count by (severity) (ALERTS{alertname="PaidOrdersNotLanding",alertstate="firing"})
-        eval_time: 27m
+        eval_time: 19m
         exp_samples:
           - labels: '{severity="critical"}'
             value: 1
@@ -395,3 +395,61 @@ tests:
         exp_samples:
           - labels: '{consumergroup="order.payment-events"}'
             value: 1
+
+  # r. 过载的压测：探针的下单全部被 429 拒绝（周期 incomplete，每秒 1 个），没有一个 failed。
+  #    ProbeFailing（critical）不响：背压的拒绝不是“路断了”。ProbeIncomplete（warning）在 10 分钟之后响。
+  - name: r_probe_rejected_is_incomplete_not_failing
+    interval: 30s
+    input_series:
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+30x20 600x60'
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="incomplete"}'
+        values: '_x20 0+30x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ProbeFailing"})
+        eval_time: 30m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="ProbeIncomplete",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="ProbeIncomplete",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{severity="warning"}'
+            value: 1
+
+  # s. 每天的全量对账：最近的一次用了 30 分钟：响。
+  - name: s_recon_daily_slow_latest
+    interval: 1m
+    input_series:
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '1000x30'
+      - series: 'kube_job_status_completion_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '1100x30'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-2"}'
+        values: '90000x30'
+      - series: 'kube_job_status_completion_time{namespace="oppenheimer",job_name="recon-daily-2"}'
+        values: '91800x30'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ReconDailySlow",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # t. 前一次慢（30 分钟）、最近的一次快（2 分钟）：不响。慢的那个 Job 还留在历史里，不能让它一直响。
+  - name: t_recon_daily_slow_then_fast_recovers
+    interval: 1m
+    input_series:
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '1000x30'
+      - series: 'kube_job_status_completion_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '2800x30'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-2"}'
+        values: '90000x30'
+      - series: 'kube_job_status_completion_time{namespace="oppenheimer",job_name="recon-daily-2"}'
+        values: '90120x30'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ReconDailySlow"})
+        eval_time: 10m
+        exp_samples: []

@@ -270,3 +270,23 @@ tests:
       - expr: count(ALERTS{alertname="IngressGateway5xxHigh"})
         eval_time: 20m
         exp_samples: []
+
+  # round-6 7.3 的情形：只有在途上限溢出在涨（排队和连接的溢出都是 0）：t=10m 起每分钟 100 次，15m 在响，signal=active。
+  - name: ingress_active_overflow_fires
+    interval: 1m
+    input_series:
+      - series: 'envoy_cluster_upstream_rq_active_overflow{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0",pod="envoy-a"}'
+        values: '0x10 100+100x30'
+      - series: 'envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0",pod="envoy-a"}'
+        values: '0x40'
+      - series: 'envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0",pod="envoy-a"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname, signal) (ALERTS{alertname="IngressRejectingRequests",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, signal) (ALERTS{alertname="IngressRejectingRequests",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="IngressRejectingRequests", signal="active"}'
+            value: 1

@@ -42,27 +42,32 @@ spec:
             description: "从入口 Envoy 看，发往 gateway 的请求有 1% 以上以 5xx 结束，包括 gateway 整个不在时入口自己返回的 503。用户正在受影响。和 SLO 的燃烧率告警对照：只有这条响而 SLO 的不响，说明 gateway 不在或者它的指标没有报上来。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/ingress-gateway-5xx.md
 
-        # 入口 Envoy 到 gateway 的排队溢出（pending）或连接数上限溢出（cx），任何一个有增长就是入口在拒绝请求。
-        # 出处：round-3 2.2、round-6 第 7 节。入口的 Envoy 没有 upstream_rq_active_overflow 这条（只有边车有），
-        # 入口一侧的“在途上限”实际是连接数上限，所以看 cx_overflow。
+        # 入口 Envoy 到 gateway 的三种溢出，任何一个有增长就是入口在拒绝请求或让请求排队：
+        #   active  在途请求到了上限（maxParallelRequests 1024），直接答 503 UO。round-6 的 7.3：过载时主要是这一条，
+        #           2384 请求/秒那一档每秒 530 个 503，而排队溢出是 0
+        #   queue   排队也满了（rq_pending_overflow），503 UO
+        #   conn    连接数到了上限（cx_overflow），新请求开始排队
+        # 出处：round-3 2.2、round-6 第 7 节。active 这一条原来没有抓（ingress-podmonitor.yaml 的保留列表里没有），2026-11-23 补上。
         # 只看 job="monitoring/ingress-envoy"；窗口 5m 配 for 2m：窗口要比 for 长，否则“第一次出现”那半边（只管出现后的一个窗口）撑不满 for，会漏掉。
         - alert: IngressRejectingRequests
           expr: |
             max by (envoy_cluster_name, signal) (
                 label_replace(increase(envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"}[5m]), "signal", "queue", "", "")
               or label_replace(increase(envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"}[5m]), "signal", "conn", "", "")
+              or label_replace(increase(envoy_cluster_upstream_rq_active_overflow{job="monitoring/ingress-envoy"}[5m]), "signal", "active", "", "")
             ) > 0
             or
             max by (envoy_cluster_name, signal) (
                 label_replace((envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"} > 0 unless envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"} offset 5m), "signal", "queue", "", "")
               or label_replace((envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"} > 0 unless envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"} offset 5m), "signal", "conn", "", "")
+              or label_replace((envoy_cluster_upstream_rq_active_overflow{job="monitoring/ingress-envoy"} > 0 unless envoy_cluster_upstream_rq_active_overflow{job="monitoring/ingress-envoy"} offset 5m), "signal", "active", "", "")
             )
           for: 2m
           labels:
             severity: warning
             component: ingress
           annotations:
-            summary: "入口 Envoy 在拒绝请求（{{ $labels.envoy_cluster_name }}，{{ $labels.signal }} 溢出：queue 是排队、conn 是连接数），5 分钟内 {{ $value }} 次"
+            summary: "入口 Envoy 在拒绝请求（{{ $labels.envoy_cluster_name }}，{{ $labels.signal }} 溢出：active 是在途请求上限、queue 是排队、conn 是连接数），5 分钟内 {{ $value }} 次"
             description: "入口到后端的排队队列或连接数上限溢出，溢出的请求被直接拒绝（503）。说明后端处理不过来，或者上限设得比实际能承受的低。是原因一级的线索，用户是否受影响看 SLO 的燃烧率。出处：round-3 2.2、round-6 第 7 节。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mesh-overflow.md
 

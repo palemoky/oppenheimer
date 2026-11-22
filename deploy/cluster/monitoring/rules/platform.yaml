@@ -176,3 +176,25 @@ spec:
             summary: "Alertmanager 到 {{ $labels.integration }} 的通知在失败，15 分钟内 {{ $value }} 次"
             description: "Alertmanager 往这个接收端发通知持续失败，告警可能没有送达。如果坏的是主人的渠道，这条本身也送不到，要靠别的接收端或大盘发现。出处：设计 4.6。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/alertmanager-notifications.md
+
+        # 告警送不到接收端了：从“规则求值”到“webhook 接收端收到”这一整条路上任何一环断了都算
+        # （Prometheus 不求值、Prometheus 到 Alertmanager 不通、Alertmanager 的路由或配置坏了、alertsink 不在）。
+        # 做法：Watchdog 一直在响，Alertmanager 每 5 分钟把它发给 alertsink 一次（alertmanager.yaml 的第一条路由），
+        # alertsink 把最后一次收到的时刻报成指标；15 分钟（三次）没有更新就算断了。
+        # absent 那一半：alertsink 不在、或者它重启之后一次都没收到过。for 10 分钟盖住它重启后等下一次 Watchdog 的时间。
+        # critical：发给 Telegram，那条路不经过 alertsink。但如果断的是 Prometheus 或 Alertmanager 自己，这条同样发不出来，
+        # 那要靠集群外的东西盯着 Watchdog（设计第 7 节，不做，记成考点）。
+        # Collector 的 gateway 不在时这个指标也会消失，由 OtelGatewayDown 抑制。
+        - alert: AlertDeliveryStalled
+          expr: |
+            time() - max(alertsink_watchdog_last_received) > 15 * 60
+            or
+            absent(alertsink_watchdog_last_received)
+          for: 10m
+          labels:
+            severity: critical
+            component: monitoring
+          annotations:
+            summary: "webhook 接收端已经超过 15 分钟没有收到 Watchdog，告警可能送不出去"
+            description: "从规则求值到 webhook 接收端这条路断了，或者接收端 alertsink 不在。这期间别的告警可能同样没有送达；3d 之后诊断 Agent 也收不到。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/alertmanager-notifications.md
