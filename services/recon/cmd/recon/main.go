@@ -9,6 +9,8 @@
 //	PAYMENT_DSN          payment 必填
 //	INVENTORY_DSN        stock 必填
 //
+// 另有一种常驻的用法：recon watch-totals，按笔数和金额核对支付和订单两边，把结果报成指标（见 watch.go）。
+//
 // 报告的文本打到标准输出，日志（JSON）打到标准错误。
 // 退出码：0 没有差异；1 有确认的差异（修复之后仍有的也算）；2 参数或运行错误。
 package main
@@ -65,6 +67,11 @@ type options struct {
 func main() {
 	logger := logx.New(serviceName, os.Stderr, logx.LevelFromEnv())
 	slog.SetDefault(logger)
+
+	// watch-totals 是常驻的另一种用法（钱的笔数和金额，见 watch.go），参数和一次性的对账完全不同，单独解析。
+	if len(os.Args) > 1 && os.Args[1] == watchTotalsCommand {
+		os.Exit(watchTotals(logger, os.Args[2:]))
+	}
 
 	opts, err := parseFlags(os.Args[1:])
 	if err != nil {
