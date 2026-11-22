@@ -47,6 +47,7 @@ commands:
   seed         write historical orders straight into the order primaries (design 1c 5.3)
   seed-report  measure shard balance and query latency after seeding, read only
   probe        standing low-rate prober: order, land, pay, paid once a second, reported as metrics
+  alertsink    standing Alertmanager webhook receiver: logs each alert, counts them, tracks the Watchdog
 
 run "load <command> -h" for the flags of a command.
 `
@@ -73,6 +74,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return seedReportCmd(args[1:], stdout, stderr)
 	case "probe":
 		return probeCmd(args[1:], stderr)
+	case "alertsink":
+		return alertsinkCmd(args[1:], stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

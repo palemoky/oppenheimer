@@ -1,0 +1,116 @@
+# Alertmanager 的 webhook 接收端：只打日志的接收端（3c 设计 3.1、第 2 节第 9 项），3d 的诊断 Agent 做出来之后换成它。
+# 每条告警打一行 JSON 日志（人为触发告警时用 kubectl logs 确认“确实送到了”），并报两个指标：
+#   alertsink.alerts                 按 status、severity 计数
+#   alertsink.watchdog.last_received 最近一次收到 firing 的 Watchdog 的 Unix 时间，用来写“告警这条路断了”的规则
+# 代码在 test/load/alertsink_cmd.go 和 test/load/internal/alertsink/。Alertmanager 的 webhook 地址：
+#   http://alertsink.monitoring:8080/alerts
+# 镜像是 chaos 镜像（load 和 recon 在 /app），__IMAGE__、__IMAGE_TAG__ 由脚本填上后 apply，可重复执行。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertsink
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alertsink
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  # 1 个副本：Alertmanager 的 webhook 一次只发给一个地址，多副本只会让日志和计数分散。
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alertsink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alertsink
+        app.kubernetes.io/part-of: oppenheimer
+      annotations:
+        # 不进网格：它是监控的一部分，不该依赖网格的控制面才能把告警送到。
+        sidecar.istio.io/inject: "false"
+    spec:
+      # 停止时 http.Server.Shutdown 最多等 10 秒，再加 OTel 关闭时把最后一批指标发出去，30 秒（默认值）够。
+      terminationGracePeriodSeconds: 30
+      # 不碰 Kubernetes 的 API，不挂令牌。
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          # 软的，偏好控制面节点 k3s-server（理由同 probe）：阶段 4 的故障实验要关的是工作节点，
+          # 告警的接收端是“眼睛”的一部分，不能跟着被关掉。放不下时宁可去别的节点也不要排不上。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alertsink
+          # chaos 镜像（deploy/docker/chaos.Dockerfile）：ENTRYPOINT 是 /busybox/sh，
+          # 所以这里用 command 覆盖成 load，不能只给 args。
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          command: ["/app/load", "alertsink"]
+          args:
+            - -listen=:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # OTLP 接收端：monitoring 命名空间的 Collector（Service otel-gateway，gRPC 4317），和六个服务一样。
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-gateway.monitoring:4317
+            # Pod 的身份放进每个指标的资源属性（Downward API），写法同 probe。
+            # 服务名 alertsink 是程序里定的（alertsink_cmd.go 的 alertsinkServiceName），不在这里设。
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              # service.version 用镜像的 tag（__IMAGE_TAG__）。
+              value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"
+            # 内存上限（128Mi）的 90%：Go 的垃圾回收不知道容器的上限。
+            - name: GOMEMLIMIT
+              value: 115MiB
+          # 有 HTTP 端口，所以加就绪和存活探针（/healthz 只表示进程在接请求）。
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            # 估的，没有实测：只解析小 JSON、打日志，应当很小。不设 CPU limit，内存 limit 128Mi 是兜底。
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertsink
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alertsink
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  selector:
+    app.kubernetes.io/name: alertsink
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
