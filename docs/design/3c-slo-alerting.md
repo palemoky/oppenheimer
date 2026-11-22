@@ -424,3 +424,54 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - 分位数是从直方图的桶里插值出来的，p99 以上的数受桶边界限制（支付那两个 0.2 秒就是桶的边界），只当量级看。
 - **支付处理时延的 SLO 阈值保持 5 秒**。空载的基线是 0.2 秒，但这条路在负载下慢得多（3b 第 1 轮：支付出结果每秒 76 笔就到顶；今天 10 单/秒的冒烟 p99 是 0.36 秒），有负载时的数还没有量。下一次在 125 单/秒上跑的时候量一次，那时再看要不要收到 2 秒（桶的边界有 1、2、5）。
 
+
+### `recon-daily` 改成全量（2026-11-22，主人定的）
+
+- 清单里去掉 `-since 26h`，加 `ARCHIVE_DSN`：全量要读冷库，否则已归档订单的支付单、预占、索引在订单一侧找不到对应的行，全部报成差异。每小时的那个不用（窗口 2 小时，里面的订单不会被归档）。
+- 16:05 UTC 手工触发过一次（`kubectl create job --from=cronjob/recon-daily`，看完已删）：1 分 57 秒，1474.9 万单，差异 0；订单一侧比不带冷库时多一条语句，是读冷库的。到点自己跑的第一次是 21:30 UTC。
+
+### 第 4 步的一半：业务一侧的规则（2026-11-22）
+
+`deploy/cluster/monitoring/rules/business.yaml`，8 个组，1 条记录规则加 31 条告警，主会话写的；测试 `tests/business_test.yaml` 20 个用例。**已下发**（`monitoring.sh rules`），32 条求值正常，没有一条在响。Alertmanager 还没配接收端。
+
+- **每条表达式都在 Prometheus 上求过值**：不报错，现在没有结果。指标名和标签是对着代码和 Prometheus 查的，设计第 4 节里凭印象写的名字有几处不对：熔断器的标签是 `breaker` 不是 `name`；`payment_results_total` 的标签是 `result`；`order_transitions_total` 是 `from`、`to` 两个标签。
+- **“有增长”的写法**（文件头注释第 1 条）：超卖、死信这类计数器平时没有序列，第一次 `Add` 才有。`increase()` 在序列从无到有的那一下是 0，第一次发生恰恰报不出来。所以写成两半：已有的序列又涨了，或者窗口之前没有、现在有了。第二半要逐条 `unless` 再 `sum`，否则 Pod 重启后新序列会被别的 Pod 的旧值盖住。三种情形都有测试（用例 a、b、c）。
+- **对账失败不直接写 `kube_job_status_failed > 0`**：失败的 Job 为了留日志保留 5 个，那样告警在人删掉 Job 之前一直响，下一次对上了也不恢复。写成“最近一次失败的 Job 的开始时间晚于上次成功的时间”。退出码 1 和 2 在 kube-state-metrics 里分不开，都按 `critical`，runbook 里教人看日志分。
+- **比设计多出来的几条**：`ReconDailySlow`（全量对账超过 20 分钟，时限 55 分钟；改成全量之后要盯耗时）；`PaidOrdersNotLanding`（支付在出成功的结果而 10 分钟没有订单变成已支付，`critical`；这种时候支付处理时延的 SLO 没有观测值、算不出来）；`CDCPipelineMissing`（按管道的清单查序列在不在）；钱的核对三条（有差异 `critical`、核对自己停了、有支付单 20 分钟没封口）。
+- **人为停掉的不报**：探针的副本数是 0 时 `ProbeNoData` 不响，对账的 CronJob 暂停着时 `ReconNotRunning` 不响。`recon-totals` 没有“停”的子命令，缩到 0 的话 `PaymentTotalsCheckStalled` 会响，要加静默。
+- **做过反向验证**：把“从无到有”那一半删掉、把探针的分子改成只算 `failed`，测试会失败；改回来通过。
+- **已知的弱点，没有处理**：
+  - `PaymentReplyOverdue` 在支付单滑出 30 分钟的核对窗口之后会自己恢复，问题可能还在（注释和描述里写了）。
+  - `ServiceMetricsMissing`、`CDCPipelineMissing` 的清单是写死的，加服务、加分片时要跟着改。
+  - `ConsumerNotConsuming` 的指标来自 Kafka Exporter，没有命名空间的标签，按消费组的名字限定；`oppenheimer-e2e` 如果用同名的消费组、同一个 Kafka，会混在一起。**没有核对 e2e 用的组名。**
+  - 设计 4.1 的“入口到 gateway 的 5xx 比例高”没有写：按 `envoy_cluster_upstream_rq_xx`、`istio_requests_total` 都没有查到入口到 gateway 的序列，等基础设施那一半（Sonnet 子 Agent 在查网格和入口的指标名）回来再定。
+  - 探针“SKU 快售罄”的告警没有写：探针没有报库存余量的指标。10 个 SKU 各 10 亿库存、每秒 1 单，够用几十年，不做。
+  - 这些规则都**没有在集群上真的触发过**，那是第 5 节第 2 层的事。
+
+### 第 4 步的另一半：网格、中间件、节点的规则（2026-11-22）
+
+`mesh.yaml`（6 条）、`middleware.yaml`（18 条）、`platform.yaml`（9 条）和各自的测试。Sonnet 子 Agent 写的（指标名逐个在 Prometheus 上查过），主会话读过全部规则，改了两处、补了一条；只取了它那一个提交，worktree 和分支已删。**已下发**：现在集群上自己写的规则是 5 个 PrometheusRule、105 条（76 条告警加 29 条记录规则），求值都正常，**没有一条在响或在等**。`make rules-test` 8 个测试文件全过。
+
+- **主会话改的**：
+  - `ContainerMemoryNearLimit` 原来按工作集（working set）算，下发就会对 Kafka 一直响：三个 broker 的工作集是 limit（1.5 GiB）的 87% 到 96%，而常驻内存（RSS）只有 67% 到 71%。差的那部分是活跃的页缓存，内存紧的时候内核会回收，不会导致 OOM。改成按 RSS 算。MySQL 的 buffer pool、Redis 的数据、Go 的堆都是匿名页，RSS 量得到。
+  - 补了 `IngressGateway5xxHigh`（设计 4.1）：入口的指标在 `job="monitoring/ingress-envoy"` 下，路由的标签是 `envoy_cluster_name="httproute/oppenheimer/gateway/rule/0"`（之前按 `cluster_name` 找所以没找到）。
+- **与设计不一致的**：
+  - KEDA 那条拆成两条（错误计数有增长、HPA 的 `ScalingActive` 不是 `True`），两个值的含义不同。
+  - 入口没有“在途上限溢出”的指标（只有边车有），入口一侧看的是排队溢出和连接数上限溢出。
+  - Kafka“没有 leader”用的是控制器的离线分区数，不是 Kafka Exporter 的 leader 指标（没有 leader 时那个指标的值没有确切的约定）。
+  - 磁盘拆成三条（server 两档、agent 一档）。
+- **没有写的**：“`Kafka` 资源不是 `Ready`”。Prometheus 里没有 Strimzi 的指标，kube-state-metrics 也没有配自定义资源的状态。要写就得二选一先把指标接进来，**这一条还欠着**（计划里点了名的，round-8 那次就是它）。
+- **子 Agent 提的、值得记的**：
+  - “有增长”那种写法里，“第一次出现”的那一半只管出现后的一个窗口；`for` 不短于窗口时，计数器出现之后不再动的情形撑不满 `for`，会漏。所以窗口都取得比 `for` 长。业务规则里这一类都没有写 `for`，不受影响。
+  - 用正则匹配多个指标名再 `increase` 会因为去掉指标名后标签重复而报错，Collector 的三种信号是逐个算再合并的。
+  - Collector 的 `send_failed_spans` 累计 120 多万（导出到 Tempo），`refused_spans` 累计 14 万，最近 10 分钟没有增长。是压测那两天留下的，**没有回头查是哪一天、丢了多少**。
+  - Sentinel 那条只在少于法定数（2）时报，3 个掉到 2 个不报。要不要“掉一个就报”没有定。
+  - 从库的清单（`mysql-order-0-1`、`mysql-order-1-1`）是写死的。
+- **没有实测、只有单元测试的**：Exporter 连不上 Kafka 时 `kafka_brokers` 是不是真的消失；`OOMKilled` 的序列长什么样（集群上现在没有样例，标签是推断的）；Sentinel 掉线时两个指标的行为。都留到第 5 节的真实触发。
+- **压线的**：`mysql-order-0-backup` 上次成功距今约 21 小时（阈值 26 小时，每天一次，正常）；server 的根分区剩约 23.6 GiB（阈值 15 GiB）。
+
+### 第 5 步：筛 chart 自带的规则（2026-11-22）
+
+- 自带的是 16 个组、149 条告警。现在在响的只有三条：`Watchdog`（本来就该一直响）、`KubeCPUOvercommit`、`KubeMemoryOvercommit`。其余 146 条求值正常、没有在响，**保留，不逐条改阈值**：它们盖住的是节点不在、kubelet、Pod 反复重启、副本不足、Job 失败、磁盘按趋势预测、etcd、Prometheus 和 Alertmanager 自己，这些没有理由自己重写。放一周看误报时（第 5 节第 3 层）再按实际响的情况调。
+- 两条 Overcommit 在 values 里关掉了（`defaultRules.disabled`，理由写在 `deploy/cluster/monitoring/kube-prometheus-stack.yaml` 的注释里）。**values 改了，还没有 `helm upgrade`**：和下一步 Alertmanager 的配置改的是同一份 values，一起下发，免得监控栈滚两次。所以现在这两条还在响。
+- 自带的规则没有 `runbook_url` 指到本仓库（指向的是上游的 runbooks.prometheus-operator.dev），按设计第 2 节定的不给它们写 runbook。
