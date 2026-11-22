@@ -1,0 +1,76 @@
+# 抑制的核对表（scripts/cluster/monitoring.sh inhibit-test）：每行是“期望 | 告警的标签”。
+# 脚本把这些告警一次塞进集群上的 Alertmanager（另加 synthetic=true、run、case 三个标签，4 分钟后自己过期），
+# 再从它的 API 读每一条是不是被抑制了、被谁抑制的。不动任何组件；critical 的那些先加了静默，不发 Telegram。
+#
+#   inhibited  应当被抑制
+#   active     不该被抑制（源告警，以及每条抑制规则的对照：equal 里的标签对不上的那一个）
+#
+# 标签照规则真实产生的写（2026-11-23 从 Prometheus 里取的：mysql_up 带 cluster 和 instance，实例名是 Pod 名；
+# 节点的 instance 是 地址:9100）。equal 的坑是“两边都没有这个标签也算相同”，所以标签要写全，不能只写规则里匹配的那几个。
+# 改了 alertmanager.yaml 的 inhibit_rules，或者改了这些规则的标签，就在这里加一行再跑一遍。
+
+# ---- SLO：快档压中、慢档；中档压慢档；不同的 SLO 互不相干 ----
+active    | alertname=SLOOrderCreateAvailabilityBurnFast severity=critical slo=order_create_availability burn=fast
+inhibited | alertname=SLOOrderCreateAvailabilityBurnMedium severity=critical slo=order_create_availability burn=medium
+inhibited | alertname=SLOOrderCreateAvailabilityBurnSlow severity=warning slo=order_create_availability burn=slow
+active    | alertname=SLOOrderCreateLatencyBurnMedium severity=critical slo=order_create_latency burn=medium
+inhibited | alertname=SLOOrderCreateLatencyBurnSlow severity=warning slo=order_create_latency burn=slow
+active    | alertname=SLOOrderPersistDelayBurnSlow severity=warning slo=order_persist_delay burn=slow
+
+# ---- 两档阈值的四对：重的压同一个对象的轻的 ----
+active    | alertname=ConsumerBlockedTooLong severity=critical service=order service_name=order messaging_consumer_group_name=order.payment-events messaging_destination_name=payment.events
+inhibited | alertname=ConsumerBlocked severity=warning service=order service_name=order messaging_consumer_group_name=order.payment-events messaging_destination_name=payment.events
+active    | alertname=ConsumerBlocked severity=warning service=order service_name=order messaging_consumer_group_name=order.order-close-delay messaging_destination_name=order.close.delay
+active    | alertname=ConsumerBlocked severity=warning service=inventory service_name=inventory messaging_consumer_group_name=inventory.order-events messaging_destination_name=order.events
+active    | alertname=CDCLaggingTooLong severity=critical service=cdc pipeline=order-0
+inhibited | alertname=CDCLagging severity=warning service=cdc pipeline=order-0
+active    | alertname=CDCLagging severity=warning service=cdc pipeline=order-1
+active    | alertname=RedisGateMemoryCritical severity=critical component=redis cluster=redis-gate instance=redis-gate-0 job=redis
+inhibited | alertname=RedisGateMemoryHigh severity=warning component=redis cluster=redis-gate instance=redis-gate-0 job=redis
+active    | alertname=RedisGateMemoryHigh severity=warning component=redis cluster=redis-gate instance=redis-gate-1 job=redis
+active    | alertname=ServerDiskCritical severity=critical component=node instance=192.168.50.40:9100 job=node-exporter namespace=monitoring mountpoint=/
+inhibited | alertname=ServerDiskLow severity=warning component=node instance=192.168.50.40:9100 job=node-exporter namespace=monitoring mountpoint=/
+
+# ---- MySQL：实例连不上压它自己的复制和连接数；主库连不上只压同一套从库的 IO 线程 ----
+# 从库 mysql-order-0-1 连不上：
+active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+inhibited | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+inhibited | alertname=MySQLReplicaLagHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+inhibited | alertname=MySQLReplicaMetricsMissing severity=warning component=mysql instance=mysql-order-0-1
+inhibited | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+# 同一套里的主库没有连不上，它的连接数照报：
+active    | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-0 job=mysql
+# 主库 mysql-order-1-0 连不上：从库的 IO 线程被压住，SQL 线程和延迟照报（它们说的是从库自己）。
+active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-0 job=mysql
+inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
+active    | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
+active    | alertname=MySQLReplicaLagHigh severity=warning component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
+# 不相干的一套不受影响：
+active    | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-main instance=mysql-main-0 job=mysql
+
+# ---- Kafka：broker 少了压副本不足 ----
+active    | alertname=KafkaBrokerMissing severity=critical component=kafka
+inhibited | alertname=KafkaUnderReplicatedPartitions severity=warning component=kafka topic=order.events
+active    | alertname=KafkaPartitionsOffline severity=critical component=kafka
+
+# ---- Collector 不在：压各条“没有数据” ----
+active    | alertname=OtelGatewayDown severity=critical component=otel
+inhibited | alertname=ServiceMetricsMissing severity=warning service=order service_name=order k8s_namespace_name=oppenheimer
+inhibited | alertname=ProbeNoData severity=warning service=probe
+inhibited | alertname=CDCPipelineMissing severity=warning service=cdc k8s_namespace_name=oppenheimer pipeline=order-0
+inhibited | alertname=PaymentTotalsCheckStalled severity=warning service=recon
+inhibited | alertname=AlertDeliveryStalled severity=critical component=monitoring
+# 不是“没有数据”这一类的照报：
+active    | alertname=ProbeFailing severity=critical service=probe
+
+# ---- chart 自带的：同名、同命名空间，重的压轻的；InfoInhibitor 压同命名空间的 info ----
+active    | alertname=SyntheticTiered severity=critical namespace=synthetic-a
+inhibited | alertname=SyntheticTiered severity=warning namespace=synthetic-a
+active    | alertname=SyntheticTiered severity=warning namespace=synthetic-b
+inhibited | alertname=SyntheticTiered severity=info namespace=synthetic-b
+# InfoInhibitor 自己被“任何告警”压住（chart 的第四条规则没有源的条件），所以它是 inhibited；
+# 它照样能当源（抑制不连锁的另一面：被抑制的告警仍然是有效的源）。
+inhibited | alertname=InfoInhibitor severity=none namespace=synthetic-c
+inhibited | alertname=SyntheticInfo severity=info namespace=synthetic-c
+active    | alertname=SyntheticInfo severity=info namespace=synthetic-d

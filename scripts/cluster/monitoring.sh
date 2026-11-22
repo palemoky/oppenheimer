@@ -22,6 +22,8 @@
 #   monitoring.sh silence '<匹配>' <时长> '<原因>'
 #                                   加一条静默，例如 silence 'alertname=ProbeNoData' 2h '正式压测，探针停了'；多个匹配用空格分开。
 #                                   计划内的操作之前加，原因必须写。silence list 列出现有的，silence expire <id> 提前结束一条
+#   monitoring.sh inhibit-test      在集群上核对抑制规则：按 alertmanager/tests/inhibit.txt 塞合成的告警（4 分钟后自己过期，
+#                                   不动任何组件，不发 Telegram），看每一条有没有被抑制、被谁抑制。改了 inhibit_rules 之后跑
 #   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards、rules、alertsink
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
@@ -185,6 +187,76 @@ cmd_silence() {
     am_tool silence add --author="${USER:-monitoring-sh}" --duration="$duration" --comment="$comment" $matchers
     ;;
   esac
+}
+
+# 在集群上核对抑制规则（设计文档 3c 第 5 节第 2 层；amtool 在本机只测得了路由，测不了抑制）。
+# 把 alertmanager/tests/inhibit.txt 里的告警一次塞进 Alertmanager，再从它的 API 读每一条有没有被抑制、被谁抑制。
+# 每条另加三个标签：synthetic=true、run=<这一次的编号>、case=<行号>。多出来的标签不影响 equal（它只比列出的那几个）。
+# critical 的合成告警会走到 Telegram，所以先加一条只匹配 synthetic=true 的静默。静默不妨碍它当抑制的源：
+# 抑制看的是“源告警在不在”，不看它有没有被通知出去。告警 4 分钟后自己过期，静默 7 分钟后自己结束。
+cmd_inhibit_test() {
+  local file="$DEPLOY/alertmanager/tests/inhibit.txt" run end n=0 lineno=0 line expect labels
+  local tmp
+  tmp="$(mktemp -d)"
+  run="$(date -u +%H%M%S)"
+  end="$(date -u -v+4M +%Y-%m-%dT%H:%M:%SZ)"
+
+  # 静默比告警多活 3 分钟，到点自己结束；不在退出时撤：那时告警还在，撤了它们就发出去了（第一次跑就是这样漏的）。
+  am_tool silence add --author="${USER:-monitoring-sh}" --duration=7m \
+    --comment="monitoring.sh inhibit-test $run: synthetic alerts, keep them off Telegram" synthetic=true severity=critical >/dev/null
+  # shellcheck disable=SC2064 # 现在就展开：退出时变量已经不在作用域里
+  trap "rm -rf '$tmp'" EXIT
+
+  : >"$tmp/add.sh"
+  : >"$tmp/expect.tsv"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    expect="$(echo "${line%%|*}" | tr -d '[:space:]')"
+    labels="$(echo "${line#*|}" | sed -e 's/^ *//' -e 's/ *$//')"
+    case "$expect" in
+    inhibited | active) ;;
+    *)
+      echo "inhibit.txt:$lineno: expected 'inhibited' or 'active', got '$expect'" >&2
+      return 1
+      ;;
+    esac
+    n=$((n + 1))
+    # 标签里没有空格和引号（表里自己保证），按空格拆成参数。
+    echo "amtool --alertmanager.url=http://localhost:9093 alert add --end=$end $labels synthetic=true run=$run case=$lineno || exit 1" >>"$tmp/add.sh"
+    printf '%s\t%s\t%s\n' "$lineno" "$expect" "$labels" >>"$tmp/expect.tsv"
+  done <"$file"
+
+  echo "adding $n synthetic alerts (run=$run, expire at $end)"
+  kubectl -n "$NS" exec -i "alertmanager-$KPS_RELEASE-alertmanager-0" -c alertmanager -- sh <"$tmp/add.sh"
+  # 抑制器是从告警的订阅里异步收到源告警的，等它收齐。
+  sleep 10
+  am_tool alert query --active --inhibited --silenced --unprocessed -o json "run=$run" >"$tmp/alerts.json"
+
+  # 每条告警：行号、被哪些告警抑制（指纹换成名字）。
+  jq -r '
+    (map({key: .fingerprint, value: .labels.alertname}) | from_entries) as $names
+    | .[] | [.labels.case, ([.status.inhibitedBy[]? | $names[.] // .] | unique | join(","))] | @tsv
+  ' "$tmp/alerts.json" >"$tmp/got.tsv"
+
+  local fail=0 by got
+  while IFS=$'\t' read -r lineno expect labels; do
+    if ! by="$(awk -F'\t' -v c="$lineno" '$1 == c { print $2; found = 1 } END { exit !found }' "$tmp/got.tsv")"; then
+      echo "FAIL  line $lineno: not in Alertmanager | $labels"
+      fail=$((fail + 1))
+      continue
+    fi
+    got=active
+    [[ -n "$by" ]] && got=inhibited
+    if [[ "$got" == "$expect" ]]; then
+      printf 'ok    %-9s %s%s\n' "$got" "$labels" "${by:+   <- $by}"
+    else
+      printf 'FAIL  line %s: want %s, got %s%s | %s\n' "$lineno" "$expect" "$got" "${by:+ (by $by)}" "$labels"
+      fail=$((fail + 1))
+    fi
+  done <"$tmp/expect.tsv"
+  echo "$n cases, $fail failed"
+  return "$((fail > 0))"
 }
 
 cmd_kps() {
@@ -483,6 +555,7 @@ alertmanager) cmd_alertmanager ;;
 alertsink) cmd_alertsink ;;
 alerts) cmd_alerts ;;
 silence) cmd_silence "$@" ;;
+inhibit-test) cmd_inhibit_test ;;
 up)
   cmd_kps
   cmd_loki
@@ -500,7 +573,7 @@ password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | alerts | silence ... | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | alerts | silence ... | inhibit-test | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

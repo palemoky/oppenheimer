@@ -305,9 +305,13 @@ spec:
         # Collector 的 gateway 不在了（没有一个就绪的抓取目标）。六个服务、探针、对账的指标都经它写进 Prometheus（ADR-0030），
         # 它不在时这些序列一起消失，按阈值写的业务规则和 SLO 全部不响（设计 1.3 第 2 条）：这是“监控瞎了”，所以是 critical。
         # for 比各条“没有数据”（5 到 10 分钟）短：它先响，Alertmanager 里用它抑制那几条（alertmanager.yaml）。
+        # 抑制的源要“先来、后走”：先来靠 for 短，后走靠 keep_firing_for。
         - alert: OtelGatewayDown
           expr: absent(up{job="monitoring/otel-gateway-agent"} == 1)
           for: 2m
+          # 条件不成立之后再多响 5 分钟。gateway 一回来这条立刻就不成立了，而被它压着的“没有数据”要等指标重新攒够一个窗口
+          # 才恢复（慢 1 到 4 分钟）；源先走，那几条就漏出去（2026-11-23 的故障注入里漏了两条，设计第 8 节“第 8 步”第 11 项）。
+          keep_firing_for: 5m
           labels:
             severity: critical
             component: otel

@@ -718,6 +718,28 @@ tests:
           - labels: '{alertname="OtelGatewayDown"}'
             value: 1
 
+  # 恢复之后多响 5 分钟（keep_firing_for）：t=11m 到 21m 抓取失败，22m 恢复。25m 仍在响（被它压着的“没有数据”
+  # 那时还没恢复），29m 不响。
+  - name: otel_gateway_keeps_firing_after_recovery
+    interval: 1m
+    input_series:
+      - series: 'up{job="monitoring/otel-gateway-agent",pod="otel-gateway-a"}'
+        values: '1x10 0x10 1x20'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{alertname="OtelGatewayDown"}'
+            value: 1
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="OtelGatewayDown"}'
+            value: 1
+      - expr: count by (alertname) (ALERTS{alertname="OtelGatewayDown",alertstate="firing"})
+        eval_time: 29m
+        exp_samples: []
+
   # Pod 整个没有了（目标消失，up 的序列断掉）：同样在响。
   - name: otel_gateway_target_gone_fires
     interval: 1m
