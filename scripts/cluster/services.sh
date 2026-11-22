@@ -9,6 +9,9 @@
 #   services.sh e2e-up             e2e-prepare 之后把六个服务部署到 e2e 的命名空间（values 叠上 deploy/cluster/services/e2e/）
 #   services.sh e2e-down           删掉 e2e 的命名空间，再清理它留在中间件里的库、topic、消费者组和 Redis 键
 #   services.sh e2e-render [服务]   只渲染 e2e 那一套的清单
+#   services.sh recon-cron         装或更新对账的两个 CronJob（recon-hourly、recon-daily，deploy/cluster/recon/），可重复执行
+#   services.sh recon-cron-suspend 暂停这两个 CronJob（正式压测之前；已经在跑的 Job 不受影响）
+#   services.sh recon-cron-resume  恢复它们（压测之后）
 #
 # 不带服务名就是六个，按依赖顺序：inventory、order、payment、orderindex、cdc、gateway。
 # 环境变量：
@@ -22,6 +25,8 @@
 #                  可以用冒号隔开写几个目录，按顺序叠（scripts/cluster/bench.sh 用）。
 #   LOADTEST       deploy 时设为 1，在 deploy/cluster/services/<服务>.yaml 之上叠 deploy/cluster/services/loadtest/<服务>.yaml
 #                  （压测用：关掉 gateway 按客户端地址的限流 RATE_LIMIT_IP）。不影响 e2e 那一套。压完不带它再 deploy 一次就恢复。
+#   RECON_IMAGE_TAG recon-cron 用的 recon 镜像的 tag，默认取现在部署的 order Deployment 的 tag（make deploy 把七个镜像推成同一个 tag）。
+#                  镜像要已经在仓库里，没有的话 Job 起不来（ImagePullBackOff）；脚本会先问仓库，没有就报错。
 #   LOADTEST_EMPTY deploy 时设为 1，再叠 deploy/cluster/services/loadtest-empty/（空表对照：DSN 指到 e2e_* 空库，Kafka、Redis 带前缀）。
 #                  不要手工设：库要先建好，由 scripts/cluster/loadtest.sh empty-up、empty-down 成对地做。
 # 服务之间走 Istio 的边车（设计文档 2d）：deploy、e2e-up 要求 istiod 已经装好（make mesh-up），在部署任何 release
@@ -75,7 +80,7 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 E2E_ROOT_SECRET_KEYS=(root-password)
 
 usage() {
-  sed -n '2,31p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,36p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -343,6 +348,64 @@ cmd_e2e_down() {
   e2e_clean_redis
 }
 
+# ---------- 对账的 CronJob（设计文档 3c 的 3.7 节） ----------
+
+RECON_MANIFEST="$ROOT/deploy/cluster/recon/cronjob.yaml"
+RECON_CRONJOBS=(recon-hourly recon-daily)
+
+# order Deployment 现在的镜像 tag：recon 要和部署着的服务是同一个提交。
+current_order_tag() {
+  local image
+  image="$(kubectl -n "$NS" get deploy order -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)" || image=""
+  if [[ -z "$image" ]]; then
+    return 1
+  fi
+  echo "${image##*:}"
+}
+
+cmd_recon_cron() {
+  local tag="${RECON_IMAGE_TAG:-}" image
+  if [[ -z "$tag" ]]; then
+    tag="$(current_order_tag)" || {
+      echo "cannot read the image of deploy/order in $NS; set RECON_IMAGE_TAG (or run make deploy first)" >&2
+      exit 1
+    }
+  fi
+  # 先问仓库有没有这个镜像：没有的话 CronJob 照样建出来，到点才在 Job 里 ImagePullBackOff，那时已经没人看着了。
+  if ! curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/recon/manifests/$tag" >/dev/null 2>&1; then
+    echo "image oppenheimer/recon:$tag is not in the registry $REGISTRY_ADDR (scripts/cluster/images.sh all recon with IMAGE_TAG=$tag builds it)" >&2
+    exit 1
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/recon:$tag"
+  echo "==> secret (the CronJobs read $SECRET_NAME)"
+  if ! kubectl -n "$NS" get secret "$SECRET_NAME" >/dev/null 2>&1; then
+    echo "secret $NS/$SECRET_NAME not found; run services.sh deploy first" >&2
+    exit 1
+  fi
+  echo "==> recon cronjobs (image $image)"
+  # 不用 sed 的 / 做分隔符：镜像名里有 /。
+  sed "s|__IMAGE__|$image|g" "$RECON_MANIFEST" | kubectl -n "$NS" apply -f - >/dev/null
+  kubectl -n "$NS" get cronjob "${RECON_CRONJOBS[@]}"
+}
+
+# 暂停和恢复：只改 spec.suspend，不删对象，历史的 Job 还在。暂停不影响已经在跑的 Job，要停它自己 kubectl delete job。
+recon_cron_suspend() { # true|false
+  local c
+  for c in "${RECON_CRONJOBS[@]}"; do
+    kubectl -n "$NS" patch cronjob "$c" --type merge -p "{\"spec\":{\"suspend\":$1}}" >/dev/null ||
+      {
+        echo "cronjob $NS/$c not found; run services.sh recon-cron first" >&2
+        exit 1
+      }
+  done
+  kubectl -n "$NS" get cronjob "${RECON_CRONJOBS[@]}"
+  if [[ "$1" == true ]]; then
+    echo "    running jobs are not stopped:"
+    kubectl -n "$NS" get jobs -l app.kubernetes.io/name=recon --no-headers 2>/dev/null | awk '$2 !~ /^1\/1$/' || true
+  fi
+}
+
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
 shift
@@ -366,5 +429,8 @@ e2e-render)
   use_e2e
   cmd_render "$@"
   ;;
+recon-cron) cmd_recon_cron ;;
+recon-cron-suspend) recon_cron_suspend true ;;
+recon-cron-resume) recon_cron_suspend false ;;
 *) usage ;;
 esac

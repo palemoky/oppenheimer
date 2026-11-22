@@ -7,6 +7,7 @@
 //	load warmup [flags]       通过库存服务把 SKU 装载进闸门
 //	load seed [flags]         直接向订单主库灌历史订单（1c 设计 5.3）
 //	load seed-report [flags]  灌数之后量分片均匀度和查询延迟，只读（1c 设计 5.3）
+//	load probe [flags]        常驻的低速探针，给 SLO 提供连续的数据（3c 设计 3.6）
 //
 // 设计见 docs/design/1b-high-concurrency.md 的 7.3.1 节。
 package main
@@ -45,6 +46,7 @@ commands:
   warmup       load skus into the stock gate through the inventory service
   seed         write historical orders straight into the order primaries (design 1c 5.3)
   seed-report  measure shard balance and query latency after seeding, read only
+  probe        standing low-rate prober: order, land, pay, paid once a second, reported as metrics
 
 run "load <command> -h" for the flags of a command.
 `
@@ -69,6 +71,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return seedCmd(args[1:], stdout, stderr)
 	case "seed-report":
 		return seedReportCmd(args[1:], stdout, stderr)
+	case "probe":
+		return probeCmd(args[1:], stderr)
 	case "-h", "-help", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
