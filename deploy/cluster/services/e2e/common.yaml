@@ -10,6 +10,14 @@
 replicas: 1
 autoscaling: {enabled: false}
 
+# CPU requests 不跟长期运行的那一套：那边是按压测拐点的用量定的（每个节点约 3.4 核），这一套要和它同时待在
+# 同一批节点上，照抄的话放不下（Pod 会一直 Pending）。这一套只验证功能，用小的数；gateway、order、inventory
+# 在各自的文件里保持 2026-11-22 之前的值。边车用回网格的默认值（三项都置空，注解就不渲染）。
+# 叠在这一套之上的 bench、chaos、fault 也因此不变。
+resources: {cpu: 100m}
+istio:
+  proxy: {cpu: "", memory: "", memoryLimit: ""}
+
 config:
   LOG_LEVEL: warn
   # 链路导出到测试 Job 里的接收端（test/e2e/otlp_test.go），前面是 deploy/cluster/e2e/otlp-service.yaml 那个 Service。

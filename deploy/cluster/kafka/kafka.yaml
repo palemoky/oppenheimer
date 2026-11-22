@@ -26,7 +26,9 @@ spec:
     # 内存 requests 等于 limits；CPU 不设上限，避免被节流（设计文档 6.1）。
     requests:
       memory: 1536Mi
-      cpu: 250m
+      # CPU 按实测定（2026-11-22，3b 的记录 round-8-cpu-requests.md 第 5 节；算法和为什么乘 0.9 见 deploy/cluster/services/gateway.yaml）：
+      # 混合读写 1526 请求/秒时每个 broker 用 0.38 到 0.47 核。
+      cpu: 400m
     limits:
       memory: 1536Mi
   # 堆只给一半：Kafka 的读写主要靠操作系统的页缓存，页缓存也算在容器的内存里。

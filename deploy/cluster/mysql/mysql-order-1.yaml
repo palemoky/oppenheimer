@@ -22,7 +22,9 @@ mysqld:
 # 同一天又从 2Gi 提到 2560Mi：灌完 1000 万单后匿名内存 1844 MB（缓冲池 1047、固定开销约 400、分配器留着的约 400），贴着 2Gi。
 resources:
   memory: 2560Mi
-  cpu: 250m
+  # CPU requests 按实测定（2026-11-22，3b 的记录 round-8-cpu-requests.md 第 5 节；算法和为什么乘 0.9 见 deploy/cluster/services/gateway.yaml）：
+  # 混合读写 1526 请求/秒时主库用 0.42 到 0.45 核，从库 0.15 到 0.19 核。主从是同一个 StatefulSet，只能给同一个数，按主库给。
+  cpu: 400m
 storage:
   size: 20Gi
 backup:

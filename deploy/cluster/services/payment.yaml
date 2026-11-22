@@ -1,7 +1,9 @@
 # payment 服务（设计文档 2c）。release 名 payment。
 replicas: 2   # 节点号各自从库里租（ADR-0028）
 ports: {http: 8083, grpc: 9083}
-resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
+# CPU requests 按实测定（2026-11-22，算法见 gateway.yaml）：每个 Pod 混合读写 1526 请求/秒时 0.08 到 0.13 核，
+# 普通下单 100 单/秒（一半的订单付款）时 0.14 到 0.19 核。边车 0.03 到 0.06 核，用网格的默认值 50m。
+resources: {cpu: 150m, memoryRequestMi: 64, memoryLimitMi: 512}
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
