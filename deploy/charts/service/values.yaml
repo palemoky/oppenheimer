@@ -118,4 +118,6 @@ route:
   # 入口的 Envoy 到这个服务的并发上限（templates/backendtrafficpolicy.yaml）。不写就不建这个资源，
   # 用 Envoy 的默认值（连接 1024、排队 1024）。写的话两个数都要给：
   #   circuitBreaker: {maxConnections: 1024, maxPendingRequests: 1024}
+  # 可选的 maxParallelRequests：在途请求数的上限，不写是 1024。
+  # 可选的 connectionIdleTimeout（比如 30s）：入口到这个服务的连接空闲多久关掉，不写是 Envoy 的默认值 1 小时。
   circuitBreaker: {}

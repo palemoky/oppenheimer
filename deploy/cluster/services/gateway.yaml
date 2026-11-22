@@ -22,21 +22,33 @@ route:
   enabled: true
   hostnames: [api.oppenheimer.test]
   parentRef: {name: public, namespace: envoy-gateway-system}
-  # 入口到 gateway 的并发上限（3b 第 3 轮的记录）。入口到 gateway 是 HTTP/1.1，在途请求数就是连接数。
-  # 1024 的来历：在途请求数 = 到达速率 × 平均耗时。这套环境压过的最高到达速率是 2000 请求/秒，
-  # 正常时一个请求几毫秒到二十毫秒，在途只有几十个；在途到 1024 相当于平均耗时到了半秒，
-  # 是正常值的几十倍，这时让入口拒绝一部分比让所有请求一起更慢要好。
+  # 入口到 gateway 的连接上限（3b 第 3 轮的记录；2026-11-22 按扩容系数那一轮的记录第 4.1 节改过）。
+  # 第 3 轮定 1024 时的算法是“入口到 gateway 是 HTTP/1.1，在途请求数就是连接数”。这个等式不成立：
+  # maxConnections 数的是所有连接，闲着的也算；入口的连接池按“工作线程 × gateway 的 Pod”分开，互相借不到。
+  # 4 个 gateway 副本、1526 请求/秒时在途只有 82 个请求，连接已经占满 1024 条，再往上入口就答 503（UO）：
+  # 副本越多入口能接的越少，和扩容的目的相反。
+  # 并发上限交给 maxParallelRequests（数的是在途请求）：1024，第 3 轮的算法原样适用——在途请求数 = 到达速率 × 平均耗时，
+  # 正常时几十个，到 1024 相当于平均耗时到了半秒，这时让入口拒绝一部分比让所有请求一起更慢要好。
+  # maxConnections 4096：只要不先于 maxParallelRequests 触发就行。改完之后量到的连接数是在途请求数的三到六倍
+  # （4 个副本：在途 81 个时 466 条，547 个时 1512 条，1024 个时 3716 条），4096 刚好盖住；gateway 的副本数或入口的
+  # 线程数再涨，这个数要跟着重算。
+  # connectionIdleTimeout 30 秒：闲连接半分钟关掉，连接数跟着在途请求数走，不跟着“历史上的峰值 × 池子个数”走。
+  # 它要短于 gateway 自己关闭空闲连接的时间（gateway 不主动关，见 chart 模板里的说明）。
   # 排队的 1024 不收紧：连接池是冷的时候（突发流量的头一批请求）每个请求都要先排队等连接建好，
-  # 收得太紧会在最需要接住的时候拒绝请求。两个数现在和 Envoy 的默认值相同，写出来是为了有出处、能调。
-  circuitBreaker: {maxConnections: 1024, maxPendingRequests: 1024}
+  # 收得太紧会在最需要接住的时候拒绝请求。
+  circuitBreaker: {maxParallelRequests: 1024, maxConnections: 4096, maxPendingRequests: 1024, connectionIdleTimeout: 30s}
 
-# 按请求速率伸缩，2 到 4 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 按请求速率伸缩，2 到 3 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 上限从 4 收到 3（2026-11-22，3b 扩容系数那一轮的记录第 5 节）：这两个节点上加副本不加能力，4 个副本的拐点
+# 比 2 个还低一档、同样的请求量多用一成 CPU。2 个副本的理由是可用性；留 3 是为了伸缩的机制还在、能验证
+# “扩容时不丢请求”。加了节点之后这个数要重定。
 # 查询数的是 gateway 自己记的 HTTP 请求（SDK 的指标，不含探针）；窗口 1 分钟：指标每 15 秒导出一次，
 # 窗口太短速率会跳，太长扩容就慢。
 # perReplica 的来历（设计文档第 8 节“第 7 步”）：探针的请求组合下每个请求每秒约 0.92 毫核（服务加边车），
 # 每个 Pod 的 CPU requests 是 250m，70% 对应 190 请求/秒；取 180，让请求速率比 CPU 早一步触发。3b 压测后重定。
 autoscaling:
   enabled: true
+  maxReplicas: 3
   requestRate:
     query: sum(rate(http_server_request_duration_seconds_count{k8s_namespace_name="oppenheimer",service_name="gateway"}[1m]))
     perReplica: 180
