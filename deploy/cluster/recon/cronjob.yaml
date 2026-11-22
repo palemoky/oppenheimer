@@ -4,7 +4,9 @@
 #
 # 两个 CronJob 的分工：
 #   recon-hourly  每小时比最近的，差异发现得快；
-#   recon-daily   每天比更长的范围，盖住每小时那次没覆盖到的订单。
+#   recon-daily   每天全量比一遍（不带 -since），盖住每小时那次看不到的：订单创建很久之后才出现的差异。
+#                 2026-11-22 量过，1473.7 万单四对 1 分 55 秒（设计文档 3c 第 8 节），所以每天全量是便宜的；
+#                 耗时随总量线性增长，告警里要盯它的耗时，接近时限时再换成按场景的对账（阶段计划的 3e）。
 # 两者共用的设置（理由写在这里一遍，下面各自只写不同的）：
 #   -pairs payment,stock,replica,index   订单对支付单、对库存预占、对从库、对商家索引。不含 archive：
 #                                        它要显式给一份存下来的树（-snapshot-out、-against），不是定时对账的形态。
@@ -13,7 +15,9 @@
 #   -recheck 30s                         发现差异后隔 30 秒重读再比，只有还在的才算确认。默认 5 秒；这里要盖住从库的复制延迟
 #                                        和 outbox、消费者的处理延迟（压测中是秒级），30 秒与 loadtest.sh recon 的取值一致。
 #                                        代价只是出现差异时多等 30 秒。
-#   不设 ARCHIVE_DSN                     窗口最多 26 小时，里面的订单不会被归档（归档只动旧的终态订单），不用读冷库。
+#   ARCHIVE_DSN                          只有 recon-daily 设。每小时那次的窗口只有 2 小时，里面的订单不会被归档
+#                                        （归档只动旧的终态订单），不用读冷库；全量的要读，否则已归档订单的支付单、
+#                                        预占、索引在订单一侧找不到对应的行，全部报成差异。
 #   不加 -repair                         对账只报告。索引的自动修复会把差异盖住，Job 就不会失败，告警也就没有了。
 ---
 apiVersion: batch/v1
@@ -124,7 +128,7 @@ metadata:
     app.kubernetes.io/part-of: oppenheimer
 spec:
   # 每天 UTC 21:30：在 MySQL 备份（19:00、19:30、20:00 起）之后，不和备份抢从库的读。
-  # -since 26h 加默认的 -settle 30m：窗口是 [现在-26 小时, 现在-30 分钟)，一天一跑，相邻两次重叠 2 小时，没有缝。
+  # 不带 -since，只有默认的 -settle 30m：比的是 30 分钟之前创建的全部订单，包括已归档的。
   # 比每小时那次多看的是创建时间在 2 小时以前的订单，用来发现订单创建很久之后才出现的差异。
   schedule: "30 21 * * *"
   # 写明 UTC：不依赖控制器所在机器的时区。
@@ -147,7 +151,8 @@ spec:
       backoffLimit: 0
       # Job 的总时限，是兜底：recon 自己的 -timeout（55m）先到，它会干净地退出并打日志；
       # 这个在它卡死、没有响应 -timeout 的时候强杀。
-      # 一小时：窗口大 13 倍，读得多，时限放宽；超过一小时说明有问题，也不会拖到下一次。
+      # 一小时：全量，现在约 2 分钟（1473.7 万单），线性外推到 1 亿单约 13 分钟，余量还很大；
+      # 超过一小时说明有问题，也不会拖到下一次。
       # -timeout 55m 比它短 5 分钟，给 recon 留出打日志退出的时间。
       activeDeadlineSeconds: 3600
       template:
@@ -186,7 +191,6 @@ spec:
               # 镜像的 ENTRYPOINT 是 /app/entrypoint（指向 recon），这里只给参数。distroless 没有 shell。
               args:
                 - -pairs=payment,stock,replica,index
-                - -since=26h
                 - -recheck=30s
                 - -timeout=55m
               env:
@@ -200,6 +204,8 @@ spec:
                 - {name: MYSQL_DSNS, value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/order_db_1"}
                 - {name: MYSQL_REPLICA_DSNS, value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/order_db_1"}
                 - {name: MERCHANT_INDEX_DSNS, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_1"}
+                # 冷库：全量对账的订单一侧要包含已归档的订单（见文件开头）。
+                - {name: ARCHIVE_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"}
                 - {name: PAYMENT_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/payment_db"}
                 - {name: INVENTORY_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/inventory_db"}
               resources:

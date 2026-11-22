@@ -12,6 +12,8 @@
 #   services.sh recon-cron         装或更新对账的两个 CronJob（recon-hourly、recon-daily，deploy/cluster/recon/），可重复执行
 #   services.sh recon-cron-suspend 暂停这两个 CronJob（正式压测之前；已经在跑的 Job 不受影响）
 #   services.sh recon-cron-resume  恢复它们（压测之后）
+#   services.sh recon-totals       装或更新钱的笔数和金额核对（Deployment recon-totals，deploy/cluster/recon/totals.yaml），可重复执行；
+#                                  镜像的 tag 按当前工作区算（RECON_TOTALS_IMAGE_TAG 可覆盖），仓库里没有就构建并推送 recon 的镜像
 #   services.sh probe              装或更新常驻探针（Deployment probe，deploy/cluster/probe/），可重复执行；装之前核对 PROBE_SKUS 在库存里都存在
 #   services.sh probe-stop         把探针的副本数改成 0（正式压测之前）
 #   services.sh probe-start        改回 1（压测之后）
@@ -87,7 +89,7 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 E2E_ROOT_SECRET_KEYS=(root-password)
 
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,47p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -504,6 +506,31 @@ probe_scale() { # 副本数
   kubectl -n "$NS" get deployment probe
 }
 
+# ---------- 钱的笔数和金额核对（设计文档 3c 第 8 节） ----------
+
+RECON_TOTALS_MANIFEST="$ROOT/deploy/cluster/recon/totals.yaml"
+
+cmd_recon_totals() {
+  local tag="${RECON_TOTALS_IMAGE_TAG:-}" image
+  # 和 probe 一样按当前工作区算 tag：这个子命令在 recon 里是后加的，沿用现在部署的 tag 可能拿到没有它的旧镜像。
+  [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
+  if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/recon/manifests/$tag" >/dev/null 2>&1; then
+    echo "==> recon image $tag already in the registry"
+  else
+    echo "==> building recon image $tag (from the working tree)"
+    IMAGE_TAG="$tag" "$HERE/images.sh" all recon
+  fi
+  if ! kubectl -n "$NS" get secret "$SECRET_NAME" >/dev/null 2>&1; then
+    echo "secret $NS/$SECRET_NAME not found; run services.sh deploy first" >&2
+    exit 1
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/recon:$tag"
+  echo "==> recon-totals (image $image)"
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$RECON_TOTALS_MANIFEST" | kubectl -n "$NS" apply -f - >/dev/null
+  kubectl -n "$NS" rollout status deployment recon-totals --timeout=120s
+}
+
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
 shift
@@ -530,6 +557,7 @@ e2e-render)
 recon-cron) cmd_recon_cron ;;
 recon-cron-suspend) recon_cron_suspend true ;;
 recon-cron-resume) recon_cron_suspend false ;;
+recon-totals) cmd_recon_totals ;;
 probe) cmd_probe ;;
 probe-stop) probe_scale 0 ;;
 probe-start) probe_scale 1 ;;
