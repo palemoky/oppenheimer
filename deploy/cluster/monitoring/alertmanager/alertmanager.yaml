@@ -1,0 +1,136 @@
+# Alertmanager 的配置（设计文档 3c 的 3.4、3.5）。这是 Alertmanager 自己的配置文件格式，不是 Kubernetes 的清单。
+# 由 scripts/cluster/monitoring.sh alertmanager 做成 Secret alertmanager-oppenheimer（和 oppenheimer.tmpl、Telegram 的 token 一起），
+# kps 的 Alertmanager 用它当配置（kube-prometheus-stack.yaml 的 useExistingSecret、configSecret）。改完重跑那个子命令，不用重启。
+# 提交前：make alertmanager-test（amtool check-config，再按 tests/routes.txt 核对每类告警走到哪个接收端）。
+#
+# 为什么不用 AlertmanagerConfig 这个自定义资源：它是给“每个命名空间管自己的路由”设计的，operator 会给它的路由和抑制规则
+# 都加上 namespace 的匹配，表达不了全局的抑制（节点、Collector 坏了抑制别的命名空间里的告警）。也不放在 chart 的 values 里：
+# 那样会话号要入库，而且 amtool 检查不了。
+#
+# 两个去向（设计第 2 节第 9 项）：
+#   webhook   全部告警。集群里的 alertsink（只打日志、记数；3d 的诊断 Agent 做出来之后换成它）
+#   critical  severity=critical 的另外发给主人的 Telegram。一个接收端里放两种通知方式，不用两条路由加 continue：
+#             同一组告警只算一次分组和节流，两边看到的内容和时刻一致
+#
+# 占位符 __TELEGRAM_CHAT_ID__ 由脚本从仓库根目录的 .env（不入库）填。.env 里没有 Telegram 的两个变量时，
+# 脚本把 “# telegram-begin” 到 “# telegram-end” 之间的行删掉：critical 也只发 webhook，其余照常。
+global:
+  # 告警规则不再报某条告警之后多久算它恢复了。Prometheus 每次都带 EndsAt，这个值实际只对别的来源有用，留默认。
+  resolve_timeout: 5m
+
+templates:
+  - /etc/alertmanager/config/*.tmpl
+
+route:
+  receiver: webhook
+  # 分组：同名的告警一条通知（十个 Pod 的同一种毛病不是十条消息）。alertname 之外再按 namespace、service、component 分开，
+  # 免得两个不相干的服务的同名告警（BreakerOpen、ConsumerBlocked）并成一条。slo 让四个 SLO 各自成组。
+  # 没有这个标签的告警在这一维上都算空值，不影响。
+  group_by: [alertname, namespace, service, component, slo]
+  # 一组里的第一条告警到了之后等多久再发：等同一个原因引出的其余几条凑齐。
+  group_wait: 30s
+  # 一组已经发过，组里又多了（或少了）告警，最快多久再发一次。
+  group_interval: 5m
+  # 一组没有变化，多久重发一次（warning 当天看，所以 12 小时；critical 在下面的路由里是 1 小时）。
+  repeat_interval: 12h
+  routes:
+    # Watchdog 一直在响，是“从规则求值到通知送达这条路是通的”的心跳。发到 webhook，alertsink 记下最后一次收到的时刻
+    # （指标 alertsink_watchdog_last_received，规则 AlertDeliveryStalled 看它）。
+    # 每 5 分钟发一次：repeat_interval 是在 group_interval 的节拍上检查的，所以 group_interval 也要短。
+    - matchers: [alertname = "Watchdog"]
+      receiver: webhook
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 5m
+    # InfoInhibitor 只是给下面的抑制规则当源用的（chart 自带的做法），info 级别按设计 3.4 不通知。
+    - matchers: [alertname = "InfoInhibitor"]
+      receiver: "null"
+    - matchers: [severity = "info"]
+      receiver: "null"
+    - matchers: [severity = "critical"]
+      receiver: critical
+      repeat_interval: 1h
+
+# 抑制：源告警在响的时候，匹配的目标告警不通知（在 Alertmanager 的界面上仍然看得到，标着 inhibited）。
+# equal 里的标签要两边的值相同才抑制。注意：两边都没有这个标签也算“相同”，所以 equal 里只放源告警一定带的标签。
+# 抑制不会连锁：被抑制的告警仍然可以当源去抑制别的。
+inhibit_rules:
+  # ---- chart 自带的四条（原样保留）----
+  # 同名告警，严重的在响时不报轻的。
+  - source_matchers: [severity = "critical"]
+    target_matchers: [severity =~ "warning|info"]
+    equal: [namespace, alertname]
+  - source_matchers: [severity = "warning"]
+    target_matchers: [severity = "info"]
+    equal: [namespace, alertname]
+  # 一个命名空间里没有 warning 以上的告警时 InfoInhibitor 在响，把这个命名空间的 info 压住（info 只在出事时当上下文）。
+  - source_matchers: [alertname = "InfoInhibitor"]
+    target_matchers: [severity = "info"]
+    equal: [namespace]
+  - target_matchers: [alertname = "InfoInhibitor"]
+
+  # ---- SLO：同一个 SLO，烧得快的一档在响时不报慢的 ----
+  - source_matchers: [burn = "fast"]
+    target_matchers: [burn =~ "medium|slow"]
+    equal: [slo]
+  - source_matchers: [burn = "medium"]
+    target_matchers: [burn = "slow"]
+    equal: [slo]
+
+  # ---- 两档阈值、名字不同的几对：重的在响时不报轻的 ----
+  - source_matchers: [alertname = "ConsumerBlockedTooLong"]
+    target_matchers: [alertname = "ConsumerBlocked"]
+    equal: [service_name, messaging_consumer_group_name, messaging_destination_name]
+  - source_matchers: [alertname = "CDCLaggingTooLong"]
+    target_matchers: [alertname = "CDCLagging"]
+    equal: [pipeline]
+  - source_matchers: [alertname = "RedisGateMemoryCritical"]
+    target_matchers: [alertname = "RedisGateMemoryHigh"]
+    equal: [instance]
+  - source_matchers: [alertname = "ServerDiskCritical"]
+    target_matchers: [alertname = "ServerDiskLow"]
+    equal: [instance]
+
+  # ---- 上游坏了，下游的不用再报 ----
+  # MySQL 实例连不上：它自己的复制状态、延迟、连接数都跟着没有或不对。
+  - source_matchers: [alertname = "MySQLDown"]
+    target_matchers: [alertname =~ "MySQLReplica.*|MySQLConnectionsHigh"]
+    equal: [instance]
+  # 主库连不上：同一套里的从库的 IO 线程必然连不上主库。SQL 线程和延迟不在这里：主库没了它们仍然说明从库自己的状态。
+  - source_matchers: [alertname = "MySQLDown"]
+    target_matchers: [alertname = "MySQLReplicaIOThreadStopped"]
+    equal: [cluster]
+  # broker 少了：副本不足是必然的结果。
+  - source_matchers: [alertname = "KafkaBrokerMissing"]
+    target_matchers: [alertname = "KafkaUnderReplicatedPartitions"]
+  # Collector 的 gateway 不在：经它进来的指标都没有了，各条“没有数据”不用再报。
+  # 被压住的只有“没有数据”这一类；阈值类的规则这时本来就不响（没有数据），这正是 OtelGatewayDown 定成 critical 的原因。
+  - source_matchers: [alertname = "OtelGatewayDown"]
+    target_matchers: [alertname =~ "ServiceMetricsMissing|ProbeNoData|CDCPipelineMissing|PaymentTotalsCheckStalled|AlertDeliveryStalled"]
+  # operator 的指标没有了：靠这些指标的那一条不会响，不用抑制；这里没有规则。
+  #
+  # 设计 3.5 里的“节点不在 → 抑制这个节点上的 Pod、中间件实例的告警”没有写：我们的告警上没有 node 标签
+  #（实例是 Pod 名），equal 对不上；要做就得在每条规则里把 kube_pod_info 的 node 并进来。见设计第 8 节。
+
+receivers:
+  - name: "null"
+  - name: webhook
+    webhook_configs:
+      - url: http://alertsink.monitoring:8080/alerts
+        send_resolved: true
+        # 一条通知里最多带多少条告警；超出的被截掉，通知里只留个数（truncatedAlerts；alertsink 现在不记它）。
+        max_alerts: 100
+  - name: critical
+    webhook_configs:
+      - url: http://alertsink.monitoring:8080/alerts
+        send_resolved: true
+        max_alerts: 100
+    # telegram-begin
+    telegram_configs:
+      - bot_token_file: /etc/alertmanager/config/telegram-token
+        chat_id: __TELEGRAM_CHAT_ID__
+        send_resolved: true
+        # HTML 模式下 Alertmanager 用 html/template 渲染，标签和注解里的 <、& 会被转义，不会把消息弄成非法的 HTML。
+        parse_mode: HTML
+        message: '{{ template "oppenheimer.telegram" . }}'
+    # telegram-end

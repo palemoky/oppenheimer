@@ -13,7 +13,16 @@
 #   monitoring.sh rules             把 deploy/cluster/monitoring/rules/*.yaml（PrometheusRule，SLO 的记录规则和告警）服务端 apply 到集群，
 #                                   删掉仓库里已经没有的；下发前先 promtool check rules（要 make promtool yq 装好 ./bin）；
 #                                   规则的单元测试是 make rules-test，这里不跑
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards
+#   monitoring.sh alertmanager      Alertmanager 的配置（deploy/cluster/monitoring/alertmanager/）：路由、分组、抑制、Telegram 的模板。
+#                                   做成 Secret alertmanager-oppenheimer，Alertmanager 自己重新加载，不重启。Telegram 的 token 和会话号
+#                                   从仓库根目录的 .env 读（TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID，不入库）；没有就只发 webhook。
+#                                   下发前先 amtool check-config（要 make amtool）。kps 会先调用它（Secret 要先于 Alertmanager 存在）
+#   monitoring.sh alertsink         告警的 webhook 接收端（Deployment alertsink，只打日志、记数；chaos 镜像，仓库里没有就构建）
+#   monitoring.sh alerts            只读：Alertmanager 里现在的告警（含被抑制、被静默的）
+#   monitoring.sh silence '<匹配>' <时长> '<原因>'
+#                                   加一条静默，例如 silence 'alertname=ProbeNoData' 2h '正式压测，探针停了'；多个匹配用空格分开。
+#                                   计划内的操作之前加，原因必须写。silence list 列出现有的，silence expire <id> 提前结束一条
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards、rules、alertsink
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -87,10 +96,103 @@ ensure_grafana_secret() {
   echo "==> generated the Grafana admin password (monitoring.sh password prints it)"
 }
 
+# 从仓库根目录的 .env 取一个变量的值（KEY=value 或 export KEY=value，值可以带引号）。不 source 整个文件：
+# 里面可能有别的东西，而且 source 会执行它。值只进变量，不打印。
+dotenv() { # <变量名>
+  [[ -f "$ROOT/.env" ]] || return 0
+  sed -n -E -e "s/^[[:space:]]*(export[[:space:]]+)?$1=//p" "$ROOT/.env" | tail -n 1 |
+    sed -E -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\1/"
+}
+
+# Alertmanager 的配置（设计文档 3c 的 3.5）。Secret alertmanager-oppenheimer 里三个键：
+#   alertmanager.yaml   渲染过的配置（会话号填好，或者去掉了 Telegram 那一段）
+#   oppenheimer.tmpl    通知的模板
+#   telegram-token      机器人的 token（有的话）。operator 把 Secret 里的其他键原样挂到 /etc/alertmanager/config/，
+#                       配置里用 bot_token_file 指过去，token 不出现在配置里
+# 内容经文件交给 kubectl（--from-file），不出现在命令行参数里；服务端 apply，不留 last-applied 注解。
+# Secret 变了之后 operator 重新生成配置，Alertmanager 的 config-reloader 自己加载，不用重启（约一分钟内）。
+AM_SECRET="alertmanager-oppenheimer"
+cmd_alertmanager() {
+  if ! command -v amtool >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/amtool" ]]; then
+    echo "amtool not found; run 'make amtool' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  "$ROOT/scripts/alertmanager-test.sh" >/dev/null || {
+    echo "alertmanager config check failed; run make alertmanager-test to see why" >&2
+    return 1
+  }
+  ensure_ns
+  local dir token chat
+  dir="$(mktemp -d)"
+  token="$(dotenv TELEGRAM_BOT_TOKEN)"
+  chat="$(dotenv TELEGRAM_CHAT_ID)"
+  if [[ -n "$token" && -n "$chat" ]]; then
+    "$ROOT/scripts/alertmanager-test.sh" --render "$dir" "$chat"
+    (umask 077 && printf '%s' "$token" >"$dir/telegram-token")
+    echo "==> alertmanager config: webhook + Telegram for critical"
+  else
+    "$ROOT/scripts/alertmanager-test.sh" --render "$dir"
+    echo "==> alertmanager config: webhook only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not both set in .env)"
+  fi
+  local rc=0
+  kubectl -n "$NS" create secret generic "$AM_SECRET" --from-file="$dir" --dry-run=client -o yaml |
+    kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f - >/dev/null || rc=$?
+  rm -rf "${dir:?}"
+  return "$rc"
+}
+
+# 告警的 webhook 接收端（设计文档 3c 第 2 节第 9 项）。镜像是 chaos 镜像里的 load alertsink，tag 按当前工作区算，
+# 仓库里没有才构建并推送（同 services.sh probe）。
+cmd_alertsink() {
+  ensure_ns
+  local tag="${ALERTSINK_IMAGE_TAG:-}" image
+  [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
+  if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/chaos/manifests/$tag" >/dev/null 2>&1; then
+    echo "==> chaos image $tag already in the registry"
+  else
+    echo "==> building chaos image $tag (from the working tree)"
+    IMAGE_TAG="$tag" "$HERE/images.sh" all chaos
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/chaos:$tag"
+  echo "==> alertsink (image $image)"
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$DEPLOY/alertsink.yaml" | kubectl apply -f - >/dev/null
+  kubectl -n "$NS" rollout status deployment/alertsink --timeout=3m
+}
+
+# amtool 在 Alertmanager 的容器里就有，经 kubectl exec 用它，不用端口转发。
+am_tool() {
+  kubectl -n "$NS" exec "alertmanager-$KPS_RELEASE-alertmanager-0" -c alertmanager -- \
+    amtool --alertmanager.url=http://localhost:9093 "$@"
+}
+
+cmd_alerts() {
+  am_tool alert query --active --inhibited --silenced --unprocessed -o extended
+}
+
+# 静默（设计文档 3c 的 3.5）：人手动加的、有期限的，原因必须写。
+cmd_silence() {
+  case "${1:-}" in
+  list) am_tool silence query -o extended ;;
+  expire) am_tool silence expire "${2:?usage: monitoring.sh silence expire <id>}" ;;
+  "")
+    echo "usage: $0 silence '<matchers>' <duration> '<comment>' | silence list | silence expire <id>" >&2
+    return 2
+    ;;
+  *)
+    local matchers="$1" duration="${2:?duration, e.g. 2h}" comment="${3:?comment: why this silence exists}"
+    # shellcheck disable=SC2086 # 多个匹配按空格拆开
+    am_tool silence add --author="${USER:-monitoring-sh}" --duration="$duration" --comment="$comment" $matchers
+    ;;
+  esac
+}
+
 cmd_kps() {
   echo "==> kube-prometheus-stack $KPS_VERSION (Prometheus $PROMETHEUS_VERSION)"
   ensure_ns
   ensure_grafana_secret
+  # values 里 Alertmanager 用现成的 Secret 当配置，它要先存在。
+  cmd_alertmanager
   local values
   values="$(mktemp)"
   # shellcheck disable=SC2064 # 要的就是现在展开
@@ -377,6 +479,10 @@ istio) cmd_istio ;;
 keda) cmd_keda ;;
 dashboards) cmd_dashboards ;;
 rules) cmd_rules ;;
+alertmanager) cmd_alertmanager ;;
+alertsink) cmd_alertsink ;;
+alerts) cmd_alerts ;;
+silence) cmd_silence "$@" ;;
 up)
   cmd_kps
   cmd_loki
@@ -386,13 +492,15 @@ up)
   cmd_istio
   cmd_keda
   cmd_dashboards
+  cmd_rules
+  cmd_alertsink
   ;;
 status) cmd_status ;;
 password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | alerts | silence ... | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

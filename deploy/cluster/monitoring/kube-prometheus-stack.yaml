@@ -106,9 +106,12 @@ prometheus:
     probeSelectorNilUsesHelmValues: false
     scrapeConfigSelectorNilUsesHelmValues: false
 
-# 告警的路由和通知在 3c 做，这里只让它跑起来。
+# 路由、分组、抑制、接收端不在这里：配置在 alertmanager/alertmanager.yaml，由 monitoring.sh alertmanager 做成 Secret
+# alertmanager-oppenheimer（理由在那个文件的开头）。chart 自己生成的配置因此不用。
 alertmanager:
   alertmanagerSpec:
+    useExistingSecret: true
+    configSecret: alertmanager-oppenheimer
     replicas: 1
     affinity: *preferServer
     resources:

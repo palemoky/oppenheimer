@@ -193,3 +193,6 @@ jobs:
         run: make promtool yq
       - name: Check and test the rules
         run: make rules-test
+      # Alertmanager 的配置：amtool check-config，再按 alertmanager/tests/routes.txt 核对每类告警走到哪个接收端。
+      - name: Check the Alertmanager config and routes
+        run: make alertmanager-test

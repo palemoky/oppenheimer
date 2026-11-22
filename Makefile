@@ -13,7 +13,9 @@ OAPI_CODEGEN_VERSION       := v2.8.2
 # promtool 跟集群上的 Prometheus 走（scripts/cluster/cluster.env 的 PROMETHEUS_VERSION）
 PROMTOOL_VERSION           := 3.13.5
 YQ_VERSION                 := v4.54.3
-export PROMTOOL_VERSION YQ_VERSION
+# amtool 跟集群上的 Alertmanager 走（kube-prometheus-stack 的 chart 带的版本，kubectl -n monitoring get alertmanager 看得到）
+AMTOOL_VERSION             := 0.35.0
+export PROMTOOL_VERSION YQ_VERSION AMTOOL_VERSION
 
 # go.work 里的所有模块目录
 MODULES  := $(shell go list -m -f '{{.Dir}}')
@@ -59,6 +61,10 @@ proto-plugins: ## 只安装 proto 的 Go 插件（CI 里 buf 由 action 提供�
 promtool: ## 只安装 promtool（版本同集群的 Prometheus，校验 sha256）到 ./bin
 	scripts/install-bin.sh promtool
 
+.PHONY: amtool
+amtool: ## 只安装 amtool（版本同集群的 Alertmanager，校验 sha256）到 ./bin
+	scripts/install-bin.sh amtool
+
 .PHONY: yq
 yq: ## 只安装 yq（从规则清单里抽出 .spec.groups 用，校验 sha256）到 ./bin
 	scripts/install-bin.sh yq
@@ -76,6 +82,10 @@ openapi: ## 由 api/openapi/gateway.yaml 生成 gateway 的类型和服务端接
 .PHONY: rules-test
 rules-test: promtool yq ## 检查并单元测试 Prometheus 的规则（deploy/cluster/monitoring/rules/，promtool check rules + test rules）
 	scripts/rules-test.sh
+
+.PHONY: alertmanager-test
+alertmanager-test: amtool ## 检查 Alertmanager 的配置并核对路由（deploy/cluster/monitoring/alertmanager/，amtool check-config + routes test）
+	scripts/alertmanager-test.sh
 
 .PHONY: proto-lint
 proto-lint: ## 检查 proto 的格式与规范

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 把 promtool 或 yq 的指定版本装进 ./bin（不入库）。版本由 Makefile 通过环境变量传入（PROMTOOL_VERSION、YQ_VERSION）。
+# 把 promtool、amtool 或 yq 的指定版本装进 ./bin（不入库）。版本由 Makefile 通过环境变量传入（PROMTOOL_VERSION、AMTOOL_VERSION、YQ_VERSION）。
 # 按本机的操作系统和架构选发布包，校验发布页的 sha256 之后才放进 ./bin；已经是这个版本就什么都不做。
 #
-#   scripts/install-bin.sh promtool | yq
+#   scripts/install-bin.sh promtool | amtool | yq
 #
 # 在 macOS 自带的 bash 3.2 和 ubuntu-latest 上都能运行。
 set -euo pipefail
@@ -57,6 +57,23 @@ install_promtool() {
   echo "installed promtool $v ($os-$arch)"
 }
 
+install_amtool() {
+  local v="${AMTOOL_VERSION:?AMTOOL_VERSION not set}"
+  if [[ "$("$BIN/amtool" --version 2>&1 | awk 'NR==1 {print $3}')" == "$v" ]]; then
+    echo "amtool $v already installed"
+    return 0
+  fi
+  local name="alertmanager-$v.$os-$arch"
+  local base="https://github.com/prometheus/alertmanager/releases/download/v$v"
+  fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"
+  fetch "$base/sha256sums.txt" "$tmp/sha256sums.txt"
+  verify "$tmp/$name.tar.gz" "$(awk -v f="$name.tar.gz" '$2 == f {print $1}' "$tmp/sha256sums.txt")"
+  tar -xzf "$tmp/$name.tar.gz" -C "$tmp" "$name/amtool"
+  mkdir -p "$BIN"
+  mv "$tmp/$name/amtool" "$BIN/amtool"
+  echo "installed amtool $v ($os-$arch)"
+}
+
 install_yq() {
   local v="${YQ_VERSION:?YQ_VERSION not set}"
   if [[ "$("$BIN/yq" --version 2>/dev/null | awk '{print $NF}')" == "$v" ]]; then
@@ -77,9 +94,10 @@ install_yq() {
 
 case "${1:-}" in
 promtool) install_promtool ;;
+amtool) install_amtool ;;
 yq) install_yq ;;
 *)
-  echo "usage: $0 promtool | yq" >&2
+  echo "usage: $0 promtool | amtool | yq" >&2
   exit 2
   ;;
 esac
