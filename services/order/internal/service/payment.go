@@ -187,6 +187,7 @@ func (s *Service) HandlePaymentEvent(ctx context.Context, ev *eventv1.PaymentEve
 	s.afterCommit(ctx, ev.GetOrderId())
 	if paid {
 		transitionDone(ctx, transPendingToPaid)
+		s.paymentApplied(ctx, ev)
 	}
 	if reply.GetDisposition() == refundRequired {
 		otelx.SetReason(ctx, reply.GetReason())

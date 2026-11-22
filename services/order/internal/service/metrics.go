@@ -32,6 +32,7 @@ var (
 	persistsCounter    = otelx.Counter(meter, "order.persists", "Order submitted messages handled, by outcome")
 	persistDelayHist   = otelx.Histogram(meter, "order.persist.delay", "Time from admission to the order landing in the database")
 	transitionsCounter = otelx.Counter(meter, "order.transitions", "Order status transitions completed by this process")
+	paymentDelayHist   = otelx.Histogram(meter, "order.payment.delay", "Time from a payment result to the order becoming paid")
 	reclaimedCounter   = otelx.Counter(meter, "order.sweeper.reclaimed", "Orders and holds reclaimed by background tasks, by kind")
 	readsCounter       = otelx.Counter(meter, "order.reads", "Display reads by the source of the result and read mode")
 )
@@ -209,6 +210,21 @@ func transitionOpt(from, to string) metric.MeasurementOption {
 // transitionDone 记一次由本次调用完成的迁移（条件更新影响了 1 行、事务已提交）。
 func transitionDone(ctx context.Context, opt metric.MeasurementOption) {
 	transitionsCounter.Add(ctx, 1, opt)
+}
+
+// paymentApplied 记一笔支付从出结果（支付事件的 occur_time，支付服务写结果的那个事务用的时刻）到订单变成
+// 已支付花了多久：支付服务的 outbox 里等的、Kafka 上的、这里排队和处理的三段加在一起，也就是用户付完钱之后
+// 订单多久显示已支付。它是“支付处理时延”这条 SLO 的数据来源（设计文档 3c 的 3.2）。
+//
+// 只在本次调用把订单置为 PAID、事务已提交之后记：重复投递、要求退款的不是“订单变成已支付”，不在这里。
+// 起点是另一个进程的时钟，两边差几毫秒时可能算出负数，截成 0；事件里没有这个时刻（零值）时不记，
+// 否则会记进去一个几十年的数。名字以 .delay 结尾，用的是到 30 分钟的那组桶（otelx.WaitBuckets）。
+func (s *Service) paymentApplied(ctx context.Context, ev *eventv1.PaymentEvent) {
+	occurred := ev.GetOccurTime()
+	if occurred == nil || !occurred.IsValid() || occurred.AsTime().Unix() <= 0 {
+		return
+	}
+	paymentDelayHist.Record(ctx, max(s.clock().Sub(occurred.AsTime()).Seconds(), 0))
 }
 
 // transitionOfEvent 返回 transition 写的事件对应的迁移。transition 只用于取消、关单、置为失败这三种。

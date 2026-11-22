@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/palemoky/oppenheimer/api/eventx"
 	commonv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/common/v1"
@@ -456,4 +457,43 @@ func TestPaymentRacesClose(t *testing.T) {
 		}
 	}
 	t.Logf("paid wins %d of %d", paidWins, rounds)
+}
+
+// 支付处理时延只在订单真的变成已支付时记一次：重复投递、另一笔支付被要求退款、事件里没有出结果的时刻，都不记。
+// 别的用例造的支付事件都不带 occur_time（paymentEvent），所以这里的差值不受并行的用例影响，可以断言恰好是 1。
+func TestMetricsPaymentDelay(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	o := e.mustPending(t, 1, "k")
+	total := o.GetTotal().GetAmount()
+
+	withTime := func(paymentID int64) *eventv1.PaymentEvent {
+		ev := paymentEvent(o.GetOrderId(), paymentID, total, true)
+		ev.OccurTime = timestamppb.New(e.clock.Now().Add(-3 * time.Second))
+		return ev
+	}
+	d := counterDelta(t, "order.payment.delay", nil, func() {
+		for range 2 { // 第二次是重复投递
+			if err := e.svc.HandlePaymentEvent(t.Context(), withTime(601)); err != nil {
+				t.Fatalf("handle payment: %v", err)
+			}
+		}
+		// 另一笔支付：订单已经付清，要求退款。
+		if err := e.svc.HandlePaymentEvent(t.Context(), withTime(602)); err != nil {
+			t.Fatalf("handle second payment: %v", err)
+		}
+	})
+	if d != 1 {
+		t.Errorf("order.payment.delay recorded %d times, want 1", d)
+	}
+
+	// 没有 occur_time 的事件照常处理，只是不记时延。
+	o2 := e.mustPending(t, 1, "k2")
+	d = counterDelta(t, "order.payment.delay", nil, func() {
+		reply, err := e.pay(t, o2.GetOrderId(), 603, o2.GetTotal().GetAmount(), true)
+		wantReply(t, reply, err, accepted, "")
+	})
+	if d != 0 {
+		t.Errorf("order.payment.delay recorded %d times for an event without occur_time, want 0", d)
+	}
 }
