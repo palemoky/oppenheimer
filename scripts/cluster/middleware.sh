@@ -354,8 +354,15 @@ cmd_redis() {
 cmd_kafka() {
   echo "==> kafka (namespace kafka): strimzi $STRIMZI_VERSION"
   ensure_namespace kafka
+  # 集群域名写死，不让 Operator 自己探测。它启动时用 DNS 查 kubernetes.default 来猜域名，
+  # 2026-11-20 宿主机重启后那一次查询赶在集群 DNS 就绪之前，拿到的是代理的假地址，猜出来的域名是
+  # "19818.25.232   kubernetes.default"。之后每次调和都在生成证书时失败（Invalid DNS name），broker 照常跑，
+  # 但对 Kafka 资源的任何改动都不生效，直到 2026-11-22 改 broker 的 requests 时才发现。
+  # chart 的 kubernetesServiceDnsDomain 是 cluster.local 时不渲染这个变量（等于交给探测），所以用 extraEnvs 显式给。
   helm upgrade --install strimzi oci://quay.io/strimzi-helm/strimzi-kafka-operator \
-    --version "$STRIMZI_VERSION" -n kafka --wait --timeout 10m >/dev/null
+    --version "$STRIMZI_VERSION" -n kafka \
+    --set-json 'extraEnvs=[{"name":"KUBERNETES_SERVICE_DNS_DOMAIN","value":"cluster.local"}]' \
+    --wait --timeout 10m >/dev/null
   # 先提交指标规则的 ConfigMap：kafka.yaml 里 Kafka 的 metricsConfig 引用它，不存在的话 broker 起不来。
   # 第一次带 metricsConfig 提交时，Strimzi 会滚动重启 broker（一次一个，等 Ready 再下一个）。
   kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka-metrics.yaml"
