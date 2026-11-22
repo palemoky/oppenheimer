@@ -73,11 +73,34 @@
 - [ ] 错误预算与多窗口燃烧率告警
 - [ ] 基础设施告警：节点、Pod 重启、磁盘、主从延迟、Kafka 消费积压、Redis 内存、`Kafka` 资源的 `Ready` 条件（Strimzi 的 operator 调和失败过两天没人发现，见 3b 的 round-8 记录第 6.3 节）；Kafka 的保留期 2026-11-22 起是 24 小时，消费积压的告警要按“最老的未消费消息的年龄”设，远早于 24 小时；闸门 Redis 是 `noeviction`，内存到上限的七成就要报（round-9 记录第 2.2、3.3 节）
   - 2026-11-22 规则写完并下发：`mesh.yaml`、`middleware.yaml`、`platform.yaml`（33 条），单元测试通过。还没有勾：“`Kafka` 资源不是 `Ready`”没有写（Prometheus 里没有这个指标，要先接进来）；chart 自带的 149 条还没筛；runbook 没写，没有真的触发过
+  - 2026-11-23：Kafka 那一条补上了，改成看 Strimzi operator 的调和计数（`KafkaOperatorNotReconciling`、`KafkaOperatorMetricsMissing`，理由在设计第 8 节）；另加 `OtelGatewayDown`、`AlertDeliveryStalled`。chart 自带的筛完，两条 Overcommit 已关掉并下发；入口的在途上限溢出补进了抓取和 `IngressRejectingRequests`。还没有勾：没有真的触发过
 - [ ] 业务告警：下单成功率骤降、对账差异、库存异常
   - 2026-11-22 规则写完并下发：`deploy/cluster/monitoring/rules/business.yaml`（31 条，含探针、对账的 CronJob、钱的笔数和金额），单元测试 20 个用例。还没有勾：runbook 没写，没有在集群上真的触发过
+  - 2026-11-23：写 runbook 时查出三条规则的问题，已改并下发：`ProbeFailing` 不再把被拒绝和售罄算成失败（另加 `ProbeIncomplete`）、`PaidOrdersNotLanding` 从约 15 分钟收紧到约 7 分钟、`ReconDailySlow` 只看最近一次。还没有勾：没有在集群上真的触发过
 - [ ] Alertmanager 路由、分组、抑制、静默；通知渠道（webhook，为阶段 6 的 Agent 留接口）
-- [ ] 每条告警配一份 runbook（`docs/runbooks/`）：我们自己写的规则每条一份（相关的几条可以共用），chart 自带的沿用上游的链接
+  - 2026-11-23：配置（`deploy/cluster/monitoring/alertmanager/`）、`make alertmanager-test`、webhook 接收端 alertsink、`monitoring.sh alertmanager|alertsink|alerts|silence` 做完并下发，用合成的告警验证了路由、分组和一条抑制。Telegram 同日接上，一条合成的 critical 发出成功。还没有勾：其余的抑制和静默没有试过；“节点不在”的抑制没有做（告警上没有节点标签，设计第 8 节）
+- [x] 每条告警配一份 runbook（`docs/runbooks/`）：我们自己写的规则每条一份（相关的几条可以共用），chart 自带的沿用上游的链接
+  - 2026-11-23：44 份加 `README.md`（总则和索引）。结构和链接用脚本核对过；里面的命令没有在集群上执行过，39 份主会话没有逐行读，告警质量检查时逐条照着走一遍当验收（设计第 8 节“第 7 步”）
 - [ ] 告警质量检查：人为触发每条告警，确认能响且不误报（规则的单元测试进 CI；集群上逐条触发，要用的故障注入动手前登记在这里；上线后放几天看误报）
+  - **故障注入登记（2026-11-23 登记，都还没有做）**。都在长期运行的那一套上做，除了标明 e2e 的；每一项做之前加对应的静默只限于“不是这次要看的”那几条，做完撤掉故障、确认告警恢复、跑一次 `recon-hourly` 差异为 0。一次只做一项。不删 PVC、不清数据、不重置节点。
+    | # | 做什么 | 预期响的 | 怎么撤 |
+    |---|---|---|---|
+    | 1 | 合成告警（`amtool alert add`，不动组件）逐条试其余的抑制 | 无（验证抑制和路由） | 自己过期 |
+    | 2 | 探针缩到 0（`services.sh probe-stop`）15 分钟 | 不该响 `ProbeNoData`（人为停的不报）；SLO 不该响 | `probe-start` |
+    | 3 | inventory 缩到 0 约 10 分钟（3a 做过） | `ProbeFailing`、可用性的快档、`MeshEndpointEjected` 或网格溢出、`ServiceMetricsMissing{inventory}`、`KedaHPAScalingInactive` 不该响 | 缩回 2 |
+    | 4 | payment 缩到 0 约 15 分钟 | `PaymentReplyOverdue`、`PaidOrdersNotLanding`、支付时延的 SLO、`ConsumerNotConsuming`、`PaymentTotalsCheckStalled` 不该响 | 缩回 2 |
+    | 5 | orderindex 缩到 0 约 15 分钟（3a 做过） | `ConsumerNotConsuming`、`ServiceMetricsMissing{orderindex}` | 缩回 2 |
+    | 6 | cdc 缩到 0 约 15 分钟（3a 做过） | `CDCPipelineMissing`、`ServiceMetricsMissing{cdc}`；恢复后短暂的 `CDCLagging` | 缩回 1 |
+    | 7 | 一个订单从库 `STOP REPLICA SQL_THREAD` 约 10 分钟（3a 验证 7 做过） | `MySQLReplicaSQLThreadStopped`；之后 `MySQLReplicaLagHigh` | `START REPLICA` |
+    | 8 | 同一个从库 `STOP REPLICA IO_THREAD` 约 5 分钟 | `MySQLReplicaIOThreadStopped` | `START REPLICA` |
+    | 9 | 闸门 Redis 临时把 `maxmemory` 调到当前用量的 1.3 倍、再到 1.15 倍（`CONFIG SET`，不灌数据） | `RedisGateMemoryHigh`、`RedisGateMemoryCritical`（后者压住前者） | `CONFIG SET` 改回原值，核对和清单一致 |
+    | 10 | 删一个 Sentinel 的 Pod 不够（会自己回来）：把 Sentinel 的 StatefulSet 缩到 1 约 5 分钟 | `RedisSentinelBelowQuorum` | 缩回 3 |
+    | 11 | otel-gateway 缩到 0 约 12 分钟 | `OtelGatewayDown`；各条“没有数据”应当被抑制；`AlertDeliveryStalled` 被抑制 | 缩回原值。这段时间的指标、日志、链路会丢 |
+    | 12 | alertsink 缩到 0 约 30 分钟 | `AlertmanagerNotificationsFailing{webhook}`、`AlertDeliveryStalled`（Telegram 配好之后才看得到送达） | 缩回 1 |
+    | 13 | Strimzi operator 缩到 0 约 25 分钟（不动 broker） | `KafkaOperatorMetricsMissing` | 缩回 1，确认一次调和成功 |
+    | 14 | 压测：普通下单阶梯打过写入的拐点（3b 的脚本；先 `LOADTEST=1 make deploy`、`pin`，本机 `make down`，探针和对账按 3b 的规矩） | `OrderBackpressureRejecting`、`OrderQueueNearWaitLimit`、落库时延的 SLO、`NodeCPUHigh`、`OutboxRelaySlow`、`RateLimitFallingBack` 可能 | 停压，恢复平时的配置 |
+    | 15 | 对账差异：在 `oppenheimer-e2e` 里手工改一行（不动长期运行的库）；这只验证 `recon` 报得出来，长期运行那一套的 `ReconFoundDifferences` 用临时改阈值代替 | `recon` 退出码 1 | e2e 的命名空间用完即弃 |
+    | 16 | 不方便真做的（磁盘、内存、OOM、超卖、死信、钱对不上、节点重启、Kafka 分区离线、broker 少一个、MySQL 连不上、备份过期、对账过慢）：临时把规则的阈值改到当前值以下（只改集群上的 PrometheusRule，仓库不动），响了再 `monitoring.sh rules` 改回来 | 对应的那一条 | 重新下发规则。**这只验证了路是通的，结果里单列，不算真实触发** |
 - CDC 源库心跳**不做**（2026-11-22，主人确认）：它要解决的是“源库空闲时 `cdc_lag_ms` 不可信”，常驻探针让两个订单分片一直有写入；主从的告警按运行状态和延迟写三条，不依赖心跳
 
 ## 3e 对账方式按场景拆（2026-11-22 加，主人定：放在 3d 之后、阶段 4 的故障实验之前）

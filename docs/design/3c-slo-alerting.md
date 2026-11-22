@@ -475,3 +475,73 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - 自带的是 16 个组、149 条告警。现在在响的只有三条：`Watchdog`（本来就该一直响）、`KubeCPUOvercommit`、`KubeMemoryOvercommit`。其余 146 条求值正常、没有在响，**保留，不逐条改阈值**：它们盖住的是节点不在、kubelet、Pod 反复重启、副本不足、Job 失败、磁盘按趋势预测、etcd、Prometheus 和 Alertmanager 自己，这些没有理由自己重写。放一周看误报时（第 5 节第 3 层）再按实际响的情况调。
 - 两条 Overcommit 在 values 里关掉了（`defaultRules.disabled`，理由写在 `deploy/cluster/monitoring/kube-prometheus-stack.yaml` 的注释里）。**values 改了，还没有 `helm upgrade`**：和下一步 Alertmanager 的配置改的是同一份 values，一起下发，免得监控栈滚两次。所以现在这两条还在响。
 - 自带的规则没有 `runbook_url` 指到本仓库（指向的是上游的 runbooks.prometheus-operator.dev），按设计第 2 节定的不给它们写 runbook。
+
+### 欠着的那条 Kafka 规则（2026-11-23）
+
+计划里写的是“`Kafka` 资源的 `Ready` 条件”。**没有照这个做**，改成看 Strimzi operator 自己的调和计数：
+
+- 抓取：`kafka-podmonitor.yaml` 里加了第二个 PodMonitor（`strimzi-operator`，端口 `http` 8080，只留 `strimzi_` 开头的指标，共 30 条上下）。
+- 规则（`middleware.yaml`）：`KafkaOperatorNotReconciling`（成功调和的计数 20 分钟没有涨，或者 operator 看得到 Kafka 资源而成功的计数根本不存在；`for` 10 分钟，`warning`）、`KafkaOperatorMetricsMissing`（指标没有了）。
+- 为什么不用 `Ready`：要给 kube-state-metrics 配自定义资源的状态（一段配置加一份 RBAC，还要重启它），而 round-8 出的事是“operator 每次调和都失败”，调和计数量的就是这件事。operator 每 2 分钟定时调和一次，正常时这个计数一直在涨。
+- **第二半是专门对付 round-8 那种情形的**：operator 重启之后一次都没成功过，成功的计数器从未出现，`increase()` 没有结果；只写前一半的话恰恰是出过事的那种情况报不出来。有单元测试（`kafka_operator_never_reconciled_fires`）。
+- 没有查到的：Strimzi 1.3.1 的 operator 没有导出 `strimzi_resource_state`（按资源报 Ready 的那个指标，在 operator 的 `/metrics` 上查过，没有）；失败的计数器 `strimzi_reconciliations_failed_total` 在没有失败过的时候也不存在，所以规则不依赖它。
+- 局限：operator 在调和但 Kafka 资源因为别的原因不是 `Ready`（例如 broker 起不来）时，这条不一定响；那种情况由 `KafkaBrokerMissing`、`KafkaPartitionsOffline` 报。
+
+### 第 6 步：Alertmanager 的路由和抑制、webhook 接收端（2026-11-23）
+
+**配置放在哪**：`deploy/cluster/monitoring/alertmanager/alertmanager.yaml`（Alertmanager 自己的配置格式）加 `oppenheimer.tmpl`（Telegram 的消息模板），`monitoring.sh alertmanager` 把它们做成 Secret `alertmanager-oppenheimer`，values 里 `useExistingSecret` 指过去。没有用 `AlertmanagerConfig`（operator 会给它的路由和抑制都加上命名空间的匹配，表达不了全局的抑制），也没有写进 chart 的 values（会话号要入库，`amtool` 也检查不了）。Secret 变了之后 Alertmanager 自己重新加载，不重启（实测一分钟内生效）。
+
+**路由**：默认去 `webhook`（alertsink）；`critical` 去 `critical` 接收端（一个接收端里放 webhook 和 Telegram 两种通知，没有用两条路由加 `continue`）；`info` 和 `InfoInhibitor` 不通知；`Watchdog` 每 5 分钟发给 webhook 一次当心跳。分组按 `alertname`、`namespace`、`service`、`component`、`slo`；`group_wait` 30 秒、`group_interval` 5 分钟、`repeat_interval` 12 小时（`critical` 1 小时）。
+
+**抑制**（14 条，含 chart 自带的 4 条）：SLO 快档压中、慢档，中档压慢档；`ConsumerBlockedTooLong`、`CDCLaggingTooLong`、`RedisGateMemoryCritical`、`ServerDiskCritical` 各压自己轻的一档；`MySQLDown` 压同一实例的复制和连接数、同一套的 IO 线程；`KafkaBrokerMissing` 压副本不足；`OtelGatewayDown` 压各条“没有数据”。
+
+**与设计 3.5 不一致的**：
+
+- **“节点不在 → 抑制这个节点上的 Pod、中间件实例的告警”没有做。** 我们的告警上没有 `node` 标签（实例是 Pod 名），`equal` 对不上；要做得在每条规则里把 `kube_pod_info` 的 `node` 并进来。节点掉了的时候会有一批告警一起到，靠 runbook 总则里的“先看最上游的”。放一周看误报之后再定值不值得做。
+- “Prometheus 取不到服务的指标（Collector 挂了）”原来没有对应的源告警，**新加了 `OtelGatewayDown`**（`critical`，`for` 2 分钟，比各条“没有数据”的 5 到 10 分钟短，所以它先响）。定成 `critical` 是因为它在响的时候业务告警和 SLO 都没有数据、不会响。
+- 新加了 `AlertDeliveryStalled`（`critical`）：alertsink 把最后一次收到 `Watchdog` 的时刻报成指标 `alertsink_watchdog_last_received`，15 分钟没更新或者指标不在就响。它走 Telegram（不经过 alertsink）。断的是 Prometheus 或 Alertmanager 自己时它同样发不出来，那要集群外的东西（第 7 节，不做）。
+
+**Telegram**：从 Alertmanager 的 Pod 里访问 `api.telegram.org` 是通的（返回 302，经 R2S 的透明代理）。**`.env` 现在不在，所以集群上的配置是“只发 webhook”的那一种**；主人写好 `.env`（`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`）之后重跑 `scripts/cluster/monitoring.sh alertmanager` 就带上。token 作为 Secret 里另一个键挂进容器，配置里用 `bot_token_file` 指过去；会话号在渲染时填进配置（只在 Secret 里，不入库）。模板用 `amtool template render` 在本机渲染过（HTML 模式下标签和注解里的 `<`、`&` 会被转义）。**后来接上了**（同一天稍晚，主人写了 `.env`）：重跑 `monitoring.sh alertmanager` 后一分钟内生效，一条 `severity=critical` 的合成告警发了出去，`alertmanager_notifications_total{integration="telegram"}` 是 1、各种失败原因的计数都是 0。主人实际看到的消息样子没有确认。
+
+**webhook 接收端 alertsink**（Sonnet 子 Agent 写，主会话读过全部代码）：`load alertsink` 子命令（`test/load/internal/alertsink/`），装在 chaos 镜像里，`monitoring.sh alertsink` 部署到 `monitoring` 命名空间，偏好 k3s-server。每条告警打一行 JSON 日志；指标 `alertsink_alerts_total`（标签只有 `status`、`severity`）和 `alertsink_watchdog_last_received`（名字在 Prometheus 上核对过）。放在 `test/load` 而不是单开一个模块：它是 3d 之前的临时替身，几十行，不值得为它加一个模块、改三个 Dockerfile。
+
+**检查和测试**：`make alertmanager-test`（`amtool check-config`，带和不带 Telegram 的两种渲染结果都查；再按 `alertmanager/tests/routes.txt` 的 11 行核对每类告警去哪个接收端），进了 CI 的 `rules` job。`amtool` 0.35.0 跟集群上的 Alertmanager 同版本，`make amtool` 装进 `./bin`。分组和抑制 `amtool` 测不了。
+
+**在集群上验证过的**（往 Alertmanager 里塞合成的告警，标签带 `synthetic=true`，4 分钟后自己过期；没有动任何组件）：
+
+- `severity=critical` 的走到了 `critical` 接收端，其余走 `webhook`，alertsink 的日志里都有。
+- 同一个 `slo` 的快档在时，慢档没有送出来（Alertmanager 里标成 inhibited）；另一个 `slo` 的慢档照常送出。
+- 三条同名、不同 `instance` 的告警在同一个组里一起送出（`group_wait` 30 秒之后）。
+- chart 的两条 Overcommit 在这次 `helm upgrade` 之后消失了，Prometheus 里在响的只剩 `Watchdog`。
+
+**没有验证的**：其余几条抑制（MySQL、Kafka、Collector、两档阈值的那几对）只有配置检查，没有用合成告警逐条试；`repeat_interval` 到点重发；`monitoring.sh silence` 加了没有用过。
+
+**顺带改的**：`monitoring.sh up` 现在包含 `rules` 和 `alertsink`；`kps` 会先生成 Alertmanager 的 Secret。新增 `monitoring.sh alerts`（列出现在的告警，含被抑制和被静默的）、`silence`。
+
+### 第 7 步：runbook（2026-11-23）
+
+`docs/runbooks/`：44 份（按规则的 `runbook_url` 一份一个文件，49 到 104 行）加 `README.md`（总则和索引，主会话写）。44 份由三个 Sonnet 子 Agent 按 3.8 的模板分三批写（SLO 和业务 21 份、中间件 13 份、网格和平台 10 份）。
+
+**验收到哪**：用脚本核对过 44 份的七个标题齐全、顺序一致，仓库内的相对链接都存在。主会话逐行读过的只有 `mesh-overflow.md`，改过的有 `probe.md`、`outbox.md`、`recon.md`、`ratelimit-fallback.md`、`mesh-overflow.md`（跟着下面的规则改动）。**其余 39 份没有逐行读；所有 runbook 里的 PromQL、kubectl 命令都没有在集群上执行过**（子 Agent 不许碰集群）。告警质量检查时每触发一条就照着它的 runbook 走一遍，走不通的当场改，这是这批 runbook 真正的验收。
+
+子 Agent 自己标明没有核对的：Loki 里 `recon`、`cdc` 的 `service_name`；闸门 Redis 的 `redis-cli` 要不要密码；broker Pod 里 Kafka 脚本的路径；入口 Envoy 的容器名；`redis_instance_info` 的 `role` 标签；local-path 的目录。没有现成办法、只写了建议的：死信的重放；消费者被挡住后跳过一条消息；cdc 的 `-reset-checkpoint` 在集群里怎么执行。约一半告警的“怎么人为触发它”是“待定”加建议，和计划文件里登记的 16 项对一遍之后再定。
+
+**写 runbook 时查出来的规则问题（“让它报告认为设计存在的问题”又一次有用），已改并下发的**：
+
+- **`IngressRejectingRequests` 看不到入口最主要的拒绝路径。** round-6 的 7.3 量到过载时入口拒绝请求靠的是在途上限（`upstream_rq_active_overflow`，2384 档每秒 530 个 503，排队溢出是 0），而这个计数不在入口 PodMonitor 的保留列表里，规则的注释还写着“入口没有这条”。在入口 Envoy 的 `/stats/prometheus` 上核对过它有。补进了抓取和规则（`signal="active"`），加了测试。
+- **`ProbeFailing` 把 `incomplete` 也算成失败**（分子是 `outcome!="ok"`）：过载的压测里探针被背压的 429 拒绝、或者探针的 SKU 卖完，都会报成 critical 的“下单的路断了”，和第 2 节第 2 项（429 不算坏）、探针小节第 1 点都不一致。分子改成 `failed` 加 `skipped`，另加 `ProbeIncomplete`（warning，10 分钟）。
+- **`PaidOrdersNotLanding` 响的时候已经来不及**：10 分钟的窗口加 `for` 5 分钟，正好是关单的 15 分钟时限。收紧成 5 分钟加 2 分钟。
+- **`ReconDailySlow` 慢过一次之后不恢复**：取的是所有保留的 Job 里最长的。改成只看最近开始的那一个。
+- 两处注释和记录对不上：`MySQLConnectionsHigh`（round-6 4.3 没有撞上连接数，报过 1040 的是本机的 compose）、`RateLimitFallingBack`（过拐点的几档每秒 8.6 到 12 次，不是“偶发”；那时响是对的）。
+
+**提了、没有改的**（放一周看误报时一起定）：
+
+- `KafkaBrokerMissing` 的 `absent(kafka_brokers)` 在 Kafka Exporter 自己挂了而 broker 都好的时候也会响，并且是 critical、还会压住副本不足。没有拆：三个 broker 全不在时 Exporter 同样连不上，那时这一半是唯一的 critical。
+- `NodeRebooted`：节点停机超过 30 分钟再回来时不响（`offset 30m` 那一刻没有数据）。停机本身由自带的 `KubeNodeNotReady` 报。
+- `ContainerOOMKilled` 要重启次数增长，Job 的 Pod 被 OOM 杀掉（3b 的备份 Job 遇到过）不响，由自带的 `KubeJobFailed` 接；`ContainerMemoryNearLimit` 按 RSS 算，看不见页缓存撑爆的那种（同一个备份 Job）。
+- `MySQLReplicaMetricsMissing` 的从库清单按 Pod 序号写死，主从切换之后要跟着改（已知）。
+- `MySQLConnectionsHigh` 的阈值（80%，160）正好等于 order 扩到上限且池用满时的连接数，那时会响；注释里写明了这是对的。
+- `ConsumerNotConsuming` 实际约 20 分钟才响（10 分钟的 `delta` 加 `for` 10 分钟）。
+- `ReconFoundDifferences` 的恢复靠 CronJob 的 `lastSuccessfulTime`；手工 `create job --from=cronjob` 跑成功的 Job 会不会更新它没有核对（`MySQLBackupStale` 同理）。
+- `MeshEndpointEjected`、`MeshConcurrencyLimitOverflow` 只看 `oppenheimer` 命名空间，`make cluster-fault`（在 e2e 的命名空间里）验证不了它们。
+- server 的根分区剩 22 到 24 GiB，长稳时每小时掉约 1.5 GiB：一次长稳约 5 小时碰 `ServerDiskLow`，压测前看一眼。
