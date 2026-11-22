@@ -1,0 +1,711 @@
+# 中间件的告警的单元测试（rules/middleware.yaml）。每条至少一个“该响”和一个“不该响”；
+# “序列消失”类（从库的延迟和状态、broker 数）测了序列消失和从来没有的情形；“有增长”类的再加“计数器第一次出现”（设计 1.3 第 1 条）。
+# 输入每分钟一个点，规则每分钟求值一次（evaluation_interval 1m）。断言读 ALERTS 的 firing。
+rule_files:
+  - ../middleware.yaml
+evaluation_interval: 1m
+
+tests:
+
+  # exporter 活着（up=1）而数据库连不上（mysql_up=0）：要看 mysql_up，不看 up。t=10m 起 mysql_up 变 0，持续 2 分钟：15m 在响。
+  - name: mysql_down_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_up{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '1x10 0x30'
+      - series: 'up{job="mysql",instance="mysql-order-0-0"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="MySQLDown",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="MySQLDown",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="MySQLDown", cluster="mysql-order-0", instance="mysql-order-0-0"}'
+            value: 1
+
+  # 一直是 1：不响；只掉了 1 分钟（短于 for）也不响。
+  - name: mysql_up_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_up{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '1x10 0x1 1x30'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="MySQLDown",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # SQL 线程 t=10m 起是 0（IO 线程还是 1），持续 2 分钟：15m 在响，IO 的那条不响。
+  - name: replica_sql_stopped_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x10 0x30'
+      - series: 'mysql_slave_status_replica_io_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaSQLThreadStopped",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaSQLThreadStopped",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaSQLThreadStopped", instance="mysql-order-0-1"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaIOThreadStopped",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+
+  # 一直是 1：不响。
+  - name: replica_sql_running_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaSQLThreadStopped",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # IO 线程 t=10m 起是 0：15m 在响。
+  - name: replica_io_stopped_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_replica_io_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x10 0x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaIOThreadStopped",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaIOThreadStopped", instance="mysql-order-0-1"}'
+            value: 1
+
+  # 一直是 1：不响。
+  - name: replica_io_running_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_replica_io_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaIOThreadStopped",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 延迟 t=10m 起是 60 秒，持续 5 分钟以上：20m 在响。
+  - name: replica_lag_high_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x10 60x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaLagHigh",alertstate="firing"})
+        eval_time: 13m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaLagHigh",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaLagHigh", instance="mysql-order-0-1"}'
+            value: 1
+
+  # 延迟只冒了 2 分钟的尖：不响；一直是 0 也不响。
+  - name: replica_lag_spike_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x10 60x2 0x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaLagHigh",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 设计 1.3 第 3 条：复制停了以后延迟的序列消失，SQL 线程的状态也没有（exporter 读不到复制状态）。
+  # mysql-order-0-1 的两条序列在 t=10m 结束（5 分钟的回看之后序列没了），再等 for 5m：25m 在响，只有这一个实例。另一个从库一切正常。
+  - name: replica_metrics_missing_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x10'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x10'
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-1-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-1-1"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 12m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaMetricsMissing", instance="mysql-order-0-1"}'
+            value: 1
+
+  # 清单里的第二个从库（mysql-order-1-1）的序列消失：同样在响，标签指出是它。
+  - name: replica_metrics_missing_second_replica
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x80'
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-1-1"}'
+        values: '0x10'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-1-1"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaMetricsMissing", instance="mysql-order-1-1"}'
+            value: 1
+
+  # 清单里的从库从来没有出现过（被拆了、没部署）：absent 也在响。
+  - name: replica_metrics_never_existed
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-1-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-1-1"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaMetricsMissing", instance="mysql-order-0-1"}'
+            value: 1
+
+  # 两个从库的延迟和状态都在：不响。
+  - name: replica_metrics_present_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x80'
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-1-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-1-1"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 延迟序列消失了，但 SQL 线程的状态还在（值是 0）：这种情况归“复制停了”管，这条不响，那条在响。
+  - name: replica_stopped_but_status_present_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-0-1"}'
+        values: '0x10'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x10 0x70'
+      - series: 'mysql_slave_status_replica_io_running{job="mysql",instance="mysql-order-0-1"}'
+        values: '1x80'
+      - series: 'mysql_slave_status_seconds_behind_source{job="mysql",instance="mysql-order-1-1"}'
+        values: '0x80'
+      - series: 'mysql_slave_status_replica_sql_running{job="mysql",instance="mysql-order-1-1"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaMetricsMissing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLReplicaSQLThreadStopped",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{alertname="MySQLReplicaSQLThreadStopped", instance="mysql-order-0-1"}'
+            value: 1
+
+  # 连接数 90、上限 100（90%，高于 80%）持续 5 分钟：10m 在响。
+  - name: mysql_connections_high_fires
+    interval: 1m
+    input_series:
+      - series: 'mysql_global_status_threads_connected{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '90x30'
+      - series: 'mysql_global_variables_max_connections{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '100x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLConnectionsHigh",alertstate="firing"})
+        eval_time: 3m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLConnectionsHigh",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="MySQLConnectionsHigh", instance="mysql-order-0-0"}'
+            value: 1
+
+  # 连接数 50、上限 100：不响；刚好 80% 也不响（要大于）。
+  - name: mysql_connections_normal_silent
+    interval: 1m
+    input_series:
+      - series: 'mysql_global_status_threads_connected{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '50x30'
+      - series: 'mysql_global_variables_max_connections{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-0"}'
+        values: '100x30'
+      - series: 'mysql_global_status_threads_connected{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-1"}'
+        values: '80x30'
+      - series: 'mysql_global_variables_max_connections{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-1"}'
+        values: '100x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="MySQLConnectionsHigh",alertstate="firing"})
+        eval_time: 20m
+        exp_samples: []
+
+  # 备份 CronJob 的上次成功时间是 0，到 27 小时时已经过去 97200 秒（超过 26 小时 = 93600），再等 for 10m：27h20m 在响；20 小时时不响。
+  - name: backup_stale_fires
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '0+0x1700'
+      - series: 'kube_cronjob_spec_suspend{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '0+0x1700'
+    promql_expr_test:
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 20h
+        exp_samples: []
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 27h20m
+        exp_samples:
+          - labels: '{alertname="MySQLBackupStale", cronjob="mysql-main-backup"}'
+            value: 1
+
+  # 上次成功在 86400 秒（24 小时）：27h20m 时才过去 3 小时多，不响。
+  - name: backup_recent_silent
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '86400+0x1700'
+    promql_expr_test:
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 27h20m
+        exp_samples: []
+
+  # 从来没成功过（没有 last_successful_time 序列）：用创建时间代替，创建后 27 小时在响。
+  - name: backup_never_succeeded_fires
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_created{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '0+0x1700'
+    promql_expr_test:
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 20h
+        exp_samples: []
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 27h20m
+        exp_samples:
+          - labels: '{alertname="MySQLBackupStale", cronjob="mysql-main-backup"}'
+            value: 1
+
+  # 暂停的 CronJob（suspend=1）即使很久没成功也不报。
+  - name: backup_suspended_silent
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '0+0x1700'
+      - series: 'kube_cronjob_spec_suspend{cronjob="mysql-main-backup",namespace="mysql"}'
+        values: '1+0x1700'
+    promql_expr_test:
+      - expr: count by (alertname, cronjob) (ALERTS{alertname="MySQLBackupStale",alertstate="firing"})
+        eval_time: 27h20m
+        exp_samples: []
+
+  # exporter 活着（up=1）而 Redis 连不上（redis_up=0）：t=10m 起，15m 在响。
+  - name: redis_down_fires
+    interval: 1m
+    input_series:
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '1x10 0x30'
+      - series: 'up{job="redis",instance="redis-gate-0"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisDown",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisDown",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="RedisDown", cluster="redis-gate", instance="redis-gate-0"}'
+            value: 1
+
+  # 一直是 1：不响。
+  - name: redis_up_silent
+    interval: 1m
+    input_series:
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisDown",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 闸门 Redis 用了 75%（上限 100，已用 75）：警告响（5m 之后），critical 不响。
+  - name: redis_gate_memory_warning
+    interval: 1m
+    input_series:
+      - series: 'redis_memory_used_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '75x30'
+      - series: 'redis_memory_max_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '100x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryHigh",alertstate="firing"})
+        eval_time: 3m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryHigh",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="RedisGateMemoryHigh", instance="redis-gate-0"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryCritical",alertstate="firing"})
+        eval_time: 10m
+        exp_samples: []
+
+  # 闸门 Redis 用了 85%：critical 在响（2m 之后），警告也在响。
+  - name: redis_gate_memory_critical
+    interval: 1m
+    input_series:
+      - series: 'redis_memory_used_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '85x30'
+      - series: 'redis_memory_max_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '100x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryCritical",alertstate="firing"})
+        eval_time: 1m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryCritical",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="RedisGateMemoryCritical", instance="redis-gate-0"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryHigh",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="RedisGateMemoryHigh", instance="redis-gate-0"}'
+            value: 1
+
+  # 闸门 60%：不响。缓存集群（redis-cache）用到 95% 也不响：这两条只看闸门。
+  - name: redis_gate_memory_low_and_cache_ignored
+    interval: 1m
+    input_series:
+      - series: 'redis_memory_used_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '60x30'
+      - series: 'redis_memory_max_bytes{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '100x30'
+      - series: 'redis_memory_used_bytes{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '95x30'
+      - series: 'redis_memory_max_bytes{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '100x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryHigh",alertstate="firing"})
+        eval_time: 20m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisGateMemoryCritical",alertstate="firing"})
+        eval_time: 20m
+        exp_samples: []
+
+  # 从库的 master_link_up 从 t=10m 起是 0（redis-cache-5 断了 3 小时那次）：15m 在响。
+  - name: redis_replica_link_down_fires
+    interval: 1m
+    input_series:
+      - series: 'redis_master_link_up{job="redis",cluster="redis-cache",instance="redis-cache-5"}'
+        values: '1x10 0x30'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisReplicaLinkDown",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="RedisReplicaLinkDown", instance="redis-cache-5"}'
+            value: 1
+
+  # 链路一直正常：不响。
+  - name: redis_replica_link_up_silent
+    interval: 1m
+    input_series:
+      - series: 'redis_master_link_up{job="redis",cluster="redis-cache",instance="redis-cache-5"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisReplicaLinkDown",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 集群状态 t=10m 起是 0：15m 在响。
+  - name: redis_cluster_state_fail_fires
+    interval: 1m
+    input_series:
+      - series: 'redis_cluster_state{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '1x10 0x30'
+      - series: 'redis_cluster_slots_ok{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '16384x40'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisClusterUnhealthy",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="RedisClusterUnhealthy", cluster="redis-cache", instance="redis-cache-0"}'
+            value: 1
+
+  # 状态还是 1，但 ok 的槽位掉到 16000（有槽位 fail 或没分配）：15m 在响。
+  - name: redis_cluster_slots_not_ok_fires
+    interval: 1m
+    input_series:
+      - series: 'redis_cluster_state{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '1x40'
+      - series: 'redis_cluster_slots_ok{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '16384x10 16000x30'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisClusterUnhealthy",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisClusterUnhealthy",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="RedisClusterUnhealthy", cluster="redis-cache", instance="redis-cache-0"}'
+            value: 1
+
+  # 状态 1、16384 个槽位全部 ok：不响。
+  - name: redis_cluster_healthy_silent
+    interval: 1m
+    input_series:
+      - series: 'redis_cluster_state{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '1x40'
+      - series: 'redis_cluster_slots_ok{job="redis",cluster="redis-cache",instance="redis-cache-0"}'
+        values: '16384x40'
+    promql_expr_test:
+      - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisClusterUnhealthy",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 能看到的正常 Sentinel 数从 3 掉到 1（法定数 2）：t=10m 起，15m 在响。
+  - name: redis_sentinel_below_quorum_fires
+    interval: 1m
+    input_series:
+      - series: 'redis_sentinel_master_ok_sentinels{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-0",master_name="gate"}'
+        values: '3x10 1x30'
+      - series: 'redis_sentinel_master_setting_ckquorum{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-0",master_name="gate"}'
+        values: '2x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisSentinelBelowQuorum",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisSentinelBelowQuorum",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="RedisSentinelBelowQuorum", instance="redis-gate-sentinel-0"}'
+            value: 1
+
+  # 只掉了一个（3 变 2，刚好等于法定数）：不响；3 个都在也不响。
+  - name: redis_sentinel_at_quorum_silent
+    interval: 1m
+    input_series:
+      - series: 'redis_sentinel_master_ok_sentinels{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-0",master_name="gate"}'
+        values: '3x10 2x30'
+      - series: 'redis_sentinel_master_setting_ckquorum{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-0",master_name="gate"}'
+        values: '2x40'
+      - series: 'redis_sentinel_master_ok_sentinels{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-1",master_name="gate"}'
+        values: '3x40'
+      - series: 'redis_sentinel_master_setting_ckquorum{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-1",master_name="gate"}'
+        values: '2x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="RedisSentinelBelowQuorum",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 某个 topic 的分区副本不足 t=10m 起，持续 5 分钟：18m 在响，只有这个 topic。
+  - name: kafka_under_replicated_fires
+    interval: 1m
+    input_series:
+      - series: 'kafka_topic_partition_under_replicated_partition{topic="order.events",partition="0",job="monitoring/kafka"}'
+        values: '0x10 1x30'
+      - series: 'kafka_topic_partition_under_replicated_partition{topic="order.submit",partition="0",job="monitoring/kafka"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname, topic) (ALERTS{alertname="KafkaUnderReplicatedPartitions",alertstate="firing"})
+        eval_time: 13m
+        exp_samples: []
+      - expr: count by (alertname, topic) (ALERTS{alertname="KafkaUnderReplicatedPartitions",alertstate="firing"})
+        eval_time: 18m
+        exp_samples:
+          - labels: '{alertname="KafkaUnderReplicatedPartitions", topic="order.events"}'
+            value: 1
+
+  # 全是 0：不响；只冒了 3 分钟也不响。
+  - name: kafka_under_replicated_silent
+    interval: 1m
+    input_series:
+      - series: 'kafka_topic_partition_under_replicated_partition{topic="order.events",partition="0",job="monitoring/kafka"}'
+        values: '0x10 1x2 0x30'
+      - series: 'kafka_topic_partition_under_replicated_partition{topic="order.submit",partition="0",job="monitoring/kafka"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname, topic) (ALERTS{alertname="KafkaUnderReplicatedPartitions",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 活动控制器报告有 2 个离线分区（另外两个 broker 报 0）：t=10m 起，15m 在响。
+  - name: kafka_partitions_offline_fires
+    interval: 1m
+    input_series:
+      - series: 'kafka_controller_kafkacontroller_offlinepartitionscount{job="monitoring/kafka",instance="kafka-dual-0"}'
+        values: '0x10 2x30'
+      - series: 'kafka_controller_kafkacontroller_offlinepartitionscount{job="monitoring/kafka",instance="kafka-dual-1"}'
+        values: '0x40'
+      - series: 'kafka_controller_kafkacontroller_offlinepartitionscount{job="monitoring/kafka",instance="kafka-dual-2"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaPartitionsOffline",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaPartitionsOffline",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="KafkaPartitionsOffline"}'
+            value: 1
+
+  # 都是 0：不响。
+  - name: kafka_partitions_offline_silent
+    interval: 1m
+    input_series:
+      - series: 'kafka_controller_kafkacontroller_offlinepartitionscount{job="monitoring/kafka",instance="kafka-dual-0"}'
+        values: '0x40'
+      - series: 'kafka_controller_kafkacontroller_offlinepartitionscount{job="monitoring/kafka",instance="kafka-dual-1"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaPartitionsOffline",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # broker 数从 3 掉到 2：t=10m 起，15m 在响。
+  - name: kafka_broker_missing_fires
+    interval: 1m
+    input_series:
+      - series: 'kafka_brokers{job="monitoring/kafka"}'
+        values: '3x10 2x30'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="KafkaBrokerMissing"}'
+            value: 1
+
+  # 设计 1.3 第 3 条：Exporter 连不上 Kafka，kafka_brokers 的序列直接没有了（t=10m 结束）：absent 在响，25m 在响。
+  - name: kafka_brokers_series_gone_fires
+    interval: 1m
+    input_series:
+      - series: 'kafka_brokers{job="monitoring/kafka"}'
+        values: '3x10'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 12m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="KafkaBrokerMissing"}'
+            value: 1
+
+  # 3 个 broker：不响。
+  - name: kafka_brokers_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'kafka_brokers{job="monitoring/kafka"}'
+        values: '3x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # Collector 拒收 spans：refused_spans 从 t=10m 起每分钟涨 5，15m 在响（signal=spans）。
+  - name: otel_refusing_fires
+    interval: 1m
+    input_series:
+      - series: 'otelcol_receiver_refused_spans{job="monitoring/otel-gateway-agent",receiver="otlp"}'
+        values: '0x10 5+5x30'
+    promql_expr_test:
+      - expr: count by (alertname, job, receiver, signal) (ALERTS{alertname="OtelCollectorRefusing",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, job, receiver, signal) (ALERTS{alertname="OtelCollectorRefusing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorRefusing", job="monitoring/otel-gateway-agent", receiver="otlp", signal="spans"}'
+            value: 1
+
+  # 日志（log_records）被拒收同理，signal=log_records。
+  - name: otel_refusing_log_records_fires
+    interval: 1m
+    input_series:
+      - series: 'otelcol_receiver_refused_log_records{job="monitoring/otel-gateway-agent",receiver="otlp"}'
+        values: '0x10 5+5x30'
+      - series: 'otelcol_receiver_refused_spans{job="monitoring/otel-gateway-agent",receiver="otlp"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, receiver, signal) (ALERTS{alertname="OtelCollectorRefusing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorRefusing", job="monitoring/otel-gateway-agent", receiver="otlp", signal="log_records"}'
+            value: 1
+
+  # 计数器不动：不响（现在 Prometheus 上累计值是 14 万，但不涨）。
+  - name: otel_refusing_silent
+    interval: 1m
+    input_series:
+      - series: 'otelcol_receiver_refused_spans{job="monitoring/otel-gateway-agent",receiver="otlp"}'
+        values: '140579x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, receiver, signal) (ALERTS{alertname="OtelCollectorRefusing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # refused_metric_points 的计数器 t=10m 才第一次出现、一出现就是 50：靠第一次出现的那半边，14m 在响。
+  - name: otel_refusing_first_appearance
+    interval: 1m
+    input_series:
+      - series: 'otelcol_receiver_refused_metric_points{job="monitoring/otel-gateway-agent",receiver="otlp"}'
+        values: '_x10 50x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, receiver, signal) (ALERTS{alertname="OtelCollectorRefusing",alertstate="firing"})
+        eval_time: 14m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorRefusing", job="monitoring/otel-gateway-agent", receiver="otlp", signal="metric_points"}'
+            value: 1
+
+  # 导出到 Tempo 失败：send_failed_spans 从 t=10m 起涨，15m 在响。
+  - name: otel_export_failing_fires
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_spans{job="monitoring/otel-gateway-agent",exporter="otlp_grpc"}'
+        values: '0x10 10+10x30'
+    promql_expr_test:
+      - expr: count by (alertname, job, exporter, signal) (ALERTS{alertname="OtelCollectorExportFailing",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, job, exporter, signal) (ALERTS{alertname="OtelCollectorExportFailing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorExportFailing", job="monitoring/otel-gateway-agent", exporter="otlp_grpc", signal="spans"}'
+            value: 1
+
+  # 计数器不动（累计值 120 万，但不涨）：不响。
+  - name: otel_export_silent
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_spans{job="monitoring/otel-gateway-agent",exporter="otlp_grpc"}'
+        values: '1217504x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, exporter, signal) (ALERTS{alertname="OtelCollectorExportFailing",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # send_failed_metric_points 的计数器 t=10m 第一次出现、一出现就是 8：14m 在响。
+  - name: otel_export_first_appearance
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_metric_points{job="monitoring/otel-gateway-agent",exporter="otlp_grpc"}'
+        values: '_x10 8x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, exporter, signal) (ALERTS{alertname="OtelCollectorExportFailing",alertstate="firing"})
+        eval_time: 14m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorExportFailing", job="monitoring/otel-gateway-agent", exporter="otlp_grpc", signal="metric_points"}'
+            value: 1

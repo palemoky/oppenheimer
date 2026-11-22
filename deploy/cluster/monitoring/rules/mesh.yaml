@@ -1,0 +1,147 @@
+# 网格和入口的告警（设计文档 3c 的 4.3）。手写的。
+#
+# 都是 warning：它们是“某个保护机制在起作用”（排队溢出、并发上限、摘除、KEDA 取不到数），
+# 是原因一级的线索，用户有没有受影响由 SLO 的燃烧率告警说了算。
+#
+# “有增长”类的写法（设计 1.3 的第 1 条）：计数器从不存在到第一次出现，increase() 是 0，第一次的增长会被漏掉。
+# 所以写成 increase(x[w]) > 0 or (x > 0 unless x offset w)：后一半抓“w 之前没有这条序列、现在有而且大于 0”。
+# Envoy 的计数器在集群建出来时就是 0，这个坑平时碰不到，但 Pod 刚重建、第一次抓取就已经有值时会碰到；统一写上。
+#
+# 标签：边车的指标按 cluster_name（目标服务）聚合，入口的按 envoy_cluster_name（路由）聚合，都是有限的枚举；
+# Pod、IP 不进告警标签。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oppenheimer-mesh
+  namespace: monitoring
+  labels:
+    oppenheimer.rules: "1"
+spec:
+  groups:
+    - name: mesh
+      interval: 30s
+      rules:
+        # 入口 Envoy 看到的、gateway 这个上游返回（或者入口替它生成）的 5xx 比例超过 1% 持续 5 分钟。critical。
+        # 它是下单可用性 SLO 的补充（设计 4.1）：SLO 的指标是 gateway 自己报的，gateway 整个不在时那边没有数据、不响；
+        # 入口这时对每个请求返回 503，只有入口的指标看得见。也盖住 gateway 报不出指标（Collector 坏了）的情况。
+        # 每秒不到 0.2 个请求时不算（一两个失败就是很高的比例）；探针保证了平时有每秒几个请求。
+        - alert: IngressGateway5xxHigh
+          expr: |
+            sum(rate(envoy_cluster_upstream_rq_xx{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0",envoy_response_code_class="5"}[5m]))
+              /
+            sum(rate(envoy_cluster_upstream_rq_total{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0"}[5m]))
+              > 0.01
+            and
+            sum(rate(envoy_cluster_upstream_rq_total{job="monitoring/ingress-envoy",envoy_cluster_name="httproute/oppenheimer/gateway/rule/0"}[5m])) >= 0.2
+          for: 5m
+          labels:
+            severity: critical
+            component: ingress
+          annotations:
+            summary: "入口到 gateway 的请求有 {{ $value | humanizePercentage }} 是 5xx"
+            description: "从入口 Envoy 看，发往 gateway 的请求有 1% 以上以 5xx 结束，包括 gateway 整个不在时入口自己返回的 503。用户正在受影响。和 SLO 的燃烧率告警对照：只有这条响而 SLO 的不响，说明 gateway 不在或者它的指标没有报上来。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/ingress-gateway-5xx.md
+
+        # 入口 Envoy 到 gateway 的排队溢出（pending）或连接数上限溢出（cx），任何一个有增长就是入口在拒绝请求。
+        # 出处：round-3 2.2、round-6 第 7 节。入口的 Envoy 没有 upstream_rq_active_overflow 这条（只有边车有），
+        # 入口一侧的“在途上限”实际是连接数上限，所以看 cx_overflow。
+        # 只看 job="monitoring/ingress-envoy"；窗口 5m 配 for 2m：窗口要比 for 长，否则“第一次出现”那半边（只管出现后的一个窗口）撑不满 for，会漏掉。
+        - alert: IngressRejectingRequests
+          expr: |
+            max by (envoy_cluster_name, signal) (
+                label_replace(increase(envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"}[5m]), "signal", "queue", "", "")
+              or label_replace(increase(envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"}[5m]), "signal", "conn", "", "")
+            ) > 0
+            or
+            max by (envoy_cluster_name, signal) (
+                label_replace((envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"} > 0 unless envoy_cluster_upstream_rq_pending_overflow{job="monitoring/ingress-envoy"} offset 5m), "signal", "queue", "", "")
+              or label_replace((envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"} > 0 unless envoy_cluster_upstream_cx_overflow{job="monitoring/ingress-envoy"} offset 5m), "signal", "conn", "", "")
+            )
+          for: 2m
+          labels:
+            severity: warning
+            component: ingress
+          annotations:
+            summary: "入口 Envoy 在拒绝请求（{{ $labels.envoy_cluster_name }}，{{ $labels.signal }} 溢出：queue 是排队、conn 是连接数），5 分钟内 {{ $value }} 次"
+            description: "入口到后端的排队队列或连接数上限溢出，溢出的请求被直接拒绝（503）。说明后端处理不过来，或者上限设得比实际能承受的低。是原因一级的线索，用户是否受影响看 SLO 的燃烧率。出处：round-3 2.2、round-6 第 7 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mesh-overflow.md
+
+        # 服务之间的边车并发上限溢出。指标名 upstream_rq_active_overflow 已在 Prometheus 上核对（只有 istio-proxy 有）。
+        # 按目标服务（cluster_name）聚合，不带源 Pod。出处：round-4。
+        - alert: MeshConcurrencyLimitOverflow
+          expr: |
+            sum by (cluster_name) (
+              increase(envoy_cluster_upstream_rq_active_overflow{job="monitoring/istio-proxy",namespace="oppenheimer"}[5m])
+            ) > 0
+            or
+            sum by (cluster_name) (
+              envoy_cluster_upstream_rq_active_overflow{job="monitoring/istio-proxy",namespace="oppenheimer"} > 0
+              unless
+              envoy_cluster_upstream_rq_active_overflow{job="monitoring/istio-proxy",namespace="oppenheimer"} offset 5m
+            )
+          for: 2m
+          labels:
+            severity: warning
+            component: mesh
+          annotations:
+            summary: "到 {{ $labels.cluster_name }} 的并发上限溢出，5 分钟内 {{ $value }} 次"
+            description: "边车对这个下游的在途请求数达到了上限，超出的请求被边车直接拒绝。说明下游慢了或者上限偏低；上限的值和理由见设计文档 1d 的 5.3。出处：round-4。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mesh-overflow.md
+
+        # 边车把某个下游实例摘除了（连续 5xx 或网关错误触发的离群检测）。用 enforced_total（真正执行了的摘除），
+        # 不用 detected（检测到但没执行）。10m 窗口配 for 1m：摘除是离散事件，窗口放宽一点免得错过。出处：round-3。
+        - alert: MeshEndpointEjected
+          expr: |
+            sum by (cluster_name) (
+              increase(envoy_cluster_outlier_detection_ejections_enforced_total{job="monitoring/istio-proxy",namespace="oppenheimer"}[10m])
+            ) > 0
+            or
+            sum by (cluster_name) (
+              envoy_cluster_outlier_detection_ejections_enforced_total{job="monitoring/istio-proxy",namespace="oppenheimer"} > 0
+              unless
+              envoy_cluster_outlier_detection_ejections_enforced_total{job="monitoring/istio-proxy",namespace="oppenheimer"} offset 10m
+            )
+          for: 1m
+          labels:
+            severity: warning
+            component: mesh
+          annotations:
+            summary: "{{ $labels.cluster_name }} 的实例被边车摘除，10 分钟内 {{ $value }} 次"
+            description: "边车的离群检测把这个服务的实例摘出了负载均衡（连续失败达到阈值）。被摘的实例有问题，或者整个服务在失败（边车的规则是连续 5 次，整个服务都坏时会被全部摘除）。先看这个服务的日志和 SLO 告警。出处：round-3。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mesh-ejection.md
+
+        # KEDA 取不到数：scaler 的错误计数有增长。KEDA 取不到数时 HPA 不会再扩容，压测时会让服务卡在最小副本数。
+        # exported_namespace 是被伸缩的对象所在的命名空间（namespace 是 KEDA 自己的）。出处：3a 第 7 步。
+        - alert: KedaScalerErrors
+          expr: |
+            sum by (scaledObject) (
+              increase(keda_scaler_detail_errors_total{exported_namespace="oppenheimer"}[10m])
+            ) > 0
+            or
+            sum by (scaledObject) (
+              keda_scaler_detail_errors_total{exported_namespace="oppenheimer"} > 0
+              unless
+              keda_scaler_detail_errors_total{exported_namespace="oppenheimer"} offset 10m
+            )
+          for: 1m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "KEDA 取不到 {{ $labels.scaledObject }} 的伸缩指标，10 分钟内出错 {{ $value }} 次"
+            description: "KEDA 向 Prometheus 查伸缩指标失败，对应的 HPA 拿不到数就不再调整副本数，负载上来时不会自动扩容。出处：3a 第 7 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/keda-scaling.md
+
+        # KEDA 建出来的 HPA，ScalingActive 条件不是 True。这是 kube-state-metrics 的 status 标签：status="true" 的那条序列值为 1 才是正常。
+        # 用 == 0 判断；这个条件在 scaler 取不到数时会变 False，比错误计数更直接。出处：3a 第 7 步。
+        - alert: KedaHPAScalingInactive
+          expr: |
+            kube_horizontalpodautoscaler_status_condition{namespace="oppenheimer",condition="ScalingActive",status="true"} == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "HPA {{ $labels.horizontalpodautoscaler }} 的 ScalingActive 不是 True（当前 {{ $value }}）"
+            description: "HPA 没有在工作（取不到指标，或者伸缩对象有问题），副本数不会自动调整。出处：3a 第 7 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/keda-scaling.md

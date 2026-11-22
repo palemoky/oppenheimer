@@ -1,0 +1,397 @@
+# 业务告警（../business.yaml）的单元测试。只测容易悄悄写错的那几类，阈值类的简单比较不逐条测：
+#   a-c  “有增长”：序列从无到有的第一次、已有的序列又涨、Pod 重启换了序列
+#   d-g  对账的 CronJob：失败后响、之后成功了恢复、暂停的不报“没在跑”、从没成功过也报
+#   h-j  探针：卡住时 skipped 变多也算不通、没有数据、人为停掉不报
+#   k-l  钱的核对：有差异、核对自己停了
+#   m-n  队列：落库速率为 0 时是无穷大也响；支付成功而订单不变成已支付
+#   o-q  序列消失：CDC 的管道、服务的指标、消费者不消费
+# 断言都用 ALERTS：exp_alerts 要逐字对注解，注解改一个字就得改测试。
+rule_files:
+  - ../business.yaml
+evaluation_interval: 30s
+
+tests:
+  # a. 超卖的计数器平时没有序列。t=10m 第一次出现，值是 1：increase 在那一刻是 0，靠第二半（unless offset）报出来。
+  #    之后不再涨，15 分钟后恢复。
+  - name: a_counter_first_appearance_fires
+    interval: 30s
+    input_series:
+      - series: 'inventory_oversell_detected_total{k8s_namespace_name="oppenheimer",k8s_pod_name="inventory-a"}'
+        values: '_x20 1x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="InventoryOversellDetected",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="InventoryOversellDetected",alertstate="firing",severity="critical"})
+        eval_time: 10m30s
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count(ALERTS{alertname="InventoryOversellDetected",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count(ALERTS{alertname="InventoryOversellDetected",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # b. 已有的序列（很久以前出过一次）又涨了一次：第一半（increase）报出来。
+  - name: b_existing_counter_increases
+    interval: 30s
+    input_series:
+      - series: 'kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",service_name="order",messaging_destination_name="order.submit",k8s_pod_name="order-a"}'
+        values: '3x60 4x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderSubmitDeadLettered",alertstate="firing"})
+        eval_time: 29m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="OrderSubmitDeadLettered",alertstate="firing",severity="critical"})
+        eval_time: 32m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      # order.submit 上的不重复报成 warning 的那条。
+      - expr: count(ALERTS{alertname="ConsumerDeadLettered"})
+        eval_time: 32m
+        exp_samples: []
+
+  # c. 两个 Pod 各有一条序列。order-a 重启：旧序列（值 5）消失，新 Pod order-c 的序列从 1 开始。
+  #    先 sum 再比 offset 的写法会被 order-b 的旧值盖住；这里按每条序列各自判断，报得出来。
+  - name: c_new_series_after_pod_restart
+    interval: 30s
+    input_series:
+      - series: 'kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",service_name="orderindex",messaging_destination_name="cdc.order.orders",k8s_pod_name="orderindex-a"}'
+        values: '5x40 stale'
+      - series: 'kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",service_name="orderindex",messaging_destination_name="cdc.order.orders",k8s_pod_name="orderindex-b"}'
+        values: '2x120'
+      - series: 'kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",service_name="orderindex",messaging_destination_name="cdc.order.orders",k8s_pod_name="orderindex-c"}'
+        values: '_x80 1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ConsumerDeadLettered",alertstate="firing"})
+        eval_time: 39m
+        exp_samples: []
+      - expr: count by (service, severity) (ALERTS{alertname="ConsumerDeadLettered",alertstate="firing"})
+        eval_time: 41m
+        exp_samples:
+          - labels: '{service="orderindex", severity="warning"}'
+            value: 1
+
+  # d. 每小时的对账在 t=1h 那次失败了：响。t=2h 那次成功：恢复，尽管失败的 Job 还留着（kube_job_status_failed 仍是 1）。
+  - name: d_recon_failed_then_succeeded
+    interval: 1m
+    input_series:
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-1",owner_kind="CronJob",owner_name="recon-hourly"}'
+        values: '_x60 1x200'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-1"}'
+        values: '_x60 3600x200'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1"}'
+        values: '_x60 0 1x199'
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-2",owner_kind="CronJob",owner_name="recon-hourly"}'
+        values: '_x120 1x140'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-2"}'
+        values: '_x120 7200x140'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-2"}'
+        values: '_x120 0x140'
+      # 上次成功：一开始是 t=0 之前的那次（值 60），t=2h1m 起是第二个 Job 完成的时刻 7260。
+      - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '60x120 7260x140'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+        eval_time: 59m
+        exp_samples: []
+      - expr: count by (cronjob, severity) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+        eval_time: 1h5m
+        exp_samples:
+          - labels: '{cronjob="recon-hourly", severity="critical"}'
+            value: 1
+      - expr: count by (cronjob, severity) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+        eval_time: 1h59m
+        exp_samples:
+          - labels: '{cronjob="recon-hourly", severity="critical"}'
+            value: 1
+      - expr: count(ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+        eval_time: 2h5m
+        exp_samples: []
+
+  # e. 从来没有成功过的 CronJob 第一次就失败：没有 last_successful_time 这条序列，照样响。
+  - name: e_recon_failed_never_succeeded
+    interval: 1m
+    input_series:
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-daily-1",owner_kind="CronJob",owner_name="recon-daily"}'
+        values: '1x30'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '0x30'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '0 0 1x28'
+    promql_expr_test:
+      - expr: count by (cronjob) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{cronjob="recon-daily"}'
+            value: 1
+
+  # f. 每小时的对账 3 小时没有成功：响。同样的情形但 CronJob 被暂停着：不响。
+  - name: f_recon_not_running
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '0x240'
+      - series: 'kube_cronjob_spec_suspend{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '0x240'
+      - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-daily"}'
+        values: '0x240'
+      - series: 'kube_cronjob_spec_suspend{namespace="oppenheimer",cronjob="recon-daily"}'
+        values: '0x240'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ReconNotRunning",alertstate="firing"})
+        eval_time: 2h
+        exp_samples: []
+      # 每天的那个才过了 3 小时，不该响；只有每小时的响。
+      - expr: count by (cronjob) (ALERTS{alertname="ReconNotRunning",alertstate="firing"})
+        eval_time: 3h
+        exp_samples:
+          - labels: '{cronjob="recon-hourly"}'
+            value: 1
+  - name: f2_recon_suspended_is_quiet
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '0x240'
+      - series: 'kube_cronjob_spec_suspend{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '1x240'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ReconNotRunning"})
+        eval_time: 3h
+        exp_samples: []
+
+  # g. 刚建的 CronJob 从没成功过：没有 last_successful_time，用创建时间顶上，过了 2.5 小时照样响。
+  - name: g_recon_never_succeeded_uses_creation_time
+    interval: 1m
+    input_series:
+      - series: 'kube_cronjob_created{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '0x240'
+      - series: 'kube_cronjob_spec_suspend{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '0x240'
+    promql_expr_test:
+      - expr: count by (cronjob) (ALERTS{alertname="ReconNotRunning",alertstate="firing"})
+        eval_time: 3h
+        exp_samples:
+          - labels: '{cronjob="recon-hourly"}'
+            value: 1
+
+  # h. 探针正常 10 分钟之后卡住：ok 不再涨，周期不结束，新的周期被在途上限跳过（skipped 每秒 1 个）。
+  #    没有一个 failed，但这条路是不通的：分子算 outcome!="ok"，响。
+  - name: h_probe_stuck_cycles_count_as_failing
+    interval: 30s
+    input_series:
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+30x20 600x40'
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="skipped"}'
+        values: '_x20 0+30x40'
+      - series: 'kube_deployment_spec_replicas{namespace="oppenheimer",deployment="probe"}'
+        values: '1x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ProbeFailing",alertstate="firing"})
+        eval_time: 10m
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="ProbeFailing",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{severity="critical"}'
+            value: 1
+
+  # i. 探针的指标整个没有了（进程挂了，序列过期），副本数还是 1：ProbeNoData 响，ProbeFailing 不响（0 除以没有）。
+  - name: i_probe_no_data
+    interval: 30s
+    input_series:
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+30x20 stale'
+      - series: 'kube_deployment_spec_replicas{namespace="oppenheimer",deployment="probe"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (severity) (ALERTS{alertname="ProbeNoData",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{severity="warning"}'
+            value: 1
+      - expr: count(ALERTS{alertname="ProbeFailing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # j. 同样没有数据，但探针是人为停的（副本数 0，正式压测之前）：不响。
+  - name: j_probe_stopped_on_purpose_is_quiet
+    interval: 30s
+    input_series:
+      - series: 'probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+30x20 stale'
+      - series: 'kube_deployment_spec_replicas{namespace="oppenheimer",deployment="probe"}'
+        values: '1x20 0x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ProbeNoData"})
+        eval_time: 30m
+        exp_samples: []
+
+  # k. 钱的核对：金额差了 1990 分、笔数差 1，持续着。两种各报一条。旧 Pod 留下的序列是 0，取 max 不受影响。
+  - name: k_payment_totals_mismatch
+    interval: 30s
+    input_series:
+      - series: 'recon_totals_mismatch{k8s_namespace_name="oppenheimer",kind="amount",k8s_pod_name="new"}'
+        values: '0x10 1990x20'
+      - series: 'recon_totals_mismatch{k8s_namespace_name="oppenheimer",kind="count",k8s_pod_name="new"}'
+        values: '0x10 1x20'
+      - series: 'recon_totals_mismatch{k8s_namespace_name="oppenheimer",kind="amount",k8s_pod_name="old"}'
+        values: '0x30'
+      - series: 'recon_totals_runs_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+1x30'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="PaymentTotalsMismatch",alertstate="firing"})
+        eval_time: 5m
+        exp_samples: []
+      - expr: count by (kind, severity) (ALERTS{alertname="PaymentTotalsMismatch",alertstate="firing"})
+        eval_time: 7m
+        exp_samples:
+          - labels: '{kind="amount", severity="critical"}'
+            value: 1
+          - labels: '{kind="count", severity="critical"}'
+            value: 1
+      - expr: count(ALERTS{alertname="PaymentTotalsCheckStalled"})
+        eval_time: 7m
+        exp_samples: []
+
+  # l. 核对自己停了：成功的轮次不再涨（还在报错的那种），以及整个没有指标（从来没起来过）两种都响。
+  - name: l_payment_totals_check_stalled
+    interval: 30s
+    input_series:
+      - series: 'recon_totals_runs_total{k8s_namespace_name="oppenheimer",outcome="ok"}'
+        values: '0+1x20 20x40'
+      - series: 'recon_totals_runs_total{k8s_namespace_name="oppenheimer",outcome="error"}'
+        values: '_x20 0+1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="PaymentTotalsCheckStalled",alertstate="firing"})
+        eval_time: 12m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="PaymentTotalsCheckStalled",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+  - name: l2_payment_totals_check_never_reported
+    interval: 30s
+    input_series:
+      - series: 'unrelated_metric'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="PaymentTotalsCheckStalled",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # m. 队列里有 500 个已受理的订单，落库的速率是 0（消费者停了）：比值是无穷大，响。
+  #    队列是 0、落库也是 0（没有流量）：0 除以 0 不是数，不响。
+  - name: m_queue_with_no_persisting
+    interval: 30s
+    input_series:
+      - series: 'order_gate_unclaimed_holds{k8s_namespace_name="oppenheimer"}'
+        values: '0x20 500x40'
+      - series: 'order_persists_total{k8s_namespace_name="oppenheimer",outcome="pending_payment"}'
+        values: '1000x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderQueueNearWaitLimit"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="OrderQueueNearWaitLimit",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{severity="warning"}'
+            value: 1
+
+  # n. 支付每秒出 1 个成功的结果，订单变成已支付的计数 t=10m 起不动了：过了 10 分钟的窗口再加 for 5m 之后响。
+  - name: n_paid_orders_not_landing
+    interval: 30s
+    input_series:
+      - series: 'payment_results_total{k8s_namespace_name="oppenheimer",result="succeeded"}'
+        values: '0+30x80'
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '0+30x20 600x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="PaidOrdersNotLanding",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="PaidOrdersNotLanding",alertstate="firing"})
+        eval_time: 27m
+        exp_samples:
+          - labels: '{severity="critical"}'
+            value: 1
+
+  # o. CDC 的 order-1 这条管道不报延迟了（序列过期），order-0 还在：只报 order-1，带着 pipeline 标签。
+  - name: o_cdc_pipeline_missing
+    interval: 30s
+    input_series:
+      - series: 'cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-0"}'
+        values: '200x80'
+      - series: 'cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-1"}'
+        values: '300x20 stale'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="CDCPipelineMissing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (pipeline) (ALERTS{alertname="CDCPipelineMissing",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{pipeline="order-1"}'
+            value: 1
+      - expr: count(ALERTS{alertname=~"CDCLagging.*"})
+        eval_time: 25m
+        exp_samples: []
+
+  # p. payment 不报指标了，其余五个还在：只报 payment。e2e 命名空间里的 payment 还在报，不能顶替。
+  - name: p_service_metrics_missing
+    interval: 30s
+    input_series:
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="gateway"}'
+        values: '50x60'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="order"}'
+        values: '50x60'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="inventory"}'
+        values: '50x60'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="orderindex"}'
+        values: '50x60'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="cdc"}'
+        values: '50x60'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="payment"}'
+        values: '50x10 stale'
+      - series: 'go_goroutine_count{k8s_namespace_name="oppenheimer-e2e",service_name="payment"}'
+        values: '50x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ServiceMetricsMissing",alertstate="firing"})
+        eval_time: 5m
+        exp_samples: []
+      - expr: count by (service) (ALERTS{alertname="ServiceMetricsMissing",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{service="payment"}'
+            value: 1
+
+  # q. 消费组有积压、位点不动：响。延迟关单的组同样的情形不看（积压是没到期的延迟消息）。
+  - name: q_consumer_not_consuming
+    interval: 30s
+    input_series:
+      - series: 'kafka_consumergroup_lag{consumergroup="order.payment-events",topic="payment.events",partition="0"}'
+        values: '0x10 50+30x70'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="order.payment-events",topic="payment.events",partition="0"}'
+        values: '0+30x10 300x70'
+      - series: 'kafka_consumergroup_lag{consumergroup="order.order-close-delay",topic="order.close.delay",partition="0"}'
+        values: '900x80'
+      - series: 'kafka_consumergroup_current_offset{consumergroup="order.order-close-delay",topic="order.close.delay",partition="0"}'
+        values: '100x80'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="ConsumerNotConsuming",alertstate="firing"})
+        eval_time: 10m
+        exp_samples: []
+      - expr: count by (consumergroup) (ALERTS{alertname="ConsumerNotConsuming",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{consumergroup="order.payment-events"}'
+            value: 1

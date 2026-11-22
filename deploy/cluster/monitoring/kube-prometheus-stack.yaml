@@ -35,6 +35,12 @@ defaultRules:
     kubeSchedulerAlerting: false
     kubeSchedulerRecording: false
     windows: false
+  # 关掉的两条（设计文档 3c 第 2 节定的）：它们报的是“所有 Pod 的 requests 加起来，掉一个节点后剩下的装不下”。
+  # 这套集群三个节点、不是为掉一个节点还能全装下而配的（3b 把 requests 按实测定到了节点的九成上下），
+  # 所以它们从装上那天起一直在响，是已知的、不打算处理的状态。一直响的告警会让人习惯忽略告警。
+  disabled:
+    KubeCPUOvercommit: true
+    KubeMemoryOvercommit: true
 windowsMonitoring:
   enabled: false
 
