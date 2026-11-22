@@ -45,7 +45,10 @@ tempo:
 
   resources:
     requests: {cpu: 100m, memory: 512Mi}
-    limits: {memory: 2Gi}
+    # 2026-11-20 从 2Gi 提到 3Gi：3b 的两轮阶梯（全量导出加过载，约 2000 请求/秒）里它都在第 16 分钟前后被 OOMKilled，
+    # 那一段的链路有缺口。server 节点当时用了 58% 的内存（14 GiB 里约 7.3 GiB），多给 1 GiB 放得下。
+    # requests 不动：平时只用 270 Mi 上下，这个上限只在压测时碰到。
+    limits: {memory: 3Gi}
 
 # 本地盘。卷里放块（/var/tempo/traces）、WAL 和生成器的 WAL。
 persistence:

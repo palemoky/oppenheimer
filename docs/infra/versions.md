@@ -19,6 +19,7 @@
 | actions/checkout | v7 | 稳定版 | 2026-11-11 | CI |
 | actions/setup-go | v7 | 稳定版 | 2026-11-11 | CI |
 | actions/upload-artifact | v7 | 稳定版 | 2026-11-11 | CI，端到端测试失败时上传服务日志 |
+| codecov/codecov-action | v7（查证时最新 v7.1.1） | 稳定版 | 2026-11-19 | CI，按模块上传测试覆盖率 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | 集群上也是这个版本，server-id：`mysql-order-0` 11、12，`mysql-order-1` 21、22，`mysql-main` 1（和本机 compose 对应）。Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
@@ -63,6 +64,7 @@
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
 | kubectl / helm（MacBook） | v1.37.2 / v4.3.2 | 稳定版 | 2026-11-15 | Homebrew 安装 |
 | oapi-codegen/runtime | v1.9.0 | 稳定版 | 2026-11-11 | 生成代码的运行时依赖（参数绑定），仅 gateway 使用 |
+| k6 | 2.4.0 | 稳定版 | 2026-11-12 | 发布日期 2026-11-12；没有 LTS，用最新正式版。本机用镜像 `grafana/k6:2.4.0`（`scripts/k6-local.sh`），发压机 Mac mini 上是 Homebrew 的 k6 2.4.0（`scripts/cluster/k6.sh`） |
 | golang（构建镜像） | 1.27.4 | 稳定版 | 2026-11-15 | 服务镜像的构建阶段，Docker Hub 官方镜像 `golang`，1.27 系列最新补丁版本；https://hub.docker.com/_/golang 。吞吐对比里 1a（732f9ab）的镜像（`deploy/docker/bench1a.Dockerfile`）也用它编译，两边的编译器和运行时相同 |
 | distroless static（运行镜像） | static-debian13:nonroot@sha256:aafe9936…e3931 | 无版本号，按摘要固定 | 2026-11-15 | 基于 Debian 13（trixie），多架构清单的摘要；`gcr.io/distroless/static-debian13`，见 https://github.com/GoogleContainerTools/distroless 。1a 的镜像（`deploy/docker/bench1a.Dockerfile`）用同一个摘要 |
 | distroless base（端到端测试的运行镜像） | base-debian13:nonroot@sha256:a08d9054…b0c5db | 无版本号，按摘要固定 | 2026-11-15 | `deploy/docker/e2e.Dockerfile`。带 `-race` 的测试二进制要 cgo、动态链接 glibc，static 镜像起不来，换成多了 glibc 的 base（仍然没有 shell）。摘要是 `gcr.io/distroless/base-debian13:nonroot` 当天的多架构清单（`docker buildx imagetools inspect` 从官方仓库读出），glibc 2.41（Debian 13），和构建阶段一致 |
@@ -137,7 +139,6 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 | Strimzi、MySQL Operator | 2 | 无 |
 | OpenTelemetry Collector 与 Go SDK | 1d / 3 | 无 |
 | Grafana、Loki、Alertmanager | 3 | 无 |
-| k6 | 3 | 无 |
 | Chaos Mesh | 4 | 无 |
 | Rust | 8 | 无，选最新 stable |
 

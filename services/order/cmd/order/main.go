@@ -93,22 +93,32 @@ const (
 const defaultMySQLDSNs = "root:oppenheimer@tcp(127.0.0.1:3311)/order_db_0," +
 	"root:oppenheimer@tcp(127.0.0.1:3321)/order_db_1"
 
-// order 调 inventory（Reserve、WarmUp）这一跳的时限（设计文档 1d 的 5.6）。
+// order 调 inventory 这一跳的时限（设计文档 1d 的 5.6，ADR-0020 和它 2026-11-21 的补充）。两个方法两个预算。
 //
-// inventoryHopBudget 是这一跳的预算，写在 deploy/envoy/order.yaml 出站路由 to_inventory 的 timeout 上，由边车执行
-// （有测试核对两处一致）。取 1 秒：Reserve 是一次短事务，正常几毫秒；网关给下游的总预算是 3 秒，
-// order 在 Reserve 超时之后还有时间返回明确的错误。
+// inventoryHopBudget 是默认的预算（现在只有 WarmUp 用它），写在 deploy/envoy/order.yaml 出站路由 to_inventory
+// 的兜底路由和集群上 VirtualService 的 from-order 路由的 timeout 上，由边车执行（有测试核对三处一致）。
+// 取 1 秒：WarmUp 在受理的同步路径上，网关给下游的总预算是 3 秒，order 在它超时之后还有时间返回明确的错误。
 //
-// inventoryHopTimeout 是进程里的时限，比预算多 grpcx.SidecarMargin，只做兜底（边车不在或卡住时 order 仍然放手）。
-// 边车必须先超时，慢的 inventory 才会被摘除，理由见 grpcx.SidecarMargin。所以 inventory 超时时这里正常看到的是
-// 边车返回的 UNAVAILABLE。
+// reserveHopBudget 是 Reserve 的预算，写在同两个文件里按 gRPC 路径匹配的那条路由上。取 3 秒：
+// Reserve 只在落库的消费者里调用，没有用户在等，失败了由消费者重试，所以它的时限不按“用户等不等得起”定，
+// 按“区分慢和坏”定。Reserve 要提交一个事务，这块盘上一次提交偶尔要 1 到 2 秒（3b 第 3 轮的 l5b：12.6 万次里
+// 53 次超过 1 秒、0 次超过 2 秒）。时限是 1 秒时，盘卡一下，几十个在途的 Reserve 同时超时，边车按
+// “连续 5 次 5xx”把 inventory 的全部副本摘除 5 秒：一秒的慢被放大成五秒的断
+// （docs/notes/3b-rounds/round-3-overload-behavior.md 第 4 节）。代价是 inventory 真的卡死时晚 2 秒发现。
+// 上限：它加上落库的两次订单库事务要在消费者处理一条消息的时限（service.DefaultEventTimeout）之内，有测试核对。
 //
-// 落库的消费者没有上游截止时间（它有自己的 DefaultEventTimeout），这个时限对它同样生效：
-// Reserve 超时按“结果未知”原地重试。
+// inventoryHopTimeout、reserveHopTimeout 是进程里的时限，各比预算多 grpcx.SidecarMargin，只做兜底
+// （边车不在或卡住时 order 仍然放手）。边车必须先超时，慢的 inventory 才会被摘除，理由见 grpcx.SidecarMargin。
+// 所以 inventory 超时时这里正常看到的是边车返回的 UNAVAILABLE。Reserve 超时按“结果未知”由消费者重试。
 const (
 	inventoryHopBudget  = time.Second
 	inventoryHopTimeout = inventoryHopBudget + grpcx.SidecarMargin
+	reserveHopBudget    = 3 * time.Second
+	reserveHopTimeout   = reserveHopBudget + grpcx.SidecarMargin
 )
+
+// reserveMethod 是 Reserve 的完整方法名：进程里按它取时限，两份边车配置里按它（HTTP/2 的 :path）匹配路由。
+const reserveMethod = inventoryv1.InventoryService_Reserve_FullMethodName
 
 // archiveMaxOpenConns 是冷库的连接池上限。冷库只承接旧订单的查询，量很小；
 // 本机它和 inventory、payment、商家索引共用一个 MySQL 实例（max_connections 151），不能多占。
@@ -121,6 +131,19 @@ const archiveMaxOpenConns = 10
 // 都很空闲。8 × 4 个分区 = 同时 32 单在途，低于默认的订单库连接池总和（25 × 2 个库 = 50），
 // 不会让落库自己在连接池上排队。改大之前先看启动时的连接池检查（checkSubmitConcurrency）。
 const defaultSubmitConcurrency = 8
+
+// defaultPaymentEventsConcurrency 是 PAYMENT_EVENTS_CONCURRENCY 的默认值：支付结果（payment.events）的消费者
+// 在一个分区内同时处理的消息数。
+//
+// 原来是分区内串行，理由是“量小”。3b 第 1 轮把支付出结果修通之后量不小了：每秒 100 笔支付结果时
+// 它只处理得了约 70 条（一条一个事务，一次提交约 50 毫秒，4 个分区），积压到 1.4 万条，
+// 用户付了款要等几分钟订单才变成已支付（docs/notes/3b-rounds/）。
+//
+// 可以按 key 并发的依据：消息的 key 是订单号，同一个订单的支付结果仍然串行；处理一条消息碰到的是这个订单的行
+// （先加行锁）、它的 payment_results 和同一个事务里的 outbox。handler 本来就不假设消息之间的先后，
+// 同一笔支付被并发处理两次也只生效一次（TestHandlePaymentConcurrentDuplicates 等）。
+// 它和落库共用订单库的连接池：两者的在途数加起来不要超过连接池（checkSubmitConcurrency 只算了落库）。
+const defaultPaymentEventsConcurrency = 8
 
 // defaultMySQLMaxOpenConns 是 MYSQL_MAX_OPEN_CONNS 的默认值：每个订单库的连接池上限。
 //
@@ -163,18 +186,22 @@ type config struct {
 	archiveMaxConcurrency int
 	// submitConcurrency 是落库消费者每个分区的并发度，见 defaultSubmitConcurrency。
 	submitConcurrency int
-	workerID          int64
-	inventoryAddr     string
-	paymentTimeout    time.Duration
-	idempotencyTTL    time.Duration
-	sweeper           service.SweeperConfig
-	reaper            service.ReaperConfig
-	backlog           stockgate.BacklogLimit
-	kafkaBrokers      []string
-	kafkaPrefix       string
-	outboxInterval    time.Duration
-	redisAddr         string
-	redisPrefix       string
+	// paymentEventsConcurrency 是支付结果的消费者每个分区的并发度，见 defaultPaymentEventsConcurrency。
+	paymentEventsConcurrency int
+	workerID                 int64
+	inventoryAddr            string
+	paymentTimeout           time.Duration
+	idempotencyTTL           time.Duration
+	sweeper                  service.SweeperConfig
+	reaper                   service.ReaperConfig
+	gateMemoryPercent        int
+	gateMemoryInterval       time.Duration
+	backlog                  stockgate.BacklogLimit
+	kafkaBrokers             []string
+	kafkaPrefix              string
+	outboxInterval           time.Duration
+	redisAddr                string
+	redisPrefix              string
 	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
 	cacheRedisAddr string
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
@@ -297,6 +324,14 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("SUBMIT_CONCURRENCY must be at least 1")
 	}
 	cfg.submitConcurrency = int(concurrency)
+	concurrency, err = envInt("PAYMENT_EVENTS_CONCURRENCY", defaultPaymentEventsConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if concurrency < 1 {
+		return cfg, errors.New("PAYMENT_EVENTS_CONCURRENCY must be at least 1")
+	}
+	cfg.paymentEventsConcurrency = int(concurrency)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -341,6 +376,13 @@ func loadConfig() (config, error) {
 	if cfg.idempotencyTTL, err = envDuration("IDEMPOTENCY_TTL", service.DefaultIdempotencyTTL); err != nil {
 		return cfg, err
 	}
+	// 幂等键在闸门里至少要留到订单的支付时限（ADR-0033）。比它短的话，订单还等着支付时重放同一个请求，
+	// 用户拿到的是一个新订单号，随后这个订单在落库时被丢弃、查不到，而原订单其实还能支付。
+	// 账不会错（订单库的唯一键挡着），错的是用户看到的东西，所以在启动时拒绝。
+	if cfg.idempotencyTTL < cfg.paymentTimeout {
+		return cfg, fmt.Errorf("IDEMPOTENCY_TTL (%s) must not be shorter than PAYMENT_TIMEOUT (%s)",
+			cfg.idempotencyTTL, cfg.paymentTimeout)
+	}
 	if cfg.reaper.Grace, err = envDuration("HOLD_REAP_GRACE", service.DefaultReapGrace); err != nil {
 		return cfg, err
 	}
@@ -372,6 +414,19 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
 	}
 	cfg.backlog.MaxStale = stale
+	// 闸门内存的水位（ADR-0034）：已用内存占 maxmemory 的百分比到这个数就停止受理，0 表示不检查。
+	// 闸门没有设 maxmemory（本机）时这项检查不起作用。
+	percent, err := envInt("GATE_MEMORY_WATERMARK_PERCENT", service.DefaultGateMemoryWatermarkPercent)
+	if err != nil {
+		return cfg, err
+	}
+	if percent < 0 || percent > 99 {
+		return cfg, fmt.Errorf("GATE_MEMORY_WATERMARK_PERCENT must be between 0 and 99, got %d", percent)
+	}
+	cfg.gateMemoryPercent = int(percent)
+	if cfg.gateMemoryInterval, err = envDuration("GATE_MEMORY_INTERVAL", service.DefaultGateMemoryInterval); err != nil {
+		return cfg, err
+	}
 	if cfg.readPinTTL, err = envDuration("ORDER_READ_PIN_TTL", service.DefaultReadPinTTL); err != nil {
 		return cfg, err
 	}
@@ -562,7 +617,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}()
 	}
 
-	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeout(inventoryHopTimeout))
+	conn, err := grpcx.Dial(cfg.inventoryAddr, grpcx.WithHopTimeouts(inventoryHopTimeout,
+		map[string]time.Duration{reserveMethod: reserveHopTimeout}))
 	if err != nil {
 		return err
 	}
@@ -673,14 +729,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 		Backlog:           cfg.backlog,
-		ReadMode:          cfg.readMode,
-		ReadPinTTL:        cfg.readPinTTL,
-		ReadGTIDTTL:       cfg.readGTIDTTL,
-		ReadGTIDWait:      cfg.readGTIDWait,
+		// ADR-0034：闸门内存到水位时停止受理，采样由下面的 gateMemory 组件做。
+		GateMemoryWatermarkPercent: cfg.gateMemoryPercent,
+		ReadMode:                   cfg.readMode,
+		ReadPinTTL:                 cfg.readPinTTL,
+		ReadGTIDTTL:                cfg.readGTIDTTL,
+		ReadGTIDWait:               cfg.readGTIDWait,
 		// 设计文档 1d 的 5.7：展示读对每个订单库、读冷库各有并发上限，满了答 RESOURCE_EXHAUSTED。
 		ReadMaxConcurrency:     cfg.readMaxConcurrency,
 		ReadGateMaxConcurrency: cfg.readGateMaxConcurrency,
 		GateFailureSpan:        service.DefaultGateFailureSpan,
+		LandingFailureSpan:     service.DefaultLandingFailureSpan,
 		ArchiveMaxConcurrency:  cfg.archiveMaxConcurrency,
 	})
 	if err != nil {
@@ -707,6 +766,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	gateMemory, err := service.NewGateMemoryWatcher(svc, cfg.gateMemoryInterval)
+	if err != nil {
+		return err
+	}
 	// 闸门里排队的占用数，由回收任务每轮顺带读一次；只有在跑回收任务的实例（leader）上报。
 	unregisterQueueMetrics, err := reaper.RegisterQueueMetrics()
 	if err != nil {
@@ -719,6 +782,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:  eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderPaymentEvents),
 		Topics: []string{paymentsTopic},
 		Logger: logger,
+		// 分区内按订单号并发，见 defaultPaymentEventsConcurrency。1 就是原来的分区内串行。
+		Concurrency: cfg.paymentEventsConcurrency,
 		// 支付结果不能因为订单库抖了一下就进死信：钱已经收了，这条消息是订单变成已支付的唯一途径，
 		// 没有任何任务会重发它（设计文档 1b 的 5.4：长期 notified = 0 的支付单没有人扫）。
 		// 默认的 5 次重试合计只有约 1.5 秒，订单库的一次主从切换、扩容时被搬的 slot 的不可用窗口
@@ -738,7 +803,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 由它的行锁保护（1a 起有并发测试），不在这个消费者里。同一个用户的不同订单共用的只有
 	// (user_id, idempotency_key) 唯一键，由数据库保证。
 	// 代价是重启和再平衡后重复投递变成常态（提交的是连续完成的前缀），handler 本来就按至少一次设计。
-	// 支付结果和延迟关单的消费者保持串行：量小，延迟消费者也不允许并发。
+	// 支付结果的消费者也按 key 并发（defaultPaymentEventsConcurrency）；延迟关单的保持串行：延迟消费者不允许并发。
 	checkSubmitConcurrency(logger, cfg)
 	submitConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
 		Config:      kcfg,
@@ -833,7 +898,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	for _, r := range relays {
 		components = append(components, r)
 	}
-	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper)
+	components = append(components, submitConsumer, closeConsumer, paymentConsumer, grpcServer, reaper, sweeper, gateMemory)
 	components = append(components, background...)
 	return app.RunWith(ctx, logger, app.Options{Readiness: readiness, DrainDelay: cfg.drainDelay}, app.WithDebug(debugServer, components...)...)
 }

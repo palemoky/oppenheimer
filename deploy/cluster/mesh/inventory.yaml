@@ -28,6 +28,20 @@ spec:
         - destination: {host: inventory, port: {number: 9082}}
       timeout: 3s
       retries: {attempts: 0}
+    # order 调 Reserve 单独一条路由，时限 3 秒（ADR-0020 的 2026-11-21 补充，3b 第 3 轮记录第 4 节）。
+    # Reserve 只在落库的消费者里调用：没有用户在等，失败了消费者重试，所以时限按“区分慢和坏”定，
+    # 不按“用户等不等得起”定。1 秒时，盘卡一下，几十个在途的 Reserve 同时超时，两个副本一起被摘除 5 秒。
+    # 一个 match 条目里的条件是“与”的关系（来源是 order 并且路径是 Reserve）。必须排在 from-order 之前。
+    # retries 仍然是 0：重试由消费者做，一条链上只有一层重试。
+    - name: from-order-reserve
+      match:
+        - sourceLabels: {app.kubernetes.io/name: order}
+          uri: {exact: /oppenheimer.inventory.v1.InventoryService/Reserve}
+      route:
+        - destination: {host: inventory, port: {number: 9082}}
+      timeout: 3s
+      retries: {attempts: 0}
+    # order 的其余调用（现在只有受理时同步的 WarmUp）。
     - name: from-order
       match:
         - sourceLabels: {app.kubernetes.io/name: order}

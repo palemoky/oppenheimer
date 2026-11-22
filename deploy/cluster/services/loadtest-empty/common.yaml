@@ -1,0 +1,12 @@
+# 空表对照（设计文档 3b 第 2 节第 10 项）：把长期运行的那一套临时指到空库，其余一切不变
+#（同样的 Pod、副本数、资源、入口、监控标签），量“库里有 1000 万单”本身占了多少。
+# scripts/cluster/loadtest.sh empty-up 时叠在 deploy/cluster/services/<服务>.yaml（和 loadtest/）之上，empty-down 恢复。
+#
+# 空库用的是集群 e2e 那一套的名字（同一批 MySQL 实例上的 e2e_* 库、e2e- 开头的 Kafka 和 Redis 前缀），
+# 所以建库、授权、清理都是 scripts/cluster/e2e-lib.sh 里现成的；代价是这期间不能跑 make cluster-e2e 一类
+#（e2e-lib.sh 的建库和删库会拒绝）。和 e2e/ 那一层不同，这里只改“数据在哪”，不改任何行为上的配置。
+#
+# 前缀六个服务都给，用不到的服务不读它。正式的 topic、消费者组、Redis 键这期间没有人读写，切回来接着用。
+config:
+  KAFKA_PREFIX: "e2e-empty."
+  REDIS_PREFIX: "e2e-empty:"

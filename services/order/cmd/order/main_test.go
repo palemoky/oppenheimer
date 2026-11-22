@@ -36,8 +36,28 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-// envoyRouteTimeout 读 Envoy 配置里名为 listener 的监听的第一条路由的 timeout。
-func envoyRouteTimeout(t *testing.T, file, listener string) time.Duration {
+// envoyRoute 是 Envoy 配置里的一条路由（只取这里要核对的字段）。Path 是精确匹配，Prefix 是前缀匹配。
+type envoyRoute struct {
+	Match struct {
+		Path   string `yaml:"path"`
+		Prefix string `yaml:"prefix"`
+	} `yaml:"match"`
+	Route struct {
+		Timeout string `yaml:"timeout"`
+	} `yaml:"route"`
+}
+
+func (r envoyRoute) timeout(t *testing.T) time.Duration {
+	t.Helper()
+	d, err := time.ParseDuration(r.Route.Timeout)
+	if err != nil {
+		t.Fatalf("route %+v timeout %q: %v", r.Match, r.Route.Timeout, err)
+	}
+	return d
+}
+
+// envoyRoutes 读 Envoy 配置里名为 listener 的监听的路由，按文件里的顺序（Envoy 用第一条匹配的）。
+func envoyRoutes(t *testing.T, file, listener string) []envoyRoute {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "envoy", file))
 	if err != nil {
@@ -52,11 +72,7 @@ func envoyRouteTimeout(t *testing.T, file, listener string) time.Duration {
 						TypedConfig struct {
 							RouteConfig struct {
 								VirtualHosts []struct {
-									Routes []struct {
-										Route struct {
-											Timeout string `yaml:"timeout"`
-										} `yaml:"route"`
-									} `yaml:"routes"`
+									Routes []envoyRoute `yaml:"routes"`
 								} `yaml:"virtual_hosts"`
 							} `yaml:"route_config"`
 						} `yaml:"typed_config"`
@@ -77,27 +93,54 @@ func envoyRouteTimeout(t *testing.T, file, listener string) time.Duration {
 			len(l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts[0].Routes) == 0 {
 			t.Fatalf("%s: listener %s has no route", file, listener)
 		}
-		raw := l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts[0].Routes[0].Route.Timeout
-		d, err := time.ParseDuration(raw)
-		if err != nil {
-			t.Fatalf("%s: listener %s route timeout %q: %v", file, listener, raw, err)
-		}
-		return d
+		return l.FilterChains[0].Filters[0].TypedConfig.RouteConfig.VirtualHosts[0].Routes
 	}
 	t.Fatalf("%s: no listener named %s", file, listener)
-	return 0
+	return nil
 }
 
-// order 调 inventory 的按跳时限和 Envoy 上 to_inventory 出站路由的 timeout 是同一个数（设计文档 1d 的 5.6）。
+// order 调 inventory 的两个按跳时限和 Envoy 上 to_inventory 的两条出站路由是同样的数（设计文档 1d 的 5.6，
+// ADR-0020 的 2026-11-21 补充）：Reserve 按路径匹配的那条等于 reserveHopBudget，兜底的那条等于 inventoryHopBudget。
 func TestInventoryHopTimeoutMatchesEnvoy(t *testing.T) {
 	t.Parallel()
-	if got := envoyRouteTimeout(t, "order.yaml", "to_inventory"); got != inventoryHopBudget {
-		t.Fatalf("envoy to_inventory route timeout = %s, inventoryHopBudget = %s; keep them equal", got, inventoryHopBudget)
+	routes := envoyRoutes(t, "order.yaml", "to_inventory")
+	if len(routes) != 2 {
+		t.Fatalf("envoy to_inventory has %d routes, want 2 (Reserve, then the catch-all)", len(routes))
 	}
+	// 顺序有意义：第一条匹配的生效，Reserve 的排在兜底之后就永远匹配不到。
+	if routes[0].Match.Path != reserveMethod {
+		t.Errorf("envoy to_inventory first route matches path %q, want exactly %q", routes[0].Match.Path, reserveMethod)
+	} else if got := routes[0].timeout(t); got != reserveHopBudget {
+		t.Errorf("envoy to_inventory Reserve route timeout = %s, reserveHopBudget = %s; keep them equal", got, reserveHopBudget)
+	}
+	if routes[1].Match.Prefix != "/" {
+		t.Errorf("envoy to_inventory last route matches %+v, want prefix \"/\"", routes[1].Match)
+	} else if got := routes[1].timeout(t); got != inventoryHopBudget {
+		t.Errorf("envoy to_inventory catch-all route timeout = %s, inventoryHopBudget = %s; keep them equal", got, inventoryHopBudget)
+	}
+	checkHopConstants(t)
+}
+
+// checkHopConstants 核对进程里的几个数之间的关系。
+func checkHopConstants(t *testing.T) {
+	t.Helper()
 	// 进程里的时限必须比边车的长：边车先超时，慢下游才会被摘除。
-	if inventoryHopTimeout != inventoryHopBudget+grpcx.SidecarMargin || grpcx.SidecarMargin <= 0 {
-		t.Fatalf("inventoryHopTimeout = %s, want inventoryHopBudget %s plus a positive grpcx.SidecarMargin %s",
+	if grpcx.SidecarMargin <= 0 {
+		t.Fatalf("grpcx.SidecarMargin = %s, want positive", grpcx.SidecarMargin)
+	}
+	if inventoryHopTimeout != inventoryHopBudget+grpcx.SidecarMargin {
+		t.Errorf("inventoryHopTimeout = %s, want inventoryHopBudget %s plus grpcx.SidecarMargin %s",
 			inventoryHopTimeout, inventoryHopBudget, grpcx.SidecarMargin)
+	}
+	if reserveHopTimeout != reserveHopBudget+grpcx.SidecarMargin {
+		t.Errorf("reserveHopTimeout = %s, want reserveHopBudget %s plus grpcx.SidecarMargin %s",
+			reserveHopTimeout, reserveHopBudget, grpcx.SidecarMargin)
+	}
+	// 落库处理一条消息的时限里除了 Reserve 还有两次订单库事务：Reserve 等满之后至少还要剩同样长的时间，
+	// 否则一次慢的 Reserve 之后，本来能成功的 MarkReserved 会被消息的时限打断，白等一轮重试。
+	if 2*reserveHopTimeout > service.DefaultEventTimeout {
+		t.Errorf("reserveHopTimeout = %s leaves less than itself within service.DefaultEventTimeout %s",
+			reserveHopTimeout, service.DefaultEventTimeout)
 	}
 }
 
@@ -217,6 +260,9 @@ type meshRoute struct {
 	Name  string `yaml:"name"`
 	Match []struct {
 		SourceLabels map[string]string `yaml:"sourceLabels"`
+		URI          struct {
+			Exact string `yaml:"exact"`
+		} `yaml:"uri"`
 	} `yaml:"match"`
 	Timeout string `yaml:"timeout"`
 	Retries *struct {
@@ -278,27 +324,75 @@ func checkMeshRoute(t *testing.T, path string, r meshRoute, want time.Duration) 
 	}
 }
 
-// meshEdgeRoute 找出 sourceLabels 的 app.kubernetes.io/name 等于 caller 的那条路由。
-func meshEdgeRoute(t *testing.T, path string, routes []meshRoute, caller string) (meshRoute, bool) {
+// meshEdgeRoute 找出来源是 caller（sourceLabels 的 app.kubernetes.io/name）并且路径条件是 uri 的那条路由，
+// 返回它在列表里的位置（Istio 用第一条匹配的）。uri 为空表示不限路径的那条。
+func meshEdgeRoute(t *testing.T, path string, routes []meshRoute, caller, uri string) (int, bool) {
 	t.Helper()
-	for _, r := range routes {
+	for i, r := range routes {
 		for _, m := range r.Match {
-			if m.SourceLabels["app.kubernetes.io/name"] == caller {
-				return r, true
+			if m.SourceLabels["app.kubernetes.io/name"] == caller && m.URI.Exact == uri {
+				return i, true
 			}
 		}
 	}
-	t.Errorf("%s: no route matches sourceLabels app.kubernetes.io/name=%s; %s would fall through to the catch-all route "+
-		"(or have no timeout at all without a VirtualService), so a slow downstream is never ejected", path, caller, caller)
-	return meshRoute{}, false
+	t.Errorf("%s: no route matches sourceLabels app.kubernetes.io/name=%s with uri.exact=%q; these calls would fall through "+
+		"to another route with a different timeout (or have none at all without a VirtualService)", path, caller, uri)
+	return 0, false
 }
 
-// 集群上 inventory 的 VirtualService 里，order 这个调用方有自己的路由：timeout 等于 inventoryHopBudget，且不重试。
+// 集群上 inventory 的 VirtualService 里，order 这个调用方有两条自己的路由，都不重试：
+// Reserve（按路径匹配）的 timeout 等于 reserveHopBudget，其余的等于 inventoryHopBudget；前者排在前面。
 func TestInventoryHopTimeoutMatchesMesh(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(repoRoot(t), "deploy", "cluster", "mesh", "inventory.yaml")
 	routes := meshRoutes(t, path)
-	if r, ok := meshEdgeRoute(t, path, routes, "order"); ok {
-		checkMeshRoute(t, path, r, inventoryHopBudget)
+	reserve, okReserve := meshEdgeRoute(t, path, routes, "order", reserveMethod)
+	rest, okRest := meshEdgeRoute(t, path, routes, "order", "")
+	if okReserve {
+		checkMeshRoute(t, path, routes[reserve], reserveHopBudget)
+	}
+	if okRest {
+		checkMeshRoute(t, path, routes[rest], inventoryHopBudget)
+	}
+	if okReserve && okRest && reserve > rest {
+		t.Errorf("%s: route %q comes after %q; the first match wins, so Reserve would get the %s budget",
+			path, routes[reserve].Name, routes[rest].Name, inventoryHopBudget)
+	}
+	checkHopConstants(t)
+}
+
+// IDEMPOTENCY_TTL：默认值不短于默认的支付时限；比支付时限短时拒绝启动（ADR-0033）。
+func TestIdempotencyTTLConfig(t *testing.T) {
+	for _, c := range []struct {
+		name, ttl, payment string
+		want               time.Duration // 0 表示应当拒绝
+	}{
+		{"default", "", "", service.DefaultIdempotencyTTL},
+		{"explicit", "2h", "", 2 * time.Hour},
+		{"equal to the payment timeout", "15m", "15m", 15 * time.Minute},
+		{"shorter than the default payment timeout", "10m", "", 0},
+		{"default shorter than a long payment timeout", "", "2h", 0},
+		{"shorter than a short payment timeout", "2s", "3s", 0},
+		{"short but not shorter", "5s", "3s", 5 * time.Second},
+		{"not a duration", "soon", "", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("MYSQL_DSN", "")
+			t.Setenv("IDEMPOTENCY_TTL", c.ttl)
+			t.Setenv("PAYMENT_TIMEOUT", c.payment)
+			cfg, err := loadConfig()
+			if c.want == 0 {
+				if err == nil {
+					t.Fatalf("IDEMPOTENCY_TTL=%q PAYMENT_TIMEOUT=%q accepted (%s), want error", c.ttl, c.payment, cfg.idempotencyTTL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.idempotencyTTL != c.want {
+				t.Fatalf("idempotencyTTL = %s, want %s", cfg.idempotencyTTL, c.want)
+			}
+		})
 	}
 }

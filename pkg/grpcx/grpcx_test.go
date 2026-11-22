@@ -228,3 +228,31 @@ func TestHopTimeoutIsTheEarlierOfHopAndCaller(t *testing.T) {
 		t.Fatalf("fast call: %v", err)
 	}
 }
+
+// 按方法分时限：列出的方法用自己的时限（可以比默认的长），没列出的用默认的。
+func TestHopTimeoutsPerMethod(t *testing.T) {
+	_, _, srv := startServer(t)
+	slowCall := func(t *testing.T, perMethod map[string]time.Duration) time.Duration {
+		t.Helper()
+		conn, err := Dial(srv.Addr().String(), WithHopTimeouts(100*time.Millisecond, perMethod))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		caller, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := check(caller, conn, "slow"); status.Code(err) != codes.DeadlineExceeded {
+			t.Fatalf("slow call = %v, want DeadlineExceeded", err)
+		}
+		return time.Since(start)
+	}
+
+	if el := slowCall(t, map[string]time.Duration{probeCheck: 500 * time.Millisecond}); el < 450*time.Millisecond || el > 2*time.Second {
+		t.Errorf("listed method returned after %v, want about its own 500ms", el)
+	}
+	// 只列了别的方法：这个方法仍然用默认的 100 毫秒。
+	if el := slowCall(t, map[string]time.Duration{probeList: 5 * time.Second}); el < 80*time.Millisecond || el > 400*time.Millisecond {
+		t.Errorf("unlisted method returned after %v, want about the default 100ms", el)
+	}
+}

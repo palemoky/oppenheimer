@@ -30,7 +30,10 @@ spec:
                   gateway.envoyproxy.io/owning-gateway-name: public
         container:
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
+            # CPU 按实测定（2026-11-22，3b 的记录 round-8-cpu-requests.md 第 5 节；算法和为什么乘 0.9 见 deploy/cluster/services/gateway.yaml）：
+            # 混合读写 1526 请求/秒时接流量的那个 Pod 用 0.73 到 0.74 核（MetalLB 是二层模式，两个 Pod 里只有一个在接）。
+            # 原来的 100m 在节点满的时候只保证得了它用量的几分之一，过载时在途请求会在入口堆到上限。
+            requests: { cpu: 700m, memory: 128Mi }
             limits: { memory: 512Mi }
       # 排空节点时一次最多带走一个 Envoy。
       envoyPDB:

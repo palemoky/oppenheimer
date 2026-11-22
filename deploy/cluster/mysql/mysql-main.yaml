@@ -16,10 +16,14 @@ cdc:
 mysqld:
   # 本机的连接池合计已经是 164（compose 里的注释），给到 400 留出余量。
   maxConnections: 400
-  innodbBufferPoolSize: 768M
+  innodbBufferPoolSize: 1G
+# 2026-11-18 从 1536Mi（缓冲池 768M）调上来：灌 1000 万历史订单时商家索引的消费者往这里追数，
+# 工作集涨到 1530 Mi，贴着上限（订单库在同一天被 OOMKilled 过，见 mysql-order-0.yaml）。设计文档 3b 第 6 节。
 resources:
-  memory: 1536Mi
-  cpu: 250m
+  memory: 2560Mi
+  # CPU requests 按实测定（2026-11-22，3b 的记录 round-8-cpu-requests.md 第 5 节；算法和为什么乘 0.9 见 deploy/cluster/services/gateway.yaml）：
+  # 混合读写 1526 请求/秒时用 0.57 到 0.61 核。它是节点 CPU 满了之后的权重，要和服务的 requests 用同一个算法。
+  cpu: 550m
 storage:
   size: 30Gi
 backup:

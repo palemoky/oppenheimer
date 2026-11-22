@@ -55,16 +55,21 @@ echo "SELECT WAIT_FOR_EXECUTED_GTID_SET('$G', 60)" | q $NEW     # 返回 0 是�
 
 返回 1 就停在这里查原因，不要往下做。要回退的话在旧主库上 `SET PERSIST super_read_only = OFF; SET PERSIST read_only = OFF;`，一切回到起点。
 
-**4. 提升从库。** 去掉它的复制配置，放开写入：
+**4. 提升从库。** 去掉它的复制配置，把落盘方式设回每次提交都落盘，再放开写入：
 
 ```sh
 q $NEW <<'SQL'
 STOP REPLICA;
 RESET REPLICA ALL;
+SET PERSIST innodb_flush_log_at_trx_commit = 1;
+SET PERSIST sync_binlog = 1;
 SET PERSIST super_read_only = OFF;
 SET PERSIST read_only = OFF;
 SQL
 ```
+
+- 落盘的两行必须在放开写入**之前**：订单库的从库平时不逐次刷盘（ADR-0032），带着那个设置当主库，答复过成功的事务在节点掉电时会丢。两个变量是动态的，立刻生效。
+- 忘了这两行的话，第 6 步的核对会报 `ANOMALY: durability is 2/0, a primary here should have 1/1`，那时在新主库上执行 `/scripts/durability.sh apply` 补上。
 
 从这一刻起它按状态算是主库，但 `-primary` 还指着旧主库（没有端点），所以还没有流量。
 
@@ -93,7 +98,7 @@ SQL'
 scripts/cluster/middleware.sh mysql
 ```
 
-它做 `helm upgrade`（只有两个 Service 的 selector 变了，Pod 不重启；前提是这次没有夹带 chart 的其他改动），再核对。结尾应当是：新主库 `role=primary`，旧主库 `role=replica`、两个线程在跑，没有 `ANOMALY`。写入从这里恢复。
+它做 `helm upgrade`（只有两个 Service 的 selector 变了，Pod 不重启；前提是这次没有夹带 chart 的其他改动），把每个实例的落盘方式按它现在的角色设一遍（旧主库成了从库，在这里被放松成 2/0），再核对。结尾应当是：新主库 `role=primary`，旧主库 `role=replica`、两个线程在跑，没有 `ANOMALY`。写入从这里恢复。
 
 **7. 把留在旧主库上的连接赶走。** 服务原来连着旧主库的连接还在，在上面写会一直报 1290，直到连接池把它们换掉。在旧主库上断开业务账号的连接，连接池重连时经 Service 到新主库：
 
@@ -142,7 +147,7 @@ SQL
 
 记下这个 `gtid_executed`。主库上提交过、这里没有的事务，从这一刻起就是“可能丢了”的：服务收到过成功的答复，数据却不在新主库上。对订单库来说是“已受理并落库的订单不见了”，之后要靠对账（`recon`）和上游的重试找回来，这是异步复制的代价（要不丢就得半同步，见 ADR-0027 放弃了什么）。
 
-**3. 提升从库**（同第一节第 4 步），**改 `primaryOrdinal` 并部署**（同第 6 步）。核对会因为旧主库连不上而报异常，这时是预期的。
+**3. 提升从库**（同第一节第 4 步，包括把落盘方式设回 1、1 的那两行），**改 `primaryOrdinal` 并部署**（同第 6 步）。核对会因为旧主库连不上而报异常，这时是预期的。
 
 **4. 旧主库回来之前，决定它以什么身份回来。** 两种：
 
@@ -160,6 +165,25 @@ SQL
 
 **5. 核对**：`scripts/cluster/middleware.sh mysql` 没有 `ANOMALY`，提交 values。
 
+## 三、从库所在的节点非正常关机之后
+
+**没有演练过**，放在阶段 4 的节点掉电实验里。背景和理由在 ADR-0032。
+
+订单库的从库提交时不逐次刷盘（`innodb_flush_log_at_trx_commit=2`、`sync_binlog=0`）。从库所在的节点掉电、内核崩溃、虚拟机被强制关闭之后，它的数据和它自己的 binlog 可能互相对不上，其中一种情况不报错：复制照常在跑，数据却少了几个事务。**所以不看复制的状态，一律重建。** mysqld 被杀、被 OOMKill、Pod 被删除、节点正常重启（先 drain）不需要：数据在页缓存里，没有丢。
+
+1. 确认主库是好的：`scripts/cluster/middleware.sh mysql`，主库 `role=primary`。主库也不在的话先处理主库（第二节），**不要删从库的数据**：它可能是仅有的一份。
+2. 重建从库。删掉它的 PVC 再删 Pod，init 容器看到空的数据目录会从主库 CLONE 全量、配好复制和落盘方式。**删 PVC 是破坏性操作，先和主人确认**：
+
+   ```sh
+   kubectl -n mysql delete pvc "data-$R-$REPLICA" --wait=false
+   kubectl -n mysql delete pod "$R-$REPLICA"
+   kubectl -n mysql rollout status "statefulset/$R" --timeout=30m
+   ```
+
+3. 核对：`scripts/cluster/middleware.sh mysql` 没有 `ANOMALY`，从库 `flush_log_at_trx_commit/sync_binlog=2/0`、两个线程在跑。
+4. 看 CDC。它的位点是 GTID 集合，从库重建后按集合续读。只有一种情况续不上：重建时 CDC 落后，它缺的事务已经不在新从库的 binlog 里（新从库的 `gtid_purged` 是 CLONE 那一刻的全部事务）。那时 cdc 启动报 `binlog after checkpoint ... has been purged`，按提示用 `-reset-checkpoint` 重做全量。
+5. 这个从库在出事之后、重建之前做出来的备份不可信，在 NAS 上删掉或者记下来不要用。
+
 ## 出了岔子怎么看
 
 | 现象 | 多半是 |
@@ -167,5 +191,7 @@ SQL
 | 核对报 `WRITABLE but not the primary` | 旧主库回来了、还可写。先设只读，再按第二节第 4 步处理 |
 | 核对报 `neither primary nor replicating` | 切换做了一半：设了只读、还没配复制，或者提升了一半。对照第一节看停在哪一步 |
 | 核对报 `replicating from ... expected ...` | 改了 values 但没改复制源，或者反过来 |
+| 核对报 `durability is ..., a primary here should have 1/1` | 提升时漏了设回落盘方式。在那个 Pod 里执行 `/scripts/durability.sh apply` |
+| 核对报 `durability is 1/1, a replica here should have 2/0` | 从库是手工接上的，没有经过 `middleware.sh mysql`。重跑它，或者在那个 Pod 里执行 `/scripts/durability.sh apply` |
 | `-primary` 没有端点 | 它指向的实例不就绪：只读又没复制，或者 Pod 不在 |
 | 建库建账号的 hook 失败，日志里是 `more than one writable instance` | 有两个可写的实例。hook 拒绝往任何一个里写，这是有意的 |

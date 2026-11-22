@@ -1,0 +1,42 @@
+# 入口 Envoy（Envoy Gateway 的数据面）的抓取对象（3b 第 3 轮）。由 scripts/cluster/monitoring.sh exporters 提交。
+#
+# 为什么要抓：入口自己拒绝的请求（并发上限溢出的 503 UO、没有健康上游的 503）没有到达 gateway，
+# gateway 的指标里完全看不到。3b 第 0 轮里阶梯那一轮有 25.7 万个这样的 503，是从 k6 和入口的日志里数出来的。
+# 入口的并发上限在 deploy/charts/service/templates/backendtrafficpolicy.yaml。
+#
+# 两个 Envoy 副本都抓，但流量只在持有入口地址的那一个上（MetalLB 二层模式），另一个的数是 0。
+# 15 秒抓一次（默认 30 秒）：在途请求数是瞬时值，抓得稀了看不到峰。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ingress-envoy
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: envoy
+      app.kubernetes.io/managed-by: envoy-gateway
+  namespaceSelector:
+    matchNames: [envoy-gateway-system]
+  podMetricsEndpoints:
+    - port: metrics
+      path: /stats/prometheus
+      interval: 15s
+      relabelings:
+        # instance 用 Pod 名，重启后 IP 变了也认得出。
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
+      metricRelabelings:
+        # 入口一共导出两千多条，只留回答下面几个问题用的（每个路由十来条）：
+        #   到上游的请求量和结果      envoy_cluster_upstream_rq_total、upstream_rq_xx（按状态码的百位）
+        #   现在有多少在途、多少在排队  upstream_rq_active、upstream_cx_active、upstream_rq_pending_active
+        #   被并发上限拒绝了多少        upstream_cx_overflow（连接用完，新请求开始排队）、
+        #                               upstream_rq_pending_overflow（排队也满了，这才是答出去的 503 UO）
+        #   上游超时、连不上            upstream_rq_timeout、upstream_cx_connect_fail
+        # 只要路由对应的集群（名字是 httproute/<命名空间>/<路由>/rule/<序号>），Envoy 自己的集群（xds_cluster 等）不要。
+        # 两列用 ; 连起来匹配，第二列是 envoy_cluster_name。
+        - action: keep
+          sourceLabels: [__name__, envoy_cluster_name]
+          regex: 'envoy_cluster_upstream_(rq_total|rq_xx|rq_active|rq_pending_active|rq_pending_overflow|rq_timeout|cx_active|cx_overflow|cx_connect_fail);httproute/.+'

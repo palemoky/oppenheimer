@@ -114,8 +114,13 @@ config:
         insecure: true
       retry_on_failure:
         max_elapsed_time: 0
+      # 队列默认 1000 批，一批最多 2000 条（约 1.7 MB），堵满时内存到过 204 Mi，正好是 memory_limiter 的线
+      # （上限 256 Mi 的 80%）；越过那条线 memory_limiter 开始拒绝数据，那条路径会不会丢没有验证过。
+      # 队列既然会堵回 filelog、磁盘上的日志文件才是真正的缓冲，内存里就不需要留这么多：改成 20 批，
+      # 让“队列满了堵住”先于“内存到线”发生。内存上限因此不用加。
       sending_queue:
         block_on_overflow: true
+        queue_size: 20
 
   service:
     pipelines:

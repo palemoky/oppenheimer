@@ -34,7 +34,7 @@ ADR-0001 选了 k3s，并留了一句：k3s 默认用 SQLite、自带 Traefik �
 
 注意：只有一个 server 时 etcd 是单成员，**没有任何容错**，这个 server 挂了控制面就没了（已经在跑的 Pod 不受影响，但不能调度、不能改配置）。这和 SQLite 的情况一样，选 etcd 并没有让集群更可用。
 
-**flannel 暂定。** 候选是 Cilium：基于 eBPF，可以取代 kube-proxy，自带按连接的可观测（Hubble），和可选的阶段 9（eBPF）也对得上。没有直接选它是因为内存：Cilium 每个节点一个 agent 加一个 operator，三个节点合计大约多用 1 到 1.5 GB（这是按公开资料的粗估，没有实测），而内存预算里的余量约 6 GB，还没有被阶段 3 的监控实际占用过。所以先用 flannel 把集群、中间件、服务都放上去，量出实际的内存占用再决定。
+**flannel 暂定。** 候选是 Cilium：基于 eBPF，可以取代 kube-proxy，自带按连接的可观测（Hubble），和可选的阶段 5（eBPF）也对得上。没有直接选它是因为内存：Cilium 每个节点一个 agent 加一个 operator，三个节点合计大约多用 1 到 1.5 GB（这是按公开资料的粗估，没有实测），而内存预算里的余量约 6 GB，还没有被阶段 3 的监控实际占用过。所以先用 flannel 把集群、中间件、服务都放上去，量出实际的内存占用再决定。
 
 flannel 配上 k3s 内嵌的策略控制器已经能执行 NetworkPolicy，2d 的那一项不依赖换 CNI。
 
@@ -63,5 +63,5 @@ flannel 配上 k3s 内嵌的策略控制器已经能执行 NetworkPolicy，2d �
 
 按“后果”一节的约定，中间件第一次部署完、灌数据之前量了内存（设计文档 [2b-middleware.md](../design/2b-middleware.md) 第 10 节）。三个节点可分配合计约 24 Gi，空集群加全部中间件的 requests 已经承诺出去 13.1 Gi，剩约 10.9 Gi。还没上的监控、业务服务、Chaos Mesh 的预算合计 9 GB，放进去之后剩约 1.9 Gi。Cilium 估计多用 1 到 1.5 GB（仍然是公开资料的粗估），装上之后基本没有余量，agent-2 已经承诺了 62%。
 
-决定保留 flannel。放弃的是用 eBPF 取代 kube-proxy、Hubble 的按连接可观测，以及它和阶段 9 的衔接；NetworkPolicy 不受影响（k3s 内嵌的策略控制器）。重新评估的条件：宿主机加内存，或者监控的实际占用明显低于预算。
+决定保留 flannel。放弃的是用 eBPF 取代 kube-proxy、Hubble 的按连接可观测，以及它和阶段 5 的衔接；NetworkPolicy 不受影响（k3s 内嵌的策略控制器）。重新评估的条件：宿主机加内存，或者监控的实际占用明显低于预算。
 

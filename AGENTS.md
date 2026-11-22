@@ -18,7 +18,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 1. 读 `docs/PROGRESS.md`，确认当前阶段、上次做到哪、下一步是什么、有没有阻塞项。
 2. 读当前阶段的 `docs/plan/phase-N-*.md`，找到第一个未勾选的任务。
-3. 如果任务需要 MacBook 以外的设备（见 `docs/infra/hardware.md`），先提醒主人开机，不要假设设备在线。
+3. 如果任务需要开发机以外的设备（见 `docs/infra/hardware.md`），先提醒主人开机，不要假设设备在线。
 
 **进行中**
 
@@ -128,6 +128,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 
 ## 环境注意事项
 
-- 开发机是 macOS Apple Silicon，集群在 Ubuntu x86_64 上。镜像需要构建 `linux/amd64`（或多架构）。
+- 开发机是 macOS Apple Silicon（2026-11-21 起是 Mac mini，之前是 MacBook），集群在 Ubuntu x86_64 上。镜像需要构建 `linux/amd64`（或多架构）。
+- 开发机同时是压测的发压机：**k6 在跑的时候不在本机跑测试、lint、构建镜像**，正式的一轮之前先 `make down`。见 `docs/infra/hardware.md`。
 - 本机容器运行时是 OrbStack。
 - 拉取 GitHub 和 Docker 镜像经过 R2S 代理，超时先怀疑网络。

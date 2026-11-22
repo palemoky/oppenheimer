@@ -2,6 +2,7 @@
 # MySQL 备份的恢复演练：在 MacBook 上运行，对集群里一个实例的最新备份做一次真实的恢复，再和线上比对。
 #
 #   mysql-restore-drill.sh <release>      release：mysql-order-0、mysql-order-1、mysql-main
+#   BACKUP=keep-seed-10m mysql-restore-drill.sh <release>   不用最新的一份，指定某一份（时间戳或钉住的 keep-<名字>）
 #
 # 做什么：
 #   1. 在 mysql 命名空间起一个临时的 MySQL Pod（和线上同一个镜像，数据放 emptyDir，只读挂备份的 PVC）
@@ -191,14 +192,29 @@ EOF
   kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=10m >/dev/null
 
   # 这个实例最新的一份备份：只认符合时间戳命名的目录（.tmp-* 不算），按名字排序取最后一个。
+  # BACKUP=<目录名> 指定某一份：时间戳，或者钉住的 keep-<名字>（middleware.sh mysql-backup-pin）。
   local dir
-  dir="$(kubectl -n "$NS" exec "$POD" -c mysql -- bash -c \
-    "ls -1d /backup/$rel/[0-9]*Z 2>/dev/null | grep -E '/[0-9]{8}T[0-9]{6}Z\$' | sort | tail -n 1" || true)"
-  if [[ -z "$dir" ]]; then
-    echo "no backup found under /backup/$rel (run: make middleware-backup)" >&2
-    exit 1
+  if [[ -n "${BACKUP:-}" ]]; then
+    case "$BACKUP" in *[!A-Za-z0-9_-]*)
+      echo "BACKUP must be a directory name (a timestamp or keep-<name>), got '$BACKUP'" >&2
+      exit 2
+      ;;
+    esac
+    dir="/backup/$rel/$BACKUP"
+    if ! kubectl -n "$NS" exec "$POD" -c mysql -- test -f "$dir/meta"; then
+      echo "no backup at $dir (list them: scripts/cluster/middleware.sh mysql-backup-list)" >&2
+      exit 1
+    fi
+    echo "==> backup: $dir"
+  else
+    dir="$(kubectl -n "$NS" exec "$POD" -c mysql -- bash -c \
+      "ls -1d /backup/$rel/[0-9]*Z 2>/dev/null | grep -E '/[0-9]{8}T[0-9]{6}Z\$' | sort | tail -n 1" || true)"
+    if [[ -z "$dir" ]]; then
+      echo "no backup found under /backup/$rel (run: make middleware-backup)" >&2
+      exit 1
+    fi
+    echo "==> latest backup: $dir"
   fi
-  echo "==> latest backup: $dir"
   kubectl -n "$NS" exec "$POD" -c mysql -- cat "$dir/meta" | sed 's/^/    /'
   local meta_gtid
   meta_gtid="$(kubectl -n "$NS" exec "$POD" -c mysql -- sed -n 's/^gtid_executed=//p' "$dir/meta")"

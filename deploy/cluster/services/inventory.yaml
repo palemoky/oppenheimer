@@ -2,7 +2,11 @@
 # 镜像的仓库和 tag 由 scripts/cluster/services.sh 传入。没有 gRPC 下游，只有入站（9082）过边车。
 replicas: 2
 ports: {http: 8082, grpc: 9082}
-resources: {cpu: 200m, memoryRequestMi: 64, memoryLimitMi: 512}
+# CPU requests 按实测定（2026-11-22，算法和为什么乘 0.9 见 gateway.yaml）：2 个副本、混合读写 1526 请求/秒时每个 Pod
+# 业务容器 0.47 到 0.52 核、边车 0.29 到 0.30 核。
+resources: {cpu: 450m, memoryRequestMi: 64, memoryLimitMi: 512}
+istio:
+  proxy: {cpu: 250m, memory: 64Mi, memoryLimit: 192Mi}   # 三项要一起写，原因见 gateway.yaml
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092

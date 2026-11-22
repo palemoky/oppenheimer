@@ -6,5 +6,7 @@ maxmemory: 128mb
 maxmemoryPolicy: allkeys-lru
 storage: 1Gi
 resources:
-  requests: {cpu: 50m, memory: 192Mi}
+  # CPU 按实测定（2026-11-22，3b 的记录 round-8-cpu-requests.md 第 5 节；算法和为什么乘 0.9 见 deploy/cluster/services/gateway.yaml）：
+  # 混合读写 1526 请求/秒时每个主库用 0.12 到 0.13 核。redis-gate 的 100m 对实测的 0.125 核已经在这个比例上，没有动。
+  requests: {cpu: 100m, memory: 192Mi}
   limits: {memory: 192Mi}

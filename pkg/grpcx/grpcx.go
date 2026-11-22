@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"runtime/debug"
 	"time"
@@ -215,7 +216,24 @@ const SidecarMargin = 500 * time.Millisecond
 // 同一跳在 Envoy 边车的出站路由上也有时限（deploy/envoy/）。d 应当等于边车的那个数加上 SidecarMargin：
 // 边车先超时，慢下游才会被摘除；进程里的保证边车不在或出问题时调用方仍然按时放手。
 func WithHopTimeout(d time.Duration) grpc.DialOption {
+	return WithHopTimeouts(d, nil)
+}
+
+// WithHopTimeouts 和 WithHopTimeout 一样，另外给个别方法单独的时限：perMethod 的键是完整的方法名
+// （生成代码里的 XxxService_Yyy_FullMethodName，形如 "/包.服务/方法"），没列出的方法用 d。
+//
+// 用在同一个下游的不同方法预算不一样的时候（ADR-0020 的 2026-11-21 补充）：同步路径上的调用按
+// “用户等不等得起”定时限，异步路径上的（消费者发起、失败了会重试）按“区分慢和坏”定，后者可以长得多。
+// 边车那一侧要有按路径匹配的路由与之对应，每个数仍然是“那条路由的 timeout 加 SidecarMargin”。
+//
+// 不能靠叠两个 WithHopTimeout 实现：两个拦截器各套一层 ctx，生效的总是短的那个。
+func WithHopTimeouts(d time.Duration, perMethod map[string]time.Duration) grpc.DialOption {
+	perMethod = maps.Clone(perMethod)
 	return grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		d := d
+		if m, ok := perMethod[method]; ok {
+			d = m
+		}
 		// context.WithTimeout 本来就取父 ctx 的截止时间和新时限中更早的一个。
 		ctx, cancel := context.WithTimeout(ctx, d)
 		defer cancel()

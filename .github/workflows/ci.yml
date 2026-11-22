@@ -82,6 +82,14 @@ jobs:
       - name: Coverage summary
         working-directory: ${{ matrix.module }}
         run: go tool cover -func=coverage.out | tail -n 1
+      - name: Upload coverage to Codecov
+        # 每个模块各传一份，Codecov 按提交合并。上传失败不算 CI 失败：覆盖率只是参考数字。
+        uses: codecov/codecov-action@v7
+        with:
+          files: ${{ matrix.module }}/coverage.out
+          disable_search: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   # 端到端测试：启动四个服务，通过网关验证主流程和并发场景下的一致性。
   e2e:

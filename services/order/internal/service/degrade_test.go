@@ -268,6 +268,62 @@ func TestLandingHealthRejectsAdmission(t *testing.T) {
 	}
 }
 
+// 在途的落库一起超时（依赖停顿了一下）不打开落库健康：失败要持续够 LandingFailureSpan 才算依赖坏了。
+// 集群上落库是上百个并发在途，光数次数的话一次停顿就凑满了“连续 N 次”，受理被白白拒绝（3b 第 3 轮）。
+func TestLandingHealthIgnoresBurstOfFailures(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	svc := degradeService(t, e, 3, func(_ *Deps, c *Config) { c.LandingFailureSpan = time.Second })
+	u0, _ := usersByDB(t, e)
+
+	var queued []*orderv1.Order
+	for i := range 5 {
+		o, err := submitWith(t, svc, u0, "q"+string(rune('a'+i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued = append(queued, o)
+	}
+	failAll := func() {
+		t.Helper()
+		for _, o := range queued {
+			e.inv.inject("Reserve", fault{err: errTimeout})
+			if err := landWith(t, e, svc, o.GetOrderId()); err == nil || kafkax.IsPermanent(err) {
+				t.Fatalf("land with inventory down: err = %v, want a retryable error", err)
+			}
+		}
+	}
+
+	// 同一刻的 5 次失败：次数够了，时间不够，不打开，受理照常。
+	failAll()
+	if got := svc.landing[0].b.State(); got != breaker.Closed {
+		t.Fatalf("landing breaker = %s after a burst of failures at one instant, want closed", got)
+	}
+	if _, err := submitWith(t, svc, u0, "during-burst"); err != nil {
+		t.Fatalf("submit right after a burst of landing failures: %v", err)
+	}
+
+	// 停顿过去，下一次落库成功，这一串失败就不算了：一秒之后再来一批同时的失败，仍然不打开。
+	if err := landWith(t, e, svc, queued[0].GetOrderId()); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(time.Second)
+	queued = queued[1:]
+	failAll()
+	if got := svc.landing[0].b.State(); got != breaker.Closed {
+		t.Fatalf("landing breaker = %s after a second burst separated by a success, want closed", got)
+	}
+
+	// 依赖真的坏了：消费者重试，一秒之后还在失败，打开。
+	e.clock.Advance(time.Second)
+	failAll()
+	if got := svc.landing[0].b.State(); got != breaker.Open {
+		t.Fatalf("landing breaker = %s after failures lasting a second, want open", got)
+	}
+	_, err := submitWith(t, svc, u0, "rejected")
+	wantErr(t, err, codes.FailedPrecondition, errx.ReasonOrderLandingUnavailable)
+}
+
 // 落库健康打开期间，什么依赖都没碰就结束的消息不能把它关上：
 // 被 sweeper 置为失败的订单重试结束、占用已经不在的消息被丢弃。
 func TestLandingHealthIgnoresMessagesThatExerciseNothing(t *testing.T) {

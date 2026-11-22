@@ -1,7 +1,9 @@
 # orderindex 服务（设计文档 2c）。release 名 orderindex。没有 gRPC 下游，只有入站（9084）过边车。
 replicas: 2
 ports: {http: 8084, grpc: 9084}
-resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
+# CPU requests 按实测定（2026-11-22，算法见 gateway.yaml）：每个 Pod 混合读写 1526 请求/秒时 0.12 到 0.13 核。
+# 边车 0.04 核，用网格的默认值 50m。
+resources: {cpu: 150m, memoryRequestMi: 64, memoryLimitMi: 512}
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092

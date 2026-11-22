@@ -233,18 +233,28 @@ func newClient(cfg Config) (client redis.UniversalClient, minIdle int, err error
 	default:
 		client = redis.NewClient(opts.Simple())
 	}
+	if err := instrument(client); err != nil {
+		return nil, 0, err
+	}
+	return client, opts.MinIdleConns, nil
+}
+
+// instrument 给客户端装上链路和指标。三种模式都装在最外层的客户端上。
+func instrument(client redis.UniversalClient) error {
 	// 链路和指标（设计文档 1d 的 8.4）：每条命令一个 CLIENT span，名字是命令名；连接池的统计进指标。
 	// 不记命令的内容：key 里有用户号和幂等键，Lua 脚本很长。
 	// 没有父 span 的命令（后台循环发的）由采样器丢掉，见 otelx 的 dropRootClient。
 	if err := redisotel.InstrumentTracing(client, redisotel.WithDBStatement(false), redisotel.WithDialFilter(true),
 		// 不记调用位置：它要每条命令做一次 runtime.Caller，而位置总是落在我们自己的封装里，没有信息量。
 		redisotel.WithCallerEnabled(false)); err != nil {
-		return nil, 0, fmt.Errorf("redisx: instrument tracing: %w", err)
+		return fmt.Errorf("redisx: instrument tracing: %w", err)
 	}
 	if err := redisotel.InstrumentMetrics(client); err != nil {
-		return nil, 0, fmt.Errorf("redisx: instrument metrics: %w", err)
+		return fmt.Errorf("redisx: instrument metrics: %w", err)
 	}
-	return client, opts.MinIdleConns, nil
+	// 每条命令的耗时（db.client.operation.duration），见 metrics.go。
+	addCommandMetrics(client, defaultCommandMetrics)
+	return nil
 }
 
 func cmp(v, def time.Duration) time.Duration {

@@ -1,0 +1,8 @@
+# 列表在 Helm 里是整个替换：三条 DSN 重写，只改库名（见 common.yaml）。节点号照常从自己的库里租。
+expandEnv:
+  - name: MYSQL_DSNS
+    value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-primary.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-primary.mysql.svc:3306)/e2e_order_db_1"
+  - name: MYSQL_REPLICA_DSNS
+    value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/e2e_order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/e2e_order_db_1"
+  - name: ARCHIVE_DSN
+    value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/e2e_order_archive_db"

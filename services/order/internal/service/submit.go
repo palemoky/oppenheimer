@@ -51,9 +51,12 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 	defer cancel()
 
 	userID := req.GetUserId()
-	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。两项检查都在 Hold 之前：被拒绝时什么都没有发生。
+	// 不受理落不了库的订单（设计文档 1d 的 6.2、6.5）。三项检查都在 Hold 之前：被拒绝时什么都没有发生。
 	if s.swAdmission.Off() {
 		return nil, admissionFailed(ctx, errAdmissionOff)
+	}
+	if s.gateMemoryFull() {
+		return nil, admissionFailedAs(ctx, admissionGateMemoryFull, errGateFull)
 	}
 	settle, err := s.admitLanding(userID)
 	if err != nil {
@@ -174,8 +177,8 @@ func (s *Service) hold(ctx context.Context, req stockgate.HoldRequest) (stockgat
 	return res, nil
 }
 
-// warmUpTimeout 是一次合并后的预热调用的时限。到 inventory 的连接上另有 1 秒的按跳时限
-// （Envoy 边车的路由超时 1 秒，进程里的 inventoryHopTimeout 比它长一截做兜底），实际生效的是其中最短的那个。
+// warmUpTimeout 是一次合并后的预热调用的时限。到 inventory 的连接上 WarmUp 另有 1 秒的按跳时限
+// （Envoy 边车的路由超时 1 秒，进程里的 inventoryHopTimeout 比它长一截做兜底；Reserve 的是 3 秒，见 main.go），实际生效的是其中最短的那个。
 const warmUpTimeout = 3 * time.Second
 
 // warmUp 请库存服务把这些 SKU 装进闸门，同一组 SKU 的并发调用合并成一次。

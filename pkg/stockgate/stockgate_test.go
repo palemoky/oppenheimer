@@ -1018,3 +1018,22 @@ func TestHoldAndClaimConcurrent(t *testing.T) {
 		t.Fatalf("heartbeat = %d, %v; want %d", v, ok, maxBeat.Load())
 	}
 }
+
+// Memory 读的是整个实例的数：已用内存总是正的，上限没设时是 0。
+func TestMemory(t *testing.T) {
+	e := newEnv(t)
+	used, limit, err := e.gate.Memory(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used <= 0 || limit < 0 {
+		t.Errorf("Memory = used %d, limit %d; want used > 0 and limit >= 0", used, limit)
+	}
+	want, err := e.rdb.ConfigGet(t.Context(), "maxmemory").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strconv.FormatInt(limit, 10); want["maxmemory"] != got {
+		t.Errorf("limit = %s, want the instance's maxmemory %s", got, want["maxmemory"])
+	}
+}

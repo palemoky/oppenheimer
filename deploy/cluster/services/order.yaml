@@ -1,7 +1,11 @@
 # order 服务（设计文档 2c）。release 名 order。
 replicas: 2   # 节点号各自从库里租（ADR-0028）
 ports: {http: 8081, grpc: 9081}
-resources: {cpu: 300m, memoryRequestMi: 96, memoryLimitMi: 768}
+# CPU requests 按实测定（2026-11-22，算法、三个用处、为什么乘 0.9 见 gateway.yaml）：2 个副本、混合读写 1526 请求/秒时每个 Pod
+# 业务容器 0.75 到 0.78 核、边车 0.28 到 0.29 核。普通下单 100 单/秒（写入拐点的八成）时是 0.54 加 0.17，比它低。
+resources: {cpu: 700m, memoryRequestMi: 96, memoryLimitMi: 768}
+istio:
+  proxy: {cpu: 250m, memory: 64Mi, memoryLimit: 192Mi}   # 三项要一起写，原因见 gateway.yaml
 
 config:
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
@@ -9,6 +13,26 @@ config:
   CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379
   # 连 Service 名加 gRPC 端口，出站被自己的边车截获（规则在 deploy/cluster/mesh/inventory.yaml）。
   INVENTORY_ADDR: inventory:9082
+  # 3b 第 2 轮之前的对照（2026-11-20）：落库的并发从每分区 8 提到 24，连接池跟着从每库 25 提到 50
+  # （两个副本合计每个分片 100 个连接，MySQL 的上限是 200）。结果见 docs/notes/3b-rounds/。
+  SUBMIT_CONCURRENCY: "24"
+  # 连接池从 50 收到 40（2026-11-22，3b 扩容系数那一轮的记录第 4.3 节）。每个订单库的 max_connections 是 200，
+  # 连到它的 order 的 Pod 数最多是“HPA 的上限 + 滚动时多出来的 1 个”。定这个数时上限是 3：4 × 40 = 160，
+  # 剩下 40 给复制、CDC、监控、对账工具和人。原来的 50 在 HPA 上限是 4 时合计正好 200，一点余量没有。
+  # 同一天上限又收到 2（见下面的 autoscaling），按公式 50 也放得下了；没有改回去：40 在 2 个副本上压测过够用
+  #（round-7-read-modes.md 第 4 节），上限再回到 3 时不用跟着动。
+  # HPA 的上限（下面的 autoscaling.maxReplicas）或 max_connections（deploy/cluster/mysql/mysql-order-*.yaml）变了，
+  # 这个数要跟着重算：(maxReplicas + 1) × 连接池 ≤ max_connections − 40。
+  # 代价：启动时 checkSubmitConcurrency 会警告（24 × 4 个分区 = 96，大于 40 × 2 个库 = 80）。它说的是
+  # “一个副本独占全部分区时落库会在连接池上排队”，只在另一个副本不在时成立；两个副本各拿两个分区时
+  # 每个库的在途落库是 24 个上下，加读名额 16 个，正好贴着 40。压测时看连接池的等待指标。
+  MYSQL_MAX_OPEN_CONNS: "40"
+  # 受理端背压的队列上限（ADR-0011）要取“落库速率 × 允许的等待”。代码里的默认值 10000 是按本机每秒落 400 单以上定的；
+  # 这套环境过载时只落 100 到 215 单/秒（3b 第 1、2 轮），1 万单要排 50 到 100 秒，贴着甚至超过回收的宽限期（60 秒）：
+  # 第 1 轮有 608 个受理了的订单等不到落库被回收，第 2 轮落库延迟的 p99 是 55 秒。
+  # 2500 = 125 单/秒（持续能落的速率）× 20 秒。按量到的最慢和最快的落库速率，最后一个被受理的订单要等 12 到 25 秒，
+  # 都短于 ADMIT_MAX_WAIT（30 秒）和宽限期。落库速率变了（换盘、加分片）这个数要跟着重算。
+  ADMIT_MAX_QUEUE: "2500"
 
 # 两个订单分片各有主库和从库（MYSQL_REPLICA_DSNS 的个数和顺序与 MYSQL_DSNS 一一对应）；冷库在共享实例上。
 secretEnv:
@@ -24,13 +48,16 @@ expandEnv:
     value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"
   # 不设 WORKER_ID：节点号启动时从自己的库里租（ADR-0028），每个副本各一个。
 
-# 按请求速率伸缩，2 到 4 个副本，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 按请求速率伸缩，CPU 兜底（设计文档 3a 的 3.8）。上面的 replicas 不再起作用。
+# 上限 2，和下限相同（2026-11-22，从 4 到 3 再到 2），来历同 gateway.yaml；它还决定上面连接池的预算。
 # 查询数的是 order 收到的 gRPC 请求（受理和查询）。它不包含消费 Kafka 落库的那一半工作：
 # 落库的量跟着受理走，但落库卡在下游时请求速率和 CPU 都不涨，那种情况要按消费延迟伸缩（KEDA 的 kafka 触发器），没有做。
-# perReplica 的来历（设计文档第 8 节“第 7 步”）：探针的请求组合（查询和下单约 4 比 1）下每个请求每秒约 2.3 毫核
-#（服务加边车，含落库），每个 Pod 的 CPU requests 是 350m，70% 对应 108 请求/秒；取 100。下单的占比变了这个数就不准，3b 压测后重定。
+# perReplica 的来历（2026-11-22 重定，记录 round-8-cpu-requests.md）：每个 Pod 的 CPU requests 是 950m（700 加边车 250），
+# 70% 是 665m。每个 gRPC 请求的 CPU（服务加边车，含落库）：混合读写（查询和受理约 5 比 1）约 3.1 毫核·秒，
+# 普通下单（约 2.4 比 1）约 4.2。按便宜的组合算 665m 对应 215 请求/秒，取 200；下单占比高时由 CPU 那一项先触发。
 autoscaling:
   enabled: true
+  maxReplicas: 2
   requestRate:
     query: sum(rate(rpc_server_call_duration_seconds_count{k8s_namespace_name="oppenheimer",service_name="order"}[1m]))
-    perReplica: 100
+    perReplica: 200

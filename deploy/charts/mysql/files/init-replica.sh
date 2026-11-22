@@ -152,6 +152,9 @@ start_temp "$D" "$W/data.sock" --skip-networking
 # GET_SOURCE_PUBLIC_KEY=1：caching_sha2_password 在非 TLS 连接上要拿主库的公钥，和本机一致（不校验主库身份，集群内部可接受）。
 # SET PERSIST 写进数据目录里的 mysqld-auto.cnf，重启后仍然只读；不能写进启动参数，官方镜像第一次初始化会失败，
 # 而且主从是同一份 Pod 模板。复制线程不受 super_read_only 的限制。
+# 落盘方式：从库按 values 的 replicaDurability（lib.sh 的 durability_want）。同样用 SET PERSIST，理由同上。
+# 显式写两个值，不依赖默认值：这份数据是从主库克隆来的，mysqld-auto.cnf 上面已经删了，但不靠这一点。
+dur="$(durability_want replica)"
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql --no-defaults -S "$W/data.sock" -uroot <<SQL
 RESET REPLICA ALL;
 CHANGE REPLICATION SOURCE TO
@@ -159,6 +162,8 @@ CHANGE REPLICATION SOURCE TO
   SOURCE_USER = 'repl', SOURCE_PASSWORD = '$REPL_PASSWORD',
   SOURCE_AUTO_POSITION = 1, GET_SOURCE_PUBLIC_KEY = 1,
   SOURCE_CONNECT_RETRY = 10, SOURCE_RETRY_COUNT = 1000000;
+SET PERSIST innodb_flush_log_at_trx_commit = ${dur% *};
+SET PERSIST sync_binlog = ${dur#* };
 SET PERSIST read_only = ON;
 SET PERSIST super_read_only = ON;
 SQL

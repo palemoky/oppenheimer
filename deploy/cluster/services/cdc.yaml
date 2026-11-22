@@ -3,7 +3,8 @@
 replicas: 1
 strategy: Recreate
 ports: {http: 8085, grpc: 0}
-resources: {cpu: 100m, memoryRequestMi: 64, memoryLimitMi: 512}
+# CPU requests 按实测定（2026-11-22，算法见 gateway.yaml）：混合读写 1526 请求/秒、普通下单 100 单/秒时都是 0.14 核上下。
+resources: {cpu: 150m, memoryRequestMi: 64, memoryLimitMi: 512}
 service: {enabled: false}
 pdb: {enabled: false}
 # 没有任何 gRPC（出站只有 MySQL 和 Kafka，都在 istio.excludeOutboundPorts 里），不注入边车：Pod 上是 inject: "false"。

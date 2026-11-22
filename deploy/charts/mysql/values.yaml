@@ -8,6 +8,14 @@ replicas: 2
 # 人工切换的最后一步是改这里再 helm upgrade：只改 Service，不重启 Pod。
 primaryOrdinal: 0
 
+# 从库提交时的落盘方式。主库永远是 strict，不受这里影响；落盘方式跟着实例当前的角色走，不跟着序号
+# （files/durability.sh，决定和取舍见 ADR-0032）。
+#   strict   innodb_flush_log_at_trx_commit=1、sync_binlog=1：每次提交 redo 和 binlog 各刷一次盘。
+#   relaxed  innodb_flush_log_at_trx_commit=2、sync_binlog=0：提交时只写到操作系统，约每秒刷一次。
+#            mysqld 被杀、Pod 被删都不丢（数据在页缓存里）；从库所在的节点掉电或内核崩溃时，
+#            它的数据和它自己的 binlog 可能互相对不上，这个从库必须从主库重建（docs/infra/mysql-switchover.md 第三节）。
+replicaDurability: strict
+
 # 有状态中间件的优先级（deploy/cluster/middleware/priorityclass.yaml，由 middleware.sh 先建好）。
 # 内存 requests 等于 limits 但 CPU 不设 limits，QoS 是 Burstable 而不是 Guaranteed，靠优先级排在业务服务之后被驱逐。
 priorityClassName: ""
@@ -29,6 +37,13 @@ cdc:
 mysqld:
   maxConnections: 200
   innodbBufferPoolSize: 512M
+  # binlog 保留多久（秒）。MySQL 的默认值是 30 天，2026-11-22 以前没有配过：长稳 125 单/秒时 mysql-main 每小时写
+  # 1.4 GiB 的 binlog、订单库每个实例 0.83 GiB（从库开着 log_replica_updates，也写一份），30 天放不下
+  # （3b 的记录 round-9-soak.md 第 3 节）。定 1 天：同一个节点上三个实例加一个 broker 的稳态约 93 GiB，盘放得下。
+  # 下限由谁要读旧的 binlog 决定：CDC 停了超过这个时间，位点就被清掉，要重做全量（设计文档 1c 的 4.5、4.6）；
+  # CDC 的全量读也要在这个时间内读完。从库断开超过这个时间要重新 CLONE（切换手册本来就是一律重建）。
+  # 备份是 mysqldump 的逻辑备份，恢复不依赖 binlog。
+  binlogExpireLogsSeconds: 86400
 
 resources:
   memory: 1Gi
@@ -63,6 +78,8 @@ backup:
   activeDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
-  # mysqldump 加 zstd，内存用量很小；dump 是流式的，不在内存里攒。
-  memory: 256Mi
+  # 原来写的是“mysqldump 加 zstd，内存用量很小；dump 是流式的”，给了 256Mi。库里只有几万行时成立；
+  # 2026-11-18 灌到每个分片 500 万单之后，两个订单库的备份 Job 开始十几秒就被 OOMKilled（mysql-main 的没有）。
+  # 实际用量见设计文档 3b 第 6 节。
+  memory: 1Gi
   cpu: 100m
