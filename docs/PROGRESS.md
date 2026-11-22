@@ -23,6 +23,7 @@
 - **3b 的阶段笔记写了：`docs/notes/3b-load-testing.md`**（541 行，按主题组织，结构同 3a 的笔记；Sonnet 子 Agent 写的，主会话验收）。验收读了第 0 到 3 节和第 10 到 12 节，**第 4 到 9 节和第 13 节没有逐行读**，主人读的时候发现和记录对不上的以记录为准。它补的“通用知识”段落面试前要对照官方文档（它自己最没把握的：`innodb_flush_log_at_trx_commit=0` 丢什么、`VirtualService` 第一条匹配生效、B+ 树层数、cgroup 里页缓存和匿名内存的回收）。有一条考点只写了一半（时限按路径定的同步那一半，材料里没有展开）。
 - **写笔记时查出容量结论里的几处错，已改**（笔记第 12 节有清单）：`mysql-main` 没有从库（原来写成一主一从，集群上核对过只有一个 Pod）；“一单是入口上 5.4 个请求”是加退避之前的数，改成 4 到 5 个；受理 p99 的“94 到 191”分开写成同样配置的 94 到 158 和调完 requests 之后的 188、191；“换盘到约 240 单/秒”补了限定（那一次下游欠着活，240 是上界）；补了第 1 轮 608 个受理了没落库的订单。round-9 结论一节的“12 MiB”改成约 20。`GOALS.md` 不受影响。没有改的一处：设计第 6 节备份表的表头“从从库读”对 `mysql-main` 不适用。
 - **PR #16 上 `746d9fe` 的 CI 29 项全部通过**（核对过这次运行的提交号）：`test (./services/order)` 3 分 19 秒、e2e 4 分 01 秒，都在以往的范围内；`test (./services/recon)` 1 分 50 秒，上次 9 分 20 秒的反常没有再出现，不用查了。
+- **PR #16 上 `0db0499`（阶段笔记等，只改文档）的 CI：第一次失败 1 项，重跑那一个 job 后 29 项全部通过**（`test (./services/order)` 重跑 4 分 25 秒）。失败的是 `services/order/internal/service` 的 `TestLandConcurrentRedeliveredShuffled`：落库时认领闸门占用的 Redis 调用超过 `gateTimeout`（300 毫秒，`protect.go`），连续几次之后 `stock-gate` 的熔断器打开，后面的调用被直接拒绝；这条测试有意不重试，handler 返回任何错误都判失败（`land_concurrent_test.go` 里 `deliverConcurrently` 的注释）。日志里没有数据竞争，没有状态或库存的断言失败，全是超时和它引出的熔断；同样的代码在 `746d9fe` 上通过。**判断是 CI 机器上 Redis 那一下慢了，不是并发缺陷；这是从日志推断的，没有在本机复现，也没有查 Redis 为什么会慢到 300 毫秒。** **主人 2026-11-22 定：暂时不改这条测试。** 再出现时把这次的记录一起拿给主人看（改法的候选：给这组并发落库测试放宽闸门的时限，和 `TestRateLimitCreateOrder` 那次同一类处理）。
 - **下一步（新会话）**：3c（SLO 与告警）。先读计划文件的 3c 一节（3b 各轮留给它的告警已经写在条目里）和 `docs/notes/3b-capacity.md`（SLO 的目标值来自这里的基线），写设计文档给主人确认，再动工。PR #16 还是 draft，标成 ready 和合并由主人定；3c 的分支从 `phase-3b` 开。
 
 ### 3b 容量结论（2026-11-22 下午，UTC 08:50 之后；在上一段之前）
@@ -741,6 +742,8 @@
 - `make run` 启动六个服务（订单库是 4 个时加 `ORDER_DBS=4`；gateway 8080、order 8081、inventory 8082、payment 8083、orderindex 8084、cdc 8085；gRPC 端口是 HTTP 端口加 1000），`make seed` 写入示例 SKU（1001 到 1003 属于商家 1，2001 属于商家 2），`make e2e` 在独立的 `e2e_*` 库上跑端到端测试。日志在 `./tmp/`。
 
 ## 阻塞项与待确认
+
+- **`TestLandConcurrentRedeliveredShuffled` 在 CI 上偶发失败过一次**（2026-11-22，`0db0499`，重跑通过）：主人定了暂时不改，再出现时再说，见“3b 收尾”一段。
 
 - （已定）1 亿数据量：主人 2026-11-22 定了不做，理由在 `docs/notes/3b-capacity.md` 第 8 节。
 
