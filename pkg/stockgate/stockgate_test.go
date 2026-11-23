@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1035,5 +1036,280 @@ func TestMemory(t *testing.T) {
 	}
 	if got := strconv.FormatInt(limit, 10); want["maxmemory"] != got {
 		t.Errorf("limit = %s, want the instance's maxmemory %s", got, want["maxmemory"])
+	}
+}
+
+// ---------- 按队列计数的背压（HoldRequest.Queue） ----------
+
+// holdIn 在 at 时刻受理一件 SKU 1，排进队列 queue。
+func (e *env) holdIn(queue string, at time.Time, backlog stockgate.BacklogLimit) stockgate.HoldResult {
+	e.t.Helper()
+	id := e.nextID.Add(1)
+	res, err := e.gate.Hold(e.t.Context(), stockgate.HoldRequest{
+		OrderID: id, UserID: 7, IdempotencyKey: "k" + strconv.FormatInt(id, 10), RequestHash: []byte("h"),
+		Items: []stockgate.Item{item(1, 1)}, Now: at, IdempotencyTTL: ttl, Backlog: backlog, Queue: queue,
+	})
+	if err != nil {
+		e.t.Fatalf("hold order %d: %v", id, err)
+	}
+	return res
+}
+
+// queueLen 返回队列 queue 的索引里有几个成员。
+func (e *env) queueLen(queue string) int64 {
+	e.t.Helper()
+	n, err := e.rdb.ZCard(e.t.Context(), e.prefix+"gate:holds:q:"+queue).Result()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
+// 队列长度上限按队列各数各的：一条满了只拒绝排进它的，别的队列照常受理。
+// 占用离开队列的四条路（认领、撤销、回收、归还）都把它从这条队列里拿掉，空出位置。
+func TestHoldQueueLimitPerQueue(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	limit := stockgate.BacklogLimit{MaxQueue: 2}
+	now := time.Now()
+
+	var q0 []int64
+	for i := range 2 {
+		res := e.holdIn("0", now, limit)
+		if res.Outcome != stockgate.Held {
+			t.Fatalf("queue 0 hold %d: %+v", i, res)
+		}
+		q0 = append(q0, res.OrderID)
+	}
+	if res := e.holdIn("0", now, limit); res.Outcome != stockgate.Backlogged || res.Rule != stockgate.BacklogQueue || res.Queued != 2 {
+		t.Fatalf("queue 0 is full: got %+v, want Backlogged by the queue rule with 2 queued", res)
+	}
+	// 全部占用已经有 2 个（等于上限），但它们都在队列 0 里：队列 1 不受影响。
+	var q1 []int64
+	for i := range 2 {
+		res := e.holdIn("1", now, limit)
+		if res.Outcome != stockgate.Held {
+			t.Fatalf("queue 1 hold %d while queue 0 is full: %+v", i, res)
+		}
+		q1 = append(q1, res.OrderID)
+	}
+	if res := e.holdIn("1", now, limit); res.Outcome != stockgate.Backlogged {
+		t.Fatalf("queue 1 is full: got %+v", res)
+	}
+	e.assertStock(1, 96, 4)
+
+	// 认领。
+	if !e.claim(q0[0], now) {
+		t.Fatal("claim failed")
+	}
+	if n := e.queueLen("0"); n != 1 {
+		t.Fatalf("queue 0 has %d after a claim, want 1", n)
+	}
+	// 撤销（发消息失败）。
+	if ok, err := e.gate.Abort(t.Context(), q0[1]); err != nil || !ok {
+		t.Fatalf("abort: %v %v", ok, err)
+	}
+	// 回收（未认领超时）。
+	if r, err := e.gate.ReturnIfUnclaimed(t.Context(), q1[0]); err != nil || r != stockgate.ReapReturned {
+		t.Fatalf("reap: %v %v", r, err)
+	}
+	// 归还（没有先认领就归还，正常流程里不会发生，但索引也要跟着清）。
+	if ok, err := e.gate.Return(t.Context(), q1[1]); err != nil || !ok {
+		t.Fatalf("return: %v %v", ok, err)
+	}
+	if a, b := e.queueLen("0"), e.queueLen("1"); a != 0 || b != 0 {
+		t.Fatalf("queues have %d and %d members after all holds left, want 0 and 0", a, b)
+	}
+	for _, q := range []string{"0", "1"} {
+		if res := e.holdIn(q, now, limit); res.Outcome != stockgate.Held {
+			t.Fatalf("queue %s after it drained: %+v", q, res)
+		}
+	}
+}
+
+// 第二条（排队超时的个数）也按队列数：队列 0 里有超时的，只拒绝排进队列 0 的。
+func TestHoldStaleCountPerQueue(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	limit := stockgate.BacklogLimit{MaxWait: 30 * time.Second, MaxStale: 1}
+	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	for i := range 2 {
+		if res := e.holdIn("0", start, limit); res.Outcome != stockgate.Held {
+			t.Fatalf("old hold %d: %+v", i, res)
+		}
+	}
+	later := start.Add(31 * time.Second)
+	// 落库活着（心跳是新的）：这个测试只看第二条。
+	e.claim(999_999, later)
+	if res := e.holdIn("0", later, limit); res.Outcome != stockgate.Backlogged || res.Rule != stockgate.BacklogStale || res.Queued != 2 {
+		t.Fatalf("queue 0 has 2 stale holds: got %+v, want Backlogged by the stale rule", res)
+	}
+	if res := e.holdIn("1", later, limit); res.Outcome != stockgate.Held {
+		t.Fatalf("queue 1 has no stale holds: got %+v", res)
+	}
+}
+
+// 第三条不分队列：落库整个没有动静时，全部占用超过 MaxStale 就拒绝，不管新订单排进哪条队列。
+func TestHoldStalledIgnoresQueues(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	// 没有心跳。三笔占用分在三条队列里，每条队列自己都没有超过任何上限。
+	for _, q := range []string{"0", "1", "2"} {
+		if res := e.holdIn(q, start, stallLimit); res.Outcome != stockgate.Held {
+			t.Fatalf("probe in queue %s: %+v", q, res)
+		}
+	}
+	if res := e.holdIn("3", start, stallLimit); res.Outcome != stockgate.Backlogged || res.Rule != stockgate.BacklogStalled {
+		t.Fatalf("landing has no heartbeat and 3 holds are queued: got %+v, want Backlogged by the stalled rule", res)
+	}
+}
+
+// 索引里的残留：占用已经不在了（这里模拟旧版本的脚本认领了它，没有清索引），条目还留在队列的索引里。
+// 在 IndexHorizon 之内它仍然占着位置；过了之后 Hold 把它丢掉，位置空出来。不设 IndexHorizon 就一直占着。
+func TestHoldQueueIndexDropsLeftovers(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	limit := stockgate.BacklogLimit{MaxQueue: 1, IndexHorizon: 2 * time.Minute}
+	res := e.holdIn("0", start, limit)
+	if res.Outcome != stockgate.Held {
+		t.Fatalf("first hold: %+v", res)
+	}
+	// 旧版本的认领：从 gate:holds 移到 gate:claimed，不碰 gate:holds:q:0。
+	id := strconv.FormatInt(res.OrderID, 10)
+	if err := e.rdb.ZRem(t.Context(), e.prefix+"gate:holds", id).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rdb.HSet(t.Context(), e.prefix+"gate:hold:"+id, "claimed", "1").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if res := e.holdIn("0", start.Add(time.Minute), limit); res.Outcome != stockgate.Backlogged {
+		t.Fatalf("leftover within the horizon still counts: got %+v", res)
+	}
+	noHorizon := stockgate.BacklogLimit{MaxQueue: 1}
+	if res := e.holdIn("0", start.Add(time.Hour), noHorizon); res.Outcome != stockgate.Backlogged {
+		t.Fatalf("without a horizon the leftover stays: got %+v", res)
+	}
+	if res := e.holdIn("0", start.Add(2*time.Minute+time.Second), limit); res.Outcome != stockgate.Held {
+		t.Fatalf("leftover past the horizon is dropped: got %+v", res)
+	}
+	if n := e.queueLen("0"); n != 1 {
+		t.Fatalf("queue 0 has %d members, want 1 (the new hold only)", n)
+	}
+}
+
+// 不分队列的占用（Queue 为空）不进任何队列的索引，也不被队列的上限数进去；它自己仍然按全部占用数。
+func TestHoldWithoutQueueIsUnchanged(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	limit := stockgate.BacklogLimit{MaxQueue: 2}
+	now := time.Now()
+	for i := range 2 {
+		if res := e.holdIn("", now, limit); res.Outcome != stockgate.Held {
+			t.Fatalf("hold %d: %+v", i, res)
+		}
+	}
+	if res := e.holdIn("", now, limit); res.Outcome != stockgate.Backlogged || res.Queued != 2 {
+		t.Fatalf("got %+v, want Backlogged with 2 queued", res)
+	}
+	if res := e.holdIn("0", now, limit); res.Outcome != stockgate.Held {
+		t.Fatalf("queue 0 is empty: got %+v", res)
+	}
+	keys, err := e.rdb.Keys(t.Context(), e.prefix+"gate:holds:q:*").Result()
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("queue index keys %v (%v), want only queue 0", keys, err)
+	}
+}
+
+func TestHoldRejectsBadQueueName(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 100, 0)
+	for _, q := range []string{"a:b", "0 1", "队列", strings.Repeat("x", 33)} {
+		_, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: e.nextID.Add(1), UserID: 7, IdempotencyKey: "k", RequestHash: []byte("h"),
+			Items: []stockgate.Item{item(1, 1)}, Now: time.Now(), IdempotencyTTL: ttl, Queue: q,
+		})
+		if err == nil {
+			t.Errorf("queue %q: want error", q)
+		}
+	}
+}
+
+// 并发受理、同时并发认领时，每条队列的上限仍然严格成立，全部认领完之后索引是空的。
+func TestHoldQueueLimitPerQueueConcurrent(t *testing.T) {
+	e := newEnv(t)
+	e.load(1, 10000, 0)
+	const (
+		queues   = 4
+		maxQueue = 20
+	)
+	limit := stockgate.BacklogLimit{MaxQueue: maxQueue}
+	var (
+		mu   sync.Mutex
+		held []int64
+		over atomic.Int64
+	)
+	stop := make(chan struct{})
+	var watcher sync.WaitGroup
+	watcher.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for q := range queues {
+				if e.queueLen(strconv.Itoa(q)) > maxQueue {
+					over.Add(1)
+				}
+			}
+		}
+	})
+	parallel(400, func(i int) {
+		id := e.nextID.Add(1)
+		res, err := e.gate.Hold(t.Context(), stockgate.HoldRequest{
+			OrderID: id, UserID: int64(i + 1), IdempotencyKey: "c", RequestHash: []byte("h"),
+			Items: []stockgate.Item{item(1, 1)}, Now: time.Now(), IdempotencyTTL: ttl,
+			Backlog: limit, Queue: strconv.Itoa(i % queues),
+		})
+		if err != nil {
+			t.Errorf("hold: %v", err)
+			return
+		}
+		if res.Outcome != stockgate.Held {
+			return
+		}
+		mu.Lock()
+		held = append(held, id)
+		mu.Unlock()
+		// 一半的占用马上被认领，给后来的腾位置。
+		if i%2 == 0 {
+			if _, _, err := e.gate.Claim(t.Context(), id, time.Now()); err != nil {
+				t.Errorf("claim: %v", err)
+			}
+		}
+	})
+	close(stop)
+	watcher.Wait()
+	if n := over.Load(); n != 0 {
+		t.Fatalf("a queue was seen above its limit %d times", n)
+	}
+	if len(held) < queues*maxQueue {
+		t.Fatalf("held %d, want at least %d (every queue filled)", len(held), queues*maxQueue)
+	}
+	for _, id := range held {
+		if _, _, err := e.gate.Claim(t.Context(), id, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for q := range queues {
+		if n := e.queueLen(strconv.Itoa(q)); n != 0 {
+			t.Fatalf("queue %d has %d members after every hold was claimed", q, n)
+		}
+	}
+	if n, err := e.rdb.ZCard(t.Context(), e.prefix+"gate:holds").Result(); err != nil || n != 0 {
+		t.Fatalf("gate:holds has %d (%v), want 0", n, err)
 	}
 }

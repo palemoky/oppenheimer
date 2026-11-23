@@ -110,6 +110,9 @@ type HoldRequest struct {
 	IdempotencyTTL time.Duration
 	// Backlog 可选，零值表示不限制。
 	Backlog BacklogLimit
+	// Queue 可选：这笔占用排在哪一条落库队列里，见 BacklogLimit 的“按队列计数”。
+	// 空字符串表示不分队列，背压的前两条数的是全部占用。只能由数字、字母、连字符组成（它是键名的一部分）。
+	Queue string
 }
 
 // BacklogLimit 是受理端的背压。
@@ -141,8 +144,24 @@ type HoldRequest struct {
 //
 // 第二、三条都只在 MaxWait > 0 时检查。心跳由落库一方的时钟写、受理一方的时钟读，
 // 两边的时钟偏差要远小于 MaxWait。
+//
+// 按队列计数（HoldRequest.Queue 非空时）。落库不是一条队列：order.submit 有几个分区，各落各的。
+// 背压把受理的总速率压到等于落库的总速率，全部占用的个数顶在上限；但每个分区自己的进和出是相等的，
+// 没有东西把它的队列拉回平均值，各分区的长度自己漂，最坏时几乎全排在一个分区里。所以数全部占用的上限
+// 能保证的等待是“上限 ÷ 单个分区的落库速率”，不是“上限 ÷ 总速率”：2500 的上限、每个分区每秒落 44 单，
+// 量到的落库延迟 p99 是 57 秒（设计文档 3c 第 8 节“第 14 项的追查”第 3 条、ADR-0035、ADR-0036）。
+// 调用方把订单会进的分区作为 Queue 传进来之后，前两条只数这一条队列里的占用：
+// MaxQueue 是每条队列的上限（单个分区的落库吞吐 × 允许的等待），MaxStale 是每条队列里允许排队超时的个数。
+// 一条队列满了只拒绝会排进它的订单，别的队列照常受理；能吸收的突发是“队列数 × MaxQueue”。
+// 第三条不分队列：心跳只有一个，它回答的是“落库整个停了没有”。
+//
+// 每条队列的成员另记在 gate:holds:q:<Queue> 里（gate:holds 照旧记全部，回收任务和第三条读它），
+// 占用上记着它在哪条队列（字段 q），认领、归还、回收时按这个字段一起删掉。这是一份可以重建的索引，
+// 不是依据：一笔占用存不存在、认领没有，只看 gate:hold:<订单号> 和 gate:holds。
+// 索引里的条目可能比占用活得久（滚动发布时旧版本的实例认领了新版本受理的占用，它的脚本不认识这份索引），
+// 所以 Hold 在数之前先丢掉早于 IndexHorizon 的条目：未认领的占用过了宽限期就被回收，比那还老的只会是残留。
 type BacklogLimit struct {
-	// MaxQueue 是等待落库的占用数上限，0 表示不限制。
+	// MaxQueue 是等待落库的占用数上限，0 表示不限制。Queue 非空时是每条队列的上限。
 	MaxQueue int64
 	// MaxWait 是允许的排队时长，0 表示不检查。
 	MaxWait time.Duration
@@ -150,6 +169,10 @@ type BacklogLimit struct {
 	// 以及落库没有动静时队列里最多容忍的占用个数（探测订单的数量，可以多放进一个）。
 	// 取 0 时落库没有动静就只放进一个探测订单，不会因为没有心跳而永远关闭。
 	MaxStale int64
+	// IndexHorizon 只在 Queue 非空时用：每条队列的索引里早于 Now - IndexHorizon 的条目当成残留丢掉。
+	// 应取回收的宽限期的两倍以上（要长于“宽限期 + 回收任务的间隔”，否则会把还在排队的占用从计数里漏掉）。
+	// 0 表示不清理。
+	IndexHorizon time.Duration
 }
 
 // HoldResult 是 Hold 的结果。
@@ -189,7 +212,10 @@ const (
 // 心跳只由 Claim 写，Hold 只读它：受理成功不能算作落库活着。
 //
 // ARGV: 前缀, 订单号, 用户, 幂等键, 请求哈希, 幂等键保留毫秒数, 受理时间毫秒, items 编码,
-// 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查第二、三条）, MaxStale, 然后是成对的 sku, 数量。
+// 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查第二、三条）, MaxStale,
+// 队列名（空串表示不分队列）, 索引的清理截止时间毫秒（0 表示不清理）, 然后是成对的 sku, 数量。
+// 分队列时前两条数的是 gate:holds:q:<队列名>，否则是 gate:holds；第三条总是 gate:holds。
+// 清理索引是脚本里唯一发生在检查之前的写：它只删这份索引里的残留，不碰占用和库存，提前返回时留下它也没有害处。
 // 第三条拿心跳和排队截止时间比：心跳早于它，说明落库至少 MaxWait 没有认领过任何消息。
 // 返回值是两个元素（结果, 订单号或 SKU 或计数）；BACKLOG 多一个，是拒绝的那一条（BacklogRule 的取值）。
 // 它来自脚本本来就在走的分支，没有多读任何键。
@@ -207,9 +233,9 @@ if prev then
   return {'DUP', prevOrder}
 end
 
-local n = (#ARGV - 11) / 2
+local n = (#ARGV - 13) / 2
 for i = 0, n - 1 do
-  local sku, qty = ARGV[12 + 2 * i], tonumber(ARGV[13 + 2 * i])
+  local sku, qty = ARGV[14 + 2 * i], tonumber(ARGV[15 + 2 * i])
   local v = redis.call('HMGET', p .. 'gate:sku:' .. sku, 'avail', 'limit')
   if not v[1] then
     return {'NOT_LOADED', sku}
@@ -226,14 +252,21 @@ for i = 0, n - 1 do
   end
 end
 
+local qk = p .. 'gate:holds'
+if ARGV[12] ~= '' then
+  qk = p .. 'gate:holds:q:' .. ARGV[12]
+  if ARGV[13] ~= '0' then
+    redis.call('ZREMRANGEBYSCORE', qk, '-inf', '(' .. ARGV[13])
+  end
+end
 if ARGV[9] ~= '0' then
-  local queued = redis.call('ZCARD', p .. 'gate:holds')
+  local queued = redis.call('ZCARD', qk)
   if queued >= tonumber(ARGV[9]) then
     return {'BACKLOG', tostring(queued), 'queue'}
   end
 end
 if ARGV[10] ~= '0' then
-  local stale = redis.call('ZCOUNT', p .. 'gate:holds', '-inf', '(' .. ARGV[10])
+  local stale = redis.call('ZCOUNT', qk, '-inf', '(' .. ARGV[10])
   if stale > tonumber(ARGV[11]) then
     return {'BACKLOG', tostring(stale), 'stale'}
   end
@@ -247,7 +280,7 @@ if ARGV[10] ~= '0' then
 end
 
 for i = 0, n - 1 do
-  local sku, qty = ARGV[12 + 2 * i], tonumber(ARGV[13 + 2 * i])
+  local sku, qty = ARGV[14 + 2 * i], tonumber(ARGV[15 + 2 * i])
   redis.call('HINCRBY', p .. 'gate:sku:' .. sku, 'avail', -qty)
   redis.call('HINCRBY', p .. 'gate:sku:' .. sku, 'held', qty)
   redis.call('HINCRBY', p .. 'gate:bought:' .. sku, user, qty)
@@ -255,6 +288,10 @@ end
 redis.call('HSET', p .. 'gate:hold:' .. order,
   'user', user, 'items', ARGV[8], 'claimed', '0', 'ts', ARGV[7], 'idem', idem)
 redis.call('ZADD', p .. 'gate:holds', ARGV[7], order)
+if ARGV[12] ~= '' then
+  redis.call('HSET', p .. 'gate:hold:' .. order, 'q', ARGV[12])
+  redis.call('ZADD', qk, ARGV[7], order)
+end
 redis.call('SET', idemKey, order .. ':' .. hash, 'PX', ARGV[6])
 return {'OK', order}
 `)
@@ -273,21 +310,28 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 		return HoldResult{}, errors.New("stockgate: items must not be empty")
 	case req.IdempotencyTTL < time.Millisecond:
 		return HoldResult{}, errors.New("stockgate: idempotency ttl must be positive")
-	case req.Backlog.MaxQueue < 0 || req.Backlog.MaxWait < 0 || req.Backlog.MaxStale < 0:
+	case req.Backlog.MaxQueue < 0 || req.Backlog.MaxWait < 0 || req.Backlog.MaxStale < 0 || req.Backlog.IndexHorizon < 0:
 		return HoldResult{}, errors.New("stockgate: backlog limit must not be negative")
+	case !validQueue(req.Queue):
+		return HoldResult{}, fmt.Errorf("stockgate: queue %q must consist of letters, digits and hyphens", req.Queue)
 	}
 	var cutoff int64 // 0 表示不检查积压
 	if req.Backlog.MaxWait > 0 {
 		cutoff = max(req.Now.Add(-req.Backlog.MaxWait).UnixMilli(), 1)
+	}
+	var horizon int64 // 0 表示不清理队列的索引
+	if req.Queue != "" && req.Backlog.IndexHorizon > 0 {
+		horizon = max(req.Now.Add(-req.Backlog.IndexHorizon).UnixMilli(), 1)
 	}
 	encoded, err := encodeItems(req.Items)
 	if err != nil {
 		return HoldResult{}, err
 	}
 
-	args := make([]any, 0, 11+2*len(req.Items))
+	args := make([]any, 0, 13+2*len(req.Items))
 	args = append(args, g.prefix, req.OrderID, req.UserID, req.IdempotencyKey, hex.EncodeToString(req.RequestHash),
-		req.IdempotencyTTL.Milliseconds(), req.Now.UnixMilli(), encoded, req.Backlog.MaxQueue, cutoff, req.Backlog.MaxStale)
+		req.IdempotencyTTL.Milliseconds(), req.Now.UnixMilli(), encoded, req.Backlog.MaxQueue, cutoff, req.Backlog.MaxStale,
+		req.Queue, horizon)
 	for _, it := range req.Items {
 		args = append(args, it.SKUID, it.Quantity)
 	}
@@ -328,6 +372,18 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 	}
 }
 
+// validQueue 报告 q 能不能当队列名：它会拼进键名，只允许字母、数字和连字符。空串（不分队列）也合法。
+func validQueue(q string) bool {
+	for _, r := range q {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '-':
+		default:
+			return false
+		}
+	}
+	return len(q) <= 32
+}
+
 func btoi(b bool) int {
 	if b {
 		return 1
@@ -359,10 +415,12 @@ type HoldInfo struct {
 // 往往正是已被回收的订单的消息，不记的话受理要等到它消费到一个还活着的占用才恢复。
 // 只往前推：多个消费者实例的时钟和调用顺序不一致，回退会让一个刚恢复的落库看起来又停了。
 //
+// 占用记着队列名（字段 q，见 BacklogLimit 的“按队列计数”）时，认领同时把它从那条队列的索引里删掉。
+//
 // ARGV: 前缀, 订单号, mode, 当前时间毫秒（get 模式不用）。
 var claimScript = redis.NewScript(`
 local hk = ARGV[1] .. 'gate:hold:' .. ARGV[2]
-local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'ts')
+local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'ts', 'q')
 if ARGV[3] == 'claim' then
   local bk = ARGV[1] .. 'gate:claim_at'
   local beat = redis.call('GET', bk)
@@ -376,10 +434,13 @@ end
 if ARGV[3] == 'claim' and h[3] ~= '1' then
   redis.call('HSET', hk, 'claimed', '1')
   redis.call('ZREM', ARGV[1] .. 'gate:holds', ARGV[2])
+  if h[5] then
+    redis.call('ZREM', ARGV[1] .. 'gate:holds:q:' .. h[5], ARGV[2])
+  end
   redis.call('ZADD', ARGV[1] .. 'gate:claimed', h[4], ARGV[2])
   h[3] = '1'
 end
-return h
+return {h[1], h[2], h[3], h[4]}
 `)
 
 // Claim 认领一笔占用：订单服务在把订单写进数据库之前调用。
@@ -440,7 +501,7 @@ func (g *Gate) readHold(ctx context.Context, orderID int64, mode string, nowMill
 var releaseScript = redis.NewScript(`
 local p, order, mode = ARGV[1], ARGV[2], ARGV[3]
 local hk = p .. 'gate:hold:' .. order
-local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'idem')
+local h = redis.call('HMGET', hk, 'user', 'items', 'claimed', 'idem', 'q')
 if not h[1] then
   return 0
 end
@@ -465,6 +526,9 @@ for sku, q in string.gmatch(h[2], '(%d+):(%d+)') do
 end
 redis.call('DEL', hk)
 redis.call('ZREM', p .. 'gate:holds', order)
+if h[5] then
+  redis.call('ZREM', p .. 'gate:holds:q:' .. h[5], order)
+end
 redis.call('ZREM', p .. 'gate:claimed', order)
 if (mode == 'abort' or mode == 'unclaimed') and h[4] then
   local ik = p .. 'gate:idem:' .. h[1] .. ':' .. h[4]
