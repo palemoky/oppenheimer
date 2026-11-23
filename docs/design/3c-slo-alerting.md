@@ -217,7 +217,7 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 | CDC 落后 | `cdc_lag_ms` 超过 60 秒持续 5 分钟（依赖探针保证源库有写入） | `warning`；超过 1 小时 `critical`（binlog 只留 1 天，超过要重做全量） | 3a 第 7 节、round-9 |
 | 熔断器打开 | `breaker_state == 1` 持续 2 分钟（落库健康的那个单独一条，`critical`） | `warning` | round-3 |
 | 降级开关被人关着 | `degrade_switch_off == 1` 持续 1 小时（防止实验做完忘了开回来） | `warning` | 1d |
-| 限流退回进程内 | `gateway_ratelimit_fallbacks_total` 的速率大于每秒 1 次持续 5 分钟（退回时限额变宽） | `warning` | ADR-0019、round-4、round-8 |
+| 限流退回进程内 | 退回占 gateway 请求的一成以上（并且每秒 0.2 次以上）持续 5 分钟（退回时限额变宽；2026-11-23 之前是按次数，每秒超过 1 次，见第 8 节“第 16 项”） | `warning` | ADR-0019、round-4、round-8 |
 | 展示读的名额在拒绝 | `order_bulkhead_rejected_total` 的速率持续偏高（长稳时平时每分钟十来次，阈值要高于它） | `warning` | round-9 |
 | 某个服务没有指标了 | 六个服务各选一个一定存在的运行时指标，10 分钟没有新点 | `warning` | ADR-0030 |
 
@@ -965,3 +965,69 @@ k6 一侧：下单请求 503809，受理 367066，失败比例 0.005%（第二�
 5. **加的两个桶起作用了**：这一轮第一次量出了 30 秒以上的尾巴有多长。
 6. **告警**：critical 只有 `SLOOrderPersistDelayBurnFast` 一条发了 Telegram（落库时延的 SLO 的阈值是 10 秒，过载时三分之二的订单超过它，响是对的）。`NodeCPUHigh` 没有抖（agent-2 11:31 响、agent-1 11:36 加入，停压后 11:51、11:56 各自恢复），两轮都是这样。`OrderQueueNearWaitLimit` 没有响（平均排 2382 单，折成约 13 秒）。
 
+**第 16 项：还没有真实触发的清单，和改阈值的那一批（2026-11-23，12:15 到 14:04 UTC；结果在本小节最后“做了之后的结果”）**
+
+**清单是从 Prometheus 里查出来的，不是从记录里数的**：`sum by (alertname) (count_over_time(ALERTS{alertstate="firing"}[48h]))`（规则是 11 月 22 日才下发的，48 小时盖得住）。自己写的 82 条里 **35 条响过，47 条没有**。和前面各项记的对得上，另外多出四条当时没有单独记的：`KafkaBrokerMissing`、`KafkaUnderReplicatedPartitions`（第 18 项）、`MeshEndpointEjected`、`InventoryGateDrift`（第二轮过载压测）。`ReconFoundDifferences` 在“响过”里，但那是拆成两条之前因为“没跑成”响的；“有差异”这一条仍然没有真实触发过，下面单算，所以要处理的是 48 条。
+
+**按“它依赖的序列现在在不在”分成两类**（逐条查了当前值）：
+
+1. **序列在、把比较改一下就能响的 41 条**（做法是登记表里写的：只改集群上的 PrometheusRule，仓库不动，响了再 `monitoring.sh rules` 改回来）：
+   - 业务 14 条：`ProbeIncomplete`、`ReconNotRunning`、`ReconDailySlow`、`PaymentTotalsMismatch`、`PaymentReplyOverdue`、`OrderQueueNearWaitLimit`、`OrderAdmitRateDropped`、`ConsumerBlockedTooLong`、`OutboxRelaySlow`、`PaidOrdersNotLanding`、`PaymentResultSlow`、`CDCLaggingTooLong`、`BreakerOpen`、`DegradeSwitchLeftOff`（`for` 是 1 小时）。
+   - 网格和入口 4 条：`IngressRejectingRequests`、`MeshConcurrencyLimitOverflow`、`KedaScalerErrors`、`KedaHPAScalingInactive`。
+   - 中间件 11 条：`MySQLDown`、`MySQLReplicaLagHigh`、`MySQLReplicaMetricsMissing`、`MySQLConnectionsHigh`、`MySQLBackupStale`、`RedisReplicaLinkDown`、`RedisClusterUnhealthy`、`RedisSentinelDown`、`KafkaPartitionsOffline`、`KafkaOperatorNotReconciling`、`OtelCollectorRefusing`。
+   - 节点 5 条：`NodeRebooted`、`ServerDiskCritical`、`AgentDiskLow`、`ContainerMemoryNearLimit`、`IngressEnvoyOnServerNode`。
+   - SLO 7 条：可用性的慢档，下单延迟的三档，支付处理时延的三档。
+   - 4b 的三样（`PaidOrdersNotLanding`、`PaymentReplyOverdue`、支付时延的 SLO）都在这一类里，按“只验证路是通的”做，不改代码。
+2. **序列现在不存在、改阈值也响不了的 7 条**：`InventoryOversellDetected`、`OrderGateMemoryFull`、`OrderSubmitDeadLettered`、`ConsumerDeadLettered`（这四个计数器从没加过，OTel 的计数器第一次加之前不导出）、`ContainerOOMKilled`（没有被 OOM 杀过的容器）、`OtelCollectorExportFailing`（`otelcol_exporter_send_failed_*` 只在失败过的进程上有；gateway 那个 Collector 11 月 22 日重启之前有过一条，值一直是 1217504，没有再涨，不响是对的）、`ReconFoundDifferences` 的“有差异”（记录规则只有在有过退出码 1 的 Job 时才有序列）。这一类验证的办法只能是真的让事件发生一次，或者只靠单元测试（“从无到有的第一次”有测试 a 到 c）。
+
+**改阈值的那一批第一次动手时没有做成（主人同意之后做了，结果见本小节最后）。** 准备好了（`tmp/3c-inject-16-gen.py` 按告警名改表达式并核对每处替换命中的次数，41 条生成之后 `promtool check rules` 通过；`tmp/3c-inject-16-run.sh` 分四段下发、每分钟记一行、退出时恢复），12:24 UTC 动手时被权限检查拦下，**集群上的规则没有动过**。它要主人对这个做法明确同意：全程约 65 分钟；critical 的十来条会真的发到 Telegram（触发和恢复合起来二十几条，内容是“钱对不上”“MySQL 不在”这一类，都是假的）；这段时间里真的告警和假的混在一起。分四段的原因：`MySQLDown` 会抑制同一实例的 `MySQLReplica*` 和 `MySQLConnectionsHigh`，SLO 的快档抑制中档和慢档、中档抑制慢档，放在一起就看不到被抑制的那几条有没有送出去；`DegradeSwitchLeftOff` 的 `for` 是 1 小时，从头挂到尾。
+
+| 段 | 时长 | 改哪些 |
+| --- | --- | --- |
+| 1 | 18 分钟 | 除 `MySQLDown`、两个 SLO 的中档和快档以外的 36 条（含 SLO 的三条慢档，`for` 15 分钟） |
+| 2 | 8 分钟 | `MySQLDown`，下单延迟和支付时延的中档 |
+| 3 | 5 分钟 | 两条中档加两条快档 |
+| 4 | 到第 63 分钟 | 只剩 `DegradeSwitchLeftOff` |
+
+每段结束时存 `monitoring.sh alerts`（含被抑制的）和 Alertmanager 的发送、失败计数。要看的不只是“响没响”：注解里的模板在真实的标签上能不能渲染、Telegram 的 HTML 模式会不会因为注解里的字符拒收（发送失败的计数）、分组之后是几条消息。
+
+**`RateLimitFallingBack` 改成按比例了（做了，已下发）。** 表达式：退回的速率除以 gateway 全部 HTTP 请求的速率大于 0.1，并且退回每秒 0.2 次以上，持续 5 分钟。
+
+- 为什么是比例：按次数的阈值随流量变。每秒 1 次在探针的流量下是五分之一的请求，在过载时是万分之六；第三轮响的时候限额实际只对 3.4% 的请求变宽了，而这条告警要说的是“限额变宽了多少”。
+- 为什么是一成：三轮压测给了三个参照，不整段退回时过载最重的一档 3.4%，整段退回时 21% 和 47%，Redis 真的不在时接近 100%。一成落在第一个和第二个之间。
+- 为什么还留一个按次数的下限：流量很小时比例的分母只有几个请求，一个超时就是一成以上。
+- 分母用 gateway 的全部 HTTP 请求：一个请求最多退回一次（第三轮里退回每秒 60.8 次、请求每秒 1766 个，和“3.4% 的请求超时”对得上）。
+- 单元测试 u、v、w：过载时零星的超时不响；Redis 不在、只有探针的流量时响；流量太小时不响。`make rules-test` 通过，`monitoring.sh rules` 下发，集群上核对过表达式。**改了之后没有真实触发过**（要让限流的 Redis 真的不可用，探针的流量就够）。
+
+**顺带看到、没有查的**：第 11 项停 otel-gateway 的十几分钟里，agent 一侧没有留下 `otelcol_exporter_send_failed_*` 的序列（现在 agent 上只有 `sent` 和 `queue_size`），也就是 agent 发不出去的那段时间 `OtelCollectorExportFailing` 不会响。可能是重试没有耗尽、数据留在队列里，也可能是丢在了入队那一步（`enqueue_failed`，规则不看它）。那一项里先响的是 `OtelGatewayDown`，没有漏报，但这条规则在 agent 上是不是有效没有验证过。
+
+**做了之后的结果（主人 2026-11-23 同意：改阈值的那一批跑；序列不存在的 7 条里 4 条真的触发、3 条不做；支付可用性加成第五个 SLO）**
+
+改阈值的那一批，12:53 到 13:56 UTC，四段按上面的表（逐分钟的记录 `tmp/3c-inject-16-watch.log`，每段结束时的存档 `tmp/3c-inject-16/`）：
+
+- **41 条里 40 条响了，并且每一条都送到了 alertsink**（warning 走 `webhook`，critical 走 `critical`）。从下发到第一条通知送到：`for` 是 1 到 2 分钟的约 3 到 4 分钟，5 分钟的约 7 分钟，10 分钟的约 12 分钟，SLO 的慢档（15 分钟）约 17 分钟，`DegradeSwitchLeftOff`（1 小时）13:54 响。
+- **没有响的一条：`OrderAdmitRateDropped`**，12:55 进了 `pending`，没有等到 `for` 的 10 分钟。推断的原因（没有用数据核对）：它拿现在的受理比例和一小时前的同一个量比，而一小时前（11:47 到 12:05）探针是停着的，那一段没有受理，右边没有值，条件中途不成立了。这是规则本身的一个性质：**一小时前没有流量时这条告警是瞎的**（探针停过、或者服务刚恢复的头一个小时）。没有改。
+- **Telegram 发了 34 条，失败 0**（`alertmanager_notifications_total{integration="telegram"}` 从 44 到 78，含死信、对账那几条真实触发的和各自的恢复）。注解在 HTML 模式下没有被拒收的。webhook 的失败计数全程是 37，没有涨（是第 12 项停 alertsink 时留下的）。
+- **注解的模板在真实的标签上都渲染出来了**，逐条读过 alertsink 收到的 `summary`。`humanizeDuration`、`humanizePercentage`、`humanizeTimestamp`、字节数的显示都对（“落后 248ms”“用了 87.34%”“只剩 21.34GiB”“上次成功是 17h 3m 10s 前”）。值是 0 的那些读起来怪（“金额差了 0 分”）是因为阈值是假的，不是模板的问题。
+- **分段起了作用**：第 2 段 `MySQLDown` 是 5 个实例一条通知；SLO 的中档 13:17 送到，快档 13:22 送到，各自单独看到了。
+- 恢复之后（13:57）没有在响的、没有 `pending` 的；集群上五个 PrometheusRule 的 `spec` 和仓库里的逐个比对过，相同。
+- **这一批只验证了“路是通的”，不算真实触发**：表达式依赖的序列存在、标签对得上、模板能渲染、路由和通知能送到。阈值取得对不对、`for` 合不合适，它验证不了。
+
+序列不存在的 7 条：
+
+| 告警 | 做法 | 结果 |
+| --- | --- | --- |
+| `OrderSubmitDeadLettered`（critical） | 12:56:04 用 broker 里的 `kafka-console-producer.sh` 往 `order.submit` 写一条不是 protobuf 的消息（key `inject-16`） | order 第 1 次处理就标成 `Permanent` 进了死信（分区 3，位点 1487162）；12:57 响，12:57:05 送到并发了 Telegram；分区没有被挡住（`oldest_pending_age` 一直是 0） |
+| `ConsumerDeadLettered` | 同样的消息写到 `payment.events`（只有 order 消费） | 进了死信（分区 3，位点 568231），12:57 响并送到 |
+| `ContainerOOMKilled` | `default` 命名空间里一个内存上限 32Mi 的一次性 Pod（`inject16-oom`），启动 5 秒后申请 300 MB | 被杀 4 次，12:58 响，12:58:58 送到；Pod 已删 |
+| `ReconFoundDifferences`（“有差异”，critical） | 13:10:03 用 `kubectl create job --from=cronjob/recon-hourly` 建一个 Job，容器换成 `bash -c 'exit 1'`（名字 `inject16-recon-diff`） | Job 的失败原因是 `PodFailurePolicy`（没有重试）；13:11 `pending`，13:12 响，13:12:22 送到并发了 Telegram；`ReconRunFailed` 全程没有动。13:13 手工跑一次真的对账（`recon-manual-1795439614`，差异 0），假的 Job 删掉，13:14:40 恢复 |
+| `InventoryOversellDetected`、`OrderGateMemoryFull`、`OtelCollectorExportFailing` | 不做（要弄坏数据、拒绝真实下单或者丢链路），留给阶段 4 | 只有单元测试 |
+
+- 这四条是真实触发：事件真的发生了，规则没有动过。**长期运行的那一套里留下了两条死信**（`order.submit` 和 `payment.events` 的死信 topic 里各一条，内容是 `not-a-proto-item-16-alert-check`），以后看死信时不要当成故障。
+- “有差异”那一条到这里才算走通：退出码 1 → `podFailurePolicy` 立刻判失败 → kube-state-metrics 认不出这个原因 → 记录规则按“不是那三种原因”归到 `differences`。
+
+**到这里，自己写的告警的验证情况**（82 条加第五个 SLO 的 3 条，共 85 条，按告警名数）：真实触发过 38 条（Prometheus 里查到的 35 条，加死信两条和 OOM；`ReconFoundDifferences` 本来在 35 条里，现在“没跑成”和“有差异”两种原因都真实触发过）；只验证了路是通的 40 条；只到过 `pending` 的 1 条（`OrderAdmitRateDropped`）；只有单元测试的 6 条（超卖、闸门内存写满、Collector 导出失败、支付可用性的三档）。
+
+**第五个 SLO：支付可用性**（[ADR-0037](../adr/0037-slo-and-burn-rate-alerts.md) 最后一节）。`slo.order_pay_availability` 组（六条错误比例、一条有效事件速率、三条告警），单元测试 `slo_order_pay_availability_test.yaml`（从下单可用性的那份换接口得到，用例相同），runbook `slo-order-pay-availability.md`，Alertmanager 的路由和抑制用例各加了它，大盘加了一行。13:56 随恢复规则一起下发，14:04 核对 `slo:order_pay_availability:error_ratio_rate5m` 有值（0）。写的时候碰到的：指标里的 `http_route` 是 `/api/v1/orders/:order_id/pay`（gin 的写法），照 OpenAPI 的 `{order_id}` 写的话没有序列、告警永远不响。加上时 7 天的剩余预算约 34%。没有真实触发过。
+
+**`OtelCollectorExportFailing` 在 agent 上响不了，查清了**（上面“顺带看到”的那一条）。agent 的导出器配的是 `retry_on_failure.max_elapsed_time: 0`（一直重试）加队列满了堵住上游（3a 验证 5 之后为了不丢日志改的），所以它既不会“重试耗尽”也不会“入队失败”，`send_failed`、`enqueue_failed` 两个计数器在 agent 上永远不加。第 11 项那 17 分钟里 agent 的队列是满的（`otelcol_exporter_queue_size` 到过 20，容量 20）。也就是说这条规则只对 gateway 那个 Collector 有效；“gateway 在、但 agent 发不过去”现在没有规则盖住，能看的信号是队列占满。要不要加一条（队列占满持续几分钟，被 `OtelGatewayDown` 抑制），没有做，等主人定。
