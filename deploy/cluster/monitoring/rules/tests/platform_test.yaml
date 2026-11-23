@@ -53,6 +53,38 @@ tests:
           - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
             value: 1
 
+  # 使用率 90% 持续 25 分钟，掉到 80% 2 分钟，再回到 90%：中间不恢复（keep_firing_for 3m），所以不会多发一轮。
+  # 之后一直是 50%：平均值掉到线以下再过 3 分钟恢复（t=47m 起是 50%，5 分钟的平均约 1 分钟后掉到线下，52m 已经恢复）。
+  - name: node_cpu_high_does_not_flap
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="192.168.50.41:9100",cpu="0",mode="idle"}'
+        values: '0+6x25 162+12x1 180+6x20 330+30x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 24m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 28m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 33m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 47m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 56m
+        exp_samples: []
+
   # 空闲每分钟涨 30 秒（使用率 50%）：不响；使用率 90% 但只有 5 分钟（短于 for）也不响。
   - name: node_cpu_normal_silent
     interval: 1m
@@ -303,52 +335,6 @@ tests:
     promql_expr_test:
       - expr: count by (alertname, pod) (ALERTS{alertname="IngressEnvoyOnServerNode",alertstate="firing"})
         eval_time: 30m
-        exp_samples: []
-
-  # 到 webhook 的失败计数 t=10m 起每分钟 +1：15 分钟窗口里有增长，持续 10 分钟：25m 在响。
-  - name: alertmanager_notifications_failing_fires
-    interval: 1m
-    input_series:
-      - series: 'alertmanager_notifications_failed_total{job="kps-alertmanager",integration="webhook",reason="clientError"}'
-        values: '0x10 1+1x60'
-    promql_expr_test:
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 15m
-        exp_samples: []
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 25m
-        exp_samples:
-          - labels: '{alertname="AlertmanagerNotificationsFailing", integration="webhook"}'
-            value: 1
-
-  # 一直是 0：不响。
-  - name: alertmanager_notifications_ok_silent
-    interval: 1m
-    input_series:
-      - series: 'alertmanager_notifications_failed_total{job="kps-alertmanager",integration="webhook",reason="clientError"}'
-        values: '0x80'
-    promql_expr_test:
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 40m
-        exp_samples: []
-
-  # 失败计数 t=10m 才第一次出现、一出现就是 4：靠第一次出现的那半边（窗口 15m），20m 在响；之后计数不再涨，窗口过去（45m）不响。
-  - name: alertmanager_notifications_first_appearance
-    interval: 1m
-    input_series:
-      - series: 'alertmanager_notifications_failed_total{job="kps-alertmanager",integration="webhook",reason="clientError"}'
-        values: '_x10 4x70'
-    promql_expr_test:
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 15m
-        exp_samples: []
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 22m
-        exp_samples:
-          - labels: '{alertname="AlertmanagerNotificationsFailing", integration="webhook"}'
-            value: 1
-      - expr: count by (alertname, integration) (ALERTS{alertname="AlertmanagerNotificationsFailing",alertstate="firing"})
-        eval_time: 45m
         exp_samples: []
 
   # Watchdog 每 5 分钟送到一次（时间戳跟着走），t=30m 之后不再更新（指标还在，值停住）：

@@ -87,32 +87,73 @@ spec:
     # ---- 对账的 CronJob（逐行的那一套） ----
     - name: business.recon
       rules:
-        # 每个对账 CronJob 最近一次失败的 Job 的开始时间。告警和大盘都读它。
+        # 每个对账 CronJob 最近一次失败的 Job 的开始时间，按失败的种类分成两条（result 标签）。告警读它。
+        #   differences  有确认的差异（recon 退出码 1）。CronJob 里的 podFailurePolicy 让这种失败的原因是 PodFailurePolicy；
+        #                kube-state-metrics（v2.20.0）只认识三种原因，别的原因它只给 kube_job_failed{condition="true"}。
+        #                所以写成“失败了，并且不是那三种原因”：认不出来的一律按有差异算，宁可错报成重的。
+        #   error        没跑成（退出码 2 重试耗尽是 BackoffLimitExceeded，撞上 Job 的时限是 DeadlineExceeded，被驱逐是 Evicted）。
+        # 用 kube_job_failed{condition="true"}（Job 的 Failed 条件）而不是 kube_job_status_failed > 0（失败的 Pod 数）：
+        # 重试期间失败的 Pod 数已经大于 0，而 Job 还没有失败。2026-11-23 在集群上用两个一次性的 Job 核对过这些序列的样子。
         - record: oppenheimer:recon_cronjob:last_failed_start_time
+          labels:
+            result: differences
           expr: |
             max by (namespace, cronjob) (
               label_replace(
-                (kube_job_status_start_time{namespace="oppenheimer"} and on (namespace, job_name) (kube_job_status_failed{namespace="oppenheimer"} > 0))
+                (
+                  kube_job_status_start_time{namespace="oppenheimer"}
+                  and on (namespace, job_name) (kube_job_failed{namespace="oppenheimer",condition="true"} == 1)
+                  unless on (namespace, job_name) (kube_job_status_failed{namespace="oppenheimer",reason=~"BackoffLimitExceeded|DeadlineExceeded|Evicted"} > 0)
+                )
                   * on (namespace, job_name) group_left (owner_name)
                 kube_job_owner{namespace="oppenheimer",owner_kind="CronJob",owner_name=~"recon-(hourly|daily)"},
                 "cronjob", "$1", "owner_name", "(.+)"
               )
             )
-        # 最近一次失败之后还没有成功过。不直接写 kube_job_status_failed > 0：失败的 Job 为了留日志会保留 5 个，
+        - record: oppenheimer:recon_cronjob:last_failed_start_time
+          labels:
+            result: error
+          expr: |
+            max by (namespace, cronjob) (
+              label_replace(
+                (
+                  kube_job_status_start_time{namespace="oppenheimer"}
+                  and on (namespace, job_name) (kube_job_status_failed{namespace="oppenheimer",reason=~"BackoffLimitExceeded|DeadlineExceeded|Evicted"} > 0)
+                )
+                  * on (namespace, job_name) group_left (owner_name)
+                kube_job_owner{namespace="oppenheimer",owner_kind="CronJob",owner_name=~"recon-(hourly|daily)"},
+                "cronjob", "$1", "owner_name", "(.+)"
+              )
+            )
+        # 最近一次“有差异”的失败之后还没有成功过。不直接看失败的 Job 在不在：失败的 Job 为了留日志会保留 5 个，
         # 那样写的话告警在人删掉 Job 之前一直响，下一次对上了也不恢复。
-        # 退出码 1（有确认的差异）和 2（运行出错）kube-state-metrics 分不开，都按 critical 报，runbook 里看日志分。
         - alert: ReconFoundDifferences
           expr: |
-            oppenheimer:recon_cronjob:last_failed_start_time
+            oppenheimer:recon_cronjob:last_failed_start_time{result="differences"}
             unless on (namespace, cronjob)
-            (kube_cronjob_status_last_successful_time{namespace="oppenheimer"} > on (namespace, cronjob) oppenheimer:recon_cronjob:last_failed_start_time)
+            (kube_cronjob_status_last_successful_time{namespace="oppenheimer"} > on (namespace, cronjob) oppenheimer:recon_cronjob:last_failed_start_time{result="differences"})
           for: 1m
           labels:
             severity: critical
             service: recon
           annotations:
-            summary: "对账 {{ $labels.cronjob }} 最近一次失败了，之后还没有成功过"
-            description: "对账的 Job 以非零退出：退出码 1 是复查之后仍然存在的差异（订单对支付单、对库存预占、对从库、对商家索引中的某一对），退出码 2 是运行出错（连不上库、超时）。差异的明细在失败的 Job 的日志里（kubectl -n oppenheimer logs job/<名字>，也在 Loki 里）。"
+            summary: "对账 {{ $labels.cronjob }} 查出了差异，之后还没有成功过"
+            description: "对账的 Job 以退出码 1 结束：复查之后仍然存在的差异（订单对支付单、对库存预占、对从库、对商家索引中的某一对）。差异的明细在失败的 Job 的日志里（kubectl -n oppenheimer logs job/<名字>，也在 Loki 里）。Job 以认不出的原因失败时也按这一条报。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
+        # 最近一次“没跑成”的失败之后还没有成功过：连不上库、超时，重试 2 次仍然不行。这一次对账没有结论，不是有差异。
+        # warning：数据没有被证明不一致，只是这一个周期没人看着；一直跑不成由 ReconNotRunning（2.5 小时）接着报。
+        - alert: ReconRunFailed
+          expr: |
+            oppenheimer:recon_cronjob:last_failed_start_time{result="error"}
+            unless on (namespace, cronjob)
+            (kube_cronjob_status_last_successful_time{namespace="oppenheimer"} > on (namespace, cronjob) oppenheimer:recon_cronjob:last_failed_start_time{result="error"})
+          for: 1m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "对账 {{ $labels.cronjob }} 最近一次没有跑成，之后还没有成功过"
+            description: "对账的 Job 运行出错（退出码 2：连不上某个库、超时；或者被杀、撞上 Job 的时限），重试之后仍然失败。这一次没有对账结果，不代表有差异。先看是哪个库连不上（kubectl -n oppenheimer logs job/<名字>），修好之后手工复跑一次。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
         # 上次成功距今超过两个周期多一点（每小时的 2.5 小时，每天的 50 小时）。从来没成功过时用创建时间顶上。
         # 人为暂停的（正式压测前 recon-cron-suspend）不报。
@@ -368,7 +409,8 @@ spec:
             severity: warning
             service: kafka-consumer
           annotations:
-            summary: "消费组 {{ $labels.consumergroup }} 在 {{ $labels.topic }} 上有 {{ $value }} 条积压，位点 10 分钟没有动"
+            # “至少 20 分钟”：位点停下 10 分钟后 delta 才是 0，再加 for 的 10 分钟（实测从停掉到通知约 21 分钟）。
+            summary: "消费组 {{ $labels.consumergroup }} 在 {{ $labels.topic }} 上有 {{ $value }} 条积压，位点至少 20 分钟没有动"
             description: "有消息等着而这个组没有提交过新的位点。消费者的 Pod 不在、反复再均衡，或者被一条消息挡住（那种情况 ConsumerBlocked 也会响）。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-blocked.md
         # outbox 里的消息从写进表到 Kafka 确认的时间。平时是几十毫秒；3b round-1 里中继跟不上时到过分钟级。
@@ -417,24 +459,25 @@ spec:
         # CDC 落后：商家维度的订单索引是从 binlog 派生的，落后多少商家看到的订单就旧多少。
         # 这个指标量的是“最后一条处理的变更距它发生有多久”，源库没有写入时不动；探针保证了一直有写入。
         - alert: CDCLagging
-          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) > 60 * 1000
+          # 除以 1000 换成秒再比：$value 是秒，通知里才能用 humanizeDuration（原来是“365.4k 毫秒”）。
+          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) / 1000 > 60
           for: 5m
           labels:
             severity: warning
             service: cdc
           annotations:
-            summary: "CDC 的 {{ $labels.pipeline }} 落后 {{ $value | humanize }} 毫秒"
+            summary: "CDC 的 {{ $labels.pipeline }} 落后 {{ $value | humanizeDuration }}"
             description: "订单库的变更到商家索引的延迟超过 1 分钟。商家查到的订单列表是旧的；买家一侧不受影响。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
         # 落后超过 1 小时：binlog 只留 1 天，再落后下去位点会被清掉，那时只能重做全量（3b round-9）。
         - alert: CDCLaggingTooLong
-          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) > 3600 * 1000
+          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) / 1000 > 3600
           for: 5m
           labels:
             severity: critical
             service: cdc
           annotations:
-            summary: "CDC 的 {{ $labels.pipeline }} 落后超过 1 小时（{{ $value | humanize }} 毫秒），binlog 只保留 1 天"
+            summary: "CDC 的 {{ $labels.pipeline }} 落后 {{ $value | humanizeDuration }}，binlog 只保留 1 天"
             description: "再落后下去，CDC 的位点对应的 binlog 会被源库清掉，那之后只能停下来重做全量快照。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
         # 管道不报延迟了：cdc 挂了或者这条管道退出了。延迟的规则这时没有值，不会响，所以按管道的清单显式地查。
@@ -449,7 +492,9 @@ spec:
             severity: warning
             service: cdc
           annotations:
-            summary: "CDC 的 {{ $labels.pipeline }} 10 分钟没有报延迟"
+            # “至少 15 分钟”：cdc 停了之后它的序列还要约 5 分钟才从查询结果里消失（指标是推上来的，Prometheus 对不再更新的
+            # 序列回看 5 分钟），absent() 那时才成立，再加 for 的 10 分钟（实测从停掉到通知约 16 分钟）。
+            summary: "CDC 的 {{ $labels.pipeline }} 至少 15 分钟没有报延迟"
             description: "这条管道没有在跑，或者 cdc 的指标送不出来。商家索引停在它停下的那一刻。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
 

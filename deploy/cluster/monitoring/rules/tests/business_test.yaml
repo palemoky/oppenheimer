@@ -77,44 +77,126 @@ tests:
           - labels: '{service="orderindex", severity="warning"}'
             value: 1
 
-  # d. 每小时的对账在 t=1h 那次失败了：响。t=2h 那次成功：恢复，尽管失败的 Job 还留着（kube_job_status_failed 仍是 1）。
-  - name: d_recon_failed_then_succeeded
+  # 对账的 Job 失败时 kube-state-metrics 给出的序列（2026-11-23 在集群上用一次性的 Job 核对过，v2.20.0）：
+  #   退出码 1（podFailurePolicy 的 FailJob）：kube_job_failed{condition="true"} 1；
+  #       kube_job_status_failed 三种认识的原因都是 0，另有一条不带 reason 的是 1
+  #   重试耗尽：kube_job_failed{condition="true"} 1；kube_job_status_failed{reason="BackoffLimitExceeded"} 1，没有不带 reason 的那条
+  #   重试途中：kube_job_status_failed（不带 reason）是已经失败的 Pod 数，kube_job_failed{condition="true"} 是 0
+
+  # d. 每小时的对账在 t=1h 那次查出差异（退出码 1）：critical 响，“没跑成”那条不响。
+  #    t=2h 那次成功：恢复，尽管失败的 Job 还留着。
+  - name: d_recon_differences_then_succeeded
     interval: 1m
     input_series:
       - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-1",owner_kind="CronJob",owner_name="recon-hourly"}'
         values: '_x60 1x200'
       - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-1"}'
         values: '_x60 3600x200'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-hourly-1",condition="true"}'
+        values: '_x60 0 1x199'
       - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1"}'
         values: '_x60 0 1x199'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="BackoffLimitExceeded"}'
+        values: '_x61 0x199'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="DeadlineExceeded"}'
+        values: '_x61 0x199'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="Evicted"}'
+        values: '_x61 0x199'
       - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-2",owner_kind="CronJob",owner_name="recon-hourly"}'
         values: '_x120 1x140'
       - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-2"}'
         values: '_x120 7200x140'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-hourly-2",condition="true"}'
+        values: '_x120 0x140'
       - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-2"}'
         values: '_x120 0x140'
       # 上次成功：一开始是 t=0 之前的那次（值 60），t=2h1m 起是第二个 Job 完成的时刻 7260。
       - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"}'
         values: '60x120 7260x140'
     promql_expr_test:
-      - expr: count(ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+      - expr: count(ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
         eval_time: 59m
         exp_samples: []
-      - expr: count by (cronjob, severity) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+      - expr: count by (alertname, cronjob, severity) (ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
         eval_time: 1h5m
         exp_samples:
-          - labels: '{cronjob="recon-hourly", severity="critical"}'
+          - labels: '{alertname="ReconFoundDifferences", cronjob="recon-hourly", severity="critical"}'
             value: 1
-      - expr: count by (cronjob, severity) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+      - expr: count by (alertname, cronjob, severity) (ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
         eval_time: 1h59m
         exp_samples:
-          - labels: '{cronjob="recon-hourly", severity="critical"}'
+          - labels: '{alertname="ReconFoundDifferences", cronjob="recon-hourly", severity="critical"}'
             value: 1
-      - expr: count(ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+      - expr: count(ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
         eval_time: 2h5m
         exp_samples: []
 
-  # e. 从来没有成功过的 CronJob 第一次就失败：没有 last_successful_time 这条序列，照样响。
+  # d2. 每小时的对账在 t=1h 那次连不上库（退出码 2）。重试途中（两分钟，失败的 Pod 数是 1、2，Job 还没有失败）什么都不响；
+  #     重试耗尽之后只响 warning 的“没跑成”，critical 的“有差异”不响。t=2h 那次成功：恢复。
+  - name: d2_recon_run_failed_is_not_differences
+    interval: 1m
+    input_series:
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-1",owner_kind="CronJob",owner_name="recon-hourly"}'
+        values: '_x60 1x200'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-1"}'
+        values: '_x60 3600x200'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-hourly-1",condition="true"}'
+        values: '_x60 0 0 0 1x197'
+      # 不带 reason 的那条只在 Job 失败之前有（已经失败的 Pod 数），失败之后换成带 reason 的三条。
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1"}'
+        values: '_x60 0 1 2 stale'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="BackoffLimitExceeded"}'
+        values: '_x63 1x197'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="DeadlineExceeded"}'
+        values: '_x63 0x197'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-hourly-1",reason="Evicted"}'
+        values: '_x63 0x197'
+      - series: 'kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"}'
+        values: '60x120 7260x140'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed"})
+        eval_time: 1h2m
+        exp_samples: []
+      - expr: count by (alertname, cronjob, severity) (ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed"})
+        eval_time: 1h6m
+        exp_samples:
+          - labels: '{alertname="ReconRunFailed", cronjob="recon-hourly", severity="warning"}'
+            value: 1
+      - expr: count(ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
+        eval_time: 2h5m
+        exp_samples: []
+
+  # d3. 以认不出的原因失败（kube-state-metrics 没有给任何带 reason 的序列）：按“有差异”报，宁可错报成重的。
+  #     撞上 Job 的时限（DeadlineExceeded）：按“没跑成”报。
+  - name: d3_recon_unknown_reason_and_deadline
+    interval: 1m
+    input_series:
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-hourly-1",owner_kind="CronJob",owner_name="recon-hourly"}'
+        values: '1x30'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-hourly-1"}'
+        values: '0x30'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-hourly-1",condition="true"}'
+        values: '0 0 1x28'
+      - series: 'kube_job_owner{namespace="oppenheimer",job_name="recon-daily-1",owner_kind="CronJob",owner_name="recon-daily"}'
+        values: '1x30'
+      - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-1"}'
+        values: '0x30'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-daily-1",condition="true"}'
+        values: '0 0 1x28'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-daily-1",reason="DeadlineExceeded"}'
+        values: '_ _ 1x28'
+      - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-daily-1",reason="BackoffLimitExceeded"}'
+        values: '_ _ 0x28'
+    promql_expr_test:
+      - expr: count by (alertname, cronjob) (ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="ReconFoundDifferences", cronjob="recon-hourly"}'
+            value: 1
+          - labels: '{alertname="ReconRunFailed", cronjob="recon-daily"}'
+            value: 1
+
+  # e. 从来没有成功过的 CronJob 第一次就查出差异：没有 last_successful_time 这条序列，照样响。
   - name: e_recon_failed_never_succeeded
     interval: 1m
     input_series:
@@ -122,13 +204,15 @@ tests:
         values: '1x30'
       - series: 'kube_job_status_start_time{namespace="oppenheimer",job_name="recon-daily-1"}'
         values: '0x30'
+      - series: 'kube_job_failed{namespace="oppenheimer",job_name="recon-daily-1",condition="true"}'
+        values: '0 0 1x28'
       - series: 'kube_job_status_failed{namespace="oppenheimer",job_name="recon-daily-1"}'
         values: '0 0 1x28'
     promql_expr_test:
-      - expr: count by (cronjob) (ALERTS{alertname="ReconFoundDifferences",alertstate="firing"})
+      - expr: count by (alertname, cronjob) (ALERTS{alertname=~"ReconFoundDifferences|ReconRunFailed",alertstate="firing"})
         eval_time: 10m
         exp_samples:
-          - labels: '{cronjob="recon-daily"}'
+          - labels: '{alertname="ReconFoundDifferences", cronjob="recon-daily"}'
             value: 1
 
   # f. 每小时的对账 3 小时没有成功：响。同样的情形但 CronJob 被暂停着：不响。
@@ -345,6 +429,33 @@ tests:
       - expr: count(ALERTS{alertname=~"CDCLagging.*"})
         eval_time: 25m
         exp_samples: []
+
+  # o2. CDC 的 order-0 落后 365.4 秒：通知里的时长是人读的（“6m 5s”），不是毫秒数。order-1 正常，不报。
+  - name: o2_cdc_lagging_text
+    interval: 30s
+    input_series:
+      - series: 'cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-0"}'
+        values: '200x10 365400x40'
+      - series: 'cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-1"}'
+        values: '300x50'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CDCLagging
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: CDCLagging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: cdc
+              pipeline: order-0
+            exp_annotations:
+              summary: "CDC 的 order-0 落后 6m 5s"
+              description: "订单库的变更到商家索引的延迟超过 1 分钟。商家查到的订单列表是旧的；买家一侧不受影响。"
+              runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
+      - eval_time: 12m
+        alertname: CDCLaggingTooLong
+        exp_alerts: []
 
   # p. payment 不报指标了，其余五个还在：只报 payment。e2e 命名空间里的 payment 还在报，不能顶替。
   - name: p_service_metrics_missing

@@ -100,6 +100,16 @@ inhibit_rules:
   - source_matchers: [alertname = "MySQLDown"]
     target_matchers: [alertname = "MySQLReplicaIOThreadStopped"]
     equal: [cluster]
+  # MySQL 的实例连不上、或者从库的复制停了：它的 Pod 会变成 NotReady（就绪探针查的就是这些），15 分钟后 chart 自带的
+  # KubePodNotReady 和 KubeStatefulSetReplicasMismatch 会说同一件事，没有新的信息（2026-11-23，告警质量检查第 7 项）。
+  # 我们的三条规则为此补了 namespace、pod、statefulset 三个标签（middleware.yaml），和自带的那两条的同名标签对得上。
+  # 源比目标早响（2 分钟对 15 分钟），晚走靠源上的 keep_firing_for。
+  - source_matchers: [alertname =~ "MySQLDown|MySQLReplicaSQLThreadStopped|MySQLReplicaIOThreadStopped"]
+    target_matchers: [alertname = "KubePodNotReady"]
+    equal: [namespace, pod]
+  - source_matchers: [alertname =~ "MySQLDown|MySQLReplicaSQLThreadStopped|MySQLReplicaIOThreadStopped"]
+    target_matchers: [alertname = "KubeStatefulSetReplicasMismatch"]
+    equal: [namespace, statefulset]
   # broker 少了：副本不足是必然的结果。
   - source_matchers: [alertname = "KafkaBrokerMissing"]
     target_matchers: [alertname = "KafkaUnderReplicatedPartitions"]

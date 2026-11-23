@@ -25,9 +25,20 @@ spec:
         - alert: MySQLDown
           expr: mysql_up == 0
           for: 2m
+          # 条件不成立之后再多响 5 分钟：它是抑制的源，要比被它压着的告警晚走（和 OtelGatewayDown 同一个道理）。
+          # 被压着的那几条恢复得比它慢一点（从库重连要等下一次重试，Pod 的就绪要等探针和下一次抓取），
+          # 源先走，中间轮到分组刷新的就漏出去。代价是恢复的通知晚 5 分钟。
+          keep_firing_for: 5m
           labels:
             severity: critical
             component: mysql
+            # 下面三个标签是给 Alertmanager 的抑制用的（alertmanager.yaml）：实例连不上或者复制停了，它的 Pod 会变成 NotReady
+            # （就绪探针查的就是这些），15 分钟后 chart 自带的 KubePodNotReady、KubeStatefulSetReplicasMismatch 会说同一件事。
+            # 自带的那两条带的是 namespace、pod、statefulset，我们的指标带的是 instance（就是 Pod 名）和 cluster（就是 StatefulSet 名），
+            # 对不上就压不住，所以在这里补成同名的标签。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
           annotations:
             summary: "MySQL {{ $labels.instance }} 连不上（mysql_up = {{ $value }}）"
             description: "exporter 连不上这个 MySQL 实例（exporter 本身还活着，所以 up 是 1，要看 mysql_up）。落在它上面的写入和读取会失败。出处：3a 第 5 步。"
@@ -38,9 +49,15 @@ spec:
         - alert: MySQLReplicaSQLThreadStopped
           expr: mysql_slave_status_replica_sql_running == 0
           for: 2m
+          # 抑制的源要后走，见 MySQLDown。
+          keep_firing_for: 5m
           labels:
             severity: critical
             component: mysql
+            # 给抑制用的三个标签，见 MySQLDown。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
           annotations:
             summary: "MySQL 从库 {{ $labels.instance }} 的 SQL 线程停了（值 {{ $value }}）"
             description: "从库不再应用主库的变更，数据在变旧；这个时候主库再出问题，从库上缺的那部分就丢了。停了以后延迟指标会消失，所以不会再有“主从延迟大”的告警，以这条为准。出处：3a 验证 7。"
@@ -50,9 +67,15 @@ spec:
         - alert: MySQLReplicaIOThreadStopped
           expr: mysql_slave_status_replica_io_running == 0
           for: 2m
+          # 抑制的源要后走，见 MySQLDown。
+          keep_firing_for: 5m
           labels:
             severity: critical
             component: mysql
+            # 给抑制用的三个标签，见 MySQLDown。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
           annotations:
             summary: "MySQL 从库 {{ $labels.instance }} 的 IO 线程停了（值 {{ $value }}）"
             description: "从库收不到主库的 binlog，数据在变旧。停了以后延迟指标会消失，所以不会再有“主从延迟大”的告警，以这条为准。出处：3a 验证 7。"
@@ -136,9 +159,12 @@ spec:
     - name: middleware.redis
       interval: 30s
       rules:
-        # Redis（缓存集群、闸门、Sentinel）exporter 连不上它。同样看 redis_up 不看 up。出处：3a 第 5 步。
+        # Redis 的数据节点（缓存集群、闸门的主从）exporter 连不上它。同样看 redis_up 不看 up。出处：3a 第 5 步。
+        # 不含 Sentinel（2026-11-23 改）：exporter 的目标里 Sentinel 和数据节点长得一样，原来不分，少两个 Sentinel 就发两条
+        # “Redis 连不上”的 critical（告警质量检查第 10 项）。Sentinel 不在的后果是“主库坏了切不了”，数据面不受影响，
+        # 归 RedisSentinelDown（warning，少一个就报）和 RedisSentinelBelowQuorum 管。
         - alert: RedisDown
-          expr: redis_up == 0
+          expr: redis_up{instance!~"redis-gate-sentinel-.*"} == 0
           for: 2m
           labels:
             severity: critical
@@ -218,6 +244,21 @@ spec:
             description: "能看到的 Sentinel 少于法定数，主库坏了的时候选不出新主，闸门 Redis 不会自动切换。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-sentinel.md
 
+        # 某个 Sentinel 连不上。RedisDown 从 2026-11-23 起不看 Sentinel，少一个 Sentinel 要有地方报：
+        # 3 个掉到 2 个时上一条不响（2 等于法定数），但已经没有余量，再掉一个就切不了；
+        # 三个全不在时上一条也不响（没有还活着的 Sentinel 来报自己看到几个同伴），这条三个实例各响一条、合成一条通知。
+        # warning：数据面不受影响。for 5 分钟：Sentinel 的 Pod 重启一次不报。
+        - alert: RedisSentinelDown
+          expr: redis_up{instance=~"redis-gate-sentinel-.*"} == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: redis
+          annotations:
+            summary: "闸门 Redis 的 Sentinel {{ $labels.instance }} 连不上"
+            description: "少了一个 Sentinel。现在的主从不受影响，下单照常；但 3 个里只剩 2 个时已经没有余量，再少一个就不够法定数，主库坏了不会自动切换。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-sentinel.md
+
     - name: middleware.kafka
       interval: 30s
       rules:
@@ -254,6 +295,10 @@ spec:
             or
             absent(kafka_brokers)
           for: 2m
+          # 条件不成立之后再多响 5 分钟：它压着 KafkaUnderReplicatedPartitions，源要后走。2026-11-23 停一个 broker 量过：
+          # 平时副本 30 秒就追上，比 broker 数的更新还早，不会漏；但追上要多久跟停的时候欠了多少数据走，
+          # 过载或者停得久时会比 broker 数晚（设计文档 3c 第 8 节“第 18 项”）。代价是恢复的通知晚 5 分钟。
+          keep_firing_for: 5m
           labels:
             severity: critical
             component: kafka

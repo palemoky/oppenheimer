@@ -47,9 +47,21 @@ spec:
         app.kubernetes.io/name: recon
         app.kubernetes.io/part-of: oppenheimer
     spec:
-      # 不重试：退出码 1 是“有确认的差异”，重跑一次也许就“好了”（在途的状态变了），那样失败被盖住，告警不响。
-      # 运行出错（退出码 2，比如连不上库）也不重试，下一个周期再来；告警按 Job 失败报，由人看日志分是哪一种。
-      backoffLimit: 0
+      # 两种失败分开处理（2026-11-23 改，原来是 backoffLimit: 0、都不重试、告警分不开，见设计文档 3c 第 8 节“第 8 项”）：
+      #   退出码 1（有确认的差异）：不重试，Job 立刻失败。重跑一次也许就“好了”（在途的状态变了），那样差异被盖住。
+      #       podFailurePolicy 的 FailJob 让 Job 的失败原因是 PodFailurePolicy。
+      #   其余的（退出码 2 是连不上库、超时；也包括被杀、panic）：重试 2 次（间隔 10 秒、20 秒），盖住“某个库有半分钟连不上”。
+      #       还不行，Job 的失败原因是 BackoffLimitExceeded。对账只读，重跑没有副作用。
+      # 规则按失败原因分成两条告警：ReconFoundDifferences（critical）和 ReconRunFailed（warning）。
+      # podFailurePolicy 要求 restartPolicy 是 Never（下面是）。
+      backoffLimit: 2
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: recon
+              operator: In
+              values: [1]
       # Job 的总时限，是兜底：recon 自己的 -timeout（25m）先到，它会干净地退出并打日志；
       # 这个在它卡死、没有响应 -timeout 的时候强杀。
       # 半小时：正常几十秒到几分钟（3b 在大库上量过，窗口 8.9 万行的一对第一遍 9 秒），余量很大；
@@ -65,7 +77,7 @@ spec:
             # 这里写明，免得以后改成全命名空间注入时它被带进去、白占一个边车。）
             sidecar.istio.io/inject: "false"
         spec:
-          # Job 的 backoffLimit 是 0，Pod 也不原地重启；失败的 Pod 留着看日志。
+          # Pod 不原地重启（重试是 Job 另起一个 Pod）；失败的 Pod 留着看日志。
           restartPolicy: Never
           # 不碰 Kubernetes 的 API，不挂令牌。
           automountServiceAccountToken: false
@@ -146,9 +158,21 @@ spec:
         app.kubernetes.io/name: recon
         app.kubernetes.io/part-of: oppenheimer
     spec:
-      # 不重试：退出码 1 是“有确认的差异”，重跑一次也许就“好了”（在途的状态变了），那样失败被盖住，告警不响。
-      # 运行出错（退出码 2，比如连不上库）也不重试，下一个周期再来；告警按 Job 失败报，由人看日志分是哪一种。
-      backoffLimit: 0
+      # 两种失败分开处理（2026-11-23 改，原来是 backoffLimit: 0、都不重试、告警分不开，见设计文档 3c 第 8 节“第 8 项”）：
+      #   退出码 1（有确认的差异）：不重试，Job 立刻失败。重跑一次也许就“好了”（在途的状态变了），那样差异被盖住。
+      #       podFailurePolicy 的 FailJob 让 Job 的失败原因是 PodFailurePolicy。
+      #   其余的（退出码 2 是连不上库、超时；也包括被杀、panic）：重试 2 次（间隔 10 秒、20 秒），盖住“某个库有半分钟连不上”。
+      #       还不行，Job 的失败原因是 BackoffLimitExceeded。对账只读，重跑没有副作用。
+      # 规则按失败原因分成两条告警：ReconFoundDifferences（critical）和 ReconRunFailed（warning）。
+      # podFailurePolicy 要求 restartPolicy 是 Never（下面是）。
+      backoffLimit: 2
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              containerName: recon
+              operator: In
+              values: [1]
       # Job 的总时限，是兜底：recon 自己的 -timeout（55m）先到，它会干净地退出并打日志；
       # 这个在它卡死、没有响应 -timeout 的时候强杀。
       # 一小时：全量，现在约 2 分钟（1473.7 万单），线性外推到 1 亿单约 13 分钟，余量还很大；
@@ -165,7 +189,7 @@ spec:
             # 这里写明，免得以后改成全命名空间注入时它被带进去、白占一个边车。）
             sidecar.istio.io/inject: "false"
         spec:
-          # Job 的 backoffLimit 是 0，Pod 也不原地重启；失败的 Pod 留着看日志。
+          # Pod 不原地重启（重试是 Job 另起一个 Pod）；失败的 Pod 留着看日志。
           restartPolicy: Never
           # 不碰 Kubernetes 的 API，不挂令牌。
           automountServiceAccountToken: false

@@ -41,6 +41,12 @@ spec:
         - alert: NodeCPUHigh
           expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.85
           for: 10m
+          # 条件不成立之后再多响 3 分钟。过载时节点的使用率就在 85% 上下晃，不加的话掉下去一会儿就恢复、再上来又进 pending，
+          # 同一次过载多发一轮“恢复”和“触发”（2026-11-23 的压测里 agent-1 是 02:49 响、02:57 恢复、又进 pending）。
+          # 3 分钟（先取的 10 分钟，主人嫌恢复的通知晚得太久）：表达式本身是 5 分钟的平均，已经抹掉了秒级的抖动，
+          # 这里只要盖住“平均值在线上下来回蹭”的那几分钟。掉下去超过 3 分钟再回来的会算成新的一次（要重新等 for 的 10 分钟）。
+          # 代价是真的降下来之后“恢复”的通知晚 3 分钟。
+          keep_firing_for: 3m
           labels:
             severity: warning
             component: node
@@ -155,28 +161,11 @@ spec:
     - name: platform.monitoring
       interval: 30s
       rules:
-        # 通知一直发不出去：Alertmanager 到某个接收端（integration）的失败数在 15 分钟窗口里有增长、持续 10 分钟。
-        # 计数器按 integration 预先建好（值 0），但仍用“有增长”的完整写法盖住第一次出现。
-        # 局限：发到主人渠道（Telegram）的通知坏了的话，这条告警恰恰送不到；它只在 webhook 接收端还通的时候有用。
-        # 所以不能当唯一的保障（设计 4.6 把这点列为面试考点）。
-        - alert: AlertmanagerNotificationsFailing
-          expr: |
-            sum by (integration) (increase(alertmanager_notifications_failed_total[15m])) > 0
-            or
-            sum by (integration) (
-              alertmanager_notifications_failed_total > 0
-              unless
-              alertmanager_notifications_failed_total offset 15m
-            )
-          for: 10m
-          labels:
-            severity: warning
-            component: monitoring
-          annotations:
-            summary: "Alertmanager 到 {{ $labels.integration }} 的通知在失败，15 分钟内 {{ $value }} 次"
-            description: "Alertmanager 往这个接收端发通知持续失败，告警可能没有送达。如果坏的是主人的渠道，这条本身也送不到，要靠别的接收端或大盘发现。出处：设计 4.6。"
-            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/alertmanager-notifications.md
-
+        # “Alertmanager 到某个接收端的通知在失败”不在这里写：chart 自带的 AlertmanagerFailedToSendAlerts（warning）和
+        # AlertmanagerClusterFailedToSendAlerts（critical）报的是同一件事，而且更快（约 9 分钟，我们原来那条约 13 分钟）。
+        # 原来的 AlertmanagerNotificationsFailing 在 2026-11-23 删掉了（告警质量检查第 12 项：同一件事四条告警）。
+        # 留下自带的那两条的代价：webhook 这种“只是日志”的接收端失败时也会有一条 critical 发到 Telegram。
+        # 局限照旧：发到主人渠道（Telegram）的通知坏了的话，这类告警恰恰送不到（设计 4.6 把这点列为面试考点）。
         # 告警送不到接收端了：从“规则求值”到“webhook 接收端收到”这一整条路上任何一环断了都算
         # （Prometheus 不求值、Prometheus 到 Alertmanager 不通、Alertmanager 的路由或配置坏了、alertsink 不在）。
         # 做法：Watchdog 一直在响，Alertmanager 每 5 分钟把它发给 alertsink 一次（alertmanager.yaml 的第一条路由），

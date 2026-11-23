@@ -33,21 +33,33 @@ inhibited | alertname=ServerDiskLow severity=warning component=node instance=192
 
 # ---- MySQL：实例连不上压它自己的复制和连接数；主库连不上只压同一套从库的 IO 线程 ----
 # 从库 mysql-order-0-1 连不上：
-active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
-inhibited | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
-inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
+active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql namespace=mysql pod=mysql-order-0-1 statefulset=mysql-order-0
+inhibited | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql namespace=mysql pod=mysql-order-0-1 statefulset=mysql-order-0
+inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql namespace=mysql pod=mysql-order-0-1 statefulset=mysql-order-0
 inhibited | alertname=MySQLReplicaLagHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
 inhibited | alertname=MySQLReplicaMetricsMissing severity=warning component=mysql instance=mysql-order-0-1
 inhibited | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-1 job=mysql
 # 同一套里的主库没有连不上，它的连接数照报：
 active    | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-order-0 instance=mysql-order-0-0 job=mysql
 # 主库 mysql-order-1-0 连不上：从库的 IO 线程被压住，SQL 线程和延迟照报（它们说的是从库自己）。
-active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-0 job=mysql
-inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
-active    | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
+active    | alertname=MySQLDown severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-0 job=mysql namespace=mysql pod=mysql-order-1-0 statefulset=mysql-order-1
+inhibited | alertname=MySQLReplicaIOThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql namespace=mysql pod=mysql-order-1-1 statefulset=mysql-order-1
+active    | alertname=MySQLReplicaSQLThreadStopped severity=critical component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql namespace=mysql pod=mysql-order-1-1 statefulset=mysql-order-1
 active    | alertname=MySQLReplicaLagHigh severity=warning component=mysql cluster=mysql-order-1 instance=mysql-order-1-1 job=mysql
 # 不相干的一套不受影响：
 active    | alertname=MySQLConnectionsHigh severity=warning component=mysql cluster=mysql-main instance=mysql-main-0 job=mysql
+
+# ---- MySQL 的实例或复制坏了，压住自带的“Pod 没就绪”“StatefulSet 副本数不对”（同一个 Pod、同一个 StatefulSet）----
+# 源是上面已经塞进去的：mysql-order-0-1 的 MySQLDown，mysql-order-1-1 的 MySQLReplicaSQLThreadStopped。
+# 自带的两条的标签照它们的表达式写：KubePodNotReady 带 namespace、pod；KubeStatefulSetReplicasMismatch 带 namespace、statefulset，
+# 它的 pod 标签是 kube-state-metrics 自己的 Pod。
+inhibited | alertname=KubePodNotReady severity=warning namespace=mysql pod=mysql-order-0-1
+inhibited | alertname=KubePodNotReady severity=warning namespace=mysql pod=mysql-order-1-1
+active    | alertname=KubePodNotReady severity=warning namespace=mysql pod=mysql-main-0
+active    | alertname=KubePodNotReady severity=warning namespace=oppenheimer pod=mysql-order-0-1
+inhibited | alertname=KubeStatefulSetReplicasMismatch severity=warning namespace=mysql statefulset=mysql-order-0 pod=kps-kube-state-metrics-0 job=kube-state-metrics
+active    | alertname=KubeStatefulSetReplicasMismatch severity=warning namespace=mysql statefulset=mysql-main pod=kps-kube-state-metrics-0 job=kube-state-metrics
+active    | alertname=KubeStatefulSetReplicasMismatch severity=warning namespace=redis statefulset=mysql-order-0 pod=kps-kube-state-metrics-0 job=kube-state-metrics
 
 # ---- Kafka：broker 少了压副本不足 ----
 active    | alertname=KafkaBrokerMissing severity=critical component=kafka

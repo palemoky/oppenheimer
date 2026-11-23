@@ -25,6 +25,39 @@ tests:
           - labels: '{alertname="MySQLDown", cluster="mysql-order-0", instance="mysql-order-0-0"}'
             value: 1
 
+  # 连不上 10 分钟之后恢复（t=20m）：再多响 5 分钟（keep_firing_for，抑制的源要后走），26m 不响了。
+  # 带着给抑制用的三个标签：pod 是实例名，statefulset 是 cluster。
+  - name: mysql_down_keeps_firing_after_recovery
+    interval: 1m
+    input_series:
+      - series: 'mysql_up{job="mysql",cluster="mysql-order-0",instance="mysql-order-0-1"}'
+        values: '1x10 0x10 1x20'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, statefulset) (ALERTS{alertname="MySQLDown",alertstate="firing"})
+        eval_time: 24m
+        exp_samples:
+          - labels: '{alertname="MySQLDown", namespace="mysql", pod="mysql-order-0-1", statefulset="mysql-order-0"}'
+            value: 1
+      - expr: count(ALERTS{alertname="MySQLDown",alertstate="firing"})
+        eval_time: 27m
+        exp_samples: []
+
+  # broker 少一个 10 分钟之后回来（t=20m）：KafkaBrokerMissing 再多响 5 分钟。
+  - name: kafka_broker_missing_keeps_firing_after_recovery
+    interval: 1m
+    input_series:
+      - series: 'kafka_brokers{job="monitoring/kafka"}'
+        values: '3x10 2x10 3x20'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 24m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count(ALERTS{alertname="KafkaBrokerMissing",alertstate="firing"})
+        eval_time: 27m
+        exp_samples: []
+
   # 一直是 1：不响；只掉了 1 分钟（短于 for）也不响。
   - name: mysql_up_silent
     interval: 1m
@@ -338,6 +371,31 @@ tests:
       - expr: count by (alertname, cluster, instance) (ALERTS{alertname="RedisDown",alertstate="firing"})
         eval_time: 30m
         exp_samples: []
+
+  # 两个 Sentinel 连不上（t=10m 起）：不算 RedisDown（它只看数据节点，critical），各报一条 warning 的 RedisSentinelDown。
+  # 连得上的那个 Sentinel 和数据节点不报。重启一次（连不上 3 分钟，短于 for）也不报。
+  - name: redis_sentinel_down_is_not_redis_down
+    interval: 1m
+    input_series:
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-0"}'
+        values: '1x10 0x3 1x30'
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-1"}'
+        values: '1x10 0x30'
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-sentinel-2"}'
+        values: '1x10 0x30'
+      - series: 'redis_up{job="redis",cluster="redis-gate",instance="redis-gate-0"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname=~"RedisDown|RedisSentinelDown",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (alertname, instance, severity) (ALERTS{alertname=~"RedisDown|RedisSentinelDown",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{alertname="RedisSentinelDown", instance="redis-gate-sentinel-1", severity="warning"}'
+            value: 1
+          - labels: '{alertname="RedisSentinelDown", instance="redis-gate-sentinel-2", severity="warning"}'
+            value: 1
 
   # 闸门 Redis 用了 75%（上限 100，已用 75）：警告响（5m 之后），critical 不响。
   - name: redis_gate_memory_warning
