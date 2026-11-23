@@ -71,3 +71,4 @@
 ## 历史
 
 （还没有真的响过）
+- 2026-11-23：`MySQLReplicaSQLThreadStopped`、`MySQLReplicaIOThreadStopped`（和 `MySQLDown`）加了 `namespace`、`pod`、`statefulset` 三个标签和 `keep_firing_for: 5m`。复制停了之后从库的 Pod 是 NotReady，chart 自带的 `KubePodNotReady`、`KubeStatefulSetReplicasMismatch` 15 分钟后会跟着成立，现在被这几条抑制，不再另发通知（在 Alertmanager 里看得到，标着 inhibited）。复制恢复之后这几条的“恢复”通知晚 5 分钟到，是有意的：源要比被它压着的晚走。

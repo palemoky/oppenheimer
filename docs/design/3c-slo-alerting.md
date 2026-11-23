@@ -786,3 +786,77 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - 验证到哪：`pkg/ratelimit` 的测试带 `-race` 跑了 3 遍通过；Collector 的配置用 `otel/opentelemetry-collector-contrib:0.165.0 validate` 校验过语法（只校验了这两个 processor，行为没有验证）；`shellcheck` 过了；`make lint` 11 个模块 0 issues；完整的 `make test` 见 `PROGRESS.md`。**四处都没有在过载下重新验证。**
 - 没有改的：延迟消费者的并发、按分区计数的队列上限、`NodeCPUHigh` 的抖动。
 
+**主人 2026-11-23 定的规则改动（“等主人定的”第 2 条的七件事；规则都已下发，`make rules-test` 通过）**
+
+| 事 | 主人定的 | 做了什么 | 验证 |
+|---|---|---|---|
+| `ReconFoundDifferences` 分不清有差异和没跑成 | 按退出码拆成两条 | CronJob 加 `podFailurePolicy`（退出码 1 → `FailJob`，不重试）、`backoffLimit: 2`（其余的重试 2 次）；规则按 Job 的失败原因分成 `ReconFoundDifferences`（critical）和新的 `ReconRunFailed`（warning） | 第 17 项真实触发了“没跑成”那一条，见下 |
+| `RedisDown` 把 Sentinel 算进去 | 排除 Sentinel | `RedisDown` 只看数据节点；新增 `RedisSentinelDown`（warning，某个 Sentinel 连不上 5 分钟） | 单元测试；没有在集群上触发 |
+| `AlertmanagerNotificationsFailing` 和自带的重复 | 留自带的，删自己的 | 删了规则和三个测试，runbook 改成讲自带的两条 | 无 |
+| `CDCLagging` 的文字、两条通知里的分钟数 | `humanizeDuration`；时间尽可能准确 | `CDCLagging`、`CDCLaggingTooLong` 除以 1000 按秒比，通知是“落后 6m 5s”；`ConsumerNotConsuming` 写“至少 20 分钟”，`CDCPipelineMissing` 写“至少 15 分钟” | 单元测试钉了 `CDCLagging` 的文字 |
+| `NodeCPUHigh` 抖 | 问好不好解决 | 加 `keep_firing_for: 10m` | 单元测试（掉下去 5 分钟不恢复，掉下去 10 分钟多恢复） |
+| 两个抑制源恢复时会不会先撤 | 先验证 | Kafka 的做了实验（第 18 项），MySQL 的只按机制和配置核对，都没有改规则，见下 | 见下 |
+| 从库 NotReady 时自带的两条说同一件事 | 没看懂，问怎么改 | 没有改，解释和建议在 `PROGRESS.md` | 无 |
+
+- **按退出码拆的做法，和事先想的不一样的两处。** (1) 第 15 项里写的“kube-state-metrics 里没有退出码可用”是对的（`last_terminated_exitcode` 只在容器原地重启之后才有），但不需要退出码：Job 的 `podFailurePolicy` 能让“退出码 1”的失败带上不同的失败原因。在集群上用两个一次性的 Job 核对过 kube-state-metrics v2.20.0 给出的序列：退出码 1（`FailJob`）是 `kube_job_failed{condition="true"}` 1、`kube_job_status_failed` 三种认识的原因（`BackoffLimitExceeded`、`DeadlineExceeded`、`Evicted`）都是 0、另有一条不带 `reason` 的是 1；重试耗尽是 `reason="BackoffLimitExceeded"` 1。它只认识这三种原因，所以规则写成“失败了，并且不是这三种”算有差异：认不出的原因一律报成重的那一条。(2) 原来的规则用 `kube_job_status_failed > 0` 判断失败，有了重试之后不能再用：重试途中失败的 Pod 数已经大于 0 而 Job 还没有失败。改成看 `kube_job_failed{condition="true"}`。
+- **`RedisDown` 排除 Sentinel 之后多做的一步。** 只排除的话，3 个 Sentinel 掉到 2 个就没有任何告警了（`RedisSentinelBelowQuorum` 只在剩 1 个时响，以前这一档靠 `RedisDown`），三个全不在也没有（没有活着的 Sentinel 来报）。所以加了 warning 的 `RedisSentinelDown`，少一个就报。先写的是只管“三个全不在”的一条，子 Agent 改 runbook 时指出掉一个没人报，换成了这一条。
+- **通知里的时间为什么写“至少”。** 这两条的条件成立时故障已经持续了一段固定的时间（位点的 `delta` 要 10 分钟才是 0；推上来的序列要约 5 分钟才从查询结果里消失），再加 `for`。通知之后告警还会继续响，所以写不出一个一直准确的数，“至少 N 分钟”在任何时刻都是对的。
+
+**第 17 项：手工建一个连不上从库的对账 Job（真实触发；2026-11-23 07:20 到 07:25 UTC，没有动任何组件）**
+
+- `kubectl create job --from=cronjob/recon-hourly --dry-run=client -o json`，把 `MYSQL_REPLICA_DSNS` 里一个端口改成 3399 再建。三个 Pod 都是 `connect order_replica_0: ... i/o timeout`（退出码 2），间隔 10 秒、20 秒，07:21:23 Job 以 `BackoffLimitExceeded` 失败。
+- `ReconRunFailed`（warning）07:22 进 `pending`，07:22:52 `firing`，07:23:22 送到 alertsink，没有发 Telegram。**`ReconFoundDifferences` 全程没有进 `pending`。** 重试途中（失败的 Pod 数是 1、2）两条都没有动。
+- 07:24 手工跑一次成功的（差异 0），约 1 分钟后告警恢复，07:28:22 恢复的通知送到；失败的 Job 已删。
+- **没有验证的**：“有差异”那一条在长期运行的那一套上因为退出码 1 而响，仍然没有真实触发过（要有真的差异）；它依据的序列形状是用一次性的 Job 核对的。
+
+**第 18 项：停一个 Kafka broker，量恢复时抑制的源和目标谁先撤（真实触发；2026-11-23 07:28 到 07:43 UTC，主人同意后做的）**
+
+做法：Strimzi operator 缩到 0（不然它马上把 Pod 建回来），删掉 `kafka-dual-2`（不是 KRaft 的 leader，卷留着），停 8.5 分钟，operator 缩回 1。每 8 到 15 秒一行的记录在 `tmp/3c-inject-18-kafka-broker.log`。
+
+| 时刻（UTC） | 事 |
+|---|---|
+| 07:28:25 | broker 2 删掉；95 个分区副本不足 |
+| 07:31:15 | `KafkaBrokerMissing`（critical）`firing`，07:31:44 送到，Telegram 也发了 |
+| 07:33:49 | `KafkaUnderReplicatedPartitions`（12 个 topic）`firing`，**被抑制，一条都没有送出去** |
+| 07:36:55 | operator 缩回 1 |
+| 07:42:00 前后 | operator 把 `kafka-dual-2` 建回来（**回来 5 分钟之后**，见下） |
+| 07:42:30 | 副本不足的分区回到 0 |
+| 07:42:46 | `KafkaUnderReplicatedPartitions` 不在了（目标先走） |
+| 07:42:55 | `kafka_brokers` 回到 3 |
+| 07:43:20 | `KafkaBrokerMissing` 不在了（源后走，晚约 35 秒） |
+
+- **这一次没有“恢复时先撤”：目标比源早走约 35 秒，没有漏出通知。** 原因和事先想的相反：副本追上得很快（平时每秒 1 单，8 分钟里欠的数据很少，Pod 起来 30 秒内就同步完），而 Kafka Exporter 看到的 broker 数更新得慢。
+- **但这个顺序不是有保证的，是量出来的一次。** 副本追上要多久取决于停的这段时间里欠了多少数据：压测中停一个 broker，追上要的时间会长得多，而 broker 数的更新不会变慢，顺序会反过来。所以结论是“平时不会漏，过载或者停得久的时候可能漏”。给 `KafkaBrokerMissing` 加 `keep_firing_for` 是便宜的保险（代价是恢复的通知晚几分钟），**没有加，等主人定**。
+- **顺带看到的：operator 回来之后 5 分钟才把 Pod 建回来。** 它启动后的第一次调和从 07:37:04 一直“in progress”到 07:42:08，这期间 `StrimziPodSet` 的状态仍然显示 3/3，缺的 Pod 没有人建；第一次调和结束、下一次调和开始时才建。像是第一次调和在等连不上的那个 broker 直到超时（默认的操作超时是 5 分钟），没有查。含义：operator 和一个 broker 同时不在（例如它们在同一个节点上、节点重启）时，broker 的恢复要多等 5 分钟。记给阶段 4。
+- `KafkaOperatorMetricsMissing`、`KafkaOperatorNotReconciling` 各进过 `pending`，没有到 10 分钟，没有响。停着的 8 分钟里探针照常下单（三副本、`min.insync.replicas` 2），没有别的告警。
+- 收尾（07:45 UTC 核对）：3 个 broker，副本不足的分区 0，调和成功的计数在涨，没有在响的告警，没有不正常的 Pod。
+- 做的时候的一个不小心：07:41 前后（恢复阶段）重新下发过一次规则（改 `RedisSentinelDown`）。改的是 `middleware.redis` 组，Kafka 的规则在另一个组里，状态没有受影响，但实验中间不该动规则。
+
+**`MySQLDown` 这个抑制源（没有做实验，按机制和配置核对的）**
+
+- Prometheus 里留着的两次 MySQL 掉线（2026-11-20 16:21 整个集群重启、2026-11-22 03:11 的 30 秒）都是主库和从库一起掉、一起回来，不是“主库单独掉几分钟”，当不了证据。
+- 压同一个实例的那一条（`equal: [instance]`，目标是这个实例自己的复制指标）：源和目标来自 exporter 对同一个实例的同一次抓取，又在同一个规则组里求值，同一轮一起恢复，没有先后。
+- 压同一套里从库 IO 线程的那一条（`equal: [cluster]`）：主库回来之后，exporter 下一次抓取（30 秒一次）`mysql_up` 就是 1，源恢复；从库要等自己的下一次重连（`CONNECTION_RETRY_INTERVAL` 是 10 秒，在 `mysql-order-0-1` 上读的）再被下一次抓取看到，目标才恢复。两个实例的抓取时刻不同步，所以**目标可能比源晚走一轮求值，最多约 40 秒**；这 40 秒里正好轮到这一组刷新（5 分钟一次）才会漏，一次事故大约一成多的可能，漏出来的是一条 critical。
+- 真的验证要让一个订单主库单独停几分钟，是阶段 4 的实验，没有在这里做。**没有改规则，等主人定**（同样是加 `keep_firing_for`）。
+
+**主人同一天定的两处代码改动：延迟消费者并发、队列上限按分区数（决定和道理在 [ADR-0036](../adr/0036-per-partition-backlog-and-concurrent-delay.md)）**
+
+| 改动 | 在哪 | 测试 |
+|---|---|---|
+| 延迟消费者可以设 `Concurrency`：等到期放在分发那一步，到期之后按 key 并行 | `pkg/kafkax/consumer.go`（`runLanes`、`process`）、`delay.go` | `delay_test.go` 加三个：到期的确实并行并提交到末尾；队首没到期时后面到期的不处理、位点不越过它；等到期时停止 |
+| order 的延迟关单用它，`CLOSE_CONCURRENCY` 默认 4 | `services/order/cmd/order/main.go`、`deploy/cluster/services/order.yaml` | 无新测试（配置） |
+| 算一条有 key 的消息会进哪个分区、读 topic 的分区数 | `pkg/kafkax/partition.go` | Kafka 自己的 murmur2 测试向量；把 200 条消息真的发到 8 个分区核对 |
+| 闸门的背压前两条按队列数，另记一份索引 | `pkg/stockgate/stockgate.go`（三个脚本） | `stockgate_test.go` 加七个：各队列各数各的、四条离开队列的路都清索引、第二条按队列、第三条不分队列、残留按时间清掉、不分队列时行为不变、并发下上限严格成立 |
+| order 受理时传分区号，启动时读 `order.submit` 的分区数 | `services/order/internal/service/{service,submit}.go`、`cmd/order/main.go` | `TestSubmitBackpressurePerPartition`：4 个分区、上限 1 时正好受理 4 单，每单的队列等于它的消息会去的分区 |
+
+- 验证到哪：`pkg`、`services/order`、`api` 三个模块 `make lint` 0 issues、`make test` 通过（28 个包 ok，`tmp/item5-test.log`）。**没有跑别的模块，没有部署，没有在过载下验证。**
+- 写的时候的一处取舍：索引里的残留靠 `Hold` 自己按时间清（比“两倍宽限期加一个回收间隔”更老的条目），不靠分两次发布。原因和代价在 ADR-0036 的“道理”第三段。
+- `OrderQueueNearWaitLimit` 的含义跟着变了：它拿全部占用的个数除以总的落库速率，四个分区都满时算出来约 27 秒，超过它的 24 秒线，会响。那时确实贴着等待的上限，没有改规则；下一次过载压测时留意它是不是在该响的时候响。
+
+**主人 2026-11-23 第二轮定的（规则和 Alertmanager 的配置都已下发）**
+
+- **两个抑制源加 `keep_firing_for: 5m`**：`MySQLDown`、`KafkaBrokerMissing`。单元测试各加一个。
+- **从库 NotReady 时自带的两条重复，加了两条抑制**：源是 `MySQLDown`、`MySQLReplicaSQLThreadStopped`、`MySQLReplicaIOThreadStopped`，目标是 `KubePodNotReady`（`equal: [namespace, pod]`）和 `KubeStatefulSetReplicasMismatch`（`equal: [namespace, statefulset]`）。两边原来没有同名的标签（我们的是 `instance`、`cluster`），所以在三条规则上补了 `namespace: mysql`、`pod`（取 `instance`）、`statefulset`（取 `cluster`）。两条复制的规则也加了 `keep_firing_for: 5m`：复制恢复之后 Pod 的就绪要等探针和下一次抓取，目标会比源晚走。比原来建议的多一个源（`MySQLDown`）：实例连不上时 Pod 同样是 NotReady。`monitoring.sh inhibit-test` 加了 7 条用例，54 条 0 条不符（合成的告警；真实的告警上没有验证，要停复制超过 15 分钟）。
+- **`NodeCPUHigh` 的 `keep_firing_for` 从 10 分钟改成 3 分钟**：主人嫌恢复的通知晚 10 分钟太长。表达式是 5 分钟的平均，秒级的抖动已经抹掉了，3 分钟盖得住平均值在线上下来回蹭；掉下去超过 3 分钟再回来算新的一次。上次压测里 agent-1 是恢复之后马上又进 `pending`，3 分钟够不够，这一轮压测看。
+- **第 4 项拆成 4a、4b**，4b 归第 16 项（计划文件的登记表）。
+

@@ -8,9 +8,9 @@
 
 cdc 服务（Deployment `cdc`，命名空间 `oppenheimer`，1 个副本）从订单从库读 binlog，把变更发到 Kafka 的 `cdc.order.orders`，`orderindex` 消费它建商家维度的订单索引。每个订单分片一条管道（现在是 `order-0`、`order-1`），位点是 GTID 集合，存在 Kafka 的压缩 topic 里。指标 `cdc_lag_ms` 量的是“最后一条处理的变更距它发生有多久”。
 
-- **`CDCLagging`**：`max by (pipeline) (cdc_lag_ms)` 超过 60 秒，持续 5 分钟。
-- **`CDCLaggingTooLong`**：超过 1 小时，持续 5 分钟（critical）。binlog 只留 1 天（2026-11-22 起，round-9 3.4），再落后下去位点对应的 binlog 会被源库清掉，那之后只能重做全量。
-- **`CDCPipelineMissing`**：`order-0` 或 `order-1` 的 `cdc_lag_ms` 序列 10 分钟没有。cdc 挂了、这条管道退出了或指标送不出来。延迟的规则这时没有值不会响，所以按管道清单显式查；订单库加分片时这里要跟着加。
+- **`CDCLagging`**：`max by (pipeline) (cdc_lag_ms) / 1000` 超过 60（秒），持续 5 分钟。除以 1000 是为了让通知里的值是秒，写成“落后 6m 5s”这种（原来是“365.4k 毫秒”）。
+- **`CDCLaggingTooLong`**：同样按秒，超过 3600（1 小时），持续 5 分钟（critical），通知写“落后 …，binlog 只保留 1 天”。binlog 只留 1 天（2026-11-22 起，round-9 3.4），再落后下去位点对应的 binlog 会被源库清掉，那之后只能重做全量。
+- **`CDCPipelineMissing`**：`order-0` 或 `order-1` 的 `cdc_lag_ms` 序列消失，持续 10 分钟（`for`）。通知写“至少 15 分钟没有报延迟”：cdc 停了之后序列还要约 5 分钟才从查询结果里消失（指标是推上来的，Prometheus 对不再更新的序列回看 5 分钟），`absent()` 那时才成立，再加 10 分钟（实测从停掉到通知约 16 分钟）。cdc 挂了、这条管道退出了或指标送不出来。延迟的规则这时没有值不会响，所以按管道清单显式查；订单库加分片时这里要跟着加。
 
 这个指标在源库没有写入时一直涨，直接设阈值会在空闲时误报；探针每秒一单保证了两个分片一直有写入，所以前两条依赖探针（探针停了见 [probe.md](probe.md)）。设计第 2 节第 7 项：没有做源库心跳，因为探针已经解决了它要解决的问题。
 

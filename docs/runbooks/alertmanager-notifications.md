@@ -1,12 +1,12 @@
 # 告警送不出去
 
-覆盖的告警：`AlertDeliveryStalled`（critical）、`AlertmanagerNotificationsFailing`（warning）
+覆盖的告警：`AlertDeliveryStalled`（critical）。chart 自带的 `AlertmanagerFailedToSendAlerts`（warning）和 `AlertmanagerClusterFailedToSendAlerts`（critical）说的是同一件事，也看这份
 
 ## 这条告警在说什么
 
-告警的链路：Prometheus 求值 → Alertmanager（配置在 `deploy/cluster/monitoring/alertmanager/alertmanager.yaml`，做成 Secret `alertmanager-oppenheimer`）→ webhook 接收端 `alertsink`（`monitoring` 命名空间的 Deployment，只打日志）；`severity=critical` 的另外发 Telegram（token 和会话号在仓库根目录不入库的 `.env` 里）。两条告警盯这条链路的两个位置。
+告警的链路：Prometheus 求值 → Alertmanager（配置在 `deploy/cluster/monitoring/alertmanager/alertmanager.yaml`，做成 Secret `alertmanager-oppenheimer`）→ webhook 接收端 `alertsink`（`monitoring` 命名空间的 Deployment，只打日志）；`severity=critical` 的另外发 Telegram（token 和会话号在仓库根目录不入库的 `.env` 里）。三条告警盯这条链路的两个位置：自带的两条看“Alertmanager 发不出去”，`AlertDeliveryStalled` 看“Watchdog 到不了 alertsink”。
 
-**`AlertmanagerNotificationsFailing`**：`alertmanager_notifications_failed_total` 按接收端（`integration`，`webhook` 或 `telegram`）汇总，15 分钟窗口里有增长，持续 10 分钟。Alertmanager 往这个接收端发通知持续失败，告警可能没有送达。后一半表达式抓计数器第一次出现的情形。
+**`AlertmanagerFailedToSendAlerts`（warning）、`AlertmanagerClusterFailedToSendAlerts`（critical）**：chart 自带，表达式见 Prometheus 的规则页。Alertmanager 往接收端（`integration`，`webhook` 或 `telegram`）发通知持续失败，告警可能没有送达。我们自己写的 `AlertmanagerNotificationsFailing` 2026-11-23 删了：同一件事四条告警，自带的更快（2026-11-22 实测 alertsink 缩到 0 后约 9 分钟响，我们那条约 13 分钟）。这两条各自按什么分组、critical 那条是否看全部接收端，没有核对。
 
 **`AlertDeliveryStalled`**：`time() - max(alertsink_watchdog_last_received) > 15 * 60`，或者这个指标不存在（`absent`），持续 10 分钟。`Watchdog` 一直在响，Alertmanager 每 5 分钟把它发给 alertsink 一次（`alertmanager.yaml` 的第一条路由），alertsink 把最后一次收到的时刻报成指标，15 分钟（三次）没更新就算断了。覆盖整条路：Prometheus 不求值、Prometheus 到 Alertmanager 不通、Alertmanager 的路由或配置坏了、alertsink 不在。从断开到响大约 25 分钟（15 分钟加 `for` 10 分钟）。
 
@@ -14,13 +14,13 @@
 
 ## 影响
 
-没有用户可见的影响，但**这期间别的告警可能同样没有送到**，监控等于瞎了；3d 之后诊断 Agent 也收不到。`AlertDeliveryStalled` 是 critical，看到就处理；`AlertmanagerNotificationsFailing` 当天看。数据没有风险。
+没有用户可见的影响，但**这期间别的告警可能同样没有送到**，监控等于瞎了；3d 之后诊断 Agent 也收不到。`AlertDeliveryStalled` 和自带的 `AlertmanagerClusterFailedToSendAlerts` 是 critical，看到就处理；`AlertmanagerFailedToSendAlerts` 是 warning，当天看。alertsink 坏了时主人现在会收到两条 critical：`AlertmanagerClusterFailedToSendAlerts` 和 `AlertDeliveryStalled`（critical 会发 Telegram）。数据没有风险。
 
-**盲区，要清楚这两条各自看不到什么：**
+**盲区，要清楚这几条各自看不到什么：**
 
-1. **坏的是 Telegram 时，`AlertmanagerNotificationsFailing`（`integration="telegram"`）只能从 webhook 那边看到。** 它是 warning，路由只去 webhook，不发 Telegram，所以主人不会被推送，要自己看 alertsink 的日志或 `monitoring.sh alerts`。此时 critical 告警实际上没有送到主人（规则注释把这点列为不能当唯一保障的原因）。`AlertDeliveryStalled` 不会响：它只看 webhook 这条路（Watchdog 到 alertsink）。
-2. **坏的是 alertsink 时，`AlertmanagerNotificationsFailing`（`integration="webhook"`）这条 warning 自己也没有地方送**（warning 只去 webhook）；只有 critical 的 `AlertDeliveryStalled` 能走 Telegram。
-3. **坏的是 Prometheus 或 Alertmanager 自己时，两条都发不出来**：规则没人求值、通知没人发。集群外没有东西盯着 `Watchdog`（dead man's switch），这是有意不做的（设计第 7 节，记成考点）。chart 自带的 Alertmanager、Prometheus 的告警也在同一个集群里，同样发不出来。
+1. **坏的是 Telegram 时，自带的两条的 critical 那条同样发不出到主人，这个盲区没有变。** 能看到的只有 warning 的 `AlertmanagerFailedToSendAlerts`：它路由只去 webhook，不发 Telegram，所以主人不会被推送，要自己看 alertsink 的日志或 `monitoring.sh alerts`。此时 critical 告警实际上没有送到主人（规则注释把这点列为不能当唯一保障的原因）。`AlertDeliveryStalled` 不会响：它只看 webhook 这条路（Watchdog 到 alertsink）。
+2. **坏的是 alertsink 时，warning 的 `AlertmanagerFailedToSendAlerts` 自己也没有地方送**（warning 只去 webhook）；critical 的 `AlertmanagerClusterFailedToSendAlerts` 和 `AlertDeliveryStalled` 能走 Telegram（2026-11-22 实测，自带的 critical 一条 Telegram 发出去了）。代价：webhook 这种“只是日志”的接收端失败时也会有一条 critical 发到 Telegram。
+3. **坏的是 Prometheus 或 Alertmanager 自己时，这几条都发不出来**：规则没人求值、通知没人发。集群外没有东西盯着 `Watchdog`（dead man's switch），这是有意不做的（设计第 7 节，记成考点）。chart 自带的 Alertmanager、Prometheus 的告警也在同一个集群里，同样发不出来。
 4. **`OtelGatewayDown` 在响时 `AlertDeliveryStalled` 被抑制**（`alertmanager.yaml` 的抑制规则）：alertsink 的指标经 Collector 进 Prometheus，Collector 不在时这个指标会消失，会误报成“送不出去”。所以 Collector 坏的时候，要自己看 alertsink 的日志确认告警到底有没有送到。
 
 ## 先看什么
@@ -66,18 +66,18 @@
 
 ## 常见的原因和各自的处理
 
-项目里这两条都还没有真的响过，下面除第 1 条外都是推断。
+`AlertDeliveryStalled` 还没有在真实故障里响过（2026-11-22 的故障注入除外，见下面的历史），自带的两条 2026-11-22 响过一次；下面除第 1 条外都是推断。
 
 1. **Telegram 根本没配。** 设计 8 的“第 6 步”记录：截至 2026-11-23 `.env` 里没有 Telegram 的两个变量，集群上是“只发 webhook”的配置，真的发一条到 Telegram 还没有做过；从 Alertmanager 的 Pod 访问 `api.telegram.org` 是通的（302，经 R2S 的透明代理）。也就是说 critical 现在大概率只进了 alertsink 的日志，没有推送到主人。处理：写好 `.env` 后重跑 `scripts/cluster/monitoring.sh alertmanager`（改完不用重启，一分钟内重新加载）。
 2. **alertsink 不在（推断，没有遇到过）。** Deployment 偏好 k3s-server，节点重启（见 [node-reboot.md](node-reboot.md)）或镜像拉不到时会不在。`monitoring.sh alertsink` 会重新部署（镜像是 chaos 镜像里的 `load alertsink`，仓库里没有就构建）。
 3. **Telegram 的 token、会话号错了，或 `api.telegram.org` 不通（推断）。** 拉取外网经 R2S 代理，超时先怀疑网络（AGENTS.md）。看第 4 步的日志。
 4. **Alertmanager 的配置坏了、重载失败（推断）。** 改过 `alertmanager.yaml` 之后先 `make alertmanager-test`，再 `monitoring.sh alertmanager`。
 5. **Collector 的 gateway 不在，指标没了（见盲区 4）。** `AlertDeliveryStalled` 被抑制，不报。看 `OtelGatewayDown`；Collector 停机各丢什么见 [3a 笔记第 10 节](../notes/3a-observability.md)。
-6. **Prometheus 或 Alertmanager 的 Pod 不在、k3s-server 出问题（推断）。** 两条都发不出来。k3s-server 空间满了（[node-disk.md](node-disk.md)）也会这样。处理：直接 `kubectl -n monitoring get pods`，看它们。
+6. **Prometheus 或 Alertmanager 的 Pod 不在、k3s-server 出问题（推断）。** 这几条都发不出来。k3s-server 空间满了（[node-disk.md](node-disk.md)）也会这样。处理：直接 `kubectl -n monitoring get pods`，看它们。
 
 ## 怎么确认恢复了
 
-`AlertmanagerNotificationsFailing` 在 15 分钟窗口里没有新的失败后恢复；`AlertDeliveryStalled` 在 alertsink 又收到 Watchdog 之后恢复（最长 5 分钟）。确认：
+自带的 `AlertmanagerFailedToSendAlerts`、`AlertmanagerClusterFailedToSendAlerts` 在没有新的失败之后恢复（2026-11-22 实测：alertsink 回来后，“发送失败”的告警要等窗口滑过去才恢复，那一次约 15 分钟，自带的窗口没有核对）；`AlertDeliveryStalled` 在 alertsink 又收到 Watchdog 之后恢复（最长 5 分钟）。确认：
 
 ```sh
 scripts/cluster/monitoring.sh promql 'time() - max(alertsink_watchdog_last_received)'
@@ -95,7 +95,7 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 
 设计 3c 第 5 节第 2 层没有单列。**待定**，建议，没有验证过：
 
-- `kubectl -n monitoring scale deploy/alertsink --replicas=0`。下一个 Watchdog（最多 5 分钟）发送失败，`AlertmanagerNotificationsFailing{integration="webhook"}` 在约 10 到 15 分钟后进入 firing（它自己送不到任何地方，只能在 `monitoring.sh alerts` 和 Prometheus 里看到，这正是盲区 2）；`AlertDeliveryStalled` 在约 25 分钟后响，并且只有配了 Telegram 才推送得到。验完 `scale --replicas=1`（或重跑 `monitoring.sh alertsink`）。
+- `kubectl -n monitoring scale deploy/alertsink --replicas=0`。下一个 Watchdog（最多 5 分钟）发送失败，自带的 `AlertmanagerFailedToSendAlerts` 约 9 分钟后响（2026-11-22 实测；它自己送不到任何地方，只能在 `monitoring.sh alerts` 和 Prometheus 里看到，这正是盲区 2），`AlertmanagerClusterFailedToSendAlerts` 同时响并发到 Telegram；`AlertDeliveryStalled` 约 15 分钟后响（实测，序列消失那一半，规则上最长约 25 分钟），并且只有配了 Telegram 才推送得到。验完 `scale --replicas=1`（或重跑 `monitoring.sh alertsink`）。
 - Telegram 这条路：把 `.env` 里的 token 临时写错再重跑 `monitoring.sh alertmanager`，发一条合成的 critical；验完改回。
 - 盲区 3（Prometheus 或 Alertmanager 自己坏）没有办法触发验证，那是设计上承认的缺口。
 
@@ -103,4 +103,4 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-22 20:08:59 到 20:37:17 UTC，告警质量检查第 12 项（人为的）：alertsink 缩到 0。自带的 `AlertmanagerFailedToSendAlerts`、`AlertmanagerClusterFailedToSendAlerts` 约 20:18 响（约 9 分钟，critical 的一条 Telegram 发出去了），我们原来的 `AlertmanagerNotificationsFailing` 约 20:22（约 13 分钟），`AlertDeliveryStalled` 约 20:24（约 15 分钟，从 `absent()` 那一半响的）。同一件事四条告警，2026-11-23 删了我们那一条。

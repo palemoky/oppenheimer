@@ -61,4 +61,4 @@
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-23 07:31 UTC，`KafkaBrokerMissing` 第一次真实触发（告警质量检查第 18 项，人为的：Strimzi operator 缩到 0 之后删掉 `kafka-dual-2`，停 8.5 分钟）：删掉约 3 分钟后响，Telegram 发了；12 个 topic 的 `KafkaUnderReplicatedPartitions` 全部被它抑制，没有送出去。恢复时副本不足先消失（Pod 起来 30 秒内同步完），`kafka_brokers` 约 35 秒后才回到 3，没有漏出通知；欠的数据多的时候这个顺序会反过来（设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 18 项”）。**operator 缩回 1 之后 5 分钟才把 Pod 建回来**（它的第一次调和一直卡到超时），这段时间 `kubectl -n kafka get strimzipodset` 仍然显示 3/3：看到 broker 少一个而 operator 刚重启过，先等 5 分钟再怀疑别的。停着的时候三副本的 topic 读写不受影响，探针照常。

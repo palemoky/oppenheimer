@@ -6,6 +6,8 @@
 
 某个节点（node-exporter 的 `instance`）的 CPU 使用率，即 1 减去所有核空闲时间占比的 5 分钟平均，超过 85%，持续 10 分钟。三个节点各自算：server 4 vCPU，agent-1、agent-2 各 8 vCPU（每个可分配 7.5 核）。
 
+加了 `keep_firing_for: 3m`（2026-11-23；先取的 10 分钟，主人嫌恢复的通知晚得太久，改成 3 分钟）：条件不成立之后再多响 3 分钟，过载时在 85% 上下晃的节点不再多发一轮“恢复”和“触发”；掉下去不到 3 分钟又回来的算同一次，超过 3 分钟再回来的算新的一次（要重新等 `for` 的 10 分钟）。代价：真的降下来之后“恢复”的通知晚 3 分钟到。
+
 阈值的来历：混合读写的拐点在九成上下，85% 是提前量；3b 量到过 95% 时延迟会晃，所以 `for` 不短于 10 分钟。出处：[round-4 的 1.2](../notes/3b-rounds/round-4-mixed-and-flash-ladders.md)（1907 请求/秒的拐点，两个 agent 节点 87% 和 95%，2384 档 92% 和 99%）、[3b 容量笔记](../notes/3b-capacity.md)、[设计 3c 的 4.5](../design/3c-slo-alerting.md)。这是原因一级的线索：用户有没有受影响看 SLO 的燃烧率，不看这条。
 
 ## 影响
@@ -80,4 +82,4 @@ scripts/cluster/monitoring.sh promql '1 - avg by (instance) (rate(node_cpu_secon
 
 ## 历史
 
-- 2026-11-23 02:47 UTC，`NodeCPUHigh` 第一次真的响（压测 280 单/秒，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：agent-2 02:47 响（93% 到 96%），agent-1 02:49 响，之后 agent-1 在 85% 上下抖：02:57 恢复又进 `pending`，多发了一轮通知。CPU 主要在用户态（agent-2 约 4.9 核，iowait 0.3 核），吃得最多的是 order、gateway 的 Pod，其次 `mysql-main-0`、`tempo-0`、入口 Envoy。停压后约 3 分钟恢复。chart 自带的 `NodeSystemSaturation`（按负载均值）同时响了两条，说的是同一件事；自带的 `NodeCPUHighUsage` 只进过 `pending`。
+- 2026-11-23 02:47 UTC，`NodeCPUHigh` 第一次真的响（压测 280 单/秒，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：agent-2 02:47 响（93% 到 96%），agent-1 02:49 响，之后 agent-1 在 85% 上下抖：02:57 恢复又进 `pending`，多发了一轮通知。CPU 主要在用户态（agent-2 约 4.9 核，iowait 0.3 核），吃得最多的是 order、gateway 的 Pod，其次 `mysql-main-0`、`tempo-0`、入口 Envoy。停压后约 3 分钟恢复。chart 自带的 `NodeSystemSaturation`（按负载均值）同时响了两条，说的是同一件事；自带的 `NodeCPUHighUsage` 只进过 `pending`。同日加了 `keep_firing_for: 10m`，这种抖动不再多发一轮通知。

@@ -10,7 +10,7 @@
 
 - **`ConsumerBlocked`**：上面这个值超过 10 分钟，持续 5 分钟。
 - **`ConsumerBlockedTooLong`**：超过 2 小时，持续 5 分钟。**Kafka 的保留期是 24 小时**，过了之后没消费的消息会被删掉，那时丢的是数据（round-9 3.4）。
-- **`ConsumerNotConsuming`**：Kafka Exporter 的 `kafka_consumergroup_lag` 大于 0（有积压），并且 `kafka_consumergroup_current_offset` 的 10 分钟 `delta` 等于 0（位点没动），持续 10 分钟。只看五个消费组：`order.order-submit`、`order.payment-events`、`inventory.order-events`、`payment.order-events`、`orderindex.cdc-orders`。`order.close.delay` 不看：它的“积压”是还没到期的延迟关单消息，是机制本身（稳定在 11.4 万，round-9 2.3）；所以第 2 步的两条查询里也没有它，延迟关单落后时用“常见的原因”里那一条的查询。它能发现消费者整个不在、卡在再均衡、进程活着但不拉消息，这些 `ConsumerBlocked` 量不到。注意 `delta` 窗口 10 分钟加 `for` 10 分钟，实际从位点停下算起最早约 20 分钟才响，比规则注释里的“10 分钟”长。
+- **`ConsumerNotConsuming`**：Kafka Exporter 的 `kafka_consumergroup_lag` 大于 0（有积压），并且 `kafka_consumergroup_current_offset` 的 10 分钟 `delta` 等于 0（位点没动），持续 10 分钟；通知写“位点至少 20 分钟没有动”。只看五个消费组：`order.order-submit`、`order.payment-events`、`inventory.order-events`、`payment.order-events`、`orderindex.cdc-orders`。`order.close.delay` 不看：它的“积压”是还没到期的延迟关单消息，是机制本身（稳定在 11.4 万，round-9 2.3）；所以第 2 步的两条查询里也没有它，延迟关单落后时用“常见的原因”里那一条的查询。它能发现消费者整个不在、卡在再均衡、进程活着但不拉消息，这些 `ConsumerBlocked` 量不到。注意 `delta` 窗口 10 分钟加 `for` 10 分钟，实际从位点停下算起最早约 20 分钟才响，（实测约 21 分钟），所以通知里写“至少 20 分钟”，不是 10 分钟。
 
 ## 影响
 

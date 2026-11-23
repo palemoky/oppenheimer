@@ -80,7 +80,7 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 | 文件 | 告警 |
 |---|---|
 | [probe.md](probe.md) | `ProbeFailing`、`ProbeIncomplete`、`ProbeNoData` |
-| [recon.md](recon.md) | `ReconFoundDifferences`、`ReconNotRunning`、`ReconDailySlow` |
+| [recon.md](recon.md) | `ReconFoundDifferences`、`ReconRunFailed`、`ReconNotRunning`、`ReconDailySlow` |
 | [payment-totals.md](payment-totals.md) | `PaymentTotalsMismatch`、`PaymentTotalsCheckStalled`、`PaymentReplyOverdue` |
 | [inventory-anomaly.md](inventory-anomaly.md) | `InventoryOversellDetected`、`InventoryGateDrift` |
 | [order-gate-memory.md](order-gate-memory.md) | `OrderGateMemoryFull` |
@@ -118,7 +118,7 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 | [redis-gate-memory.md](redis-gate-memory.md) | `RedisGateMemoryHigh`、`RedisGateMemoryCritical` |
 | [redis-replication.md](redis-replication.md) | `RedisReplicaLinkDown` |
 | [redis-cluster.md](redis-cluster.md) | `RedisClusterUnhealthy` |
-| [redis-sentinel.md](redis-sentinel.md) | `RedisSentinelBelowQuorum` |
+| [redis-sentinel.md](redis-sentinel.md) | `RedisSentinelBelowQuorum`、`RedisSentinelDown` |
 | [kafka-partitions.md](kafka-partitions.md) | `KafkaUnderReplicatedPartitions`、`KafkaPartitionsOffline` |
 | [kafka-brokers.md](kafka-brokers.md) | `KafkaBrokerMissing` |
 | [kafka-operator.md](kafka-operator.md) | `KafkaOperatorNotReconciling`、`KafkaOperatorMetricsMissing` |
@@ -133,4 +133,4 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 | [node-disk.md](node-disk.md) | `ServerDiskLow`、`ServerDiskCritical`、`AgentDiskLow` |
 | [container-memory.md](container-memory.md) | `ContainerOOMKilled`、`ContainerMemoryNearLimit` |
 | [ingress-placement.md](ingress-placement.md) | `IngressEnvoyOnServerNode` |
-| [alertmanager-notifications.md](alertmanager-notifications.md) | `AlertmanagerNotificationsFailing`、`AlertDeliveryStalled` |
+| [alertmanager-notifications.md](alertmanager-notifications.md) | `AlertDeliveryStalled`（chart 自带的 `AlertmanagerFailedToSendAlerts`、`AlertmanagerClusterFailedToSendAlerts` 也看这份） |
