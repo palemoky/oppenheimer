@@ -904,3 +904,21 @@ k6 一侧：下单请求 503168，受理 366946，失败比例 0.033%（上一�
    - 查订单被读名额拒绝的多了一倍多：等落库的订单多了、等得久了，轮询跟着多（3b 记过的正反馈）。
 7. **告警**：critical 只有 `SLOOrderPersistDelayBurnFast` 一条发了 Telegram。`NodeCPUHigh` 这一轮没有抖（agent-2 08:50 响、agent-1 09:00 加进同一组，没有出现“恢复又触发”），`keep_firing_for` 3 分钟够不够只有这一个样本。`OrderQueueNearWaitLimit` 的情况见 `PROGRESS.md`。
 
+**第 4a 项：payment 缩到 0（真实触发；2026-11-23 09:25:24 到 09:51:16 UTC，26 分钟，探针不停）**
+
+| 告警 | 级别 | `firing` 送到 | 从停掉算起 | 恢复的通知 |
+|---|---|---|---|---|
+| `IngressGateway5xxHigh` | critical | 09:31:35，Telegram 也发了 | 约 6 分钟 | 09:56:35 |
+| `ProbeFailing` | critical | 09:31:42，Telegram 也发了 | 约 6 分钟 | 09:56:42 |
+| `ServiceMetricsMissing{payment}` | warning | 09:36:16 | 约 11 分钟 | 09:56:16 |
+| `ConsumerNotConsuming{payment.order-events}` | warning | 09:46:05 | 约 21 分钟 | 09:56:05 |
+
+- **登记时预期的五条里只响了 `ConsumerNotConsuming` 一条，另外响的三条是没写进预期的。** 原因是登记时把支付想成了异步的：
+  - 探针的“支付”一步是同步调 gateway 的 `/pay`，payment 不在时直接 503（26 分钟里 1365 个），所以最先响的是 `IngressGateway5xxHigh` 和 `ProbeFailing`。这两条响是对的：用户付不了款。
+  - 支付单根本建不出来，所以没有“建了 20 分钟还没封口的支付单”，**`PaymentReplyOverdue` 连 `pending` 都没有进**；支付处理时延的 SLO 没有观测值，也不响。这两条要“支付单建出来了而结果到不了订单”才触发，和 `PaidOrdersNotLanding` 是同一类，一起归到第 16 项（4b）。
+  - `PaymentTotalsCheckStalled` 没有响，是对的（核对读的是库，不经过 payment 服务）。
+- **担心的“退款的路”没有发生，也是同一个原因。** 没有支付单就没有可退的。这段时间下的约 1300 张探针订单到 15 分钟的时限被正常关单（`pending_payment` 到 `closed`），库存放回。payment 回来时 `payment.order-events` 上积着 719 条订单事件，一分钟内消费完，没有产生支付单。
+- 可用性的 SLO 没有响：它只看下单的接口，`/pay` 的 503 不算在里面。**付款整个不可用 26 分钟而四个 SLO 没有一个响**，发现它靠的是探针和入口的 5xx。支付的可用性要不要进 SLO，记给写 SLO 的 ADR 时定。
+- 恢复：payment 回来 5 分钟内四条都恢复，没有漏出别的通知。`TargetDown` 进过一次 `pending`（payment 的 Pod 刚起来）。
+- runbook：这四条都是真实触发过的（第 3、5 项），这次没有再逐份走。
+
