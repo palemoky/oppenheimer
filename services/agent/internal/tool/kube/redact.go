@@ -1,6 +1,8 @@
 package kube
 
 import (
+	"regexp"
+
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -55,12 +57,39 @@ func redact(o object) {
 		}
 	}
 	for i := range ps.InitContainers {
-		redactEnv(ps.InitContainers[i].Env)
+		c := &ps.InitContainers[i]
+		redactEnv(c.Env)
+		redactFlags(c.Command)
+		redactFlags(c.Args)
 	}
 	for i := range ps.Containers {
-		redactEnv(ps.Containers[i].Env)
+		c := &ps.Containers[i]
+		redactEnv(c.Env)
+		redactFlags(c.Command)
+		redactFlags(c.Args)
 	}
 	for i := range ps.EphemeralContainers {
-		redactEnv(ps.EphemeralContainers[i].Env)
+		c := &ps.EphemeralContainers[i]
+		redactEnv(c.Env)
+		redactFlags(c.Command)
+		redactFlags(c.Args)
+	}
+}
+
+// secretFlag 认出命令行里“名字像密钥”的参数：--password=x、-dsn=x、TOKEN=x，或者值里带用户名密码的地址（scheme://user:pass@host）。
+var secretFlag = regexp.MustCompile(`(?i)^(.*(?:pass(?:word|wd)?|secret|token|dsn|credential|api[-_]?key)[^=]*=).+$|^(.*://[^/@:]+:)[^@/]+(@.*)$`)
+
+// redactFlags 就地抹掉命令和参数里像密钥的值。命令行本身留着（排查时有用），只换掉值。
+// 这是尽力而为：“--password x”这种分成两个参数的写法认不出来，所以密钥不该走命令行传。
+func redactFlags(args []string) {
+	for i, a := range args {
+		m := secretFlag.FindStringSubmatch(a)
+		switch {
+		case m == nil:
+		case m[1] != "":
+			args[i] = m[1] + redacted
+		default:
+			args[i] = m[2] + redacted + m[3]
+		}
 	}
 }

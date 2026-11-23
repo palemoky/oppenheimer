@@ -22,6 +22,9 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/palemoky/oppenheimer/pkg/logx"
 	"github.com/palemoky/oppenheimer/pkg/otelx"
@@ -30,6 +33,7 @@ import (
 	"github.com/palemoky/oppenheimer/services/agent/internal/report"
 	"github.com/palemoky/oppenheimer/services/agent/internal/runlog"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool"
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool/kube"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/loki"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/prom"
 	"github.com/palemoky/oppenheimer/services/agent/internal/trigger"
@@ -66,6 +70,8 @@ type serveConfig struct {
 
 	prometheusURL string
 	lokiURL       string
+	kubeconfig    string
+	inCluster     bool
 }
 
 func serveCmd(args []string, stderr io.Writer) int {
@@ -185,7 +191,7 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	return nil
 }
 
-// buildTools 登记只读工具。地址为空的那一组不登记（本机对着 compose 跑时没有 Kubernetes）；
+// buildTools 登记只读工具。没有给地址（或者没有给 Kubernetes 的连接方式）的那一组不登记；
 // 一组都没有时 Agent 只有循环自己加的 submit_report，仍然能启动。
 func buildTools(cfg serveConfig) (*tool.Registry, error) {
 	// 工具自己不设超时：每次调用的时限由循环经 ctx 给（loop.Limits.ToolTimeout）。
@@ -197,7 +203,39 @@ func buildTools(cfg serveConfig) (*tool.Registry, error) {
 	if cfg.lokiURL != "" {
 		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client})...)
 	}
+	kubeCfg, err := kubeConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if kubeCfg != nil {
+		cs, err := kubernetes.NewForConfig(kubeCfg)
+		if err != nil {
+			return nil, fmt.Errorf("kubernetes client: %w", err)
+		}
+		tools = append(tools, kube.New(kube.Config{Client: cs})...)
+	}
 	return tool.NewRegistry(tools...)
+}
+
+// kubeConfig 返回连 apiserver 的配置；两种方式都没有给时返回 nil（不登记 kube_* 工具）。
+// 集群里用 Pod 自己的 ServiceAccount（只有白名单里那些资源的 get、list、watch，清单在 deploy/ 里）；
+// 本机调试用 kubeconfig，那个身份的权限通常大得多，能读什么只靠工具里的白名单拦。
+func kubeConfig(cfg serveConfig) (*rest.Config, error) {
+	switch {
+	case cfg.kubeconfig != "":
+		c, err := clientcmd.BuildConfigFromFlags("", cfg.kubeconfig)
+		if err != nil {
+			return nil, fmt.Errorf("kubeconfig %s: %w", cfg.kubeconfig, err)
+		}
+		return c, nil
+	case cfg.inCluster:
+		c, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("in-cluster kubernetes config: %w", err)
+		}
+		return c, nil
+	}
+	return nil, nil
 }
 
 // spentToday 从运行记录里加出今天已经花掉的钱：每天的预算不能因为重启就清零。

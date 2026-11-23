@@ -70,4 +70,6 @@ func toolCmd(args []string, stdout, stderr io.Writer) int {
 func toolFlags(fs *flag.FlagSet, cfg *serveConfig) {
 	fs.StringVar(&cfg.prometheusURL, "prometheus-url", os.Getenv("PROMETHEUS_URL"), "Prometheus base URL (default $PROMETHEUS_URL); empty disables the prom_* tools")
 	fs.StringVar(&cfg.lokiURL, "loki-url", os.Getenv("LOKI_URL"), "Loki base URL (default $LOKI_URL); empty disables the loki_* tools")
+	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig path for the kube_* tools (local use)")
+	fs.BoolVar(&cfg.inCluster, "in-cluster", false, "use the pod's ServiceAccount for the kube_* tools")
 }
