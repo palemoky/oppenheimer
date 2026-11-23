@@ -31,6 +31,7 @@ func TestParseTime(t *testing.T) {
 		"2026-11-24T03:00:00Z": time.Date(2026, 11, 24, 3, 0, 0, 0, time.UTC),
 	}
 	cases["-2h"] = now.Add(-2 * time.Hour)
+	cases["-7d"] = now.Add(-7 * 24 * time.Hour)
 	cases["\t-90s\n"] = now.Add(-90 * time.Second) // 两头的空白不算错
 	for in, want := range cases {
 		got, err := ParseTime(in, now)
@@ -38,7 +39,7 @@ func TestParseTime(t *testing.T) {
 			t.Errorf("ParseTime(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"-30", "yesterday", "30m", "1795500000"} {
+	for _, bad := range []string{"-30", "yesterday", "30m", "1795500000", "--5m", "-1.5d", "-d"} {
 		if _, err := ParseTime(bad, now); err == nil {
 			t.Errorf("ParseTime(%q) accepted", bad)
 		}

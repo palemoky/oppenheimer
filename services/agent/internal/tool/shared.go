@@ -4,6 +4,7 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,7 +24,7 @@ func Decode(input jsontext.Value, dst any) error {
 	return nil
 }
 
-// ParseTime 解析工具的时间参数：RFC 3339（2026-11-24T03:00:00Z），或者相对现在的写法（-30m、-2h、-90s、now）。
+// ParseTime 解析工具的时间参数：RFC 3339（2026-11-24T03:00:00Z），或者相对现在的写法（-30m、-2h、-1d、-90s、now）。
 // 空串返回 now。模型不知道现在几点，相对写法让它不用自己算。
 func ParseTime(s string, now time.Time) (time.Time, error) {
 	s = strings.TrimSpace(s)
@@ -31,9 +32,15 @@ func ParseTime(s string, now time.Time) (time.Time, error) {
 	case s == "" || s == "now":
 		return now, nil
 	case strings.HasPrefix(s, "-"):
+		// 模型常写 -1d、-7d，而 time.ParseDuration 不认识“天”。
+		if days, ok := strings.CutSuffix(s[1:], "d"); ok {
+			if n, err := strconv.Atoi(days); err == nil && n >= 0 {
+				return now.Add(-time.Duration(n) * 24 * time.Hour), nil
+			}
+		}
 		d, err := time.ParseDuration(s[1:])
-		if err != nil {
-			return time.Time{}, fmt.Errorf("time %q: relative times look like -30m, -2h or -90s", s)
+		if err != nil || d < 0 {
+			return time.Time{}, fmt.Errorf("time %q: relative times look like -30m, -2h, -1d or -90s", s)
 		}
 		return now.Add(-d), nil
 	}

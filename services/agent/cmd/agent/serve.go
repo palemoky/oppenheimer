@@ -30,6 +30,8 @@ import (
 	"github.com/palemoky/oppenheimer/services/agent/internal/report"
 	"github.com/palemoky/oppenheimer/services/agent/internal/runlog"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool"
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool/loki"
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool/prom"
 	"github.com/palemoky/oppenheimer/services/agent/internal/trigger"
 )
 
@@ -61,6 +63,9 @@ type serveConfig struct {
 	keepAge     time.Duration
 	keepBytes   int64
 	limits      loop.Limits
+
+	prometheusURL string
+	lokiURL       string
 }
 
 func serveCmd(args []string, stderr io.Writer) int {
@@ -81,6 +86,8 @@ func serveCmd(args []string, stderr io.Writer) int {
 	fs.IntVar(&cfg.limits.MaxTurns, "max-turns", cfg.limits.MaxTurns, "model turns per run before wrap-up")
 	fs.Float64Var(&cfg.limits.MaxCostUSD, "max-cost-usd", cfg.limits.MaxCostUSD, "cost per run before wrap-up")
 	fs.DurationVar(&cfg.limits.MaxDuration, "max-duration", cfg.limits.MaxDuration, "wall time per run before wrap-up")
+	fs.StringVar(&cfg.prometheusURL, "prometheus-url", os.Getenv("PROMETHEUS_URL"), "Prometheus base URL (default $PROMETHEUS_URL); empty disables the prom_* tools")
+	fs.StringVar(&cfg.lokiURL, "loki-url", os.Getenv("LOKI_URL"), "Loki base URL (default $LOKI_URL); empty disables the loki_* tools")
 	fs.StringVar(&logLevel, "log-level", "", "log level: debug, info, warn, error (default $"+logx.LevelEnv+", else info)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -122,7 +129,7 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	tools, err := buildTools()
+	tools, err := buildTools(cfg)
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
@@ -179,10 +186,19 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	return nil
 }
 
-// buildTools 登记只读工具。三组工具（prom、loki、kube）在设计第 6 节的第 3 步接进来；
-// 在那之前只有循环自己加的 submit_report。
-func buildTools() (*tool.Registry, error) {
-	return tool.NewRegistry()
+// buildTools 登记只读工具。地址为空的那一组不登记（本机对着 compose 跑时没有 Kubernetes）；
+// 一组都没有时 Agent 只有循环自己加的 submit_report，仍然能启动。
+func buildTools(cfg serveConfig) (*tool.Registry, error) {
+	// 工具自己不设超时：每次调用的时限由循环经 ctx 给（loop.Limits.ToolTimeout）。
+	client := &http.Client{}
+	var tools []tool.Tool
+	if cfg.prometheusURL != "" {
+		tools = append(tools, prom.New(prom.Config{BaseURL: cfg.prometheusURL, HTTP: client})...)
+	}
+	if cfg.lokiURL != "" {
+		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client})...)
+	}
+	return tool.NewRegistry(tools...)
 }
 
 // spentToday 从运行记录里加出今天已经花掉的钱：每天的预算不能因为重启就清零。
