@@ -86,8 +86,7 @@ func serveCmd(args []string, stderr io.Writer) int {
 	fs.IntVar(&cfg.limits.MaxTurns, "max-turns", cfg.limits.MaxTurns, "model turns per run before wrap-up")
 	fs.Float64Var(&cfg.limits.MaxCostUSD, "max-cost-usd", cfg.limits.MaxCostUSD, "cost per run before wrap-up")
 	fs.DurationVar(&cfg.limits.MaxDuration, "max-duration", cfg.limits.MaxDuration, "wall time per run before wrap-up")
-	fs.StringVar(&cfg.prometheusURL, "prometheus-url", os.Getenv("PROMETHEUS_URL"), "Prometheus base URL (default $PROMETHEUS_URL); empty disables the prom_* tools")
-	fs.StringVar(&cfg.lokiURL, "loki-url", os.Getenv("LOKI_URL"), "Loki base URL (default $LOKI_URL); empty disables the loki_* tools")
+	toolFlags(fs, &cfg)
 	fs.StringVar(&logLevel, "log-level", "", "log level: debug, info, warn, error (default $"+logx.LevelEnv+", else info)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

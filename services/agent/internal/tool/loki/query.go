@@ -183,10 +183,29 @@ func (t *queryTool) Call(ctx context.Context, input jsontext.Value) (tool.Result
 	return tool.Result{Text: text, Raw: body}, nil
 }
 
+// noiseLabels 是不给模型看的流标签：每行都不同的、和别的标签重复的、只描述采集管道的。
+// Pod 名、容器名、命名空间、服务名留着。
+var noiseLabels = map[string]bool{
+	"observed_timestamp":          true,
+	"k8s_pod_uid":                 true,
+	"k8s_container_restart_count": true,
+	"scope_name":                  true,
+	"scope_version":               true,
+	"severity_number":             true,
+	"severity_text":               true, // 和 detected_level、日志里的 level 重复
+	"log_iostream":                true,
+	"log_file_path":               true,
+}
+
 // stepFor 让指标查询的每条序列大约 maxPoints 个点，最小 1 秒。
 func stepFor(d time.Duration) time.Duration {
-	step := (d + maxPoints - 1) / maxPoints
-	return max(step.Round(time.Second), time.Second)
+	// 点数是 floor(区间/step)+1，所以除的是 maxPoints-1：除以 maxPoints 会多出一个点（对着真的 Loki 跑出来是 61 个）。
+	step := d / (maxPoints - 1)
+	// 向上取到整秒：往下取会让点数又多出一个。
+	if rem := step % time.Second; rem != 0 || step*(maxPoints-1) < d {
+		step += time.Second - rem
+	}
+	return max(step, time.Second)
 }
 
 // ---- 日志 ----
@@ -239,9 +258,14 @@ func formatStreams(streams []stream, info queryInfo) (string, error) {
 		return cmp.Compare(a.ts, b.ts)
 	})
 
+	// 先去掉对诊断没有用的标签。对着真的 Loki 跑出来的：Collector 写进来的每一行都带 observed_timestamp（每行不同）、
+	// k8s_pod_uid 这些结构化元数据，Loki 把它们和标签一起返回，于是每一行自成一条流：
+	// 行首的标记比日志本身还长，连续相同的行也永远合并不了。
 	labelSets := make([]map[string]string, len(streams))
-	for i, s := range streams {
-		labelSets[i] = s.Stream
+	for i := range streams {
+		streams[i].Stream = maps.Clone(streams[i].Stream)
+		maps.DeleteFunc(streams[i].Stream, func(k, _ string) bool { return noiseLabels[k] })
+		labelSets[i] = streams[i].Stream
 	}
 	common := commonLabels(labelSets)
 

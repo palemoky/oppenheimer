@@ -4,6 +4,7 @@
 //	agent serve    常驻：收 Alertmanager 的 webhook 和手动提问，跑诊断
 //	agent ask      向常驻的 agent 提一个问题，打印报告
 //	agent replay   按原样回放一次运行的记录（不调 API，不碰集群）
+//	agent tool     手工调一次工具，打印模型会看到的结果（不调 API）
 package main
 
 import (
@@ -18,6 +19,7 @@ commands:
   serve    run the webhook receiver and diagnosis worker
   ask      ask a running agent a question and print its report
   replay   print a recorded run step by step
+  tool     call one tool by hand and print what the model would see
 `
 
 func main() {
@@ -36,6 +38,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return askCmd(args[1:], stdout, stderr)
 	case "replay":
 		return replayCmd(args[1:], stdout, stderr)
+	case "tool":
+		return toolCmd(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

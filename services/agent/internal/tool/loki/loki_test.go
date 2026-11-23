@@ -108,7 +108,7 @@ func TestQueryParams(t *testing.T) {
 				"query": `{app="order"}`, "limit": "100", "direction": "backward",
 				"start": strconv.FormatInt(now.Add(-15*time.Minute).UnixNano(), 10),
 				"end":   strconv.FormatInt(now.UnixNano(), 10),
-				"step":  "15",
+				"step":  "16", // 15 分钟 ÷ 59 个间隔是 15.25 秒，向上取
 			},
 		},
 		{
@@ -118,7 +118,7 @@ func TestQueryParams(t *testing.T) {
 				"limit": "300", "direction": "forward",
 				"start": strconv.FormatInt(time.Date(2026, 11, 24, 1, 0, 0, 0, time.UTC).UnixNano(), 10),
 				"end":   strconv.FormatInt(now.Add(-30*time.Minute).UnixNano(), 10),
-				"step":  "90",
+				"step":  "92", // 90 分钟 ÷ 59 个间隔，向上取到秒：60 个点
 			},
 			text: "limit 1000 was lowered to the maximum of 300",
 		},
@@ -512,4 +512,44 @@ func TestConcurrentCalls(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// 对着真的 Loki 跑出来的两件事（设计 3d 第 8 节）：Collector 写进来的结构化元数据让每一行自成一条流；
+// 点数是区间 ÷ step 再加一。
+func TestNoiseLabelsDoNotSplitStreams(t *testing.T) {
+	mk := func(observed string) stream {
+		return stream{
+			Stream: map[string]string{
+				"service_name": "order", "k8s_pod_name": "order-1", "k8s_pod_uid": "uid-1",
+				"observed_timestamp": observed, "scope_name": "filelog", "severity_number": "9",
+			},
+			Values: [][]jsontext.Value{{jsontext.Value(`"` + observed + `"`), jsontext.Value(`"same line"`)}},
+		}
+	}
+	now := time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC)
+	text, err := formatStreams([]stream{mk("1795454908000000001"), mk("1795454908000000002"), mk("1795454908000000003")},
+		queryInfo{start: now.Add(-time.Minute), end: now, limit: 100, backward: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, noise := range []string{"observed_timestamp", "k8s_pod_uid", "scope_name", "severity_number"} {
+		if strings.Contains(text, noise) {
+			t.Errorf("output contains %s:\n%s", noise, text)
+		}
+	}
+	if !strings.Contains(text, "3 entries became 1 lines") || !strings.Contains(text, "[repeated 3 times]") {
+		t.Errorf("identical lines were not collapsed:\n%s", text)
+	}
+	if !strings.Contains(text, `k8s_pod_name="order-1"`) {
+		t.Errorf("useful labels were dropped:\n%s", text)
+	}
+}
+
+func TestStepGivesAtMostMaxPoints(t *testing.T) {
+	for _, d := range []time.Duration{time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour, 90 * time.Minute, 24 * time.Hour} {
+		step := stepFor(d)
+		if points := int(d/step) + 1; points > maxPoints {
+			t.Errorf("range %s, step %s: %d points, want at most %d", d, step, points, maxPoints)
+		}
+	}
 }
