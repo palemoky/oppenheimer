@@ -14,7 +14,7 @@
 主人对上一段“等主人定的”五条都按建议定了，都做了。细节：设计第 8 节最后一小节，ADR-0035、ADR-0036 各自的最后一节。
 
 - **改了四处**：每个分区的队列上限 `ADMIT_MAX_QUEUE` 1250 改 600；等待类直方图加 40、50 秒两个桶（`pkg/otelx` 的 `WaitBuckets`）；限流要“连续失败够次数并且持续超过 200 毫秒”才打开（`pkg/ratelimit` 的 `FailureSpan`）；`CLOSE_CONCURRENCY` 4 改 2。提交前 `make lint` 11 个模块 0 issues、`make test` 60 个包 ok。
-- **提交、CI、部署**：三个提交推送了（`9c…` 起到 `07c0dcc`，`git log` 为准）。**PR #17 上 `07c0dcc` 的 CI 30 项全部通过**（`ci-watcher` 报的）：`test (./pkg)` 3 分 50 秒（上次 2 分 53 秒）变慢，这一项以前也这样波动过，没有查；`rules` 50 秒、`test (./services/order)` 4 分 19 秒、`test (./test/load)` 2 分 29 秒、`test (./services/recon)` 2 分 04 秒、e2e 4 分 22 秒。`make deploy`、`make recon-cron` 做了，六个服务的镜像是 `07c0dcc`，order 的启动日志确认每个分区 600。
+- **提交、CI、部署**：三个提交推送了（`6cd576a` 限流、`93026dc` 直方图的桶、`07c0dcc` 两个配置），之后是记录这一轮的文档提交。**PR #17 上 `07c0dcc` 的 CI 30 项全部通过**（`ci-watcher` 报的）：`test (./pkg)` 3 分 50 秒（上次 2 分 53 秒）变慢，这一项以前也这样波动过，没有查；`rules` 50 秒、`test (./services/order)` 4 分 19 秒、`test (./test/load)` 2 分 29 秒、`test (./services/recon)` 2 分 04 秒、e2e 4 分 22 秒。`make deploy`、`make recon-cron` 做了，六个服务的镜像是 `07c0dcc`，order 的启动日志确认每个分区 600。
 - **第三轮压测**（11:10 到 11:47 UTC 发压，12:02 静止，12:05 恢复成平时的配置；运行号 `3c14s-warm`、`3c14s-order-ladder`，SKU 7619 到 7628，**下一批从 7629 起**）。`recon -since 100m` 差异 0，`verify` 通过。三轮的对比表在设计第 8 节。结论：
   - **等待压到了目标以内**：等了 30 秒以上的订单 0.9%（上一轮 10.1%），p99 29.9 秒，p99.9 39 秒，没有超过 50 秒的。拦住请求的是队列长度那一条，兜底的那条每秒不到 1 次。吞吐和被拒绝的比例三轮都一样。
   - **限流不再整段退回**：退回占请求的 3.4%（47%、21%），每一次都只是超时的那个请求自己。
