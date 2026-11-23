@@ -22,6 +22,7 @@
 | codecov/codecov-action | v7（查证时最新 v7.1.1） | 稳定版 | 2026-11-19 | CI，按模块上传测试覆盖率 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
+| anthropic-sdk-go | v2.13.0 | 稳定版 | 2026-11-24 | `github.com/anthropics/anthropic-sdk-go/v2`，诊断 Agent 调 Claude API（设计文档 3d、ADR-0038）。版本是从 Go 模块代理查的（v2 的最新版；v1 仍在发，最新 v1.84.0），没有 LTS。走 beta 命名空间（`client.Beta.Messages`），因为服务端的拒绝回退只在那里有。模型的价格表写在 `services/agent/internal/llm/price.go`，查证日期同 |
 | promtool | 3.13.5 | LTS | 2026-11-22 | 随 Prometheus 的发布包（`prometheus-3.13.5.<os>-<arch>.tar.gz`，来源 github.com/prometheus/prometheus/releases，只取 `promtool`），版本跟集群上的 Prometheus（`cluster.env` 的 `PROMETHEUS_VERSION`，3.13 是 LTS）。`make promtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；SLO 规则的单元测试和下发前的检查用，版本写在 `Makefile` 里，升级时和 `cluster.env` 一起改 |
 | amtool | 0.35.0 | 稳定版 | 2026-11-23 | 随 Alertmanager 的发布包（`alertmanager-0.35.0.<os>-<arch>.tar.gz`，来源 github.com/prometheus/alertmanager/releases，只取 `amtool`），版本跟集群上的 Alertmanager（kube-prometheus-stack 的 chart 带的，`kubectl -n monitoring get alertmanager` 看得到 v0.35.0）。`make amtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；检查 Alertmanager 的配置和核对路由用（`make alertmanager-test`），版本写在 `Makefile` 里，chart 升级时一起看；Alertmanager 没有 LTS |
 | yq | v4.54.3 | 稳定版 | 2026-11-22 | mikefarah/yq，来源 github.com/mikefarah/yq/releases（`yq_<os>_<arch>`，校验发布页 `checksums` 里的 SHA-256）。从 `PrometheusRule` 清单里抽 `.spec.groups` 给 promtool；`make yq` 装进 `./bin`。ubuntu-latest 预装了同版本，但本机没有，两边统一用 `./bin` 里的；没有 LTS |
