@@ -772,7 +772,7 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - **它限制的是“排队超过 30 秒的占用有多少个”，不是“最老的排了多久”。** 这是有意的（注释里写了：按个数是为了容忍零星的孤儿占用，它们要留到宽限期才被回收）。100 个超时的占用如果分散在很多条队列的队首，每条只超一点点；如果集中在一两条慢的队列里，最老的可以超很多。
 - **落库实际上是 96 条各自串行的队列，不是 4 条。** 集群上 `SUBMIT_CONCURRENCY` 是 24：每个分区里按 key 分成 24 条 lane，一条 lane 里串行。过载时 handler 的 p50 是 0.47 秒（p99 约 1.5 秒），一条 lane 每秒落约 1.9 单，96 条合起来约 180 单/秒，和量到的落库速率对得上（两个 Pod 上处理耗时之和是每秒 46 和 44.5 秒，也就是平均有 90 条 lane 在忙）。一条 lane 上排 100 个超时的占用要再等 100 ÷ 1.9 ≈ 53 秒，两条 lane 各 50 个是各等 26 秒：30 + 26 = 56 秒，和量到的 p99（55 到 57 秒）是一个数。**所以第 2 条在这种结构下给出的上界大约是 30 秒加“100 ÷ 一条队列的速率”，队列分得越细（并发度越高、每条越慢）这个上界越松。**
 - **它那次到底拒绝了多少，没有数据。** 脚本对三条规则返回的都是 `BACKLOG`，order 不逐条记日志，指标里只有一个 `backlogged`。队列长度的采样一直贴着 2500（2497、2492），说明第 1 条在起作用；上面的算法说明第 2 条多半也在起作用，但这是推的。
-- **对第 3 个问题的影响**：上限改成 1250 之后平均的等待减半，分区一级的最坏情况是 28 秒，但 lane 一级的不均和第 2 条“限个数不限时长”这两点没有变，落库延迟的尾巴会短，不能保证在 30 秒以内。要把它做实有两条路：把 `ADMIT_MAX_STALE` 调小（孤儿是零星的，20 个也容得下；上界变成 30 秒加 20 ÷ 1.9 ≈ 10 秒），**主人 2026-11-23 定了做，已改成 20**（`deploy/cluster/services/order.yaml`）；让脚本返回是哪一条拒绝的、把它做成指标（不增加 Redis 的查询），下一次过载时就有数据，没有做。
+- **对第 3 个问题的影响**：上限改成 1250 之后平均的等待减半，分区一级的最坏情况是 28 秒，但 lane 一级的不均和第 2 条“限个数不限时长”这两点没有变，落库延迟的尾巴会短，不能保证在 30 秒以内。要把它做实有两条路：把 `ADMIT_MAX_STALE` 调小（孤儿是零星的，20 个也容得下；上界变成 30 秒加 20 ÷ 1.9 ≈ 10 秒），**主人 2026-11-23 定了做，已改成 20**（`deploy/cluster/services/order.yaml`）；让脚本返回是哪一条拒绝的、把它做成指标（不增加 Redis 的查询），下一次过载时就有数据，**主人同一天定了做，做了**：`pkg/stockgate` 的 `HoldResult.Rule`，order 的 `order.admission.backlog_rejections{rule="queue|stale|stalled"}`（Prometheus 里是 `order_admission_backlog_rejections_total`），它是 `order_admissions_total{outcome="backlogged"}` 的细分；`loadtest-round.sh` 的存档和 `order-backlog.md` 的第 1 步加了这条查询。
 
 **第 14 项查出的四个问题的修正（2026-11-23，主人确认都按建议改；决定和道理在 [ADR-0035](../adr/0035-overload-corrections.md)）**
 
@@ -784,5 +784,5 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 | 过载时链路留得太多 | gRPC 客户端的拒绝不算出错（Collector 里改状态）；“出错”“慢”各加每秒 800、600 个 span 的上限 | `deploy/cluster/monitoring/otel-gateway.yaml` | 同上 |
 
 - 验证到哪：`pkg/ratelimit` 的测试带 `-race` 跑了 3 遍通过；Collector 的配置用 `otel/opentelemetry-collector-contrib:0.165.0 validate` 校验过语法（只校验了这两个 processor，行为没有验证）；`shellcheck` 过了；`make lint` 11 个模块 0 issues；完整的 `make test` 见 `PROGRESS.md`。**四处都没有在过载下重新验证。**
-- 没有改的：延迟消费者的并发、按分区计数的队列上限、背压拒绝原因的指标、`NodeCPUHigh` 的抖动。
+- 没有改的：延迟消费者的并发、按分区计数的队列上限、`NodeCPUHigh` 的抖动。
 

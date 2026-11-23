@@ -19,6 +19,9 @@
 
 1. 现在的拒绝比例、各种结局：
    `scripts/cluster/monitoring.sh promql 'sum by (outcome) (rate(order_admissions_total{k8s_namespace_name="oppenheimer"}[5m]))'`
+   是背压三条里的哪一条在拒绝（2026-11-23 加的指标，镜像 `61f66d2` 之后的才有）：
+   `scripts/cluster/monitoring.sh promql 'sum by (rule) (rate(order_admission_backlog_rejections_total{k8s_namespace_name="oppenheimer"}[5m]))'`
+   `queue` 是队列到了 `ADMIT_MAX_QUEUE`（来得太多）；`stale` 是排队超过 30 秒的多于 `ADMIT_MAX_STALE` 个（有的队列排得太久，看落库延迟的 p99 和两个 Pod 的差别）；`stalled` 是落库 30 秒没有动静（消费者停了，按 [consumer-blocked.md](consumer-blocked.md) 查）。
 2. 队列长度、落库速率、折成的等待秒数：
    `scripts/cluster/monitoring.sh promql 'max(order_gate_unclaimed_holds{k8s_namespace_name="oppenheimer"})'`
    `scripts/cluster/monitoring.sh promql 'sum(rate(order_persists_total{k8s_namespace_name="oppenheimer"}[5m]))'`
