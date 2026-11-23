@@ -535,17 +535,26 @@ spec:
             description: "这个功能处在降级状态：对应的读走不了缓存或从库，或者接口直接返回降级的响应。是有意的就加静默并写明原因。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/degrade.md
         # 限流的 Redis 不可用，gateway 退回每个进程各算各的：限额实际变宽（副本数倍）。
-        # 每秒 1 次以上持续 5 分钟才报，滤掉零星的超时。注意 Redis 没坏时它也会响：压测打过拐点、节点 CPU 满了的几档里，
-        # 问 Redis 的超时是每秒 8.6 到 12 次（round-4、round-8）。那时响是对的（限额确实变宽了），原因在节点而不在 Redis。
+        # 按比例报：退回占 gateway 请求的一成以上并持续 5 分钟。2026-11-23 之前是按次数（每秒超过 1 次），
+        # 过载时零星的超时就够它响（第三轮过载压测：每秒 60.8 次退回只是 3.4% 的请求，每一次只是超时的那个请求自己）。
+        # 一成的来由：限流没有整段退回时过载最重的一档是 3.4%；整段退回（旧的判据）是 21% 到 47%；Redis 真的不在是接近 100%。
+        # 后一半（每秒 0.2 次以上）是流量很小时的下限：只有几个请求、其中一个超时也能算出一成。
+        # 分母是 gateway 的全部 HTTP 请求（一个请求最多退回一次）。
         - alert: RateLimitFallingBack
-          expr: sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m])) > 1
+          expr: |
+            sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer"}[5m]))
+            > 0.1
+            and
+            sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m])) > 0.2
           for: 5m
           labels:
             severity: warning
             service: gateway
           annotations:
-            summary: "限流每秒有 {{ $value | humanize }} 次退回进程内计数"
-            description: "gateway 读不到限流的 Redis，改用进程内的计数。每个副本各算各的，总的限额变成了配置的几倍。先看限流 Redis 和 gateway 所在节点的 CPU（round-4 里是节点 CPU 满了导致 Redis 调用超时）。"
+            summary: "限流有 {{ $value | humanizePercentage }} 的请求退回进程内计数"
+            description: "gateway 读不到限流的 Redis（或者调用超过 20 毫秒），这些请求改用进程内的计数。每个副本各算各的，总的限额变成了配置的几倍。一成以上说明不是零星的超时：先看限流的 Redis 好不好，再看 gateway 所在节点的 CPU。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/ratelimit-fallback.md
         # 展示读的并发名额在拒绝。长稳时平时每分钟十来次（每秒 0.2 上下，round-9），阈值取每秒 1 次。
         - alert: OrderReadBulkheadRejecting

@@ -5,6 +5,7 @@
 #   k-l  钱的核对：有差异、核对自己停了
 #   m-n  队列：落库速率为 0 时是无穷大也响；支付成功而订单不变成已支付
 #   o-q  序列消失：CDC 的管道、服务的指标、消费者不消费
+#   u-w  限流的退回按比例：过载时零星的超时不响、Redis 不在时探针的流量也响、流量太小时不响
 # 断言都用 ALERTS：exp_alerts 要逐字对注解，注解改一个字就得改测试。
 rule_files:
   - ../business.yaml
@@ -563,4 +564,51 @@ tests:
     promql_expr_test:
       - expr: count(ALERTS{alertname="ReconDailySlow"})
         eval_time: 10m
+        exp_samples: []
+
+  # u. 限流的退回按比例报。过载时零星的超时：每秒 60 次退回、1766 个请求（3.4%，第三轮过载压测的数），不响。
+  - name: u_ratelimit_fallback_scattered_timeouts_quiet
+    interval: 30s
+    input_series:
+      - series: 'gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a"}'
+        values: '0+1800x60'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a",http_route="/api/v1/orders"}'
+        values: '0+52980x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="RateLimitFallingBack"})
+        eval_time: 20m
+        exp_samples: []
+
+  # v. 限流的 Redis 不在、只有探针的流量（每秒 5.5 个请求全部退回）：比例接近 100%，响。
+  #    请求分在两个路由上，分母要把它们加起来。
+  - name: v_ratelimit_fallback_redis_down_fires_at_probe_traffic
+    interval: 30s
+    input_series:
+      - series: 'gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a"}'
+        values: '0+165x60'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a",http_route="/api/v1/orders"}'
+        values: '0+30x60'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a",http_route="/api/v1/orders/{id}"}'
+        values: '0+135x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="RateLimitFallingBack",alertstate="firing"})
+        eval_time: 4m
+        exp_samples: []
+      - expr: count by (severity, service) (ALERTS{alertname="RateLimitFallingBack",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{severity="warning", service="gateway"}'
+            value: 1
+
+  # w. 流量很小时一个请求超时：10 分钟里 12 个请求、退回 3 次（25%），每秒 0.005 次，够不着下限，不响。
+  - name: w_ratelimit_fallback_tiny_traffic_quiet
+    interval: 1m
+    input_series:
+      - series: 'gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a"}'
+        values: '0 0 1 1 1 2 2 2 3 3 3 3 3 3 3 3 3 3 3 3'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",k8s_pod_name="gateway-a",http_route="/api/v1/orders"}'
+        values: '0+1x19'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="RateLimitFallingBack"})
+        eval_time: 12m
         exp_samples: []
