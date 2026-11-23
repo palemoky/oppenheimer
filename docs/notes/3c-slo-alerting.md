@@ -114,7 +114,7 @@
 
 - **现象**：第 11 项停 gateway 的 Collector 17 分钟，agent 一侧没有留下 `otelcol_exporter_send_failed_*` 的序列（设计 8 第 16 项“顺带看到”）。
 - **机制（查清了）**：agent 的导出器配了 `retry_on_failure.max_elapsed_time: 0`（一直重试）加“队列满了堵住上游”（3a 验证 5 之后为了不丢日志改的）。它既不会重试耗尽也不会入队失败，`send_failed`、`enqueue_failed` 在 agent 上永远不加。那 17 分钟里 agent 的队列是满的（`otelcol_exporter_queue_size` 到 20，容量 20）。
-- **含义**：这条规则只对 gateway 那个 Collector 有效；“gateway 在、但 agent 发不过去”现在没有规则盖住，能看的信号是队列占满。要不要加一条没有做，等主人定。
+- **含义**：这条规则只对 gateway 那个 Collector 有效；“gateway 在、但 agent 发不过去”当时没有规则盖住。后来加了 `OtelCollectorExportQueueFull`（队列占用超过八成持续 5 分钟，被 `OtelGatewayDown` 抑制），只有单元测试，没有真实触发过。
 
 ### 3.8 其余几个值得记的
 
@@ -160,6 +160,8 @@
 | 只验证了路是通的（改阈值） | 40 |
 | 只到过 `pending` | 1（`OrderAdmitRateDropped`） |
 | 只有单元测试 | 6（超卖、闸门内存写满、Collector 导出失败、支付可用性的三档） |
+
+这张表之后又加了一条 `OtelCollectorExportQueueFull`（3.7），只有单元测试：现在是 86 条，只有单元测试的 7 条。本篇其余地方的“85 条”“6 条”是加它之前的数。
 
 **两种验证各自验证了什么、验证不了什么**（设计 8“第 16 项”、设计第 5 节）：
 - **真实触发**：事件真的发生了，规则没有动过。验证表达式、`for`、从 `pending` 到 `firing` 的时间、分组和抑制、alertsink 和 Telegram 的送达、runbook 的“先看什么”能不能走到原因。
@@ -222,7 +224,7 @@
 
 - **集群外盯 `Watchdog` 的东西**（dead man's switch）：要一个集群外的服务，只讲清为什么需要（设计 3.5、第 7 节）。`AlertDeliveryStalled` 走 Telegram，不经 alertsink，但 Prometheus 或 Alertmanager 自己断了它同样发不出来（设计 8“第 6 步”）。
 - **“节点不在”的抑制**：见 3.2。节点掉了的时候会有一批告警一起到，靠 runbook 总则里“先看最上游的”。
-- **`OtelCollectorExportFailing` 在 agent 上无效**：要不要加“队列占满持续几分钟，被 `OtelGatewayDown` 抑制”的一条，没有做。
+- **`OtelCollectorExportFailing` 在 agent 上无效**：后来加了 `OtelCollectorExportQueueFull` 补这个缺口；它单独响的情形（gateway 在、agent 发不过去）没有做过，留给阶段 4。
 - **诊断 Agent**：3d。这里只留好接口（webhook 格式、runbook 的固定七节）。
 - 值班轮换、升级策略、事故复盘的流程；Prometheus 的长期存储和告警的高可用（设计第 7 节）。
 

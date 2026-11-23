@@ -27,7 +27,12 @@
   3. 这一段的改动怎么提交（建议分开：`RateLimitFallingBack`；第五个 SLO 的规则、测试、runbook、Alertmanager 用例；大盘；ADR 和文档）。推送后 CI 派给 `ci-watcher`。
 - **集群的状态（14:04 UTC 核对）**：没有在响的告警（除 `Watchdog`），没有 `pending`，没有不正常的 Pod；没有动过任何业务组件；`recon-hourly` 13:07 那次成功，13:13 手工的一次差异 0。本机 compose 起着。
 - **阶段笔记写了**：`docs/notes/3c-slo-alerting.md`（255 行，Sonnet 子 Agent 写的；主会话读了开头、结论和统计，核对了它标出的几处文档不一致并改了其中两处（runbook 总则、ADR-0037 后果第 8 条），**其余部分没有逐行读**）。
-- **下一步**：主人看上面三条、提交 → 3c 收尾（开 PR 或并进 PR #17，主人定）→ 3d 最小诊断 Agent（动工前先查最新的 Claude API 和 Agent SDK 文档）。放几天之后回头看误报（计划里“上线后放几天看误报”没有做）。
+- **提交并推送了**（主人说“都按建议做，提交并推送”）：`17e0fad`（`RateLimitFallingBack`）、`1b727c8`（第五个 SLO）、`71be1c3`（大盘）、`1244620`（ADR、笔记、文档）。上面“全部没有提交”是提交之前写的。**PR #17 上 `1244620` 的 CI 28 个 job 全部通过**（`ci-watcher` 报的）：`rules` 1 分 36 秒、`test (./services/order)` 3 分 24 秒（上次 4 分 33 秒）、`test (./pkg)` 3 分 32 秒、`test (./test/load)` 2 分 51 秒、`test (./services/recon)` 1 分 59 秒、e2e 3 分 34 秒（上次 4 分 28 秒），没有变慢的。**这一条写进本文件之后没有提交**，下次提交时带上。“等主人定的”第 1、2 条主会话给了建议（第 1 条加一条按队列占用比例的 warning；第 2 条先不改，记到阶段 4 核对原因），主人还没有答复，没有动。
+- **第 1、2 条主人定了（2026-11-23，UTC 15:40 到 15:50 做的）**：
+  1. **加了 `OtelCollectorExportQueueFull`**（`middleware.yaml`：导出队列占用超过八成持续 5 分钟，warning，被 `OtelGatewayDown` 抑制），三个单元测试，runbook `otel-collector.md` 补了，规则和 Alertmanager 的配置都已下发；集群上 `inhibit-test` 58 条 0 条不符（下发后马上跑的那一次有 1 条不符，是 Alertmanager 还没重新加载，过两分钟重跑通过）。表达式在 Prometheus 上有 6 条序列，现在都是 0，没有在响的告警。**只有单元测试，没有真实触发过，也没有改阈值验证过。** 自己写的告警现在 86 条，只有单元测试的 7 条。`make rules-test`、`make alertmanager-test` 通过。
+  2. **`OrderAdmitRateDropped` 不改**，登记到 `docs/plan/phase-4-chaos.md` 的“4a 准备”（连同 3c 留下的其余没有真实触发的告警）。
+  - **这两条的改动没有提交**（规则、测试、Alertmanager 配置和用例、runbook、设计、笔记、两个计划文件、本文件）。
+- **下一步**：主人说提交时提交上面这一批 → 3c 收尾（开 PR 或并进 PR #17，主人定）→ 3d 最小诊断 Agent（动工前先查最新的 Claude API 和 Agent SDK 文档）。放几天之后回头看误报（计划里“上线后放几天看误报”没有做）。
 
 ### 3c 第三轮过载压测（2026-11-23，UTC 10:35 到 12:05；在上一段之前）
 
