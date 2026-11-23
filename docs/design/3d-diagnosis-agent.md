@@ -310,3 +310,13 @@ runs/<运行号>/            运行号：UTC 时间加 4 位随机，例 2026112
 - 20 KB 的总上限截断 50 条的列表时，只说截了多少字节，不说留下了几条。
 - client-go 的 fake 不认字段选择器，“服务端按对象过滤事件”只在真集群上走到过。
 
+### 第 4 步：部署用的清单和脚本（2026-11-24；只写了文件，没有下发）
+
+Sonnet 子 Agent 写的，主会话读了 RBAC 的规则和 `cmd_agent`，重跑了 `make alertmanager-test`、shellcheck、`services/agent` 的测试和 lint，本机构建了一个现有服务的镜像（order，不推送）。**清单没有在集群上 apply 过，`cmd_agent` 没有运行过。**
+
+- **修了主会话引入的一个问题**：`services/agent` 进了 `go.work` 之后，`deploy/docker/` 下三个 Dockerfile（服务、chaos、e2e）都要多复制它的 `go.mod`，否则所有镜像都构建不出来（`go.work` 列出的目录在构建上下文里不存在）。CI 不构建镜像，所以两轮 CI 都是绿的。`bench1a.Dockerfile` 用的是 1a 的旧工作区，不受影响。
+- `deploy/cluster/monitoring/agent.yaml`：ServiceAccount、ClusterRole（只有白名单里那些资源的 get、list、watch 和 `pods/log` 的 get）、2Gi 的 PVC、Deployment、Service。`services/agent/deploy_test.go` 读这份清单，断言没有写动词、没有 `secrets`、`configmaps`、`pods/exec`、通配符。
+- `scripts/cluster/monitoring.sh agent`（`make agent`）：镜像没有就构建，`.env` 里有 `ANTHROPIC_API_KEY` 就做成 Secret `agent-anthropic`（没有也能起来，只是每次诊断都以 `api_error` 结束），下发，等就绪。不在 `monitoring.sh up` 里。
+- **Alertmanager 的第二个地址是带开关的**：配置里两个接收端各加了一段 `# agent-begin` 到 `# agent-end`，渲染时默认删掉，`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager` 才带上。原因：Agent 没有部署时带着这个地址，Alertmanager 每次通知都会失败并触发它自己的失败告警。`make alertmanager-test` 现在检查四种渲染（有没有 Telegram × 有没有 Agent）。给 Agent 的那一条 `send_resolved: false`（它不处理恢复通知）。
+- 留下的风险：`local-path` 的卷把 Pod 钉在一个节点上，那个节点没了 Pod 会一直 Pending，要删 PVC 才能换节点（运行记录也就没了）；`/ask` 没有鉴权，集群里任何 Pod 都能让它花钱（有每天的预算兜底）；`/healthz` 不检查 Claude、Prometheus、Loki，依赖坏了 Pod 不会被重启，要靠指标发现。
+

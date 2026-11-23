@@ -118,14 +118,14 @@
 
 - [x] Agent 主循环（Go + Claude API 工具调用）：多轮推理、终止条件、步数与费用上限
   - 2026-11-24：`services/agent/internal/loop`、`internal/llm`，有单元测试（含并发和 `-race`）。**没有对真的 API 跑过**
-- [ ] 三个只读工具：Prometheus 查询（PromQL 即时与范围）、Loki 日志查询、Kubernetes（get、describe、events、logs）
-  - 2026-11-24：十个工具写了（`internal/tool/prom`、`loki`、`kube`），对着真的 Prometheus、Loki、apiserver 只读核对过。**ServiceAccount 和 RBAC 的清单还没写**（下面那一条），所以不勾
+- [x] 三个只读工具：Prometheus 查询（PromQL 即时与范围）、Loki 日志查询、Kubernetes（get、describe、events、logs）
+  - 2026-11-24：十个工具写了（`internal/tool/prom`、`loki`、`kube`），对着真的 Prometheus、Loki、apiserver 只读核对过。ServiceAccount 和 RBAC 的清单写了并入库（`deploy/cluster/monitoring/agent.yaml`，有测试核对里面没有写权限）。**清单没有在集群上下发过**：核对时用的是本机的 kubeconfig，不是这个 ServiceAccount
   - Kubernetes 工具从阶段 6 提前到这里（2026-11-15）：阶段 4 的故障里有一大类是 Pod 被杀、OOM、节点失联、调度不上，只有指标和日志时 Agent 只能从数据的缺口去猜
   - 用 client-go，单独的 ServiceAccount，只给 get、list、watch；不给 exec、不给任何写权限，权限写在清单里入库
 - [x] 工具输出的裁剪，控制上下文长度
   - 2026-11-24：各工具自己裁，裁了什么写在结果里，原始结果另存。对着真的后端看过输出；**数合不合适没有经过模型验证**（没有密钥）
 - [ ] 触发方式：Alertmanager webhook 和命令行手动提问
-  - 2026-11-24：程序这一侧写了（`internal/trigger`、`agent serve` 的 `/alerts` 和 `/ask`、`agent ask`），有测试。**没有部署，Alertmanager 还没有加这个地址**，所以不勾
+  - 2026-11-24：程序这一侧写了（`internal/trigger`、`agent serve` 的 `/alerts` 和 `/ask`、`agent ask`），有测试。部署用的清单和脚本也写了（`make agent`，Alertmanager 的第二个地址带开关）。**没有部署，Alertmanager 还没有加这个地址**，所以不勾
 - [x] 输出 Markdown 报告：根因判断、证据（每条结论附查询和结果）、置信度
   - 2026-11-24：`internal/report`。证据由程序按步骤号从运行记录里渲染（ADR-0038）
 - [x] 全过程留痕：每次运行的工具调用、token 用量、耗时落盘，可回放

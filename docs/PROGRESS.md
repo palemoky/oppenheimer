@@ -27,11 +27,12 @@
 - **验证**：`services/agent` 里 `go test -race ./...` 十个包通过，lint 0 issues，`GOWORK=off go build` 和 `make build` 通过。**没有跑整个仓库的 `make lint test`。**
 - **CI**：PR #18 上 `8be9b74`（只有核心部分）30 个 job 加 codecov 两项全部通过（`ci-watcher` 报的）：新的 `lint (./services/agent)` 54 秒、`test (./services/agent)` 2 分 29 秒；`rules` 2 分 24 秒（以往 50 秒到 1 分半）、`test (./services/recon)` 2 分 24 秒（上次 1 分 53 秒）变慢，这次没有动规则和 recon，没有查；order 4 分 10 秒、pkg 3 分 29 秒、load 3 分 18 秒、e2e 3 分 58 秒。**之后的提交（三组工具等）推送后的 CI 结果，本段没有写的话就是还没看。**
 - **顺带看到的（集群，没有动）**：`PrometheusErrorSendingAlertsToAnyAlertmanager`（critical）和 `...ToSomeAlertmanagers` 时不时进 `pending`。Prometheus 发给 Alertmanager 的请求 24 小时里失败 22 次（`EOF` 或 `connection reset by peer`，每次 1 条），平时只有 `Watchdog` 在发（约 90 秒一次），一次失败在 5 分钟窗口里就是三到五成，超过规则的阈值；`for` 是 15 分钟，7 天里只到过 `pending`、没有响过。两个 Pod 都是 Running。**原因没有查**（推断是空闲的长连接被对端关掉时正好在发）。这是 3c 留下的“放几天看误报”该看的一条：连续两三次失败挨得近就会真的响一条 critical。
-- **没有做的**（设计第 6 节）：
-  1. 第 4 步：Dockerfile、Deployment、ServiceAccount 和 RBAC（只给白名单里那些资源的 get、list、watch 加 `pods/log`）、PVC、放密钥的 Secret 的脚本、Alertmanager 加第二个 webhook 地址（含 `amtool` 的用例）、`make` 目标。按分工派给 Sonnet。可以先写清单，不依赖密钥。
-  2. 第 0 步和第 5 步：Pod 到 `api.anthropic.com` 通不通、试跑。**等主人有了 API 密钥。**
-  3. 阶段笔记 `docs/notes/3d-*.md`。
-- **下一步**：第 4 步的清单和脚本 → 主人有密钥之后部署、试跑 → 勾计划里剩下的三项（工具、触发、试跑）→ 阶段笔记 → 3e。
+- **第 4 步（部署用的清单和脚本）也写了**（Sonnet 子 Agent，主会话读了 RBAC 和 `cmd_agent`、重跑了检查后合并；设计第 8 节“第 4 步”）：`deploy/cluster/monitoring/agent.yaml`、`scripts/cluster/monitoring.sh agent`（`make agent`）、Alertmanager 的第二个 webhook 地址（默认不带，`AGENT_WEBHOOK=1` 才渲染进去）、RBAC 的测试。**只写了文件：清单没有 apply 过，`cmd_agent` 没有运行过。**
+- **修了主会话引入的镜像构建问题**：新模块进 `go.work` 之后三个 Dockerfile 要多复制它的 `go.mod`，否则所有镜像构建失败。CI 不构建镜像，发现不了；是写第 4 步的任务说明时读 Dockerfile 看出来的。修后本机构建 order、recon、agent 三个镜像通过（没有推送）。**从 `4e6460e` 到修复之前的提交上 `make images`、`make deploy` 是坏的。**
+- **没有做的**：
+  1. 部署和试跑（设计第 6 节的第 0、5 步）：`make agent`、Pod 到 `api.anthropic.com` 通不通、`AGENT_WEBHOOK=1` 打开第二个地址、用 3c 的场景试跑。**等主人有了 API 密钥**；每一步动集群之前先登记、先拿同意。
+  2. 阶段笔记 `docs/notes/3d-*.md`。
+- **下一步**：主人有密钥之后：把 `ANTHROPIC_API_KEY` 放进仓库根目录的 `.env` → `make agent` → 手动提问一次（`kubectl -n monitoring port-forward svc/agent 8080` 加 `bin/agent ask "..."`）→ 打开第二个地址 → 试跑 → 勾计划里剩下的两项（触发、试跑）→ 阶段笔记。密钥没到之前可以先做 3e（对账方式按场景拆），它不依赖 3d。
 
 ### 3d 核心部分写完（2026-11-24；在上一段之前）
 
