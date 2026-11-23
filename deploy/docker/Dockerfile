@@ -1,4 +1,4 @@
-# 业务服务的镜像，七个服务共用这一份。用法（构建上下文必须是仓库根目录）：
+# 业务服务的镜像，七个服务和诊断 Agent（SERVICE=agent，不走 Helm chart）共用这一份。用法（构建上下文必须是仓库根目录）：
 #
 #   docker buildx build --platform linux/amd64 -f deploy/docker/Dockerfile --build-arg SERVICE=order .
 #
@@ -25,11 +25,12 @@ WORKDIR /src
 
 # 先只复制 go.work 和各模块的 go.mod、go.sum，再下载依赖。
 # 这些文件很少变，下面这一层就能被缓存：改业务代码不会触发重新下载。
-# 缺哪个文件 go 都会报错（go.work 列出的目录必须存在），所以七个服务的 go.mod 全部复制，
+# 缺哪个文件 go 都会报错（go.work 列出的目录必须存在），所以全部模块（七个服务加 agent）的 go.mod 全部复制，
 # 即便只构建其中一个；代价是任何一个服务加了依赖，所有服务的这一层都会失效。
 COPY go.work go.work.sum ./
 COPY api/go.mod api/go.sum ./api/
 COPY pkg/go.mod pkg/go.sum ./pkg/
+COPY services/agent/go.mod services/agent/go.sum ./services/agent/
 COPY services/cdc/go.mod services/cdc/go.sum ./services/cdc/
 COPY services/gateway/go.mod services/gateway/go.sum ./services/gateway/
 COPY services/inventory/go.mod services/inventory/go.sum ./services/inventory/

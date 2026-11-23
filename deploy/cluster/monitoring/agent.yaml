@@ -1,0 +1,224 @@
+# 诊断 Agent（设计文档 3d，ADR-0038）：收 Alertmanager 的 webhook（POST /alerts），调 Claude API，
+# 用只读的 Prometheus、Loki、Kubernetes 查询工具查出原因，把诊断记录写到卷里（GET /runs 看）。也有 POST /ask 手动提问。
+# 代码在 services/agent。它加在 alertsink 旁边，不替换它：alertsink 带着 Watchdog 的心跳，不能丢。
+# 镜像用 deploy/docker/Dockerfile 的 SERVICE=agent（images.sh all agent），__IMAGE__、__IMAGE_TAG__ 由脚本填上后 apply，可重复执行。
+#
+# 这份清单不在 monitoring.sh up 里，要显式 monitoring.sh agent。Alertmanager 的第二个 webhook 地址
+# （http://agent.monitoring:8080/alerts）默认也不下发，Agent 起来之后用 AGENT_WEBHOOK=1 monitoring.sh alertmanager 打开。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+---
+# 只读的边界就划在这里：Agent 的 Kubernetes 查询工具只能 get、list、watch。
+# 故意不给：secrets、configmaps（里面可能有密钥和配置）、pods/exec、任何写动词、通配符。
+# pods/log 只给 get（读日志）。services/agent/deploy_test.go 核对这些规则，改这里要同步想一想为什么。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oppenheimer-agent-readonly
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, services, persistentvolumeclaims, events]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oppenheimer-agent-readonly
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: oppenheimer-agent-readonly
+subjects:
+  - kind: ServiceAccount
+    name: agent
+    namespace: monitoring
+---
+# 诊断记录（每次诊断一个文件）放在这里，Pod 重建后还在。local-path：卷在 Pod 所在的节点上，
+# 所以 Deployment 用 Recreate，Pod 也不能随意换节点（换了就看不到旧记录；记录丢了不影响 Agent 工作）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-runs
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  # 1 个副本：Alertmanager 的 webhook 一次只发给一个地址，多副本只会让同一条告警被诊断多次、白花 API 的钱。
+  replicas: 1
+  # Recreate：卷是 ReadWriteOnce，滚动更新时新旧 Pod 会争同一个卷。代价是更新时有几秒钟收不到 webhook
+  # （Alertmanager 会重试，alertsink 那一路不受影响）。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent
+        app.kubernetes.io/part-of: oppenheimer
+      annotations:
+        # 不进网格：它是监控的一部分，不该依赖网格的控制面才能工作。
+        sidecar.istio.io/inject: "false"
+    spec:
+      # 停止时正在跑的诊断会被取消，并把已有的过程写成一条记录落盘；这要比 alertsink 的 30 秒多留一些时间。
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: agent
+      # 要读 Kubernetes 的 API，令牌要挂（alertsink 不挂）。权限只有上面那个只读的 ClusterRole。
+      automountServiceAccountToken: true
+      affinity:
+        nodeAffinity:
+          # 软的，偏好控制面节点 k3s-server（理由同 alertsink）：阶段 4 的故障实验要关的是工作节点，
+          # 诊断 Agent 要在出事时还活着。放不下时宁可去别的节点也不要排不上。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # 让挂进来的卷对 65532 可写（local-path 的目录默认属于 root）。
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          # 镜像（deploy/docker/Dockerfile）把二进制放在 /app/agent，ENTRYPOINT 是指向它的 /app/entrypoint，
+          # 这里用 command 写明子命令。
+          command: ["/app/agent", "serve"]
+          args:
+            - -listen=:8080
+            - -runs-dir=/var/lib/agent/runs
+            # 用 Pod 里的 ServiceAccount 令牌访问 Kubernetes，不读 kubeconfig。
+            - -in-cluster
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # 查询工具的后端，都是只读的。
+            - name: PROMETHEUS_URL
+              value: http://kps-prometheus.monitoring:9090
+            - name: LOKI_URL
+              value: http://loki.monitoring:3100
+            # Claude API 的密钥：Secret agent-anthropic 由 monitoring.sh agent 从 .env 建。optional：Secret 不存在也能起来，
+            # 只是每次诊断都以 api_error 结束。密钥不入库、不写在这里。
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-anthropic
+                  key: api-key
+                  optional: true
+            # OTLP 接收端：monitoring 命名空间的 Collector（Service otel-gateway，gRPC 4317），和六个服务一样。
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-gateway.monitoring:4317
+            # Pod 的身份放进每个指标的资源属性（Downward API），写法同 alertsink。
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              # service.version 用镜像的 tag（__IMAGE_TAG__）。
+              value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"
+            # 内存上限（256Mi）的 90%：Go 的垃圾回收不知道容器的上限。
+            - name: GOMEMLIMIT
+              value: 230MiB
+          volumeMounts:
+            - name: runs
+              mountPath: /var/lib/agent/runs
+          # /healthz 只表示进程在接请求，不查 Claude API、Prometheus 或 Loki：依赖不可用不该让 Pod 被重启。
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            # 估的，没有实测：诊断时要在内存里攒对话和工具返回的结果（Loki、Prometheus 的返回有上限但不小）。
+            # 不设 CPU limit，内存 limit 256Mi 是兜底。跑过几次真实的诊断之后按 /metrics 的数据再调。
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: runs
+          persistentVolumeClaim:
+            claimName: agent-runs
+---
+# 只有集群内部能访问，没有 Ingress 或别的外部路由：POST /ask 每次都要花 Claude API 的钱，
+# 而且没有鉴权，不能让集群外的人（或者集群里不该碰它的东西）随便调。看记录、手动提问用端口转发。
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

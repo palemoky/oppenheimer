@@ -16,8 +16,12 @@
 #   monitoring.sh alertmanager      Alertmanager 的配置（deploy/cluster/monitoring/alertmanager/）：路由、分组、抑制、Telegram 的模板。
 #                                   做成 Secret alertmanager-oppenheimer，Alertmanager 自己重新加载，不重启。Telegram 的 token 和会话号
 #                                   从仓库根目录的 .env 读（TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID，不入库）；没有就只发 webhook。
+#                                   AGENT_WEBHOOK=1 时两个接收端多发一份给诊断 Agent（默认不发，Agent 没在跑时会发送失败）。
 #                                   下发前先 amtool check-config（要 make amtool）。kps 会先调用它（Secret 要先于 Alertmanager 存在）
 #   monitoring.sh alertsink         告警的 webhook 接收端（Deployment alertsink，只打日志、记数；chaos 镜像，仓库里没有就构建）
+#   monitoring.sh agent             诊断 Agent（设计文档 3d，Deployment agent，services/agent；镜像仓库里没有就构建）：只读的 RBAC、存诊断记录的卷、
+#                                   Secret agent-anthropic（ANTHROPIC_API_KEY 从 .env 读，没有就不建，Agent 照常起来但每次诊断都以 api_error 结束）。
+#                                   不在 up 里。Alertmanager 的第二个 webhook 地址要另外打开：AGENT_WEBHOOK=1 monitoring.sh alertmanager
 #   monitoring.sh alerts            只读：Alertmanager 里现在的告警（含被抑制、被静默的）
 #   monitoring.sh silence '<匹配>' <时长> '<原因>'
 #                                   加一条静默，例如 silence 'alertname=ProbeNoData' 2h '正式压测，探针停了'；多个匹配用空格分开。
@@ -119,6 +123,8 @@ cmd_alertmanager() {
     echo "amtool not found; run 'make amtool' in the repo root (installs into ./bin)" >&2
     return 1
   fi
+  # AGENT_WEBHOOK=1 时 Alertmanager 的两个接收端多发一份给 Agent（见 alertmanager.yaml 的 agent-begin）；
+  # 没设就去掉那一段：Agent 没在跑时 Alertmanager 会一直发送失败，还会为此自己报警。环境变量由 alertmanager-test.sh 读。
   "$ROOT/scripts/alertmanager-test.sh" >/dev/null || {
     echo "alertmanager config check failed; run make alertmanager-test to see why" >&2
     return 1
@@ -131,10 +137,10 @@ cmd_alertmanager() {
   if [[ -n "$token" && -n "$chat" ]]; then
     "$ROOT/scripts/alertmanager-test.sh" --render "$dir" "$chat"
     (umask 077 && printf '%s' "$token" >"$dir/telegram-token")
-    echo "==> alertmanager config: webhook + Telegram for critical"
+    echo "==> alertmanager config: webhook + Telegram for critical (agent webhook: ${AGENT_WEBHOOK:-0})"
   else
     "$ROOT/scripts/alertmanager-test.sh" --render "$dir"
-    echo "==> alertmanager config: webhook only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not both set in .env)"
+    echo "==> alertmanager config: webhook only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not both set in .env; agent webhook: ${AGENT_WEBHOOK:-0})"
   fi
   local rc=0
   kubectl -n "$NS" create secret generic "$AM_SECRET" --from-file="$dir" --dry-run=client -o yaml |
@@ -160,6 +166,47 @@ cmd_alertsink() {
   echo "==> alertsink (image $image)"
   sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$DEPLOY/alertsink.yaml" | kubectl apply -f - >/dev/null
   kubectl -n "$NS" rollout status deployment/alertsink --timeout=3m
+}
+
+# 诊断 Agent（设计文档 3d、ADR-0038）。镜像是 deploy/docker/Dockerfile 的 SERVICE=agent，tag 按当前工作区算，
+# 仓库里没有才构建并推送。不在 up 里：要显式运行，而且 Alertmanager 的第二个 webhook 地址默认不下发（见 cmd_alertmanager）。
+# 密钥：Secret agent-anthropic 的 api-key 来自 .env 的 ANTHROPIC_API_KEY。值经文件（umask 077）交给 kubectl，
+# 不出现在命令行参数里，也不打印；服务端 apply，不留 last-applied 注解。没有这个变量就不建 Secret
+# （清单里的 secretKeyRef 是 optional），Agent 能起来，但每次诊断都以 api_error 结束。
+cmd_agent() {
+  ensure_ns
+  local tag="${AGENT_IMAGE_TAG:-}" image dir key rc=0
+  [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
+  if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/agent/manifests/$tag" >/dev/null 2>&1; then
+    echo "==> agent image $tag already in the registry"
+  else
+    echo "==> building agent image $tag (from the working tree)"
+    IMAGE_TAG="$tag" "$HERE/images.sh" all agent
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/agent:$tag"
+  key="$(dotenv ANTHROPIC_API_KEY)"
+  if [[ -n "$key" ]]; then
+    dir="$(mktemp -d)"
+    (umask 077 && printf '%s' "$key" >"$dir/api-key")
+    echo "==> secret agent-anthropic (from ANTHROPIC_API_KEY in .env)"
+    kubectl -n "$NS" create secret generic agent-anthropic --from-file=api-key="$dir/api-key" --dry-run=client -o yaml |
+      kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f - >/dev/null || rc=$?
+    rm -rf "${dir:?}"
+    [[ $rc -eq 0 ]] || return "$rc"
+  else
+    echo "==> note: ANTHROPIC_API_KEY is not set in .env; secret agent-anthropic is not created." >&2
+    echo "    The agent will run, but every diagnosis will end in api_error until the key is added and this command is run again." >&2
+  fi
+  echo "==> agent (image $image)"
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$DEPLOY/agent.yaml" | kubectl apply -f - >/dev/null
+  # 密钥是在启动时从 Secret 读进环境变量的：Secret 变了而 Pod 没变时，要重启才能用上新密钥。
+  if [[ -n "$key" ]]; then
+    kubectl -n "$NS" rollout restart deployment/agent >/dev/null
+  fi
+  kubectl -n "$NS" rollout status deployment/agent --timeout=3m
+  echo "==> to send alerts to the agent, enable the second webhook address:"
+  echo "    AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager"
 }
 
 # amtool 在 Alertmanager 的容器里就有，经 kubectl exec 用它，不用端口转发。
@@ -553,6 +600,7 @@ dashboards) cmd_dashboards ;;
 rules) cmd_rules ;;
 alertmanager) cmd_alertmanager ;;
 alertsink) cmd_alertsink ;;
+agent) cmd_agent ;;
 alerts) cmd_alerts ;;
 silence) cmd_silence "$@" ;;
 inhibit-test) cmd_inhibit_test ;;
@@ -573,7 +621,7 @@ password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | alerts | silence ... | inhibit-test | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | agent | alerts | silence ... | inhibit-test | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

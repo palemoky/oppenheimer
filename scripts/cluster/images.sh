@@ -7,7 +7,8 @@
 #   images.sh tag               只打印这次会用的 tag
 #
 # 不带服务名就是全部七个。镜像名 $REGISTRY_ADDR/oppenheimer/<服务>:<tag>。
-# 另有一个不在“全部”里的 e2e：端到端测试的镜像（deploy/docker/e2e.Dockerfile，带 -race 的测试二进制加 archiver），
+# 另有几个不在“全部”里的镜像，要显式写出来。agent：诊断 Agent（services/agent，用同一份 deploy/docker/Dockerfile，SERVICE=agent；
+# 不属于 Helm chart 的业务服务，只有 monitoring.sh agent 用，images.sh all agent）。e2e：端到端测试的镜像（deploy/docker/e2e.Dockerfile，带 -race 的测试二进制加 archiver），
 # 只有 scripts/cluster/e2e.sh 用，要显式写出来（images.sh all e2e）。chaos 同理：删 Pod 对账测试的发压和对账镜像
 #（deploy/docker/chaos.Dockerfile，load、recon 加 busybox），只有 scripts/cluster/chaos.sh 用（images.sh all chaos）。
 # tag 是短提交号；工作区有未提交的改动时是 <短提交号>-dirty-<UTC 时间>，
@@ -25,11 +26,11 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 ALL_SERVICES="gateway order inventory payment orderindex cdc recon"
 # 可以点名构建、但不在默认列表里的镜像。
-EXTRA_IMAGES="e2e chaos"
+EXTRA_IMAGES="agent e2e chaos"
 PLATFORM="linux/amd64"
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,17p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 

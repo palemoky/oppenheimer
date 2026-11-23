@@ -25,6 +25,7 @@ WORKDIR /src
 COPY go.work go.work.sum ./
 COPY api/go.mod api/go.sum ./api/
 COPY pkg/go.mod pkg/go.sum ./pkg/
+COPY services/agent/go.mod services/agent/go.sum ./services/agent/
 COPY services/cdc/go.mod services/cdc/go.sum ./services/cdc/
 COPY services/gateway/go.mod services/gateway/go.sum ./services/gateway/
 COPY services/inventory/go.mod services/inventory/go.sum ./services/inventory/

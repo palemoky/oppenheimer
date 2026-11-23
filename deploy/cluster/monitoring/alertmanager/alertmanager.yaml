@@ -8,12 +8,16 @@
 # 那样会话号要入库，而且 amtool 检查不了。
 #
 # 两个去向（设计第 2 节第 9 项）：
-#   webhook   全部告警。集群里的 alertsink（只打日志、记数；3d 的诊断 Agent 做出来之后换成它）
+#   webhook   全部告警。集群里的 alertsink（只打日志、记数，带 Watchdog 的心跳）；再加一份发给 3d 的诊断 Agent
+#             （在 alertsink 旁边，不是替换它：ADR-0038；第二个地址默认不下发，见下面的 agent-begin）
 #   critical  severity=critical 的另外发给主人的 Telegram。一个接收端里放两种通知方式，不用两条路由加 continue：
 #             同一组告警只算一次分组和节流，两边看到的内容和时刻一致
 #
 # 占位符 __TELEGRAM_CHAT_ID__ 由脚本从仓库根目录的 .env（不入库）填。.env 里没有 Telegram 的两个变量时，
 # 脚本把 “# telegram-begin” 到 “# telegram-end” 之间的行删掉：critical 也只发 webhook，其余照常。
+# 发给 Agent 的第二个地址同理：只有环境变量 AGENT_WEBHOOK=1 时才保留 “# agent-begin” 到 “# agent-end” 之间的行
+#（AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager）。Agent 没部署时下发它，Alertmanager 会一直发送失败，
+# 还会为此自己报警。send_resolved: false：Agent 只诊断正在响的告警，恢复通知不触发诊断。
 global:
   # 告警规则不再报某条告警之后多久算它恢复了。Prometheus 每次都带 EndsAt，这个值实际只对别的来源有用，留默认。
   resolve_timeout: 5m
@@ -131,11 +135,21 @@ receivers:
         send_resolved: true
         # 一条通知里最多带多少条告警；超出的被截掉，通知里只留个数（truncatedAlerts；alertsink 现在不记它）。
         max_alerts: 100
+      # agent-begin
+      - url: http://agent.monitoring:8080/alerts
+        send_resolved: false
+        max_alerts: 100
+      # agent-end
   - name: critical
     webhook_configs:
       - url: http://alertsink.monitoring:8080/alerts
         send_resolved: true
         max_alerts: 100
+      # agent-begin
+      - url: http://agent.monitoring:8080/alerts
+        send_resolved: false
+        max_alerts: 100
+      # agent-end
     # telegram-begin
     telegram_configs:
       - bot_token_file: /etc/alertmanager/config/telegram-token
