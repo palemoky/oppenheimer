@@ -404,7 +404,7 @@ func TestFallbackUsesSecondaryDuringCooldown(t *testing.T) {
 		return ratelimit.Decision{Denied: 0, RetryAfter: time.Second}, nil
 	}}
 	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: primary, Secondary: secondary, Cooldown: time.Second, Failures: 1,
+		Primary: primary, Secondary: secondary, Cooldown: time.Second, Failures: 1, FailureSpan: -1,
 		Now: func() time.Time { return time.Unix(0, now.Load()) },
 	})
 	call := func() ratelimit.Decision {
@@ -451,6 +451,70 @@ func TestFallbackUsesSecondaryDuringCooldown(t *testing.T) {
 	}
 }
 
+// 成片的失败不打开：同一刻有很多请求一起失败（节点卡了一下，在途的请求一起超时），次数早就数满了，
+// 但这一串失败没有持续到 FailureSpan，其间一有成功就断了。一直失败、持续超过 FailureSpan 才打开。
+func TestFallbackNeedsFailuresToLast(t *testing.T) {
+	t.Parallel()
+	var (
+		now  atomic.Int64
+		fail atomic.Bool
+	)
+	primary := &scripted{fn: func(context.Context) (ratelimit.Decision, error) {
+		if fail.Load() {
+			return ratelimit.Decision{}, errDown
+		}
+		return ratelimit.Decision{Allowed: true, Denied: -1}, nil
+	}}
+	secondary := &scripted{fn: func(context.Context) (ratelimit.Decision, error) {
+		return ratelimit.Decision{Denied: 0, RetryAfter: time.Second}, nil
+	}}
+	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
+		Primary: primary, Secondary: secondary, Cooldown: time.Second, Failures: 3, FailureSpan: 200 * time.Millisecond,
+		Now: func() time.Time { return time.Unix(0, now.Load()) },
+	})
+	asked := func() bool {
+		t.Helper()
+		before := primary.calls.Load()
+		if _, err := f.Allow(t.Context(), req("k", 1, 1)); err != nil {
+			t.Fatalf("Allow: %v", err)
+		}
+		return primary.calls.Load() != before
+	}
+
+	// 几轮卡顿：每轮 50 个请求在 50 毫秒里全部失败，然后恢复。每一个请求都去问了主的，从来没有打开。
+	for round := range 5 {
+		fail.Store(true)
+		for i := range 50 {
+			if !asked() {
+				t.Fatalf("round %d: request %d did not ask the primary; a burst of failures opened the fallback", round, i)
+			}
+			now.Add(int64(time.Millisecond))
+		}
+		fail.Store(false)
+		if !asked() {
+			t.Fatalf("round %d: the primary was not asked after the burst", round)
+		}
+		now.Add(int64(time.Second))
+	}
+
+	// 一直失败：前 200 毫秒里照常去问，过了 200 毫秒打开。
+	fail.Store(true)
+	for i := range 20 {
+		if !asked() {
+			t.Fatalf("request %d at %d ms into the outage did not ask the primary: opened too early", i, i*10)
+		}
+		now.Add(int64(10 * time.Millisecond))
+	}
+	if !asked() {
+		t.Fatal("the request that crosses the span did not ask the primary")
+	}
+	for range 5 {
+		if asked() {
+			t.Fatal("still asking the primary after failures lasted longer than the span")
+		}
+	}
+}
+
 // 主限流器挂住不返回：请求最多等 Timeout，然后由备用的判断。
 func TestFallbackBoundsThePrimaryWait(t *testing.T) {
 	t.Parallel()
@@ -493,7 +557,7 @@ func TestFallbackOpensOnlyAfterConsecutiveFailures(t *testing.T) {
 		return ratelimit.Decision{Denied: 0, RetryAfter: time.Second}, nil
 	}}
 	f := ratelimit.NewFallback(ratelimit.FallbackConfig{
-		Primary: primary, Secondary: secondary, Cooldown: time.Second, Failures: 3,
+		Primary: primary, Secondary: secondary, Cooldown: time.Second, Failures: 3, FailureSpan: -1,
 		Now: func() time.Time { return time.Unix(0, now.Load()) },
 	})
 	// call 返回这次调用是不是问了主的、是不是由主的放行。
