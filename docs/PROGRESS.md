@@ -26,8 +26,16 @@
   - **集群的状态（03:46 UTC 核对）**：六个服务的副本数是平时的，镜像 `daac679`；`RATE_LIMIT_IP` 不在 gateway 的 ConfigMap 里；两个 ScaledObject 没有暂停；`recon` 的两个 CronJob 没有暂停（03:07 那一次没有跑，04:07 的窗口盖得住这一轮，**没有等着看**）；探针在跑；没有不正常的 Pod；没有静默。本机 compose 起着。落库时延和可用性的 7 天预算这一周都只当读数看。
   - **主人 2026-11-23 的答复和之后做的**（设计第 8 节“第 14 项的追查”）：四个问题先查清再定怎么改，`ServerDiskLow` 提前收。
     - 查清了：(1) 限流的退回没有变差，3b 记的“每秒 12 次”是 Redis 超时的次数，不是退回的次数（同一场景 2026-11-21 的退回是 0、6、150、792 次/秒），round-8 和 runbook 已更正；(2) 延迟关单是分区内串行、4 个分区，上限约每秒 140 条，低于落库的上限；(3) 落库延迟 p99 是 2500 ÷ 单个分区的落库速率（44 单/秒）≈ 57 秒，全局的上限管不住单个分区；(4) 尾部采样留下了 26% 的链路，多出来的是被算成“出错”的 429 和被算成“慢”的落库链路。
-    - 给主人的建议（**主人还没有定，代码和配置都没有改**）：(1) 限流的开关改成按连续失败或失败比例打开；(2) 延迟关单先加分区；(3) 先把 `ADMIT_MAX_QUEUE` 按“30 秒 × 单个分区的落库速率”重算（约 1250），再考虑按分区计数；不建议调大宽限期；(4) 被拒绝的请求不标 Error，“慢”和“出错”两类加每秒的上限。
-    - **Tempo 的保留期临时改成了 1 小时（03:55 UTC 下发），为了把压测的那批链路提前删掉；`deploy/cluster/monitoring/tempo.yaml` 在工作区里是 `retention: 1h`，这个改动不能提交。** 盘放回来之后要改回 `72h` 再 `scripts/cluster/monitoring.sh tempo`。本段后面没有“已改回”的话就是还没有改回，新会话先做这件事（`tmp/3c-inject-14-tempo-reclaim.log` 里每 5 分钟记一次 k3s-server 的剩余）。过去 3 天的链路会一起被删掉。
+    - **主人 2026-11-23 定了：四条都按建议改**（决定和道理在 ADR-0035，改了什么在设计第 8 节最后一张表）。做到哪：
+      - (1) 限流连续失败 5 次才打开：`pkg/ratelimit/fallback.go` 加测试，**代码改了，集群上还是旧镜像（`daac679`），没有生效**，要提交之后 `make deploy`。
+      - (2) 延迟关单 8 个分区：集群上的 topic 已经加到 8（04:22 UTC，`scripts/cluster/middleware.sh kafka-topics`，核对过 `kafka_topic_partitions` 是 8）；代码里新建 topic 的分区数也改了（同样要新镜像才用得上，只影响新环境）。
+      - (3) `ADMIT_MAX_QUEUE` 1250：已下发（`IMAGE_TAG=daac679 scripts/cluster/services.sh deploy order`，order 滚动过，ConfigMap 里是 1250）。
+      - (4) Collector：已下发（`monitoring.sh collector`，04:21 UTC）。三条策略都在求值；发了 30 个查不存在订单的请求（客户端一侧是 `NOT_FOUND`），“出错”那条一条没留，改状态的那一步是起作用的。两类的上限没有在过载下验证。
+      - 验证：`make lint` 11 个模块 0 issues；`make test` 通过（60 个包 ok，没有失败，`tmp/14fix-test.log`）；`shellcheck` 过了；Collector 的配置用 0.165.0 的 `validate` 校验过。**四处都没有在过载下重新验证**，下一次打过拐点的压测要看的四个数写在 ADR-0035 的“后果”里。
+      - **主人随后要求提交、推送、部署，并把 `ADMIT_MAX_STALE` 改成 20**（`deploy/cluster/services/order.yaml`，道理在那里的注释和 ADR-0035）。分五个提交推送了；`make deploy` 在提交之后做（要干净的 tag），本段后面没有部署结果的那一条就是还没有做或者没有做完。
+    - **背压的第 2 条（排队超过 30 秒的多于 100 个就拒绝）查过了**（设计第 8 节）：规则和配置没有问题；它限制的是个数不是时长，而落库实际是 96 条各自串行的 lane（4 个分区 × `SUBMIT_CONCURRENCY` 24，过载时每条约 1.9 单/秒），100 个超时的占用集中在两条 lane 上就是 30 + 26 = 56 秒，和量到的 p99 一致。它那次拒绝了多少没有数据（脚本不记是哪一条）。`ADMIT_MAX_STALE` 已按主人的决定调成 20；让脚本返回是哪一条拒绝的并做成指标没有做（主人问了它是什么问题、怎么修，答复之后等主人定）。
+    - PR #17 上 `7104ff1`（第 14 项的文档）的 CI 30 项全部通过（`ci-watcher` 报的，提交核对过）：e2e 4 分 23 秒（上次 3 分 17 秒）、`test (./services/recon)` 2 分 25 秒（上次 1 分 44 秒）慢了，`test (./services/order)` 4 分 01 秒、`test (./test/load)` 2 分 38 秒快了；只改了文档，没有查。
+    - **Tempo 的保留期临时改成了 1 小时（03:55 UTC 下发），为了把压测的那批链路提前删掉；仓库里的 `deploy/cluster/monitoring/tempo.yaml` 仍然是 `72h`（临时的 `1h` 是改了文件下发、随后把文件改回去的，没有提交过），所以集群上的和仓库里的现在不一样。** 盘放回来之后运行 `scripts/cluster/monitoring.sh tempo` 就改回 72 小时。本段后面没有“已改回”的话就是还没有改回，新会话先做这件事（`tmp/3c-inject-14-tempo-reclaim.log` 里每 5 分钟记一次 k3s-server 的剩余）。过去 3 天的链路会一起被删掉。
   - **新会话先看一眼的**：探针恢复之后落库时延的慢档（`SLOOrderPersistDelayBurnSlow`，warning，看 1 天和 2 小时两个窗口）又进了 `pending`（03:46 UTC）：探针一有落库，比例重新有了分母，而 2 小时的窗口里还装着这一轮的慢订单。它多半会在 04:01 前后响，到 05:04 前后（顶档滑出 2 小时窗口）恢复；这是多窗口的尾巴，不是新的问题，**没有等着看**。`ProbeNoData` 同时在 `pending`（探针刚起来），探针已经在以每秒 1 单下单，应当自己消失，同样没有等着看。
   - 这一段的改动（设计、计划、七份 runbook、本文件）**没有提交**。每分钟一行的记录和现场的输出在 `tmp/3c-inject-14-*.log`，各档的服务端指标在 `tmp/k6/3c14-order-ladder/stages/`（不入库）。
 - **做完的（16 项里 13 项，含上面的第 15、14 项）**：第 1 项（抑制，做成了 `monitoring.sh inhibit-test`，14 条规则 47 条用例全部符合）、第 2 项（停探针，什么都没响）、第 3 项（inventory，7 分钟）、第 5 项（orderindex）、第 6 项（cdc）、第 7、8 项（从库的 SQL、IO 线程）、第 9 项（闸门内存）、第 10 项（Sentinel）、第 11 项（otel-gateway）、第 12 项（alertsink）、第 13 项（Strimzi operator）。每一项响的告警都在现场照 runbook 走过，命令都能跑，走得到原因；走的过程中改了 5 份 runbook。

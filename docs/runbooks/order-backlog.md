@@ -6,7 +6,7 @@
 
 ## 这条告警在说什么
 
-下单分两段：gateway 受理（Redis 闸门预扣，返回 202），order 消费 Kafka 的 `order.submit` 落库。中间的队列就是闸门里“已受理、未认领”的占用。背压在 `Hold` 里按三条拒绝（`429 BACKLOGGED`）：未认领的占用数达到 `ADMIT_MAX_QUEUE`（集群上是 2500，等于 125 单/秒 × 20 秒）；排队超过 `ADMIT_MAX_WAIT`（30 秒）的占用多于 `ADMIT_MAX_STALE`（100）个；落库超过 30 秒没有动静时，未认领的占用超过 100 个。
+下单分两段：gateway 受理（Redis 闸门预扣，返回 202），order 消费 Kafka 的 `order.submit` 落库。中间的队列就是闸门里“已受理、未认领”的占用。背压在 `Hold` 里按三条拒绝（`429 BACKLOGGED`）：未认领的占用数达到 `ADMIT_MAX_QUEUE`（集群上是 1250，等于 30 秒 × 单个分区的落库速率 44 单/秒；2026-11-23 以前是 2500，ADR-0035）；排队超过 `ADMIT_MAX_WAIT`（30 秒）的占用多于 `ADMIT_MAX_STALE`（集群上是 20，2026-11-23 以前是默认的 100）个；落库超过 30 秒没有动静时，未认领的占用超过同一个数。
 
 - **`OrderBackpressureRejecting`**：`outcome="backlogged"` 的受理占全部受理请求的比例（5 分钟速率）超过 5%，持续 10 分钟。压测打过拐点时它本来就该响（保护在起作用），所以是 warning。出处：设计第 2 节第 2 项（背压是承诺的一部分，不进 SLO，单独配这一条）。
 - **`OrderQueueNearWaitLimit`**：`max(order_gate_unclaimed_holds) ÷ sum(rate(order_persists_total[5m]))`，也就是队列里的订单按现在的落库速率要等多久，超过 30 秒的八成（24 秒），持续 5 分钟。队列长度只有回收任务的 leader 报，所以取 max。落库速率是 0 而队列里有东西时比值是无穷大，同样响，那是落库停了。出处：round-3 第 1.3 节（队列长度 ÷ 落库速率 要小于 `ADMIT_MAX_WAIT`，限制等待时间只能限制队列长度）。
@@ -33,6 +33,7 @@
 
 - **到达速率超过落库能力，盘的同步刷盘到顶（最常见）。** 持续 125 到 150 单/秒是普通下单的上限（round-0、round-2 第 10 节、[3b-capacity.md](../notes/3b-capacity.md)）；round-3 的 244 单/秒档背压第一次按队列长度触发，每秒拒绝 13.5 个。处理：降低受理速率；这是预期的保护，不是故障。
 - **队列上限是静态的，换盘或加分片后没有跟着重算。** round-1 第 6 节：默认 1 万单在落库 100 单/秒时要排 100 秒，超过 60 秒的宽限期，608 个订单被回收；round-3 改成 2500。处理：落库速率变了就重算 `ADMIT_MAX_QUEUE`（`deploy/cluster/services/order.yaml` 里有算法）。
+- **全局的上限只管得住总数，管不住单条队列（2026-11-23 压测量到，ADR-0035）。** 落库是 4 个分区、每个分区 24 条 lane 各落各的，队列在它们之间会不均；上限 2500 时落库延迟 p99 到过 57 秒（2500 ÷ 单个分区的 44 单/秒）。上限已改成 1250。背压的第 2 条限制的是排队超过 30 秒的占用的个数（100），不是时长。看两个 order Pod 的落库延迟差多少：`scripts/cluster/monitoring.sh promql 'histogram_quantile(0.99, sum by (le, k8s_pod_name) (rate(order_persist_delay_seconds_bucket{k8s_namespace_name="oppenheimer"}[5m])))'`。
 - **全局的上限在慢的分片上偏松。** round-3 2.2：上限是全局一个数，两个分片的落库速率不同，慢的分片排得长，落库延迟 p99 是 27.8 秒而不是算出来的 12 秒，离 30 秒的上限余量比算的小。还没有按分片分开。
 - **盘进入慢的一档**（刷盘耗时翻倍）：写入上限更低（round-1 第 5 节、round-2 第 10 节）。
 - **order 的消费者被一条消息挡住或不在了**（落库速率 0，比值 `+Inf`）：看 [consumer-blocked.md](consumer-blocked.md)。
