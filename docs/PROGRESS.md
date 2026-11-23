@@ -34,6 +34,7 @@
 - **第 4a 项做了**（09:25 到 09:51 UTC，payment 缩到 0，探针不停；设计第 8 节“第 4a 项”）：响了 `IngressGateway5xxHigh`、`ProbeFailing`（两条 critical，Telegram 发了）、`ServiceMetricsMissing{payment}`、`ConsumerNotConsuming{payment.order-events}`，payment 回来 5 分钟内全部恢复。`PaymentReplyOverdue` 和支付时延的 SLO 没有响：支付是同步建单，payment 不在时 `/pay` 直接 503、支付单建不出来，这两条和 4b 一起归第 16 项。没有退款发生，约 1300 张探针订单到时限被正常关单。付款不可用 26 分钟而四个 SLO 都没响（SLO 只看下单），记给写 SLO 的 ADR。对账的结果见本段最后一条。
 - PR #17 上 `7f6b0ff`（文档）的 CI 30 项全部通过（`ci-watcher` 报的）：`rules` 1 分 30 秒（上次 53 秒）、`test (./pkg)` 3 分 24 秒（上次 2 分 42 秒）、e2e 3 分 52 秒（上次 3 分 08 秒）变慢，`test (./services/order)` 3 分 24 秒、`test (./services/recon)` 1 分 54 秒变快，只改了文档，像运行机的波动，没有查。
 - **收尾的对账（10:24 UTC）**：`recon-hourly` 10:07 那一次成功，差异 0（窗口 08:07 到 09:37，盖住压测）；10:23 手工跑的一次差异 0（窗口 08:23 到 09:53，盖住 payment 停着的 26 分钟）。10:24 时在响的只有 `SLOOrderPersistDelayBurnSlow`（warning，压测留在 2 小时窗口里的尾巴，约 11:10 UTC 自己恢复，**没有等着看**），没有不正常的 Pod。手工的 Job `recon-manual-1795429387`、`recon-manual-1795418641` 留着（成功的，会被历史上限挤掉）。
+- PR #17 上 `adc63c8`（文档，当前的头）的 CI 30 项全部通过（`ci-watcher` 报的）：`test (./services/order)` 4 分 24 秒（上次 3 分 24 秒）、e2e 4 分 20 秒（上次 3 分 52 秒）变慢，`rules` 1 分 05 秒、`test (./pkg)` 2 分 53 秒、`test (./test/load)` 2 分 43 秒变快，`test (./services/recon)` 1 分 54 秒；只改了文档，都在以往的范围内，没有查。**这一条写进本文件之后没有提交**，下次提交时带上。
 - **下一步**：主人看上面五条 → 第 16 项（含 4b；先列出 82 条里还没真实触发的清单）→ 勾 3c 的五项 → SLO 的大盘、ADR、阶段笔记。
 
 ### 3c 待定项的处理（2026-11-23 下午，UTC 07:10 到 07:50；在上一段之前）
