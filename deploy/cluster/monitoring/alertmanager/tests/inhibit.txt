@@ -13,6 +13,9 @@
 active    | alertname=SLOOrderCreateAvailabilityBurnFast severity=critical slo=order_create_availability burn=fast
 inhibited | alertname=SLOOrderCreateAvailabilityBurnMedium severity=critical slo=order_create_availability burn=medium
 inhibited | alertname=SLOOrderCreateAvailabilityBurnSlow severity=warning slo=order_create_availability burn=slow
+active    | alertname=SLOOrderPayAvailabilityBurnFast severity=critical slo=order_pay_availability burn=fast
+inhibited | alertname=SLOOrderPayAvailabilityBurnMedium severity=critical slo=order_pay_availability burn=medium
+inhibited | alertname=SLOOrderPayAvailabilityBurnSlow severity=warning slo=order_pay_availability burn=slow
 active    | alertname=SLOOrderCreateLatencyBurnMedium severity=critical slo=order_create_latency burn=medium
 inhibited | alertname=SLOOrderCreateLatencyBurnSlow severity=warning slo=order_create_latency burn=slow
 active    | alertname=SLOOrderPersistDelayBurnSlow severity=warning slo=order_persist_delay burn=slow

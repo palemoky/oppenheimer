@@ -5,6 +5,7 @@ null     | alertname=InfoInhibitor severity=none
 null     | alertname=KubeQuotaAlmostFull severity=info namespace=oppenheimer
 critical | alertname=ProbeFailing severity=critical service=probe
 critical | alertname=SLOOrderCreateAvailabilityBurnFast severity=critical slo=order_create_availability burn=fast
+critical | alertname=SLOOrderPayAvailabilityBurnFast severity=critical slo=order_pay_availability burn=fast
 critical | alertname=MySQLDown severity=critical component=mysql instance=mysql-order-0-0
 critical | alertname=KubeNodeNotReady severity=critical node=k3s-agent-1
 webhook  | alertname=SLOOrderCreateLatencyBurnSlow severity=warning slo=order_create_latency burn=slow

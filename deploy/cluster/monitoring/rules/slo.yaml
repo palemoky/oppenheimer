@@ -309,6 +309,94 @@ spec:
             summary: "落库时延的错误预算在以 3 倍以上的速度消耗（慢的一档，1d 和 2h 两个窗口）"
             description: "从受理到落库超过 10 秒的订单的比例，2h 窗口里现在是 {{ $value | humanizePercentage }}，目标允许的是 99% 之外的部分。按这个速度，一周的预算约 2.3 天烧完。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/slo-order-persist-delay.md
+    # ---- 支付可用性：目标 99.9%（7 天），预算 0.001 ----
+    # POST /api/v1/orders/{order_id}/pay 上 5xx 的比例（499 不计入；409 和 429 算好的）。2026-11-23 加的（ADR-0037）：
+    # payment 整个不在的 26 分钟里 /pay 一直是 503，而原来的四个 SLO 都不响（第 4a 项）。
+    # 指标里的 http_route 是 gin 的写法（:order_id），不是 OpenAPI 的写法。
+    - name: slo.order_pay_availability
+      interval: 30s
+      rules:
+        - record: slo:order_pay_availability:error_ratio_rate5m
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[5m])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[5m]))
+        - record: slo:order_pay_availability:error_ratio_rate30m
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[30m])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[30m]))
+        - record: slo:order_pay_availability:error_ratio_rate1h
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[1h])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[1h]))
+        - record: slo:order_pay_availability:error_ratio_rate2h
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[2h])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[2h]))
+        - record: slo:order_pay_availability:error_ratio_rate6h
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[6h])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[6h]))
+        - record: slo:order_pay_availability:error_ratio_rate1d
+          expr: |
+            (sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code=~"5.."}[1d])) or vector(0))
+              /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[1d]))
+        - record: slo:order_pay_availability:valid_rate5m
+          expr: |
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id/pay",http_request_method="POST",http_response_status_code!="499"}[5m]))
+        - alert: SLOOrderPayAvailabilityBurnFast
+          expr: |
+            slo:order_pay_availability:error_ratio_rate5m > 14.4 * 0.001
+            and
+            slo:order_pay_availability:error_ratio_rate1h > 14.4 * 0.001
+            and
+            slo:order_pay_availability:valid_rate5m >= 0.2
+          for: 2m
+          labels:
+            severity: critical
+            slo: order_pay_availability
+            burn: fast
+          annotations:
+            summary: "支付可用性的错误预算在以 14.4 倍以上的速度消耗（快的一档，1h 和 5m 两个窗口）"
+            description: "POST /api/v1/orders/{order_id}/pay 上 5xx 的比例（499 不计入；409 和 429 算好的），5m 窗口里现在是 {{ $value | humanizePercentage }}，目标允许的是 99.9% 之外的部分。按这个速度，一周的预算约 12 小时烧完。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/slo-order-pay-availability.md
+        - alert: SLOOrderPayAvailabilityBurnMedium
+          expr: |
+            slo:order_pay_availability:error_ratio_rate30m > 6 * 0.001
+            and
+            slo:order_pay_availability:error_ratio_rate6h > 6 * 0.001
+            and
+            slo:order_pay_availability:valid_rate5m >= 0.2
+          for: 5m
+          labels:
+            severity: critical
+            slo: order_pay_availability
+            burn: medium
+          annotations:
+            summary: "支付可用性的错误预算在以 6 倍以上的速度消耗（中的一档，6h 和 30m 两个窗口）"
+            description: "POST /api/v1/orders/{order_id}/pay 上 5xx 的比例（499 不计入；409 和 429 算好的），30m 窗口里现在是 {{ $value | humanizePercentage }}，目标允许的是 99.9% 之外的部分。按这个速度，一周的预算约 28 小时烧完。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/slo-order-pay-availability.md
+        - alert: SLOOrderPayAvailabilityBurnSlow
+          expr: |
+            slo:order_pay_availability:error_ratio_rate2h > 3 * 0.001
+            and
+            slo:order_pay_availability:error_ratio_rate1d > 3 * 0.001
+            and
+            slo:order_pay_availability:valid_rate5m >= 0.2
+          for: 15m
+          labels:
+            severity: warning
+            slo: order_pay_availability
+            burn: slow
+          annotations:
+            summary: "支付可用性的错误预算在以 3 倍以上的速度消耗（慢的一档，1d 和 2h 两个窗口）"
+            description: "POST /api/v1/orders/{order_id}/pay 上 5xx 的比例（499 不计入；409 和 429 算好的），2h 窗口里现在是 {{ $value | humanizePercentage }}，目标允许的是 99.9% 之外的部分。按这个速度，一周的预算约 2.3 天烧完。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/slo-order-pay-availability.md
     # ---- 支付处理时延：目标 99%（7 天），预算 0.01 ----
     # 从支付出结果到订单变成已支付超过 5 秒的订单的比例（阈值是暂定的，等有了基线再定）。
     - name: slo.order_payment_delay

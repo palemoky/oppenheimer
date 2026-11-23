@@ -30,7 +30,7 @@
 
 ### 错误预算烧完了怎么办
 
-四个 SLO 各有一周的预算（7 天窗口）。剩余多少看大盘的 SLO 一块，或者查 `slo:<名字>:error_ratio_rate7d` 除以允许的错误比例。
+五个 SLO 各有一周的预算（7 天窗口）。剩余多少看大盘 `Oppenheimer / SLO` 顶上那一排。没有 7 天窗口的记录规则，要手工查的话用各 SLO 的 runbook“先看什么”第 1 步里的那条查询。
 
 - 预算还有：告警按 runbook 处理就行，实验照做。预算是拿来花的。
 - 预算烧完（7 天的错误比例超过了目标允许的）：**停掉会烧预算的事**（压测打过拐点的那几轮、阶段 4 的故障实验），先把烧预算的原因处理掉，等窗口滚过去、预算回来再继续。这个项目没有发布节奏可以冻结，这条规矩约束的是实验。
@@ -71,6 +71,7 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 | 文件 | 告警 |
 |---|---|
 | [slo-order-create-availability.md](slo-order-create-availability.md) | `SLOOrderCreateAvailabilityBurn{Fast,Medium,Slow}` |
+| [slo-order-pay-availability.md](slo-order-pay-availability.md) | `SLOOrderPayAvailabilityBurn{Fast,Medium,Slow}` |
 | [slo-order-create-latency.md](slo-order-create-latency.md) | `SLOOrderCreateLatencyBurn{Fast,Medium,Slow}` |
 | [slo-order-persist-delay.md](slo-order-persist-delay.md) | `SLOOrderPersistDelayBurn{Fast,Medium,Slow}` |
 | [slo-order-payment-delay.md](slo-order-payment-delay.md) | `SLOOrderPaymentDelayBurn{Fast,Medium,Slow}` |
