@@ -80,4 +80,4 @@ scripts/cluster/monitoring.sh promql '1 - avg by (instance) (rate(node_cpu_secon
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-23 02:47 UTC，`NodeCPUHigh` 第一次真的响（压测 280 单/秒，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：agent-2 02:47 响（93% 到 96%），agent-1 02:49 响，之后 agent-1 在 85% 上下抖：02:57 恢复又进 `pending`，多发了一轮通知。CPU 主要在用户态（agent-2 约 4.9 核，iowait 0.3 核），吃得最多的是 order、gateway 的 Pod，其次 `mysql-main-0`、`tempo-0`、入口 Envoy。停压后约 3 分钟恢复。chart 自带的 `NodeSystemSaturation`（按负载均值）同时响了两条，说的是同一件事；自带的 `NodeCPUHighUsage` 只进过 `pending`。

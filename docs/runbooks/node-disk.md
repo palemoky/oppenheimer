@@ -58,7 +58,7 @@
 
 1. **压测和长稳测试。** 记录：round-9 的 3.1：盘没有稳态，agent-2 每小时掉 4.4 GiB，agent-1 2.8，k3s-server 1.5（采样 10% 时）。server 剩 22 GiB 时，长稳测试约十个小时就会碰到 `ServerDiskLow`（15 GiB 约 5 小时、8 GiB 约 9 小时，按每小时 1.5 GiB 算）。处理：停压后看保留期能不能把它收回来；长稳测试前先看 server 的剩余。
 2. **binlog 和 Kafka 没配保留期。** 记录：round-9 的 3.2：`mysql-main` 的 binlog 每小时 1.4 GiB、保留 30 天；Kafka 每个 broker 每小时 0.78 GiB、保留 7 天。2026-11-22 已改：binlog 1 天（`binlog-expire-logs-seconds=86400`，`deploy/charts/mysql/values.yaml`），Kafka 24 小时加每分区 4 GiB（`deploy/cluster/kafka/kafka.yaml`），死信 topic 7 天（[round-9 的 3.4](../notes/3b-rounds/round-9-soak.md)）。**改完之后没有再跑一次长稳去验证盘真的走平**，93 GiB 是估算。`cdc.order.orders` 是压缩保留，不受保留期管，每个 broker 上占 5.5 GiB。
-3. **入口访问日志、链路、日志。** 记录：[3a 笔记第 12 节](../notes/3a-observability.md)：入口访问日志占 Loki 的 60%，已改成只留出错的；每个请求大约落 1.2 个 span 和 1.4 KB 日志，2000 请求/秒压一小时：Tempo 约 1.5 GB，Loki 约 1.4 GB；Tempo 的保留期 3 天、Loki 7 天，没有容量上限，**3b 不要关尾部采样压测**。
+3. **入口访问日志、链路、日志。** 记录：[3a 笔记第 12 节](../notes/3a-observability.md)：入口访问日志占 Loki 的 60%，已改成只留出错的；每个请求大约落 1.2 个 span 和 1.4 KB 日志，2000 请求/秒压一小时：Tempo 约 1.5 GB，Loki 约 1.4 GB；Tempo 的保留期 3 天、Loki 7 天，没有容量上限，**3b 不要关尾部采样压测**。**尾部采样在过载的压测里不起作用**（2026-11-23）：被拒绝的请求算“出错”、变慢的落库算“慢”，都全留，35 分钟写掉约 8 GB，比这里估的快一个量级；打过拐点的压测之前先看 server 的剩余，至少留出 10 GB。
 4. **etcd 和盘抢。** 记录：3a 12：etcd 的 fsync p99 一直高于 10 毫秒的参考线，没有查原因。盘快满时更糟。
 5. **镜像和旧的 Job 留下的东西。** server 上镜像约 6.3 GiB，etcd 约 0.5 GB。清理未使用的镜像和压缩日志是推断的办法，没有在这套集群上做过。
 6. **备份写 NFS 的页缓存。** 不是磁盘问题，是内存（见 [container-memory.md](container-memory.md)）。
@@ -85,4 +85,4 @@ server 大于 15，agent 大于 30。再用 `predict_linear` 确认它不是在�
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-23 03:13 UTC，`ServerDiskLow` 第一次真的响（压测，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：普通下单阶梯 35 分钟里 k3s-server 少了约 8 GB，从约 22 GiB 掉到 14.1 GiB。写的人是 Tempo（收了 7.5 GB 链路，卷 13 G）和 Loki（2.6 GB），Kafka 在这个节点上只涨 1.3 GB。原因（Collector 的计数，设计第 8 节“第 14 项的追查”第 4 条）：324 万条链路留下了 84.5 万条，其中被拒绝的请求（429）被算成“出错”全留了 21.6 万条，落库的 handler 过载时平均 500 毫秒、被算成“慢”全留了 35.8 万条，后一类正是 span 最多的。Tempo 的保留期 3 天，这批数据到 11 月 26 日才过期。第 1 到 3 步的命令在现场都能跑（`ssh ubuntu@192.168.50.40` 的那条也能跑，卷的位置就是 k3s 的默认位置）。

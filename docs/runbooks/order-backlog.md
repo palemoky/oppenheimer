@@ -50,10 +50,11 @@
 
 ## 怎么人为触发它
 
-设计第 5 节第 2 层：压测打过写入的拐点（3b 的普通下单阶梯：125、156、195、244 单/秒各 3 分钟，244 档背压触发，round-3 的运行号 `l5a-order-overload` 可参照）。`OrderQueueNearWaitLimit` 也可以靠停 order 的消费者（落库速率 0，`+Inf`），待定：停 order 同时会让受理失败，更干净的办法是在 `oppenheimer-e2e` 里做，没有验证过。压测时本机不跑测试和构建，正式一轮之前先 `make down`。
+设计第 5 节第 2 层：压测打过写入的拐点（3b 的普通下单阶梯：125、156、195、244 单/秒各 3 分钟，244 档背压触发，round-3 的运行号 `l5a-order-overload` 可参照）。**244 档的拒绝比例只有约 5.7%，贴着 5% 的线，各 3 分钟也不够 `for` 的 10 分钟**；2026-11-23 实际用的是 125、156、195 各 3 分钟再 280 单/秒 25 分钟（运行号 `3c14-order-ladder`），它同时会让落库时延的三档、`NodeCPUHigh`、`OrderReadBulkheadRejecting`、`RateLimitFallingBack` 响，停压后 `ConsumerBlocked`（延迟关单落后）和 `ServerDiskLow`（链路把 k3s-server 的盘写掉约 8 GB）也会响。`OrderQueueNearWaitLimit` 也可以靠停 order 的消费者（落库速率 0，`+Inf`），待定：停 order 同时会让受理失败，更干净的办法是在 `oppenheimer-e2e` 里做，没有验证过。压测时本机不跑测试和构建，正式一轮之前先 `make down`。
 
 故障注入动手前要先登记到 [phase-3-observability.md](../plan/phase-3-observability.md)。
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-23 02:50 UTC，`OrderBackpressureRejecting` 第一次真的响（压测，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：普通下单 280 单/秒，受理稳定在约 190 单/秒，每秒拒绝约 90 个（约三分之一）；从背压开始拒绝到告警响约 11 分钟（5 分钟的速率加 `for` 10 分钟），停压后约 5 分钟恢复。第 1 到 4 步的查询在现场都能跑。队列一直顶在上限（2497），折成的等待 13 到 14 秒，`OrderQueueNearWaitLimit` 没有响：队列上限 2500 在落库 190 单/秒时把这个比值压在 24 秒以下，它只在落库速率掉到约 104 单/秒以下才够得着。
+- 同一次里落库延迟的 p99 到过 57 秒（上限按总速率算是 13 秒），离回收的宽限期（60 秒）只差 3 秒；没有订单被回收（落库结局里没有 `hold_missing`，受理 380792、落库 380790）。“全局的上限在慢的分片上偏松”那一条在 280 单/秒时比 244 单/秒时（27.8 秒）严重得多。

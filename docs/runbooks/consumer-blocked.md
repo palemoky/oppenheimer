@@ -10,7 +10,7 @@
 
 - **`ConsumerBlocked`**：上面这个值超过 10 分钟，持续 5 分钟。
 - **`ConsumerBlockedTooLong`**：超过 2 小时，持续 5 分钟。**Kafka 的保留期是 24 小时**，过了之后没消费的消息会被删掉，那时丢的是数据（round-9 3.4）。
-- **`ConsumerNotConsuming`**：Kafka Exporter 的 `kafka_consumergroup_lag` 大于 0（有积压），并且 `kafka_consumergroup_current_offset` 的 10 分钟 `delta` 等于 0（位点没动），持续 10 分钟。只看五个消费组：`order.order-submit`、`order.payment-events`、`inventory.order-events`、`payment.order-events`、`orderindex.cdc-orders`。`order.close.delay` 不看：它的“积压”是还没到期的延迟关单消息，是机制本身（稳定在 11.4 万，round-9 2.3）。它能发现消费者整个不在、卡在再均衡、进程活着但不拉消息，这些 `ConsumerBlocked` 量不到。注意 `delta` 窗口 10 分钟加 `for` 10 分钟，实际从位点停下算起最早约 20 分钟才响，比规则注释里的“10 分钟”长。
+- **`ConsumerNotConsuming`**：Kafka Exporter 的 `kafka_consumergroup_lag` 大于 0（有积压），并且 `kafka_consumergroup_current_offset` 的 10 分钟 `delta` 等于 0（位点没动），持续 10 分钟。只看五个消费组：`order.order-submit`、`order.payment-events`、`inventory.order-events`、`payment.order-events`、`orderindex.cdc-orders`。`order.close.delay` 不看：它的“积压”是还没到期的延迟关单消息，是机制本身（稳定在 11.4 万，round-9 2.3）；所以第 2 步的两条查询里也没有它，延迟关单落后时用“常见的原因”里那一条的查询。它能发现消费者整个不在、卡在再均衡、进程活着但不拉消息，这些 `ConsumerBlocked` 量不到。注意 `delta` 窗口 10 分钟加 `for` 10 分钟，实际从位点停下算起最早约 20 分钟才响，比规则注释里的“10 分钟”长。
 
 ## 影响
 
@@ -34,6 +34,7 @@
 
 - **依赖暂时不可用（设计上就是这样停的）。** ADR-0021：落库、订单事件的消费者对普通错误无限重试，依赖恢复后自己继续。处理：恢复依赖，不要动消费者。
 - **一条没被识别的坏消息挡住分区。** ADR-0021 的后果、ADR-0014（一条缺列的消息会让 CDC 所在分区全部订单停止同步）。handler 应当把“数据本身不对”的错误标成 `Permanent`（进死信，见 [consumer-dead-letter.md](consumer-dead-letter.md)）。处理：找到那条消息，改代码把错误标成 `Permanent`；或者人工把它移走：没有找到现成的“跳过某个位点”的操作手册（ADR-0014 说“放到阶段 3”，3c 没写）。建议（没有验证过）：把该消费组的 Deployment 缩到 0，用 `kafka-consumer-groups.sh --group <组> --topic <topic>:<分区> --reset-offsets --to-offset <位点+1> --execute` 越过，再放回。
+- **延迟关单（`order.close.delay`）落后，不是挡住（2026-11-23 压测之后真遇到过）。** 这一组平时的积压是还没到期的消息（所以 `ConsumerNotConsuming` 不看它），但到期之后迟迟没处理的会算进 `kafkax_consumer_oldest_pending_age_seconds`。订单进来的速率长时间高于它处理的速率（实测空闲时每秒约 110 到 160 条，过载时 40 到 110 条）就会落后。看法：`scripts/cluster/monitoring.sh promql 'sum(rate(kafka_consumergroup_current_offset{consumergroup="order.order-close-delay"}[2m]))'`（位点在走就是慢不是停）、`scripts/cluster/monitoring.sh promql 'sum(kafka_consumergroup_lag{consumergroup="order.order-close-delay"})'`、order 日志里的 `close expired order failed`。处理：停掉过载的来源，等它自己追上；没付款的订单在这期间晚关单，预占晚放回，账不会错。上限的来历：延迟消费者分区内串行，这个 topic 4 个分区，每条 26 到 30 毫秒，所以空闲时也只有每秒约 140 条（设计第 8 节“第 14 项的追查”第 2 条）。
 - **被杀的消费者名下分区停摆。** 1b：会话超时默认 45 秒，整整停摆 45 秒，受理的订单有 28% 到 33% 被回收；已改成 10 秒。现在应该只有 10 秒左右。
 - **inventory 消费 `order.events` 跟不上。** round-1 第 5 节：处理速率停在约 105 条/秒，积压涨到 2 万条；是慢，不是挡住（`delta` 不为 0）。原因没有查清。
 - **库存服务处理事件时 Redis 不可用。** 1b：该消费者重试调到 60 次（约 5 分钟），宁可停住等 Redis 恢复，防止 MySQL 已释放而占用没归还。
@@ -55,4 +56,4 @@
 
 ## 历史
 
-（还没有真的响过）
+- 2026-11-23 03:11 UTC，`ConsumerBlocked{order, order.close.delay}` 第一次真的响（压测停了之后，设计 [3c](../design/3c-slo-alerting.md) 第 8 节“第 14 项”）：不是被一条消息挡住，是延迟关单的消费者落后。过载的 25 分钟里它每秒处理 40 到 110 条，订单每秒进来约 190 张，到期的消息从 02:50 起越排越晚；order 的日志里有 25 条 `close expired order failed: context deadline exceeded`。停压后它每秒处理 107 到 160 条（order 只用 0.3 核，集群是空的），最老的一条最多晚了约 25 分钟（1481 秒），03:43 前后追平。影响是没付款的订单晚十几分钟才关单、放回库存。
