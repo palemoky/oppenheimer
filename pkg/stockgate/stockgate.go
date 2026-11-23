@@ -161,7 +161,25 @@ type HoldResult struct {
 	SKUID int64
 	// Queued：Backlogged 时是触发拒绝的计数（队列长度，或排队超时的占用数）。
 	Queued int64
+	// Rule：Backlogged 时是 BacklogLimit 三条里拒绝了这次受理的那一条（按检查的先后，第一条成立的）。
+	Rule BacklogRule
 }
+
+// BacklogRule 标明背压的哪一条拒绝了受理，见 BacklogLimit。只给监控用，调用方对三条的处理是一样的。
+//
+// 为什么要分开：三条说的是三种状况（来得太多、有的排得太久、落库停了），调的也是不同的参数
+// （MaxQueue、MaxStale、消费者本身）。只有一个“被背压拒绝”的总数时，过载之后分不出是哪一条在起作用：
+// 2026-11-23 的压测里落库延迟的 p99 到了 57 秒，第二条拦了多少只能靠推（设计文档 3c 第 8 节）。
+type BacklogRule string
+
+const (
+	// BacklogQueue 是队列长度达到 MaxQueue（第一条）。
+	BacklogQueue BacklogRule = "queue"
+	// BacklogStale 是排队超过 MaxWait 的占用多于 MaxStale 个（第二条）。
+	BacklogStale BacklogRule = "stale"
+	// BacklogStalled 是落库至少 MaxWait 没有动静，并且队列长度超过 MaxStale（第三条）。
+	BacklogStalled BacklogRule = "stalled"
+)
 
 // holdScript 先做完所有检查，再做所有修改：任何一个 SKU 不满足条件都在写入之前返回，
 // 所以一个订单的多个 SKU 要么全部扣到，要么都不扣，不需要回滚。
@@ -173,6 +191,8 @@ type HoldResult struct {
 // ARGV: 前缀, 订单号, 用户, 幂等键, 请求哈希, 幂等键保留毫秒数, 受理时间毫秒, items 编码,
 // 队列长度上限（0 表示不限制）, 排队截止时间毫秒（0 表示不检查第二、三条）, MaxStale, 然后是成对的 sku, 数量。
 // 第三条拿心跳和排队截止时间比：心跳早于它，说明落库至少 MaxWait 没有认领过任何消息。
+// 返回值是两个元素（结果, 订单号或 SKU 或计数）；BACKLOG 多一个，是拒绝的那一条（BacklogRule 的取值）。
+// 它来自脚本本来就在走的分支，没有多读任何键。
 var holdScript = redis.NewScript(`
 local p, order, user, idem, hash = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local idemKey = p .. 'gate:idem:' .. user .. ':' .. idem
@@ -209,19 +229,19 @@ end
 if ARGV[9] ~= '0' then
   local queued = redis.call('ZCARD', p .. 'gate:holds')
   if queued >= tonumber(ARGV[9]) then
-    return {'BACKLOG', tostring(queued)}
+    return {'BACKLOG', tostring(queued), 'queue'}
   end
 end
 if ARGV[10] ~= '0' then
   local stale = redis.call('ZCOUNT', p .. 'gate:holds', '-inf', '(' .. ARGV[10])
   if stale > tonumber(ARGV[11]) then
-    return {'BACKLOG', tostring(stale)}
+    return {'BACKLOG', tostring(stale), 'stale'}
   end
   local beat = redis.call('GET', p .. 'gate:claim_at')
   if not beat or tonumber(beat) < tonumber(ARGV[10]) then
     local queued = redis.call('ZCARD', p .. 'gate:holds')
     if queued > tonumber(ARGV[11]) then
-      return {'BACKLOG', tostring(queued)}
+      return {'BACKLOG', tostring(queued), 'stalled'}
     end
   end
 end
@@ -275,7 +295,7 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 	if err != nil {
 		return HoldResult{}, fmt.Errorf("stockgate: hold: %w", err)
 	}
-	if len(res) != 2 {
+	if want := 2 + btoi(len(res) > 0 && res[0] == "BACKLOG"); len(res) != want {
 		return HoldResult{}, fmt.Errorf("stockgate: hold: unexpected reply %v", res)
 	}
 	id, err := strconv.ParseInt(res[1], 10, 64)
@@ -296,10 +316,23 @@ func (g *Gate) Hold(ctx context.Context, req HoldRequest) (HoldResult, error) {
 	case "LIMIT":
 		return HoldResult{Outcome: LimitExceeded, SKUID: id}, nil
 	case "BACKLOG":
-		return HoldResult{Outcome: Backlogged, Queued: id}, nil
+		rule := BacklogRule(res[2])
+		switch rule {
+		case BacklogQueue, BacklogStale, BacklogStalled:
+			return HoldResult{Outcome: Backlogged, Queued: id, Rule: rule}, nil
+		default:
+			return HoldResult{}, fmt.Errorf("stockgate: hold: unexpected reply %v", res)
+		}
 	default:
 		return HoldResult{}, fmt.Errorf("stockgate: hold: unexpected reply %v", res)
 	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ---------- 占用的读取与认领 ----------

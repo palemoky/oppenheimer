@@ -15,6 +15,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/bulkhead"
 	"github.com/palemoky/oppenheimer/pkg/errx"
 	"github.com/palemoky/oppenheimer/pkg/otelx"
+	"github.com/palemoky/oppenheimer/pkg/stockgate"
 )
 
 // 本文件是 order 的业务指标（设计文档 1d 的 8.8）。gRPC、Kafka、MySQL、Redis、outbox、熔断器、开关、缓存的
@@ -29,6 +30,7 @@ var meter = otelx.Meter("github.com/palemoky/oppenheimer/services/order/internal
 
 var (
 	admissionsCounter  = otelx.Counter(meter, "order.admissions", "Order submissions by outcome")
+	backlogRejCounter  = otelx.Counter(meter, "order.admission.backlog_rejections", "Submissions rejected by backpressure, by the rule that rejected them")
 	persistsCounter    = otelx.Counter(meter, "order.persists", "Order submitted messages handled, by outcome")
 	persistDelayHist   = otelx.Histogram(meter, "order.persist.delay", "Time from admission to the order landing in the database")
 	transitionsCounter = otelx.Counter(meter, "order.transitions", "Order status transitions completed by this process")
@@ -89,6 +91,19 @@ var admissionOpts = optsByValue("outcome",
 	admissionBacklogged, admissionQueueUnavailable, admissionArchiveUnavailable, admissionReadBusy,
 	admissionCanceled, admissionDeadlineExceeded, admissionUnavailable, admissionInternal,
 )
+
+// backlogRuleOpts 是 order.admission.backlog_rejections 的 rule：背压三条里拒绝了这次受理的那一条。
+// 它是 order.admissions{outcome="backlogged"} 的细分，两个数加起来应当相等。
+var backlogRuleOpts = optsByValue("rule",
+	string(stockgate.BacklogQueue), string(stockgate.BacklogStale), string(stockgate.BacklogStalled))
+
+// backlogRejected 记一次被背压拒绝的受理是哪一条拒绝的。闸门返回了表里没有的取值时不记
+// （stockgate 已经把它当成意外的应答报错了，这里只是不让 nil 的选项进 Add）。
+func backlogRejected(ctx context.Context, rule stockgate.BacklogRule) {
+	if opt, ok := backlogRuleOpts[string(rule)]; ok {
+		backlogRejCounter.Add(ctx, 1, opt)
+	}
+}
 
 // admissionByReason 把受理路径上返回的原因码映射到结局。
 var admissionByReason = map[string]string{

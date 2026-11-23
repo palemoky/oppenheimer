@@ -483,7 +483,7 @@ func TestQueued(t *testing.T) {
 	want(2, 3)
 
 	// 背压按同一个数拒绝：上限取现在的未认领数，下一个受理被拒，拒绝时报的也是这个数。
-	if res := e.holdAt(now, stockgate.BacklogLimit{MaxQueue: 2}); res.Outcome != stockgate.Backlogged || res.Queued != 2 {
+	if res := e.holdAt(now, stockgate.BacklogLimit{MaxQueue: 2}); res.Outcome != stockgate.Backlogged || res.Queued != 2 || res.Rule != stockgate.BacklogQueue {
 		t.Fatalf("hold at the queue limit = %+v, want Backlogged with 2 queued", res)
 	}
 	want(2, 3)
@@ -638,7 +638,7 @@ func TestHoldBacklog(t *testing.T) {
 	late := start.Add(30*time.Second + time.Millisecond)
 	before := avail()
 	res := hold(late, "late", limit)
-	if res.Outcome != stockgate.Backlogged || res.Queued != 3 {
+	if res.Outcome != stockgate.Backlogged || res.Queued != 3 || res.Rule != stockgate.BacklogStale {
 		t.Fatalf("late: %+v, want BACKLOGGED with 3 stale", res)
 	}
 	if got := avail(); got != before {
@@ -847,7 +847,7 @@ func TestHoldStalledLandingDoesNotCycle(t *testing.T) {
 		}
 		before := e.stock(1)
 		res := e.holdAt(now, stallLimit)
-		if res.Outcome != stockgate.Backlogged || res.Queued != stallLimit.MaxStale+1 {
+		if res.Outcome != stockgate.Backlogged || res.Queued != stallLimit.MaxStale+1 || res.Rule != stockgate.BacklogStalled {
 			t.Fatalf("cycle %d: %+v, want BACKLOGGED with %d queued", cycle, res, stallLimit.MaxStale+1)
 		}
 		if after := e.stock(1); after != before {

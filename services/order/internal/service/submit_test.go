@@ -452,7 +452,12 @@ func TestSubmitBackpressure(t *testing.T) {
 	e.clock.Advance(31 * time.Second)
 
 	sent := len(e.sender.records(testSubmitTopic))
-	_, err = submit(3, "c")
+	// 拒绝它的是背压的第二条（排队超时的占用太多），记在按规则分的计数上。
+	if d := counterDelta(t, "order.admission.backlog_rejections", map[string]string{"rule": "stale"}, func() {
+		_, err = submit(3, "c")
+	}); d != 1 {
+		t.Fatalf("backlog_rejections{rule=stale} grew by %d, want 1", d)
+	}
 	wantErr(t, err, codes.ResourceExhausted, errx.ReasonBacklogged)
 	e.wantGate(t, skuA, 998, 2)
 	if n := len(e.sender.records(testSubmitTopic)); n != sent {
@@ -515,7 +520,12 @@ func TestSubmitResumesAfterLandingDropsReapedOrder(t *testing.T) {
 			t.Fatalf("probe %s: %v", key, err)
 		}
 	}
-	_, err = submit(5, "e")
+	// 这一次是第三条（落库没有动静）拒绝的。
+	if d := counterDelta(t, "order.admission.backlog_rejections", map[string]string{"rule": "stalled"}, func() {
+		_, err = submit(5, "e")
+	}); d != 1 {
+		t.Fatalf("backlog_rejections{rule=stalled} grew by %d, want 1", d)
+	}
 	wantErr(t, err, codes.ResourceExhausted, errx.ReasonBacklogged)
 
 	// 消费者恢复，先处理到已被回收的订单：丢弃它，但刷新了心跳。

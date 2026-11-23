@@ -131,6 +131,8 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		// 用 RESOURCE_EXHAUSTED 而不是 UNAVAILABLE：这是有意的削峰，不是故障。grpcx 把 UNAVAILABLE
 		// 记成 ERROR，积压时每秒上百条，会淹没真正的下游故障。网关把它映射为 429。
 		// 也不逐条记日志，积压本身由落库延迟和消费积压的监控发现（1d、阶段 3）。
+		// 是三条里的哪一条拒绝的记在指标上（order.admission.backlog_rejections），调用方看到的都一样。
+		backlogRejected(ctx, res.Rule)
 		return nil, admissionFailed(ctx, errx.New(codes.ResourceExhausted, errx.ReasonBacklogged,
 			"too many orders are waiting to be processed, retry later"))
 	default:

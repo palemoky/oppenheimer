@@ -69,6 +69,8 @@ snapshot() { # 窗口秒数 [往回偏移的秒数，默认 35]
   section "gRPC 客户端耗时 p99（秒，含边车和网络），按调用方、方法" \
     "histogram_quantile(0.99, sum by (le,service_name,rpc_method) (rate(rpc_client_call_duration_seconds_bucket{$ns}$R)))"
   section "受理的结果（每秒）" "sum by (outcome) (rate(order_admissions_total{$ns}$R)) > 0"
+  section "被背压拒绝的受理（每秒），按拒绝的那一条规则（queue 队列满、stale 排队超时的太多、stalled 落库没有动静）" \
+    "sum by (rule) (rate(order_admission_backlog_rejections_total{$ns}$R)) > 0"
   section "落库的结果（每秒）" "sum by (outcome) (rate(order_persists_total{$ns}$R)) > 0"
   section "支付出结果（每秒），按结果" "sum by (result) (rate(payment_results_total{$ns}$R)) > 0"
   for q in 0.5 0.99; do
