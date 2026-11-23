@@ -14,7 +14,9 @@
 逐项的结果在设计 `docs/design/3c-slo-alerting.md` 第 8 节“第 8 步”，登记表在计划文件 3c 一节（做过的标了“做了”）。每一项的逐分钟记录在 `tmp/3c-inject-*.log`（不入库）。
 
 - **PR #17 上 `2efc147` 的 CI 30 项全部通过**（`ci-watcher` 报的，核对过提交）：`rules` 1 分 00 秒（加了 `make alertmanager-test` 之后的第一个数，以前 44 秒）；`test (./services/order)` 4 分 36 秒（以往的上沿）、`test (./pkg)` 2 分 46 秒、`test (./test/load)` 3 分 31 秒、e2e 4 分 15 秒。
-- **做完的（16 项里 11 项）**：第 1 项（抑制，做成了 `monitoring.sh inhibit-test`，14 条规则 47 条用例全部符合）、第 2 项（停探针，什么都没响）、第 3 项（inventory，7 分钟）、第 5 项（orderindex）、第 6 项（cdc）、第 7、8 项（从库的 SQL、IO 线程）、第 9 项（闸门内存）、第 10 项（Sentinel）、第 11 项（otel-gateway）、第 12 项（alertsink）、第 13 项（Strimzi operator）。每一项响的告警都在现场照 runbook 走过，命令都能跑，走得到原因；走的过程中改了 5 份 runbook。
+- **第 15 项做了（2026-11-22 23:31 到 23:37 UTC，主人要求先做它）**：在 `oppenheimer-e2e` 里改一行。改商家索引的金额、改支付单的金额（差 1 分）、删商家索引的一行，`recon` 都是退出码 1 并定位到那张订单、只报改的那一对；改回去都是 0；把从库的 DSN 换成连不上的是退出码 2。e2e 的现场已经 `e2e-down` 清掉。结果在设计第 8 节“第 15 项”，那里也写了退出码 1 和 2 在 Kubernetes 一侧为什么分不开（给“等主人定的”第 2 条备的材料）。改了设计、计划、`recon.md` 和本文件，**已提交并推送**（2026-11-23，主人要求；只改文档，一个提交），PR #17 的 CI 派给了 `ci-watcher`，本段没有这次 CI 结果的话就是还没看。
+- **PR #17 上 `562560a` 的 CI 30 项全部通过**（`ci-watcher` 报的，核对过提交）：`rules` 1 分 25 秒（上次 1 分 00 秒）、`test (./pkg)` 3 分 34 秒（上次 2 分 46 秒，这一项以前也这样波动过）；`test (./services/order)` 3 分 18 秒、`test (./test/load)` 2 分 27 秒、e2e 3 分 31 秒都比上次快。没有改 Go 代码，像运行机的波动，没有查。
+- **做完的（16 项里 12 项，含上面的第 15 项）**：第 1 项（抑制，做成了 `monitoring.sh inhibit-test`，14 条规则 47 条用例全部符合）、第 2 项（停探针，什么都没响）、第 3 项（inventory，7 分钟）、第 5 项（orderindex）、第 6 项（cdc）、第 7、8 项（从库的 SQL、IO 线程）、第 9 项（闸门内存）、第 10 项（Sentinel）、第 11 项（otel-gateway）、第 12 项（alertsink）、第 13 项（Strimzi operator）。每一项响的告警都在现场照 runbook 走过，命令都能跑，走得到原因；走的过程中改了 5 份 runbook。
 - **真实触发过的我们自己写的告警（22 种）**：`ServiceMetricsMissing`、`ConsumerNotConsuming`、`CDCPipelineMissing`、`CDCLagging`、`MySQLReplicaSQLThreadStopped`、`MySQLReplicaIOThreadStopped`、`RedisGateMemoryHigh`、`RedisGateMemoryCritical`、`RedisSentinelBelowQuorum`、`RedisDown`、`KafkaOperatorMetricsMissing`、`AlertmanagerNotificationsFailing`、`AlertDeliveryStalled`、`OtelGatewayDown`、`ProbeNoData` 和 `PaymentTotalsCheckStalled`（响了，被抑制）、`OrderLandingBreakerOpen`、`SLOOrderCreateAvailabilityBurnFast` 和 `BurnMedium`、`ProbeFailing`、`IngressGateway5xxHigh`、`ReconFoundDifferences`（意外）。critical 的 Telegram 都发出去了（发送失败 0）。81 条里其余的还没有真实触发。
 - **改了一条规则并下发了**：`OtelGatewayDown` 加 `keep_firing_for: 5m`（第 11 项里 Collector 一恢复抑制就撤了，被压着的“没有数据”漏出来两条）。加了单元测试，`make rules-test` 通过，`monitoring.sh rules` 下发，集群上核对过字段在。
 - **出过的一个事故**：第 8 项 19:06 UTC 动手，压在了 19:07 的 `recon-hourly` 上，对账连不上被摘掉的从库（退出码 2），`ReconFoundDifferences`（critical）发到了 Telegram。不是差异。19:15 手工复跑差异 0，告警恢复。**以后的故障注入避开每小时的第 5 到 9 分钟。**
@@ -35,7 +37,7 @@
 - **集群的状态（22:12 UTC 核对）**：六个服务、探针、`recon-totals` 的副本数都是平时的；otel-gateway、alertsink、Strimzi operator、Sentinel（3 个）都缩回去了；闸门 Redis 的 `maxmemory` 是 805306368（等于清单）；`mysql-order-0-1` 的复制两个线程都是 ON；没有静默；除了那个失败的 Job 的 Pod 没有不正常的 Pod。
 - **下一步**：
   1. 主人看“等主人定的”三条。
-  2. 登记表里剩的：第 4 项（重新设计之后）、第 15 项（e2e 里的对账差异）、第 16 项（改阈值的那一批，先列出 81 条里还没真实触发的清单再做）、第 14 项（压测，按 3b 的规矩：本机 `make down`、`LOADTEST=1 make deploy`、`pin`、停探针和对账；建议单独一个会话）。
+  2. 登记表里剩的：第 4 项（重新设计之后）、第 16 项（改阈值的那一批，先列出 81 条里还没真实触发的清单再做）、第 14 项（压测，按 3b 的规矩：本机 `make down`、`LOADTEST=1 make deploy`、`pin`、停探针和对账；建议单独一个会话）。
   3. 告警质量检查做完之后勾计划里 3c 的五项，然后是 SLO 的大盘、ADR（SLO 怎么定的、为什么 7 天、429 算什么、为什么手写、Alertmanager 的配置为什么不用 `AlertmanagerConfig`；这次的“抑制的源要先来后走”“流量小的系统上按请求数算的预算”可以并进去）、阶段笔记。
 - **已提交并推送**（2026-11-23，主人要求）：`inhibit-test` 和它的用例、`OtelGatewayDown` 的 `keep_firing_for` 和测试一个提交，文档（设计、计划、六份 runbook、本文件）一个提交。PR #17 的 CI 派给了 `ci-watcher`；本段没有这次 CI 结果的话就是还没看。`make rules-test`、`make alertmanager-test`、`shellcheck -x` 过了；没有改 Go 代码，没有跑 `make lint test`。
 - **主人 2026-11-23 说“等主人定的”第 2、3 条晚点定。** 它们挡住什么、不挡什么：第 3 条只挡登记表的第 4 项；第 2 条里的规则改法挡第 16 项里涉及这几条规则的部分，也最好在写 ADR 和勾 3c 的“告警质量检查”之前定。第 15 项、第 14 项（压测）、第 16 项的清单、SLO 的大盘、阶段笔记都不依赖它们，可以先做。

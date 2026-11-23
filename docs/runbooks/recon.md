@@ -52,7 +52,7 @@
 
 ## 怎么人为触发它
 
-设计第 5 节第 2 层：对账差异，在 `oppenheimer-e2e` 里手工改一行数据（不动长期运行的那一套的库），再对着 e2e 的库跑 `recon`，退出码 1。`ReconNotRunning`：待定，建议：暂停 CronJob 时这条不响，所以用 `kubectl -n oppenheimer patch cronjob recon-hourly -p '{"spec":{"schedule":"0 0 31 2 *"}}'` 让它永远不调度（没有验证过），等 2.5 小时，用完改回 `7 * * * *`（清单是 `deploy/cluster/recon/cronjob.yaml`，以它为准，`make recon-cron` 可恢复）。`ReconDailySlow`：待定，建议临时把阈值改到当前耗时（约 2 分钟）以下，只验证“路是通的”。
+设计第 5 节第 2 层：对账差异，在 `oppenheimer-e2e` 里手工改一行数据（不动长期运行的那一套的库），再对着 e2e 的库跑 `recon`，退出码 1。做过一次（2026-11-23，设计第 8 节“第 15 项”）：`CHAOS_DELETE=0 CHAOS_DURATION=30s E2E_KEEP=1 scripts/cluster/chaos.sh` 留下现场，用 root 在 `mysql-main-0` 上改 `e2e_payment_db.payments` 或 `e2e_merchant_index_db_*` 里的一行，再 `kubectl -n oppenheimer-e2e exec <chaos 的 Pod> -c chaos -- recon -pairs payment,stock,replica,index -settle 0 -recheck 5s`；用完 `scripts/cluster/services.sh e2e-down`。这只验证 `recon` 报得出来，告警本身看的是 `oppenheimer` 命名空间的 CronJob，不会响。`ReconNotRunning`：待定，建议：暂停 CronJob 时这条不响，所以用 `kubectl -n oppenheimer patch cronjob recon-hourly -p '{"spec":{"schedule":"0 0 31 2 *"}}'` 让它永远不调度（没有验证过），等 2.5 小时，用完改回 `7 * * * *`（清单是 `deploy/cluster/recon/cronjob.yaml`，以它为准，`make recon-cron` 可恢复）。`ReconDailySlow`：待定，建议临时把阈值改到当前耗时（约 2 分钟）以下，只验证“路是通的”。
 
 故障注入动手前要先登记到 [phase-3-observability.md](../plan/phase-3-observability.md)。
 

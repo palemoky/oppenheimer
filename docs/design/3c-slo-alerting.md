@@ -685,3 +685,24 @@ recon CronJob ──▶ Job 成功或失败 ──▶ kube-state-metrics ──�
 - 503 里带降级原因码的（`ORDER_LANDING_UNAVAILABLE`）也算进了 5xx，烧预算，和设计第 2 节第 2 项一致（只有 429 不算坏）。
 - 恢复：inventory 回来 2 分钟后探针全部 ok。
 - runbook（`slo-order-create-availability.md`、`probe.md`）在现场走过：状态码的查询显示 503 占 93%，受理结局是 `order_landing_unavailable`，探针的步骤里 `stock` 是 `error`，三步就指到 inventory。7 天预算的那条查询能跑（约 1 秒）。
+
+**第 15 项：对账差异，在 `oppenheimer-e2e` 里手工改一行（2026-11-22 23:31 到 23:37 UTC；没有碰长期运行的那一套，没有告警该响，也没有响的）**
+
+做法：`CHAOS_DELETE=0 CHAOS_DURATION=30s E2E_KEEP=1 scripts/cluster/chaos.sh` 拉起 e2e 那一套并留下现场（367 单，其中 180 单已支付；它自己的 `recon` 和 `verify` 通过），然后在留下的 `chaos` Pod 里重复跑 `recon -pairs payment,stock,replica,index -settle 0 -recheck 5s`，每次之前用 root 在 `mysql-main-0` 上改 `e2e_*` 库里的一行，看完改回去。同一张订单（`912486003548160055`）。每次的输出在 `tmp/3c-inject-15-recon-*.log`。
+
+| 改了什么 | 退出码 | `recon` 报的 |
+|---|---|---|
+| 不改（基线） | 0 | 四对差异 0 |
+| 商家索引那一行的 `total_amount` 1990 改成 1991 | 1 | `index` 一对 `mismatch=1`，给出订单号 |
+| 改回去 | 0 | 差异 0 |
+| 支付单的 `amount` 1990 改成 1991 | 1 | `payment` 一对 `mismatch=1`，并排印出两边：订单一侧 `amount=1990`，支付单一侧 `amount=1991` |
+| 改回去 | 0 | 差异 0 |
+| 删掉商家索引的那一行 | 1 | `index` 一对 `only_left=1`，给出订单号 |
+| 插回去 | 0 | 差异 0 |
+| 不改数据，把从库的 DSN 换成连不上的地址 | 2 | 没有对账结果，只有一行 `recon failed ... connect order_replica_0 ... connection refused` |
+
+- **`recon` 报得出来，定位到行，而且只报改的那一对**：其余三对每次都是 0。差 1 分钱也报。复查（5 秒后重读）确认了才算差异，所以每次有差异的那一遍多花 5 秒。
+- **退出码 1 和 2 从输出上很好分**：1 的最后一行是 `total outstanding differences: N`，前面有每一对的明细；2 没有这一行，只有一条 ERROR 的日志。但 **Kubernetes 那一侧两者都只是“Job 失败”**，`ReconFoundDifferences` 看的是 CronJob 最近一次失败的时间，所以分不开（第 8 项那次误报就是这样来的）。Job 的 `restartPolicy` 是 `Never`，kube-state-metrics 里没有这个 Pod 的退出码可用（主会话的判断，没有去翻它的全部指标）。要分开报，得让 `recon` 自己把结果报出来（比如跑完往 Collector 推一个“结果”和“差异数”的指标），批量的那个命令现在没有接 `otelx`。**怎么报仍然等主人定**，这里只是把材料备齐。
+- 这一项**只验证了 `recon` 这个程序**；长期运行那一套的 `ReconFoundDifferences` 因为“有差异”而响（退出码 1）仍然没有真实触发过，归到第 16 项。
+- 清理：`scripts/cluster/services.sh e2e-down`，命名空间、`e2e_*` 库、Kafka 和 Redis 里 `e2e-` 前缀的东西都删了。期间长期运行那一套没有不正常的 Pod。
+

@@ -99,7 +99,7 @@
     | 12 | alertsink 缩到 0 约 30 分钟。**做了（2026-11-23）**：28 分钟，两条都响了，critical 的经 Telegram 送到；自带的两条也响了（重复，设计第 8 节） | `AlertmanagerNotificationsFailing{webhook}`、`AlertDeliveryStalled`（Telegram 配好之后才看得到送达） | 缩回 1 |
     | 13 | Strimzi operator 缩到 0 约 25 分钟（不动 broker）。**做了（2026-11-23）**：18 分钟，响了并恢复，调和恢复正常 | `KafkaOperatorMetricsMissing` | 缩回 1，确认一次调和成功 |
     | 14 | 压测：普通下单阶梯打过写入的拐点（3b 的脚本；先 `LOADTEST=1 make deploy`、`pin`，本机 `make down`，探针和对账按 3b 的规矩） | `OrderBackpressureRejecting`、`OrderQueueNearWaitLimit`、落库时延的 SLO、`NodeCPUHigh`、`OutboxRelaySlow`、`RateLimitFallingBack` 可能 | 停压，恢复平时的配置 |
-    | 15 | 对账差异：在 `oppenheimer-e2e` 里手工改一行（不动长期运行的库）；这只验证 `recon` 报得出来，长期运行那一套的 `ReconFoundDifferences` 用临时改阈值代替 | `recon` 退出码 1 | e2e 的命名空间用完即弃 |
+    | 15 | 对账差异：在 `oppenheimer-e2e` 里手工改一行（不动长期运行的库）；这只验证 `recon` 报得出来，长期运行那一套的 `ReconFoundDifferences` 用临时改阈值代替。**做了（2026-11-23）**：改金额、删行都是退出码 1 并定位到行，改回去是 0；连不上库是退出码 2 | `recon` 退出码 1 | e2e 的命名空间用完即弃 |
     | 16 | 不方便真做的（磁盘、内存、OOM、超卖、死信、钱对不上、节点重启、Kafka 分区离线、broker 少一个、MySQL 连不上、备份过期、对账过慢）：临时把规则的阈值改到当前值以下（只改集群上的 PrometheusRule，仓库不动），响了再 `monitoring.sh rules` 改回来 | 对应的那一条 | 重新下发规则。**这只验证了路是通的，结果里单列，不算真实触发** |
 - CDC 源库心跳**不做**（2026-11-22，主人确认）：它要解决的是“源库空闲时 `cdc_lag_ms` 不可信”，常驻探针让两个订单分片一直有写入；主从的告警按运行状态和延迟写三条，不依赖心跳
 
