@@ -9,7 +9,8 @@
 //	PAYMENT_DSN          payment 必填
 //	INVENTORY_DSN        stock 必填
 //
-// 另有一种常驻的用法：recon watch-totals，按笔数和金额核对支付和订单两边，把结果报成指标（见 watch.go）。
+// 另有两种常驻的用法，结果报成指标：recon watch-totals 按笔数和金额核对支付和订单两边（见 watch.go）；
+// recon watch-stock 核对库存的计数对不对得上流水（见 watch_stock.go）。
 //
 // 报告的文本打到标准输出，日志（JSON）打到标准错误。
 // 退出码：0 没有差异；1 有确认的差异（修复之后仍有的也算）；2 参数或运行错误。
@@ -48,10 +49,12 @@ const (
 )
 
 type options struct {
-	pairs         []string
-	pairsSet      bool
-	settle        time.Duration
-	since         time.Duration
+	pairs    []string
+	pairsSet bool
+	settle   time.Duration
+	since    time.Duration
+	// from、to 是按绝对时刻给的窗口（零值表示没给）。和 -since 不能同时用；给了 -to 就不再用 -settle。
+	from, to      time.Time
 	recheck       time.Duration
 	maxRows       uint64
 	mode          recon.Mode
@@ -71,6 +74,10 @@ func main() {
 	// watch-totals 是常驻的另一种用法（钱的笔数和金额，见 watch.go），参数和一次性的对账完全不同，单独解析。
 	if len(os.Args) > 1 && os.Args[1] == watchTotalsCommand {
 		os.Exit(watchTotals(logger, os.Args[2:]))
+	}
+	// watch-stock 也是常驻的（库存的计数对流水，见 watch_stock.go）。
+	if len(os.Args) > 1 && os.Args[1] == watchStockCommand {
+		os.Exit(watchStock(logger, os.Args[2:]))
 	}
 
 	opts, err := parseFlags(os.Args[1:])
@@ -103,6 +110,9 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&pairs, "pairs", "replica,index,payment,stock", "comma separated pairs to compare: "+strings.Join(recon.PairNames, ", ")+" (archive must be given explicitly)")
 	fs.DurationVar(&o.settle, "settle", 30*time.Minute, "compare only orders created before now minus this; 0 means no upper bound")
 	fs.DurationVar(&o.since, "since", 0, "incremental run: compare only orders created within this long before now, e.g. 26h; 0 means no lower bound (full run). Not for the archive pair")
+	var from, to string
+	fs.StringVar(&from, "from", "", "compare only orders created at or after this instant (RFC 3339), e.g. the start of an experiment. Cannot be combined with -since. Not for the archive pair")
+	fs.StringVar(&to, "to", "", "compare only orders created before this instant (RFC 3339); replaces -settle. The caller makes sure the data up to here has settled")
 	fs.DurationVar(&o.recheck, "recheck", recon.DefaultRecheck, "wait this long and re-read the differences; 0 skips the recheck")
 	fs.Uint64Var(&o.maxRows, "max-rows", recon.DefaultMaxRows, "compare row by row the differing nodes with at most this many rows on each side")
 	fs.StringVar(&mode, "mode", string(recon.ModeTree), "tree (compare digests first) or full (read both sides entirely, the baseline)")
@@ -135,6 +145,13 @@ func parseFlags(args []string) (options, error) {
 			o.pairs = append(o.pairs, p)
 		}
 	}
+	var err error
+	if o.from, err = parseInstant("from", from); err != nil {
+		return o, err
+	}
+	if o.to, err = parseInstant("to", to); err != nil {
+		return o, err
+	}
 	o.mode = recon.Mode(mode)
 	if o.mode != recon.ModeTree && o.mode != recon.ModeFull {
 		return o, fmt.Errorf("unknown mode %q", mode)
@@ -146,6 +163,14 @@ func parseFlags(args []string) (options, error) {
 		return o, errors.New("-since must be longer than -settle, otherwise the window is empty")
 	case o.since > 0 && (slices.Contains(o.pairs, recon.PairArchive) || o.against != "" || o.snapshotOut != ""):
 		return o, errors.New("-since cannot be used with the archive pair: a saved tree covers everything up to its bound")
+	case !o.from.IsZero() && o.since > 0:
+		return o, errors.New("-from and -since both set the lower bound; use one")
+	case !o.from.IsZero() && !o.to.IsZero() && !o.from.Before(o.to):
+		return o, errors.New("-from must be before -to, otherwise the window is empty")
+	case !o.from.IsZero() && (slices.Contains(o.pairs, recon.PairArchive) || o.against != "" || o.snapshotOut != ""):
+		return o, errors.New("-from cannot be used with the archive pair: a saved tree covers everything up to its bound")
+	case o.since > 0 && !o.to.IsZero():
+		return o, errors.New("-since is relative to now and -to is absolute; use -from with -to")
 	case o.maxExamples <= 0, o.dbConcurrency <= 0, o.maxRows == 0:
 		return o, errors.New("-max-examples, -db-concurrency and -max-rows must be positive")
 	case o.snapshotOut != "" && o.against != "":
@@ -167,20 +192,42 @@ func parseFlags(args []string) (options, error) {
 	return o, nil
 }
 
-func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) (int, error) {
-	// 快照文件先读：-against 时水位线取文件里记的那个。
-	var (
-		bound   int64
-		against map[string]*merkle.Tree
-	)
-	now := time.Now()
-	if o.settle > 0 {
-		bound = idgen.LowerBound(now.Add(-o.settle))
+func parseInstant(name, s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
 	}
-	var since int64
-	if o.since > 0 {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("-%s %q: want RFC 3339, e.g. 2026-11-24T03:00:00Z", name, s)
+	}
+	return t, nil
+}
+
+// window 把时间上的窗口换成订单号上的窗口 [since, bound)；0 表示那一头不设限。
+// 订单号的高位是创建时间，所以一个时间窗口就是主键上的一段（设计文档 1d 的 7.17）。
+//
+// 下界：-from（绝对）或 -since（相对现在）。上界：-to（绝对），没给时是现在减 -settle。
+// 给 -to 的人自己保证到那一刻为止的数据已经定型：故障实验结束后隔一会儿再比，或者依靠 -recheck。
+func (o options) window(now time.Time) (since, bound int64) {
+	switch {
+	case !o.from.IsZero():
+		since = idgen.LowerBound(o.from)
+	case o.since > 0:
 		since = idgen.LowerBound(now.Add(-o.since))
 	}
+	switch {
+	case !o.to.IsZero():
+		bound = idgen.LowerBound(o.to)
+	case o.settle > 0:
+		bound = idgen.LowerBound(now.Add(-o.settle))
+	}
+	return since, bound
+}
+
+func run(ctx context.Context, logger *slog.Logger, o options, stdout io.Writer) (int, error) {
+	// 快照文件先读：-against 时水位线取文件里记的那个。
+	var against map[string]*merkle.Tree
+	since, bound := o.window(time.Now())
 	if o.against != "" {
 		f, err := os.Open(o.against)
 		if err != nil {
