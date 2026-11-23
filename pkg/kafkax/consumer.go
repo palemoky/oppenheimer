@@ -78,7 +78,10 @@ type ConsumerConfig struct {
 	// （设计文档 1d 的 2.2、ADR-0017）。
 	//
 	// 打开之后提交的是“连续完成的前缀”（见 prefixTracker），前缀之后已经完成的消息在重启或
-	// 再平衡后会重复投递，handler 必须幂等。延迟消费者不支持。
+	// 再平衡后会重复投递，handler 必须幂等。
+	//
+	// 延迟消费者也可以打开：等到期的是分发的那一个 goroutine，不是 lane，所以“队首没到期，
+	// 后面的都不动”照旧成立，并发的只是已经到期的那些（见 NewDelayConsumer）。
 	Concurrency int
 	// MaxUncommitted 只在 Concurrency > 1 时有意义：一个分区里已分发、位点还不能提交的消息数上限，
 	// 默认 1024。到达上限时停止分发，等最前面那条完成。
@@ -215,10 +218,6 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 		return nil, fmt.Errorf("kafkax: consumer concurrency %d is negative", cfg.Concurrency)
 	}
 	cfg.Concurrency = max(cfg.Concurrency, 1)
-	if cfg.Concurrency > 1 && clock != nil {
-		// 延迟 topic 依赖“分区内按到期时间有序、队首没到期就整个分区等着”，并发会让后面的消息越过队首。
-		return nil, errors.New("kafkax: a delay consumer cannot process a partition concurrently")
-	}
 	if cfg.MaxUncommitted <= 0 {
 		cfg.MaxUncommitted = defaultMaxUncommitted
 	}
@@ -326,6 +325,14 @@ func (c *Consumer) Start(ctx context.Context) error {
 		return errors.New("kafkax: consumer already started or stopped")
 	}
 	defer close(c.done)
+
+	// 在 Start 里登记、Start 返回时注销：Stop 等的就是 Start 返回（done 关闭），所以 Stop 返回时已经注销了。
+	// 这个 defer 在 close(c.done) 之前执行。登记失败只少一个指标，不影响消费。
+	if unregister, err := c.registerOldestPending(); err != nil {
+		c.log.WarnContext(ctx, "kafka consumer oldest pending age gauge not registered", "error", err)
+	} else {
+		defer unregister()
+	}
 
 	hardCtx, hardCancel := context.WithCancel(ctx)
 	defer hardCancel()
@@ -616,6 +623,10 @@ type worker struct {
 
 	mu    sync.Mutex
 	queue []*kgo.Record
+	// head 是串行（含按批、延迟）消费时已经从 queue 取出、还没处理完的最前面那条：一条消息在重试或等到期时
+	// 只在 worker 的局部变量里，queue 和 last 都看不到它。只给 oldest_pending_age 用（见 oldestPending），
+	// 并发消费时不设，那时 tracker 里就有。
+	head *kgo.Record
 	// paused 表示本 worker 暂停了该分区的拉取；waiting 表示正在等延迟消息到期。
 	paused  bool
 	waiting bool
@@ -760,6 +771,13 @@ func (w *worker) runLanes(ctx context.Context) {
 		w.mu.Lock()
 		w.tracker.add(rec)
 		w.mu.Unlock()
+		// 延迟消费者：在这里等到期，到期之后才交给 lane。分发是按位点顺序一条一条来的，
+		// 所以队首没到期时它后面的一条都分发不出去，已经分发出去的都是到期了的。
+		// 等之前就登记：它没有完成，可提交的前缀到不了它；oldestPending 也看得见它（没到期的年龄是 0）。
+		// 被打断时它留在 tracker 里，位点不会越过它，下次重新读到。
+		if w.c.clock != nil && !w.c.waitDue(ctx, w, rec) {
+			return
+		}
 		select {
 		case w.lanes[w.c.laneOf(rec.Key)] <- rec:
 		case <-w.stop:
@@ -840,6 +858,9 @@ func (w *worker) next(ctx context.Context) (*kgo.Record, bool) {
 			rec := w.queue[0]
 			w.queue[0] = nil
 			w.queue = w.queue[1:]
+			if len(w.lanes) == 0 {
+				w.head = rec
+			}
 			w.maybeResumeLocked()
 			w.mu.Unlock()
 			return rec, true
@@ -857,11 +878,37 @@ func (w *worker) next(ctx context.Context) (*kgo.Record, bool) {
 func (w *worker) markDone(rec *kgo.Record) {
 	w.mu.Lock()
 	w.last = rec
+	w.head = nil
 	drained := len(w.queue) == 0
 	w.mu.Unlock()
 	if drained {
 		w.c.triggerCommit()
 	}
+}
+
+// setHead 记下串行消费时正在处理的那条，见 head。
+func (w *worker) setHead(rec *kgo.Record) {
+	w.mu.Lock()
+	w.head = rec
+	w.mu.Unlock()
+}
+
+// oldestPending 返回这个分区已经拉到、还没处理完的消息里位点最小的那条，没有时返回 nil。O(1)。
+//
+// 并发消费时是 tracker 的第一条：complete 会弹出开头连续完成的一段，所以留在开头的那条一定没做完，
+// 它也正是挡住位点提交的那条。串行时是 head。两者都没有时是 queue 的第一条（拉到了、还没轮到）。
+func (w *worker) oldestPending() *kgo.Record {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	switch {
+	case len(w.lanes) > 0 && w.tracker.len() > 0:
+		return w.tracker.pending[0].rec
+	case w.head != nil:
+		return w.head
+	case len(w.queue) > 0:
+		return w.queue[0]
+	}
+	return nil
 }
 
 // uncommitted 返回尚未提交的最新已处理记录，没有则返回 nil。
@@ -883,7 +930,8 @@ func (w *worker) setCommitted(next int64) {
 // process 处理一条消息直到成功、进入死信或被打断。返回 false 表示被打断，消息没有处理完。
 func (c *Consumer) process(ctx context.Context, w *worker, rec *kgo.Record) bool {
 	log := w.log.With("offset", rec.Offset)
-	if c.clock != nil && !c.waitDue(ctx, w, rec, log) {
+	// 并发消费时到期已经在分发的时候等过了（runLanes），lane 里不再等。
+	if c.clock != nil && len(w.lanes) == 0 && !c.waitDue(ctx, w, rec) {
 		return false
 	}
 

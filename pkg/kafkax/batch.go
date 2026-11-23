@@ -88,6 +88,8 @@ func (w *worker) runBatches(ctx context.Context) {
 			if w.stopping(ctx) {
 				return
 			}
+			// 逐条回退时，前一条的 markDone 清掉了 head，而这一批剩下的还在局部变量里：重新指到正在处理的这条。
+			w.setHead(rec)
 			if !w.c.process(ctx, w, rec) {
 				return
 			}
@@ -142,6 +144,7 @@ func (w *worker) nextBatch(ctx context.Context, limit int) ([]*kgo.Record, bool)
 			copy(recs, w.queue)
 			clear(w.queue[:n])
 			w.queue = w.queue[n:]
+			w.head = recs[0]
 			w.maybeResumeLocked()
 			w.mu.Unlock()
 			return recs, true

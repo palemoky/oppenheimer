@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,4 +141,112 @@ func TestDelayConsumerStopWhileWaiting(t *testing.T) {
 	clock.Advance(15 * time.Minute)
 	startDelayConsumer(t, e.consumerConfig(t), clock, h)
 	waitFor(t, "message after restart", func() bool { return rec.len() >= 1 })
+}
+
+// 以下三个测试是延迟消费者加并发（Concurrency > 1）：等到期在分发时做，到期之后按 key 并行。
+
+// 已经到期的消息确实并行了，全部处理完之后位点提交到末尾。
+func TestDelayConsumerConcurrentAfterDue(t *testing.T) {
+	t.Parallel()
+	const total = 16
+	e := newEnv(t, 1)
+	clock := newFakeClock()
+	recs := make([]kafkax.Record, total)
+	for i := range total {
+		recs[i] = kafkax.NewDelayRecord(e.topic, []byte("order-"+strconv.Itoa(i)), []byte("m"+strconv.Itoa(i)), clock.Now().Add(-time.Second))
+	}
+	mustSend(t, newProducer(t, e.brokers), recs...)
+
+	var inFlight, peak atomic.Int32
+	release := make(chan struct{})
+	rec := &recorder{}
+	startDelayConsumer(t, concurrentConfig(t, e, 4), clock, func(ctx context.Context, m kafkax.Message) error {
+		if n := inFlight.Add(1); n > peak.Load() {
+			peak.Store(n) // 只用来判断“有没有并行过”，不需要精确的最大值
+		}
+		defer inFlight.Add(-1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		rec.add(m)
+		return nil
+	})
+	// 16 个不同的 key 分到 4 条 lane，全落在同一条上的概率可以忽略；串行的话这里永远等不到 2。
+	waitFor(t, "two handlers in flight", func() bool { return inFlight.Load() >= 2 })
+	close(release)
+	waitFor(t, "all processed", func() bool { return rec.distinct() == total })
+	waitFor(t, "offset committed to the end", func() bool { return committed(t, e.brokers, e.group, e.topic)[0] == total })
+	if peak.Load() < 2 {
+		t.Fatalf("peak in-flight %d, want at least 2", peak.Load())
+	}
+}
+
+// 队首没到期时，它后面已经到期的消息也不能处理：并发不能让后面的越过队首。
+// 队首之前已经处理完的那一条的位点可以提交，没到期的那条不能。
+func TestDelayConsumerConcurrentHeadBlocks(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 1)
+	clock := newFakeClock()
+	now := clock.Now()
+	mustSend(t, newProducer(t, e.brokers),
+		kafkax.NewDelayRecord(e.topic, []byte("a"), []byte("due-0"), now.Add(-time.Second)),
+		kafkax.NewDelayRecord(e.topic, []byte("b"), []byte("late-1"), now.Add(15*time.Minute)),
+		kafkax.NewDelayRecord(e.topic, []byte("c"), []byte("due-2"), now.Add(-time.Second)),
+		kafkax.NewDelayRecord(e.topic, []byte("d"), []byte("due-3"), now.Add(-time.Second)),
+	)
+
+	rec := &recorder{}
+	startDelayConsumer(t, concurrentConfig(t, e, 4), clock, func(_ context.Context, m kafkax.Message) error {
+		rec.add(m)
+		return nil
+	})
+	waitFor(t, "consumer waiting on the head", func() bool { return clock.pending() == 1 })
+	waitFor(t, "first message committed", func() bool { return committed(t, e.brokers, e.group, e.topic)[0] == 1 })
+	time.Sleep(300 * time.Millisecond)
+	if got := rec.values(); !slices.Equal(got, []string{"due-0"}) {
+		t.Fatalf("processed %v while the head waits, want [due-0]", got)
+	}
+	if at := committed(t, e.brokers, e.group, e.topic)[0]; at != 1 {
+		t.Fatalf("committed offset %d while the head waits, want 1", at)
+	}
+
+	clock.Advance(15 * time.Minute)
+	waitFor(t, "the rest processed", func() bool { return rec.distinct() == 4 })
+	waitFor(t, "offset committed to the end", func() bool { return committed(t, e.brokers, e.group, e.topic)[0] == 4 })
+}
+
+// 并发的延迟消费者在等到期时被停止：马上返回，没到期的那条没有处理、位点没有越过它，重启之后重新读到。
+func TestDelayConsumerConcurrentStopWhileWaiting(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 1)
+	clock := newFakeClock()
+	mustSend(t, newProducer(t, e.brokers),
+		kafkax.NewDelayRecord(e.topic, []byte("a"), []byte("late"), clock.Now().Add(15*time.Minute)),
+		kafkax.NewDelayRecord(e.topic, []byte("b"), []byte("after"), clock.Now().Add(15*time.Minute)),
+	)
+
+	rec := &recorder{}
+	h := func(_ context.Context, m kafkax.Message) error {
+		rec.add(m)
+		return nil
+	}
+	r := startDelayConsumer(t, concurrentConfig(t, e, 4), clock, h)
+	waitFor(t, "consumer waiting on due time", func() bool { return clock.pending() == 1 })
+
+	begin := time.Now()
+	if err := r.stop(t, 10*time.Second); err != nil {
+		t.Fatalf("Start returned %v, want nil", err)
+	}
+	if d := time.Since(begin); d > 5*time.Second {
+		t.Fatalf("Stop took %v while waiting", d)
+	}
+	if rec.len() != 0 || len(committed(t, e.brokers, e.group, e.topic)) != 0 {
+		t.Fatal("waiting message was processed or committed")
+	}
+
+	clock.Advance(15 * time.Minute)
+	startDelayConsumer(t, concurrentConfig(t, e, 4), clock, h)
+	waitFor(t, "messages after restart", func() bool { return rec.distinct() == 2 })
 }

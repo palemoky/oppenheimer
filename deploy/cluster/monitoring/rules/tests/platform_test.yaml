@@ -1,0 +1,384 @@
+# 节点、Kubernetes 和监控自己的告警的单元测试（rules/platform.yaml）。每条至少一个“该响”和一个“不该响”；
+# “有增长”类的再加“计数器第一次出现”的用例（设计 1.3 第 1 条）。节点用 kube_node_info 的 internal_ip 对到 node-exporter 的 instance。
+# 输入每分钟一个点，规则每分钟求值一次（evaluation_interval 1m）。断言读 ALERTS 的 firing。
+rule_files:
+  - ../platform.yaml
+evaluation_interval: 1m
+
+tests:
+
+  # 节点的启动时间 t=40m 从 1000 变成 5000：和 30 分钟前比差超过 60 秒，50m 在响；重启满 30 分钟之后（120m）不再响。
+  - name: node_rebooted_fires
+    interval: 1m
+    input_series:
+      - series: 'node_boot_time_seconds{job="node-exporter",instance="192.168.50.41:9100"}'
+        values: '1000x40 5000x100'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeRebooted",alertstate="firing"})
+        eval_time: 35m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeRebooted",alertstate="firing"})
+        eval_time: 50m
+        exp_samples:
+          - labels: '{alertname="NodeRebooted", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeRebooted",alertstate="firing"})
+        eval_time: 120m
+        exp_samples: []
+
+  # 启动时间只有 1 秒的抖动（1000 和 1001 之间）：不响。
+  - name: node_boot_time_jitter_silent
+    interval: 1m
+    input_series:
+      - series: 'node_boot_time_seconds{job="node-exporter",instance="192.168.50.41:9100"}'
+        values: '1000 1001 1000 1001 1000 1001 1000x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeRebooted",alertstate="firing"})
+        eval_time: 50m
+        exp_samples: []
+
+  # 空闲 CPU 每分钟涨 6 秒（0.1 核空闲 = 使用率 90%）：高于 85%，持续 10 分钟：20m 在响。
+  - name: node_cpu_high_fires
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="192.168.50.41:9100",cpu="0",mode="idle"}'
+        values: '0+6x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 8m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 20m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+
+  # 使用率 90% 持续 25 分钟，掉到 80% 2 分钟，再回到 90%：中间不恢复（keep_firing_for 3m），所以不会多发一轮。
+  # 之后一直是 50%：平均值掉到线以下再过 3 分钟恢复（t=47m 起是 50%，5 分钟的平均约 1 分钟后掉到线下，52m 已经恢复）。
+  - name: node_cpu_high_does_not_flap
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="192.168.50.41:9100",cpu="0",mode="idle"}'
+        values: '0+6x25 162+12x1 180+6x20 330+30x40'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 24m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 28m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 33m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 47m
+        exp_samples:
+          - labels: '{alertname="NodeCPUHigh", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 56m
+        exp_samples: []
+
+  # 空闲每分钟涨 30 秒（使用率 50%）：不响；使用率 90% 但只有 5 分钟（短于 for）也不响。
+  - name: node_cpu_normal_silent
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="192.168.50.41:9100",cpu="0",mode="idle"}'
+        values: '0+30x80'
+      - series: 'node_cpu_seconds_total{job="node-exporter",instance="192.168.50.42:9100",cpu="0",mode="idle"}'
+        values: '0+6x10 0+30x60'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="NodeCPUHigh",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # server 的根分区剩 10 GiB（低于 15 GiB，高于 8 GiB）：警告响，critical 不响，agent 那条不响。
+  - name: server_disk_low_fires
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="192.168.50.40:9100",mountpoint="/",fstype="ext4"}'
+        values: '10737418240x80'
+      - series: 'kube_node_info{node="k3s-server",internal_ip="192.168.50.40"}'
+        values: '1x80'
+      - series: 'kube_node_info{node="k3s-agent-1",internal_ip="192.168.50.41"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskLow",alertstate="firing"})
+        eval_time: 5m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskLow",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="ServerDiskLow", instance="192.168.50.40:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskCritical",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="AgentDiskLow",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+
+  # server 剩 5 GiB（低于 8 GiB）：critical 在响（5m 之后），警告也在响。
+  - name: server_disk_critical_fires
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="192.168.50.40:9100",mountpoint="/",fstype="ext4"}'
+        values: '5368709120x80'
+      - series: 'kube_node_info{node="k3s-server",internal_ip="192.168.50.40"}'
+        values: '1x80'
+      - series: 'kube_node_info{node="k3s-agent-1",internal_ip="192.168.50.41"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskCritical",alertstate="firing"})
+        eval_time: 3m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskCritical",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="ServerDiskCritical", instance="192.168.50.40:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskLow",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="ServerDiskLow", instance="192.168.50.40:9100"}'
+            value: 1
+
+  # server 剩 20 GiB（现在大约 23 GiB）：不响。server 的 20 GiB 也不触发 agent 的 30 GiB 那条（按节点筛）。
+  - name: server_disk_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="192.168.50.40:9100",mountpoint="/",fstype="ext4"}'
+        values: '21474836480x80'
+      - series: 'kube_node_info{node="k3s-server",internal_ip="192.168.50.40"}'
+        values: '1x80'
+      - series: 'kube_node_info{node="k3s-agent-1",internal_ip="192.168.50.41"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskLow",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskCritical",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="AgentDiskLow",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # agent 剩 20 GiB（低于 30 GiB）：警告响，server 的两条不响。
+  - name: agent_disk_low_fires
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="192.168.50.41:9100",mountpoint="/",fstype="ext4"}'
+        values: '21474836480x80'
+      - series: 'kube_node_info{node="k3s-server",internal_ip="192.168.50.40"}'
+        values: '1x80'
+      - series: 'kube_node_info{node="k3s-agent-1",internal_ip="192.168.50.41"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="AgentDiskLow",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="AgentDiskLow", instance="192.168.50.41:9100"}'
+            value: 1
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskLow",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (alertname, instance) (ALERTS{alertname="ServerDiskCritical",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+
+  # agent 剩 90 GiB：不响。
+  - name: agent_disk_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",instance="192.168.50.41:9100",mountpoint="/",fstype="ext4"}'
+        values: '96636764160x80'
+      - series: 'kube_node_info{node="k3s-server",internal_ip="192.168.50.40"}'
+        values: '1x80'
+      - series: 'kube_node_info{node="k3s-agent-1",internal_ip="192.168.50.41"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, instance) (ALERTS{alertname="AgentDiskLow",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 最近一次终止原因是 OOMKilled，重启次数 t=10m 从 0 变成 1：15m 在响（10 分钟窗口里有增长）。
+  - name: container_oom_fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="oppenheimer",pod="order-1",container="order",reason="OOMKilled"}'
+        values: '1x80'
+      - series: 'kube_pod_container_status_restarts_total{namespace="oppenheimer",pod="order-1",container="order"}'
+        values: '0x10 1x70'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerOOMKilled",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerOOMKilled",alertstate="firing"})
+        eval_time: 15m
+        exp_samples:
+          - labels: '{alertname="ContainerOOMKilled", namespace="oppenheimer", pod="order-1", container="order"}'
+            value: 1
+
+  # 很久以前 OOM 过一次，重启次数一直是 3 没有再涨：不响；终止原因是 Error 而重启在涨也不响。
+  - name: container_oom_old_silent
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="oppenheimer",pod="order-1",container="order",reason="OOMKilled"}'
+        values: '1x80'
+      - series: 'kube_pod_container_status_restarts_total{namespace="oppenheimer",pod="order-1",container="order"}'
+        values: '3x80'
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="oppenheimer",pod="order-2",container="order",reason="Error"}'
+        values: '1x80'
+      - series: 'kube_pod_container_status_restarts_total{namespace="oppenheimer",pod="order-2",container="order"}'
+        values: '0x10 1x70'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerOOMKilled",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # oppenheimer-e2e 里的 OOM 是故意制造的：不响。
+  - name: container_oom_e2e_ignored
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="oppenheimer-e2e",pod="order-1",container="order",reason="OOMKilled"}'
+        values: '1x80'
+      - series: 'kube_pod_container_status_restarts_total{namespace="oppenheimer-e2e",pod="order-1",container="order"}'
+        values: '0x10 1x70'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerOOMKilled",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+
+  # 工作集 950、limit 1000（95%，高于 90%）持续 10 分钟：15m 时还没满 for，25m 在响。
+  - name: container_memory_near_limit_fires
+    interval: 1m
+    input_series:
+      - series: 'container_memory_rss{namespace="oppenheimer",pod="order-1",container="order"}'
+        values: '950x80'
+      - series: 'kube_pod_container_resource_limits{namespace="oppenheimer",pod="order-1",container="order",resource="memory"}'
+        values: '1000x80'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerMemoryNearLimit",alertstate="firing"})
+        eval_time: 8m
+        exp_samples: []
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerMemoryNearLimit",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{alertname="ContainerMemoryNearLimit", namespace="oppenheimer", pod="order-1", container="order"}'
+            value: 1
+
+  # 工作集 800、limit 1000（80%）：不响；没有 limit 的容器工作集再高也不响；e2e 里 95% 也不响。
+  - name: container_memory_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'container_memory_rss{namespace="oppenheimer",pod="order-1",container="order"}'
+        values: '800x80'
+      - series: 'kube_pod_container_resource_limits{namespace="oppenheimer",pod="order-1",container="order",resource="memory"}'
+        values: '1000x80'
+      - series: 'container_memory_rss{namespace="oppenheimer",pod="nolimit",container="order"}'
+        values: '9999999x80'
+      - series: 'container_memory_rss{namespace="oppenheimer-e2e",pod="order-1",container="order"}'
+        values: '950x80'
+      - series: 'kube_pod_container_resource_limits{namespace="oppenheimer-e2e",pod="order-1",container="order",resource="memory"}'
+        values: '1000x80'
+    promql_expr_test:
+      - expr: count by (alertname, namespace, pod, container) (ALERTS{alertname="ContainerMemoryNearLimit",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 入口 Envoy 的 Pod 是 Running 并且在 k3s-server 上：持续 5 分钟，10m 在响。
+  - name: ingress_envoy_on_server_fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_info{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",created_by_name="envoy-envoy-gateway-system-public-5ea56ca9-587d54c5c9",node="k3s-server"}'
+        values: '1x80'
+      - series: 'kube_pod_status_phase{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",phase="Running"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, pod) (ALERTS{alertname="IngressEnvoyOnServerNode",alertstate="firing"})
+        eval_time: 3m
+        exp_samples: []
+      - expr: count by (alertname, pod) (ALERTS{alertname="IngressEnvoyOnServerNode",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="IngressEnvoyOnServerNode", pod="envoy-envoy-gateway-system-public-x1"}'
+            value: 1
+
+  # 入口 Envoy 在 agent 上：不响。
+  - name: ingress_envoy_on_agent_silent
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_info{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",created_by_name="envoy-envoy-gateway-system-public-5ea56ca9-587d54c5c9",node="k3s-agent-1"}'
+        values: '1x80'
+      - series: 'kube_pod_status_phase{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",phase="Running"}'
+        values: '1x80'
+    promql_expr_test:
+      - expr: count by (alertname, pod) (ALERTS{alertname="IngressEnvoyOnServerNode",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # Pod 在 server 上但已经不是 Running（旧的、被替换掉的 Pod）：Running 的序列是 0，不响。
+  - name: ingress_envoy_on_server_not_running_silent
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_info{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",created_by_name="envoy-envoy-gateway-system-public-5ea56ca9-587d54c5c9",node="k3s-server"}'
+        values: '1x80'
+      - series: 'kube_pod_status_phase{namespace="envoy-gateway-system",pod="envoy-envoy-gateway-system-public-x1",phase="Running"}'
+        values: '0x80'
+    promql_expr_test:
+      - expr: count by (alertname, pod) (ALERTS{alertname="IngressEnvoyOnServerNode",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # Watchdog 每 5 分钟送到一次（时间戳跟着走），t=30m 之后不再更新（指标还在，值停住）：
+  # 停住的值是 1800，15 分钟后（45m）超过阈值，再过 for 10m。50m 不响，57m 在响。
+  - name: alert_delivery_stalled_fires
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink"}'
+        values: '0x4 300x4 600x4 900x4 1200x4 1500x4 1800x40'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 50m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 57m
+        exp_samples:
+          - labels: '{alertname="AlertDeliveryStalled"}'
+            value: 1
+
+  # alertsink 不在了（序列在 t=10m 之后消失）：absent 那一半，30m 在响。
+  - name: alert_delivery_sink_gone_fires
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink"}'
+        values: '0x4 300x4 600'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{alertname="AlertDeliveryStalled"}'
+            value: 1
+
+  # 正常：每 5 分钟更新一次；中间 alertsink 重启（旧 Pod 的序列在 20m 断掉，新 Pod 的在 26m 出现）：不响。
+  - name: alert_delivery_ok_silent
+    interval: 1m
+    input_series:
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink",k8s_pod_name="a"}'
+        values: '0x4 300x4 600x4 900x4 1200'
+      - series: 'alertsink_watchdog_last_received{service_name="alertsink",k8s_pod_name="b"}'
+        values: '_x25 1500x3 1800x4 2100x4 2400x4 2700x4 3000x4'
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 27m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="AlertDeliveryStalled",alertstate="firing"})
+        eval_time: 45m
+        exp_samples: []

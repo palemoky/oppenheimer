@@ -121,6 +121,11 @@ type Config struct {
 	// Backlog 是受理端的背压（stockgate.BacklogLimit），零值表示不限制。
 	// MaxWait 必须小于回收任务的宽限期，由调用方保证（见 cmd/order 的配置检查）。
 	Backlog stockgate.BacklogLimit
+	// SubmitPartitions 是 SubmitTopic 的分区数。大于 0 时受理按“这张订单的落库消息会进哪个分区”分队列，
+	// Backlog 的 MaxQueue、MaxStale 是每个分区的上限（stockgate.BacklogLimit 的“按队列计数”，ADR-0036）；
+	// 0 表示不分，两个上限数的是全部占用。它只用来估计订单排在哪条队列里：和 topic 实际的分区数不一致时
+	// 各队列数得不准，订单的受理、落库、回收都不受影响。
+	SubmitPartitions int32
 	// GateMemoryWatermarkPercent 是闸门已用内存占上限的百分比到多少就停止受理（ADR-0034），取值 0 到 99。
 	// 零值表示不检查（测试用；cmd/order 给 DefaultGateMemoryWatermarkPercent）。
 	// 它只读 GateMemoryWatcher 存下的采样，没有启动那个组件时等于不检查。
@@ -236,6 +241,7 @@ type Service struct {
 	cacheTTL       time.Duration
 	cacheNullTTL   time.Duration
 	backlog        stockgate.BacklogLimit
+	submitParts    int32
 	readMode       ReadMode
 	marks          *readmark.Marks
 	pinTTL         time.Duration
@@ -331,6 +337,7 @@ func New(d Deps, cfg Config) (*Service, error) {
 		clock:          clock,
 		eventsTopic:    cmp.Or(cfg.OrderEventsTopic, eventx.OrderEvents),
 		submitTopic:    cmp.Or(cfg.SubmitTopic, eventx.OrderSubmit),
+		submitParts:    cfg.SubmitPartitions,
 		closeTopic:     cmp.Or(cfg.CloseDelayTopic, eventx.OrderCloseDelay),
 		relays:         cfg.Relays,
 		orderCache:     d.OrderCache,

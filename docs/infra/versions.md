@@ -22,6 +22,9 @@
 | codecov/codecov-action | v7（查证时最新 v7.1.1） | 稳定版 | 2026-11-19 | CI，按模块上传测试覆盖率 |
 | golangci-lint-action | v9 | 稳定版 | 2026-11-11 | CI |
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
+| promtool | 3.13.5 | LTS | 2026-11-22 | 随 Prometheus 的发布包（`prometheus-3.13.5.<os>-<arch>.tar.gz`，来源 github.com/prometheus/prometheus/releases，只取 `promtool`），版本跟集群上的 Prometheus（`cluster.env` 的 `PROMETHEUS_VERSION`，3.13 是 LTS）。`make promtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；SLO 规则的单元测试和下发前的检查用，版本写在 `Makefile` 里，升级时和 `cluster.env` 一起改 |
+| amtool | 0.35.0 | 稳定版 | 2026-11-23 | 随 Alertmanager 的发布包（`alertmanager-0.35.0.<os>-<arch>.tar.gz`，来源 github.com/prometheus/alertmanager/releases，只取 `amtool`），版本跟集群上的 Alertmanager（kube-prometheus-stack 的 chart 带的，`kubectl -n monitoring get alertmanager` 看得到 v0.35.0）。`make amtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；检查 Alertmanager 的配置和核对路由用（`make alertmanager-test`），版本写在 `Makefile` 里，chart 升级时一起看；Alertmanager 没有 LTS |
+| yq | v4.54.3 | 稳定版 | 2026-11-22 | mikefarah/yq，来源 github.com/mikefarah/yq/releases（`yq_<os>_<arch>`，校验发布页 `checksums` 里的 SHA-256）。从 `PrometheusRule` 清单里抽 `.spec.groups` 给 promtool；`make yq` 装进 `./bin`。ubuntu-latest 预装了同版本，但本机没有，两边统一用 `./bin` 里的；没有 LTS |
 | MySQL | 9.7.4 | LTS | 2026-11-11 | 集群上也是这个版本，server-id：`mysql-order-0` 11、12，`mysql-order-1` 21、22，`mysql-main` 1（和本机 compose 对应）。Docker Hub 的 `lts` 标签指向 9.7 系列；`latest` 是创新版 26.10，不用 |
 | Envoy | v1.40.2 | 稳定版 | 2026-11-14 | 服务之间的熔断和并发隔离（ADR-0020）。镜像 `envoyproxy/envoy:v1.40.2`。没有 LTS，同时维护最近四个小版本 |
 | Redis | 8.10.3 | 稳定版 | 2026-11-11 | compose 里有两个实例，同一个镜像：`redis`（闸门和锁，`noeviction`，AOF）和 `redis-cache`（查询缓存和 gateway 的限流状态，`allkeys-lru`，不持久化；限流的桶丢了只是重新装满），升级时一起改 |

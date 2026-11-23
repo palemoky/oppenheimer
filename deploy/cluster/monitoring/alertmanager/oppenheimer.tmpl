@@ -1,0 +1,23 @@
+{{/*
+发给 Telegram 的消息（alertmanager.yaml 的 critical 接收端）。parse_mode 是 HTML，只用 Telegram 认的几个标签（b、a、code）。
+一条消息是一组告警（按 alertname 等分组）：先是状态和组名，再逐条列出 summary，最后是 runbook 的链接。
+Telegram 一条消息最多 4096 个字符，Alertmanager 会截断；所以每条告警只放 summary，不放 description，最多列 10 条。
+*/}}
+{{ define "oppenheimer.telegram" -}}
+{{ if eq .Status "firing" }}🔥 <b>FIRING</b>{{ else }}✅ <b>RESOLVED</b>{{ end }} <b>{{ .GroupLabels.alertname }}</b>{{ if gt (len .Alerts) 1 }} ×{{ len .Alerts }}{{ end }}
+{{- with .CommonLabels.severity }} [{{ . }}]{{ end }}
+{{- with .CommonLabels.service }} service={{ . }}{{ end }}
+{{- with .CommonLabels.component }} component={{ . }}{{ end }}
+{{- with .CommonLabels.slo }} slo={{ . }}{{ end }}
+{{ range $i, $a := .Alerts }}{{ if lt $i 10 }}
+• {{ if eq $a.Status "resolved" }}(resolved) {{ end }}{{ if $a.Annotations.summary }}{{ $a.Annotations.summary }}{{ else }}{{ $a.Labels.SortedPairs.Values | join " " }}{{ end }}
+  since {{ $a.StartsAt.UTC.Format "01-02 15:04" }} UTC
+{{- end }}{{ end }}
+{{- if gt (len .Alerts) 10 }}
+… and {{ len .Alerts | printf "%d" }} in total{{ end }}
+{{ with .CommonAnnotations.description }}
+{{ . }}
+{{ end -}}
+{{ with .CommonAnnotations.runbook_url }}
+<a href="{{ . }}">runbook</a>{{ end }}
+{{- end }}

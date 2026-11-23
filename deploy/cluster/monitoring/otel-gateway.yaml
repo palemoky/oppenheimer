@@ -70,8 +70,34 @@ config:
     batch/logs:
       send_batch_size: 2000
       send_batch_max_size: 2000
+    # 把“不是故障”的 gRPC 客户端 span 的状态从 Error 改回 Unset，放在尾部采样之前。
+    # otelgrpc 的客户端 handler 对任何非 OK 的状态码都标 Error（v0.72.0 的 stats_handler.go 写死的，没有选项），
+    # 服务端一侧只对 UNKNOWN、DEADLINE_EXCEEDED、UNIMPLEMENTED、INTERNAL、UNAVAILABLE、DATA_LOSS 标。
+    # 于是背压的 429（RESOURCE_EXHAUSTED）、售罄和降级（FAILED_PRECONDITION）、查不到（NOT_FOUND）在调用方
+    # 一侧都是 Error，和工程规范“只有服务端故障才把 span 标成 Error”不一致，尾部采样的“出错的全留”把它们全留下：
+    # 2026-11-23 的过载压测里 21.6 万条（设计文档 3c 第 8 节“第 14 项的追查”第 4 条）。
+    # 这里让客户端和服务端用同一张表。span 在 SDK 里结束之后状态改不了，所以放在 Collector 里做；
+    # 本机的 otel-lgtm 没有这一步，本机看到的客户端 span 仍然是 Error。
+    transform/span_status:
+      error_mode: ignore
+      trace_statements:
+        - context: span
+          statements:
+            - >-
+              set(span.status.code, STATUS_CODE_UNSET)
+              where span.kind == SPAN_KIND_CLIENT
+              and span.status.code == STATUS_CODE_ERROR
+              and span.attributes["rpc.response.status_code"] != nil
+              and not IsMatch(span.attributes["rpc.response.status_code"], "^(UNKNOWN|DEADLINE_EXCEEDED|UNIMPLEMENTED|INTERNAL|UNAVAILABLE|DATA_LOSS)$")
     # 尾部采样（ADR-0030 第 6 项）：等一条链路的 span 到齐再决定留不留。三条策略是“或”的关系，命中任意一条就留：
-    # 出错的全留、慢的全留、其余留 10%。头部采样在请求开始时就掷骰子，那时还不知道它会不会出错。
+    # 出错的留、慢的留、其余留 10%。头部采样在请求开始时就掷骰子，那时还不知道它会不会出错。
+    #
+    # “出错”和“慢”各有每秒的上限（2026-11-23 加的）：过载时出错的和慢的不再是少数。那次压测里落库的 handler
+    # 平均 500 毫秒，落库的链路大半算“慢”，38 分钟留下 84.5 万条链路、2053 万个 span，Tempo 收了 7.5 GB，
+    # k3s-server 的盘掉到 ServerDiskLow 的线以下。上限用 and 套 rate_limiting：两个条件都满足才留，
+    # rate_limiting 是按 span 数的令牌桶，令牌不够的链路这一条策略不留（仍然可能被“其余 10%”留下）。
+    # 800 加 600 个 span/秒，按那次量到的每个 span 约 365 字节，两类合计每小时最多约 1.8 GB；平时出错和慢的
+    # 远到不了这个数，等于不限。这两个数没有在压测里验证过，下一次打过拐点的压测看 Tempo 收到的字节数。
     #
     # 放在 memory_limiter 之后、batch 之前：它要看到一条链路的全部 span，batch 会把它们拆到不同的批里。
     # 代价：decision_wait 这段时间里的 span 全在内存里（num_traces 是上限，超过就提前对最老的链路做决定）；
@@ -84,11 +110,25 @@ config:
       expected_new_traces_per_sec: 1000
       policies:
         - name: errors
-          type: status_code
-          status_code: {status_codes: [ERROR]}
+          type: and
+          and:
+            and_sub_policy:
+              - name: errors-status
+                type: status_code
+                status_code: {status_codes: [ERROR]}
+              - name: errors-cap
+                type: rate_limiting
+                rate_limiting: {spans_per_second: 800}
         - name: slow
-          type: latency
-          latency: {threshold_ms: 500}
+          type: and
+          and:
+            and_sub_policy:
+              - name: slow-latency
+                type: latency
+                latency: {threshold_ms: 500}
+              - name: slow-cap
+                type: rate_limiting
+                rate_limiting: {spans_per_second: 600}
         - name: rest
           type: probabilistic
           probabilistic: {sampling_percentage: 10}
@@ -115,7 +155,7 @@ config:
     pipelines:
       traces:
         receivers: [otlp]
-        processors: [memory_limiter, tail_sampling, batch]
+        processors: [memory_limiter, transform/span_status, tail_sampling, batch]
         exporters: [otlp_grpc]
       metrics:
         receivers: [otlp]

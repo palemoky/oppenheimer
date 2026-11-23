@@ -20,6 +20,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/otelx"
 	"github.com/palemoky/oppenheimer/pkg/worker"
@@ -44,6 +47,18 @@ const Schema = `CREATE TABLE outbox (
     PRIMARY KEY (id),
     KEY idx_outbox_pending (published_at, id)
 ) ENGINE = InnoDB`
+
+// 中继的指标（设计文档 1d 的 8.8）。发送本身的链路和耗时由 kafkax 的生产者记，这里只记“消息在表里等了多久”：
+// 中继停住（锁被别的实例占着不放、Kafka 不可用、某一批一直发不出去）时，这个数会先于积压的行数报出来。
+var (
+	meter = otelx.Meter("github.com/palemoky/oppenheimer/pkg/outbox")
+
+	// 名字以 .delay 结尾：otelx 给它用到 30 分钟的桶（WaitBuckets），中继停住几分钟也落在桶里。
+	relayDelay = otelx.Histogram(meter, "outbox.relay.delay", "Time a message waited in the outbox table, from insert to broker acknowledgement")
+)
+
+// topicAttrKey 和 kafkax 的消费者、生产者指标用同一个键，告警里能按 topic 把两段等待接起来。
+const topicAttrKey = "messaging.destination.name"
 
 // EventIDHeader 是消息里携带事件唯一标识的 header，值为 "<中继名>:<outbox 行 id>"。
 // 同一个事件被重发时这个值不变，消费者可以用它去重或排查问题。
@@ -219,6 +234,8 @@ type row struct {
 	payload []byte
 	// traceContext 是写入时的 traceparent，没有时为空串。
 	traceContext string
+	// age 是取出的那一刻这一行已经等了多久，由数据库用自己的时钟算（见 fetch）。
+	age time.Duration
 }
 
 // Flush 把当前所有未发布的消息发送一遍，返回成功发布的条数。
@@ -237,7 +254,13 @@ func (r *Relay) Flush(ctx context.Context) (published int, err error) {
 	// 如果每次都从头取一批，而队首恰好有一批发不出去的消息，后面的消息就永远轮不到。
 	var afterID int64
 	var sendErr error
+	// 每个 topic 的标签在这一轮里只建一次。topic 是个位数的枚举，一轮一张小表就够了；
+	// 不挂在 Relay 上，是因为 Flush 是导出的，测试和工具可能和循环并发调用它。
+	topicOpts := map[string]metric.MeasurementOption{}
 	for {
+		// 在查询之前取单调时钟：数据库的 CURRENT_TIMESTAMP 是语句开始执行的时刻，比它晚一点点，
+		// 从这里算起宁可多算一个往返，也不少算。
+		fetchedAt := time.Now()
 		rows, err := r.fetch(ctx, afterID)
 		if err != nil {
 			return published, err
@@ -262,6 +285,8 @@ func (r *Relay) Flush(ctx context.Context) (published int, err error) {
 			// 记下错误，但继续标记这一批里成功的，并处理后面的批次。
 			sendErr = errors.Join(sendErr, err)
 		}
+		// 在 mark 之前记：消息已经被 broker 确认，mark 失败（下一轮重发）也不改变它确实等了这么久。
+		r.recordDelay(ctx, rows, errs, time.Since(fetchedAt), topicOpts)
 
 		sent := make([]int64, 0, len(rows))
 		failed := 0
@@ -298,12 +323,35 @@ func (r *Relay) Flush(ctx context.Context) (published int, err error) {
 	return published, nil
 }
 
+// recordDelay 给 Send 确认成功的行记等待时长：取出时的年龄加上从取出到 Send 返回在进程里过的时间。
+// 失败的行不记：它们还在表里，下一轮发出去时会带着更大的年龄再被记一次。
+func (r *Relay) recordDelay(ctx context.Context, rows []row, errs []error, inProcess time.Duration, topicOpts map[string]metric.MeasurementOption) {
+	for i, rw := range rows {
+		if i >= len(errs) || errs[i] != nil {
+			continue
+		}
+		opt, ok := topicOpts[rw.topic]
+		if !ok {
+			opt = metric.WithAttributes(attribute.String(topicAttrKey, rw.topic))
+			topicOpts[rw.topic] = opt
+		}
+		// 负数截成 0：created_at 是按写入那个会话的时区记下的，绕过 mysqlx（会话时区不是 UTC）写的行、
+		// 主从切换后的时钟差或手工改过的数据，都可能让它比数据库此刻还晚。
+		relayDelay.Record(ctx, max(rw.age+inProcess, 0).Seconds(), opt)
+	}
+}
+
 func (r *Relay) fetch(ctx context.Context, afterID int64) ([]row, error) {
 	// 按 id 升序：同一个 key 的消息，先写入的先发送。
 	// 同一订单的两次状态变更被订单行的行锁串行，后一个事务在前一个提交之后才会插入 outbox，
 	// 所以同一个 key 的消息 id 递增，并且前一条一定先于后一条可见。
+	//
+	// 最后一列是这一行此刻的年龄，用数据库自己的时钟算，给 outbox.relay.delay 用，不为它另外查一次。
+	// 不把 created_at 读回来和 time.Now() 相减：DATETIME(6) 没有时区，按会话时区解释，
+	// 而会话时区和进程的时钟不一定一致；在同一条语句里和 CURRENT_TIMESTAMP(6) 相减，两边是同一个时钟、同一个时区。
 	rs, err := r.cfg.DB.QueryContext(ctx,
-		"SELECT id, topic, msg_key, payload, trace_context FROM outbox WHERE published_at IS NULL AND id > ? ORDER BY id LIMIT ?",
+		"SELECT id, topic, msg_key, payload, trace_context, TIMESTAMPDIFF(MICROSECOND, created_at, CURRENT_TIMESTAMP(6)) "+
+			"FROM outbox WHERE published_at IS NULL AND id > ? ORDER BY id LIMIT ?",
 		afterID, r.cfg.BatchSize,
 	)
 	if err != nil {
@@ -315,10 +363,12 @@ func (r *Relay) fetch(ctx context.Context, afterID int64) ([]row, error) {
 	for rs.Next() {
 		var rw row
 		var traceContext sql.NullString
-		if err := rs.Scan(&rw.id, &rw.topic, &rw.key, &rw.payload, &traceContext); err != nil {
+		var ageMicros int64
+		if err := rs.Scan(&rw.id, &rw.topic, &rw.key, &rw.payload, &traceContext, &ageMicros); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
 		}
 		rw.traceContext = traceContext.String
+		rw.age = time.Duration(ageMicros) * time.Microsecond
 		if len(rw.key) == 0 {
 			// 空 key 表示“没有 key”（见 Add）。还原成 nil，让生产者自己挑分区，
 			// 而不是把所有无 key 的消息按空串哈希到同一个分区。

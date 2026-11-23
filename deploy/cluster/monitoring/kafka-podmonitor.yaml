@@ -29,3 +29,30 @@ spec:
         # Strimzi 给 Pod 打的标签里有 strimzi.io/name、pool-name 等，留下来，用来区分 broker 和 exporter。
         - action: labelmap
           regex: __meta_kubernetes_pod_label_(strimzi_io_(name|pool_name))
+---
+# Strimzi 的 cluster operator 自己的指标（3c 加）：调和了几次、成功几次、看得到几个资源。
+# 规则 KafkaOperatorNotReconciling、KafkaOperatorMetricsMissing（rules/middleware.yaml）用它：operator 调和失败过两天没人发现
+# （3b round-8 记录 6.3 节）。只留 strimzi_ 开头的，JVM 和 Vert.x 的那几百条不要。端口名 http（8080）。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: strimzi-operator
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: monitoring
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: cluster-operator
+  namespaceSelector:
+    matchNames: [kafka]
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: strimzi_.*
+          action: keep

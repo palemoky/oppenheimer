@@ -1,0 +1,189 @@
+# 节点、Kubernetes 和监控自己的告警（设计文档 3c 的 4.5、4.6 里不是“自带”的那些）。手写的。
+# 自带的（节点不在、kubelet 不在、Pod 反复重启、Deployment 副本不足、Job 失败、etcd、TargetDown、Prometheus 和 Alertmanager 自己的）
+# 由 kube-prometheus-stack 提供，不在这里重写。
+#
+# 节点的区分：node-exporter 的 instance 是“IP:9100”，节点名在 kube_node_info 里（internal_ip 对应）。
+# 用 label_replace 把 kube_node_info 变成带同样 instance 的序列，再用 and on(instance) 筛出 server 或 agent。
+# 不在表达式里写死 IP：节点换 IP 时只要 kube_node_info 对得上就行。
+#
+# 只看长期运行的那一套：涉及 Pod 的规则排除 oppenheimer-e2e（那里的 OOM、内存高是故意制造的故障注入）。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oppenheimer-platform
+  namespace: monitoring
+  labels:
+    oppenheimer.rules: "1"
+spec:
+  groups:
+    - name: platform.node
+      interval: 30s
+      rules:
+        # 节点重启过：启动时间和 30 分钟前比变了（差超过 60 秒，容忍时钟抖动）。
+        # 从库的刷盘是放松的，节点掉电之后从库要重建（ADR-0032），所以重启要有人知道。
+        # 表达式的值是新的启动时间（秒），summary 用 humanizeTimestamp 显示。30 分钟后自己恢复。
+        - alert: NodeRebooted
+          expr: |
+            node_boot_time_seconds
+            and
+            (abs(node_boot_time_seconds - node_boot_time_seconds offset 30m) > 60)
+          for: 1m
+          labels:
+            severity: warning
+            component: node
+          annotations:
+            summary: "节点 {{ $labels.instance }} 在 {{ $value | humanizeTimestamp }} 重启过"
+            description: "节点的启动时间在最近 30 分钟内变了。从库的刷盘是放松的（innodb_flush_log_at_trx_commit 之类），节点掉电之后从库的数据可能不完整，要重建；先看 MySQL 从库的复制状态。出处：ADR-0032。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/node-reboot.md
+
+        # 节点 CPU 持续高：使用率（1 减空闲）超过 85% 持续 10 分钟。混合读写的拐点在九成上下，85% 是提前量。
+        # 3b 量到过 95% 时延迟会晃，所以不短于 10 分钟。出处：round-4。
+        - alert: NodeCPUHigh
+          expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.85
+          for: 10m
+          # 条件不成立之后再多响 3 分钟。过载时节点的使用率就在 85% 上下晃，不加的话掉下去一会儿就恢复、再上来又进 pending，
+          # 同一次过载多发一轮“恢复”和“触发”（2026-11-23 的压测里 agent-1 是 02:49 响、02:57 恢复、又进 pending）。
+          # 3 分钟（先取的 10 分钟，主人嫌恢复的通知晚得太久）：表达式本身是 5 分钟的平均，已经抹掉了秒级的抖动，
+          # 这里只要盖住“平均值在线上下来回蹭”的那几分钟。掉下去超过 3 分钟再回来的会算成新的一次（要重新等 for 的 10 分钟）。
+          # 代价是真的降下来之后“恢复”的通知晚 3 分钟。
+          keep_firing_for: 3m
+          labels:
+            severity: warning
+            component: node
+          annotations:
+            summary: "节点 {{ $labels.instance }} 的 CPU 使用率 {{ $value | humanizePercentage }}"
+            description: "节点 CPU 持续超过 85%，已经接近混合读写的拐点（九成上下），再涨延迟会明显变差。是原因一级的线索，用户是否受影响看 SLO 的燃烧率。出处：round-4。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/node-resources.md
+
+        # 磁盘的绝对值（自带的两条按“预计多久写满”报，这里补绝对值）。local-path 不限制卷的大小，PVC 用量指标没有意义，
+        # 所以看节点根分区的剩余。server 的系统盘小（现在剩 23 GiB 左右），低于 15 GiB 警告、低于 8 GiB critical；
+        # agent 的盘大，低于 30 GiB 警告。出处：3a 第 3 步、round-9 第 3 节。
+        - alert: ServerDiskLow
+          expr: |
+            node_filesystem_avail_bytes{mountpoint="/",fstype="ext4"} < 15 * 1024^3
+            and on (instance)
+            label_replace(kube_node_info{node="k3s-server"}, "instance", "$1:9100", "internal_ip", "(.*)")
+          for: 10m
+          labels:
+            severity: warning
+            component: node
+          annotations:
+            summary: "server 节点 {{ $labels.instance }} 的根分区只剩 {{ $value | humanize1024 }}B"
+            description: "server 的系统盘剩余低于 15 GiB。它上面有 etcd、Prometheus 的数据和镜像；写满了 etcd 会停，整个集群的控制面不可用。出处：3a 第 3 步、round-9 第 3 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/node-disk.md
+
+        - alert: ServerDiskCritical
+          expr: |
+            node_filesystem_avail_bytes{mountpoint="/",fstype="ext4"} < 8 * 1024^3
+            and on (instance)
+            label_replace(kube_node_info{node="k3s-server"}, "instance", "$1:9100", "internal_ip", "(.*)")
+          for: 5m
+          labels:
+            severity: critical
+            component: node
+          annotations:
+            summary: "server 节点 {{ $labels.instance }} 的根分区只剩 {{ $value | humanize1024 }}B，快写满了"
+            description: "server 的系统盘剩余低于 8 GiB。etcd 或镜像写满磁盘会让控制面停摆，现在就要清理。出处：3a 第 3 步、round-9 第 3 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/node-disk.md
+
+        - alert: AgentDiskLow
+          expr: |
+            node_filesystem_avail_bytes{mountpoint="/",fstype="ext4"} < 30 * 1024^3
+            and on (instance)
+            label_replace(kube_node_info{node=~"k3s-agent-.*"}, "instance", "$1:9100", "internal_ip", "(.*)")
+          for: 10m
+          labels:
+            severity: warning
+            component: node
+          annotations:
+            summary: "agent 节点 {{ $labels.instance }} 的根分区只剩 {{ $value | humanize1024 }}B"
+            description: "agent 的数据盘剩余低于 30 GiB。MySQL、Kafka 的数据（local-path 卷）都在这块盘上，写满了会让数据库或 broker 起不来。出处：3a 第 3 步、round-9 第 3 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/node-disk.md
+
+    - name: platform.kubernetes
+      interval: 30s
+      rules:
+        # 容器被 OOMKilled：最近一次终止的原因是 OOMKilled，并且重启次数在 10 分钟内有增长（两个条件一起，
+        # 免得“很久以前 OOM 过一次”一直响）。出处：3b 设计第 6 节第 4 步。
+        # kube_pod_container_status_last_terminated_reason 的值在 reason 对上时是 1。
+        - alert: ContainerOOMKilled
+          expr: |
+            (
+              kube_pod_container_status_last_terminated_reason{reason="OOMKilled",namespace!="oppenheimer-e2e"} == 1
+              and on (namespace, pod, container)
+              increase(kube_pod_container_status_restarts_total{namespace!="oppenheimer-e2e"}[10m]) > 0
+            )
+          for: 1m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} 的容器 {{ $labels.container }} 被 OOMKilled"
+            description: "容器内存超过 limit 被内核杀了并重启。重启期间这个副本不可用；反复发生说明 limit 偏小或有泄漏。出处：3b 设计第 6 节第 4 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/container-memory.md
+
+        # 容器的常驻内存（RSS，匿名页）超过 limit 的 90% 持续 10 分钟。出处：3b 设计第 6 节第 4 步。
+        # 用 RSS 不用工作集（working set）：工作集里有活跃的页缓存，那部分内核在内存紧时会回收，不会导致 OOM。
+        # 2026-11-22 实测 Kafka 的三个 broker：工作集是 limit（1.5 GiB）的 87% 到 96%，RSS 只有 67% 到 71%，
+        # 按工作集写这条会一直响。MySQL 的 buffer pool、Redis 的数据、Go 的堆都是匿名页，RSS 量得到。
+        # 只算有内存 limit 的容器（没有 limit 的和 POD 沙箱容器不参与，除法左右用 on(namespace,pod,container) 对齐）。
+        - alert: ContainerMemoryNearLimit
+          expr: |
+            container_memory_rss{container!="",container!="POD",namespace!="oppenheimer-e2e"}
+              / on (namespace, pod, container)
+            kube_pod_container_resource_limits{resource="memory",namespace!="oppenheimer-e2e"}
+              > 0.9
+          for: 10m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} 的常驻内存（RSS）用了 limit 的 {{ $value | humanizePercentage }}"
+            description: "容器的常驻内存超过内存 limit 的 90%，再涨就会被 OOMKilled。出处：3b 设计第 6 节第 4 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/container-memory.md
+
+        # 入口的 Envoy 调度到了 k3s-server：round-8 遇到过，手工挪回去的。入口应该在工作节点（agent）上，
+        # 因为 server 的资源小、还跑着 etcd。只算 Running 的 Pod（已经终止的旧 Pod 不报）。
+        - alert: IngressEnvoyOnServerNode
+          expr: |
+            kube_pod_info{namespace="envoy-gateway-system",created_by_name=~"envoy-envoy-gateway-system-public-.*",node="k3s-server"}
+            and on (namespace, pod)
+            (kube_pod_status_phase{namespace="envoy-gateway-system",phase="Running"} == 1)
+          for: 5m
+          labels:
+            severity: warning
+            component: ingress
+          annotations:
+            summary: "入口 Envoy {{ $labels.pod }} 跑在 k3s-server 上（kube_pod_info = {{ $value }}）"
+            description: "入口的 Envoy 应该在工作节点上。跑在 server 上会和 etcd、控制面抢资源，压测时入口一满整个集群的控制面跟着慢。出处：round-8。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/ingress-placement.md
+
+    - name: platform.monitoring
+      interval: 30s
+      rules:
+        # “Alertmanager 到某个接收端的通知在失败”不在这里写：chart 自带的 AlertmanagerFailedToSendAlerts（warning）和
+        # AlertmanagerClusterFailedToSendAlerts（critical）报的是同一件事，而且更快（约 9 分钟，我们原来那条约 13 分钟）。
+        # 原来的 AlertmanagerNotificationsFailing 在 2026-11-23 删掉了（告警质量检查第 12 项：同一件事四条告警）。
+        # 留下自带的那两条的代价：webhook 这种“只是日志”的接收端失败时也会有一条 critical 发到 Telegram。
+        # 局限照旧：发到主人渠道（Telegram）的通知坏了的话，这类告警恰恰送不到（设计 4.6 把这点列为面试考点）。
+        # 告警送不到接收端了：从“规则求值”到“webhook 接收端收到”这一整条路上任何一环断了都算
+        # （Prometheus 不求值、Prometheus 到 Alertmanager 不通、Alertmanager 的路由或配置坏了、alertsink 不在）。
+        # 做法：Watchdog 一直在响，Alertmanager 每 5 分钟把它发给 alertsink 一次（alertmanager.yaml 的第一条路由），
+        # alertsink 把最后一次收到的时刻报成指标；15 分钟（三次）没有更新就算断了。
+        # absent 那一半：alertsink 不在、或者它重启之后一次都没收到过。for 10 分钟盖住它重启后等下一次 Watchdog 的时间。
+        # critical：发给 Telegram，那条路不经过 alertsink。但如果断的是 Prometheus 或 Alertmanager 自己，这条同样发不出来，
+        # 那要靠集群外的东西盯着 Watchdog（设计第 7 节，不做，记成考点）。
+        # Collector 的 gateway 不在时这个指标也会消失，由 OtelGatewayDown 抑制。
+        - alert: AlertDeliveryStalled
+          expr: |
+            time() - max(alertsink_watchdog_last_received) > 15 * 60
+            or
+            absent(alertsink_watchdog_last_received)
+          for: 10m
+          labels:
+            severity: critical
+            component: monitoring
+          annotations:
+            summary: "webhook 接收端已经超过 15 分钟没有收到 Watchdog，告警可能送不出去"
+            description: "从规则求值到 webhook 接收端这条路断了，或者接收端 alertsink 不在。这期间别的告警可能同样没有送达；3d 之后诊断 Agent 也收不到。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/alertmanager-notifications.md

@@ -10,7 +10,21 @@
 #   monitoring.sh keda              KEDA（命名空间 keda）：按 Prometheus 里的请求速率伸缩 gateway、order 用的；要在 services.sh deploy 之前装（chart 里有 ScaledObject）
 #   monitoring.sh datasources       只 apply Grafana 的 Loki 和 Tempo 数据源（tempo 已经包含这一步）
 #   monitoring.sh dashboards        把 deploy/cluster/monitoring/dashboards/*.json 做成 ConfigMap，Grafana 自动加载到文件夹 Oppenheimer
-#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards
+#   monitoring.sh rules             把 deploy/cluster/monitoring/rules/*.yaml（PrometheusRule，SLO 的记录规则和告警）服务端 apply 到集群，
+#                                   删掉仓库里已经没有的；下发前先 promtool check rules（要 make promtool yq 装好 ./bin）；
+#                                   规则的单元测试是 make rules-test，这里不跑
+#   monitoring.sh alertmanager      Alertmanager 的配置（deploy/cluster/monitoring/alertmanager/）：路由、分组、抑制、Telegram 的模板。
+#                                   做成 Secret alertmanager-oppenheimer，Alertmanager 自己重新加载，不重启。Telegram 的 token 和会话号
+#                                   从仓库根目录的 .env 读（TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID，不入库）；没有就只发 webhook。
+#                                   下发前先 amtool check-config（要 make amtool）。kps 会先调用它（Secret 要先于 Alertmanager 存在）
+#   monitoring.sh alertsink         告警的 webhook 接收端（Deployment alertsink，只打日志、记数；chaos 镜像，仓库里没有就构建）
+#   monitoring.sh alerts            只读：Alertmanager 里现在的告警（含被抑制、被静默的）
+#   monitoring.sh silence '<匹配>' <时长> '<原因>'
+#                                   加一条静默，例如 silence 'alertname=ProbeNoData' 2h '正式压测，探针停了'；多个匹配用空格分开。
+#                                   计划内的操作之前加，原因必须写。silence list 列出现有的，silence expire <id> 提前结束一条
+#   monitoring.sh inhibit-test      在集群上核对抑制规则：按 alertmanager/tests/inhibit.txt 塞合成的告警（4 分钟后自己过期，
+#                                   不动任何组件，不发 Telegram），看每一条有没有被抑制、被谁抑制。改了 inhibit_rules 之后跑
+#   monitoring.sh up                按顺序装全部：kps、loki、tempo、collector、exporters、istio、keda、dashboards、rules、alertsink
 #   monitoring.sh status            只读：Pod 在哪个节点、卷、Helm release、Prometheus 的抓取目标里不健康的
 #   monitoring.sh password          打印 Grafana 的管理员密码
 #   monitoring.sh forward <名字>    端口转发到本机：prometheus（9090）、alertmanager（9093）。Ctrl-C 结束
@@ -84,10 +98,173 @@ ensure_grafana_secret() {
   echo "==> generated the Grafana admin password (monitoring.sh password prints it)"
 }
 
+# 从仓库根目录的 .env 取一个变量的值（KEY=value 或 export KEY=value，值可以带引号）。不 source 整个文件：
+# 里面可能有别的东西，而且 source 会执行它。值只进变量，不打印。
+dotenv() { # <变量名>
+  [[ -f "$ROOT/.env" ]] || return 0
+  sed -n -E -e "s/^[[:space:]]*(export[[:space:]]+)?$1=//p" "$ROOT/.env" | tail -n 1 |
+    sed -E -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\1/"
+}
+
+# Alertmanager 的配置（设计文档 3c 的 3.5）。Secret alertmanager-oppenheimer 里三个键：
+#   alertmanager.yaml   渲染过的配置（会话号填好，或者去掉了 Telegram 那一段）
+#   oppenheimer.tmpl    通知的模板
+#   telegram-token      机器人的 token（有的话）。operator 把 Secret 里的其他键原样挂到 /etc/alertmanager/config/，
+#                       配置里用 bot_token_file 指过去，token 不出现在配置里
+# 内容经文件交给 kubectl（--from-file），不出现在命令行参数里；服务端 apply，不留 last-applied 注解。
+# Secret 变了之后 operator 重新生成配置，Alertmanager 的 config-reloader 自己加载，不用重启（约一分钟内）。
+AM_SECRET="alertmanager-oppenheimer"
+cmd_alertmanager() {
+  if ! command -v amtool >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/amtool" ]]; then
+    echo "amtool not found; run 'make amtool' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  "$ROOT/scripts/alertmanager-test.sh" >/dev/null || {
+    echo "alertmanager config check failed; run make alertmanager-test to see why" >&2
+    return 1
+  }
+  ensure_ns
+  local dir token chat
+  dir="$(mktemp -d)"
+  token="$(dotenv TELEGRAM_BOT_TOKEN)"
+  chat="$(dotenv TELEGRAM_CHAT_ID)"
+  if [[ -n "$token" && -n "$chat" ]]; then
+    "$ROOT/scripts/alertmanager-test.sh" --render "$dir" "$chat"
+    (umask 077 && printf '%s' "$token" >"$dir/telegram-token")
+    echo "==> alertmanager config: webhook + Telegram for critical"
+  else
+    "$ROOT/scripts/alertmanager-test.sh" --render "$dir"
+    echo "==> alertmanager config: webhook only (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not both set in .env)"
+  fi
+  local rc=0
+  kubectl -n "$NS" create secret generic "$AM_SECRET" --from-file="$dir" --dry-run=client -o yaml |
+    kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f - >/dev/null || rc=$?
+  rm -rf "${dir:?}"
+  return "$rc"
+}
+
+# 告警的 webhook 接收端（设计文档 3c 第 2 节第 9 项）。镜像是 chaos 镜像里的 load alertsink，tag 按当前工作区算，
+# 仓库里没有才构建并推送（同 services.sh probe）。
+cmd_alertsink() {
+  ensure_ns
+  local tag="${ALERTSINK_IMAGE_TAG:-}" image
+  [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
+  if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+    "http://$REGISTRY_ADDR/v2/oppenheimer/chaos/manifests/$tag" >/dev/null 2>&1; then
+    echo "==> chaos image $tag already in the registry"
+  else
+    echo "==> building chaos image $tag (from the working tree)"
+    IMAGE_TAG="$tag" "$HERE/images.sh" all chaos
+  fi
+  image="$REGISTRY_ADDR/oppenheimer/chaos:$tag"
+  echo "==> alertsink (image $image)"
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$DEPLOY/alertsink.yaml" | kubectl apply -f - >/dev/null
+  kubectl -n "$NS" rollout status deployment/alertsink --timeout=3m
+}
+
+# amtool 在 Alertmanager 的容器里就有，经 kubectl exec 用它，不用端口转发。
+am_tool() {
+  kubectl -n "$NS" exec "alertmanager-$KPS_RELEASE-alertmanager-0" -c alertmanager -- \
+    amtool --alertmanager.url=http://localhost:9093 "$@"
+}
+
+cmd_alerts() {
+  am_tool alert query --active --inhibited --silenced --unprocessed -o extended
+}
+
+# 静默（设计文档 3c 的 3.5）：人手动加的、有期限的，原因必须写。
+cmd_silence() {
+  case "${1:-}" in
+  list) am_tool silence query -o extended ;;
+  expire) am_tool silence expire "${2:?usage: monitoring.sh silence expire <id>}" ;;
+  "")
+    echo "usage: $0 silence '<matchers>' <duration> '<comment>' | silence list | silence expire <id>" >&2
+    return 2
+    ;;
+  *)
+    local matchers="$1" duration="${2:?duration, e.g. 2h}" comment="${3:?comment: why this silence exists}"
+    # shellcheck disable=SC2086 # 多个匹配按空格拆开
+    am_tool silence add --author="${USER:-monitoring-sh}" --duration="$duration" --comment="$comment" $matchers
+    ;;
+  esac
+}
+
+# 在集群上核对抑制规则（设计文档 3c 第 5 节第 2 层；amtool 在本机只测得了路由，测不了抑制）。
+# 把 alertmanager/tests/inhibit.txt 里的告警一次塞进 Alertmanager，再从它的 API 读每一条有没有被抑制、被谁抑制。
+# 每条另加三个标签：synthetic=true、run=<这一次的编号>、case=<行号>。多出来的标签不影响 equal（它只比列出的那几个）。
+# critical 的合成告警会走到 Telegram，所以先加一条只匹配 synthetic=true 的静默。静默不妨碍它当抑制的源：
+# 抑制看的是“源告警在不在”，不看它有没有被通知出去。告警 4 分钟后自己过期，静默 7 分钟后自己结束。
+cmd_inhibit_test() {
+  local file="$DEPLOY/alertmanager/tests/inhibit.txt" run end n=0 lineno=0 line expect labels
+  local tmp
+  tmp="$(mktemp -d)"
+  run="$(date -u +%H%M%S)"
+  end="$(date -u -v+4M +%Y-%m-%dT%H:%M:%SZ)"
+
+  # 静默比告警多活 3 分钟，到点自己结束；不在退出时撤：那时告警还在，撤了它们就发出去了（第一次跑就是这样漏的）。
+  am_tool silence add --author="${USER:-monitoring-sh}" --duration=7m \
+    --comment="monitoring.sh inhibit-test $run: synthetic alerts, keep them off Telegram" synthetic=true severity=critical >/dev/null
+  # shellcheck disable=SC2064 # 现在就展开：退出时变量已经不在作用域里
+  trap "rm -rf '$tmp'" EXIT
+
+  : >"$tmp/add.sh"
+  : >"$tmp/expect.tsv"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    expect="$(echo "${line%%|*}" | tr -d '[:space:]')"
+    labels="$(echo "${line#*|}" | sed -e 's/^ *//' -e 's/ *$//')"
+    case "$expect" in
+    inhibited | active) ;;
+    *)
+      echo "inhibit.txt:$lineno: expected 'inhibited' or 'active', got '$expect'" >&2
+      return 1
+      ;;
+    esac
+    n=$((n + 1))
+    # 标签里没有空格和引号（表里自己保证），按空格拆成参数。
+    echo "amtool --alertmanager.url=http://localhost:9093 alert add --end=$end $labels synthetic=true run=$run case=$lineno || exit 1" >>"$tmp/add.sh"
+    printf '%s\t%s\t%s\n' "$lineno" "$expect" "$labels" >>"$tmp/expect.tsv"
+  done <"$file"
+
+  echo "adding $n synthetic alerts (run=$run, expire at $end)"
+  kubectl -n "$NS" exec -i "alertmanager-$KPS_RELEASE-alertmanager-0" -c alertmanager -- sh <"$tmp/add.sh"
+  # 抑制器是从告警的订阅里异步收到源告警的，等它收齐。
+  sleep 10
+  am_tool alert query --active --inhibited --silenced --unprocessed -o json "run=$run" >"$tmp/alerts.json"
+
+  # 每条告警：行号、被哪些告警抑制（指纹换成名字）。
+  jq -r '
+    (map({key: .fingerprint, value: .labels.alertname}) | from_entries) as $names
+    | .[] | [.labels.case, ([.status.inhibitedBy[]? | $names[.] // .] | unique | join(","))] | @tsv
+  ' "$tmp/alerts.json" >"$tmp/got.tsv"
+
+  local fail=0 by got
+  while IFS=$'\t' read -r lineno expect labels; do
+    if ! by="$(awk -F'\t' -v c="$lineno" '$1 == c { print $2; found = 1 } END { exit !found }' "$tmp/got.tsv")"; then
+      echo "FAIL  line $lineno: not in Alertmanager | $labels"
+      fail=$((fail + 1))
+      continue
+    fi
+    got=active
+    [[ -n "$by" ]] && got=inhibited
+    if [[ "$got" == "$expect" ]]; then
+      printf 'ok    %-9s %s%s\n' "$got" "$labels" "${by:+   <- $by}"
+    else
+      printf 'FAIL  line %s: want %s, got %s%s | %s\n' "$lineno" "$expect" "$got" "${by:+ (by $by)}" "$labels"
+      fail=$((fail + 1))
+    fi
+  done <"$tmp/expect.tsv"
+  echo "$n cases, $fail failed"
+  return "$((fail > 0))"
+}
+
 cmd_kps() {
   echo "==> kube-prometheus-stack $KPS_VERSION (Prometheus $PROMETHEUS_VERSION)"
   ensure_ns
   ensure_grafana_secret
+  # values 里 Alertmanager 用现成的 Secret 当配置，它要先存在。
+  cmd_alertmanager
   local values
   values="$(mktemp)"
   # shellcheck disable=SC2064 # 要的就是现在展开
@@ -276,6 +453,45 @@ cmd_dashboards() {
   done
 }
 
+# 规则（设计文档 3c 的 3.2、3.3）在 deploy/cluster/monitoring/rules/，一个文件一个 PrometheusRule，带标签 oppenheimer.rules=1，
+# kps 的 Prometheus 按 ruleSelector 自动加载（operator 把它们转成规则文件，不用重启）。
+# 下发前先用 promtool 检查：先把每个清单的 .spec.groups 抽成纯规则文件（scripts/rules-test.sh --extract），再 promtool check rules。
+# 服务端 apply，字段管理者名同大盘；仓库里删掉的规则文件，集群上对应的 PrometheusRule 也删掉（按标签认）。
+# 依赖：kps 已装（PrometheusRule 的 CRD）。
+cmd_rules() {
+  local dir="$DEPLOY/rules" f name keep=" " tmp
+  if ! command -v promtool >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/promtool" ]]; then
+    echo "promtool not found; run 'make promtool yq' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  if ! command -v yq >/dev/null 2>&1 && [[ ! -x "$ROOT/bin/yq" ]]; then
+    echo "yq not found; run 'make promtool yq' in the repo root (installs into ./bin)" >&2
+    return 1
+  fi
+  tmp="$(mktemp -d)"
+  PATH="$ROOT/bin:$PATH"
+  "$ROOT/scripts/rules-test.sh" --extract "$tmp"
+  if ! promtool check rules "$tmp"/*.yaml; then
+    rm -rf "${tmp:?}"
+    return 1
+  fi
+  rm -rf "${tmp:?}"
+  ensure_ns
+  for f in "$dir"/*.yaml; do
+    [[ -e "$f" ]] || continue
+    name="$(yq '.metadata.name' "$f")"
+    keep="$keep$name "
+    kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f "$f" >/dev/null
+    echo "    $name"
+  done
+  for name in $(kubectl -n "$NS" get prometheusrule -l oppenheimer.rules=1 -o jsonpath='{.items[*].metadata.name}'); do
+    if [[ "$keep" != *" $name "* ]]; then
+      kubectl -n "$NS" delete prometheusrule "$name" >/dev/null
+      echo "    removed $name"
+    fi
+  done
+}
+
 cmd_status() {
   kubectl -n "$NS" get pods -o wide
   kubectl -n "$NS" get pvc
@@ -334,6 +550,12 @@ exporters) cmd_exporters ;;
 istio) cmd_istio ;;
 keda) cmd_keda ;;
 dashboards) cmd_dashboards ;;
+rules) cmd_rules ;;
+alertmanager) cmd_alertmanager ;;
+alertsink) cmd_alertsink ;;
+alerts) cmd_alerts ;;
+silence) cmd_silence "$@" ;;
+inhibit-test) cmd_inhibit_test ;;
 up)
   cmd_kps
   cmd_loki
@@ -343,13 +565,15 @@ up)
   cmd_istio
   cmd_keda
   cmd_dashboards
+  cmd_rules
+  cmd_alertsink
   ;;
 status) cmd_status ;;
 password) cmd_password ;;
 forward) cmd_forward "$@" ;;
 promql) cmd_promql "$@" ;;
 *)
-  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | datasources | up | status | password | forward <name> | promql '<query>'" >&2
+  echo "usage: $0 kps | loki | tempo | collector | exporters | istio | keda | dashboards | rules | alertmanager | alertsink | alerts | silence ... | inhibit-test | datasources | up | status | password | forward <name> | promql '<query>'" >&2
   exit 2
   ;;
 esac

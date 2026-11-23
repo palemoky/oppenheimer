@@ -1,0 +1,433 @@
+# 中间件（MySQL、Redis、Kafka、Collector、备份）的告警（设计文档 3c 的 4.4）。手写的。
+#
+# 三个专门处理的地方（设计 1.3 的第 3 条）：
+#   - exporter 活着而数据库死了时 up 是 1，所以看 mysql_up、redis_up，不看 up。exporter 自己不在了（序列消失）是自带的 TargetDown 的事。
+#   - 复制停了以后 Seconds_Behind_Source 是 NULL，延迟的序列会断掉，阈值规则发现不了。
+#     所以“主从延迟大”之外另写“该有延迟指标的从库没有了”：按清单（下面的两个从库）显式 absent，
+#     并且要 SQL 线程的状态也没有才响（线程状态在、值是 0 的情况由“复制停了”报，不重复）。
+#     清单是 2026-11-23 在 Prometheus 上查到的：mysql-order-0-1、mysql-order-1-1（mysql-main 没有从库）。加从库要同步改这里。
+#   - “有增长”类（Collector）写成 increase(x[w]) > 0 or (x > 0 unless x offset w)：计数器从不存在到第一次出现，increase() 是 0。
+#
+# 标签只放有限的枚举：cluster（mysql-order-0 之类）、instance（Pod 名，数量固定的有状态副本）、topic 不用。Pod IP 不进标签。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oppenheimer-middleware
+  namespace: monitoring
+  labels:
+    oppenheimer.rules: "1"
+spec:
+  groups:
+    - name: middleware.mysql
+      interval: 30s
+      rules:
+        # exporter 连不上数据库。mysql_up 是 exporter 自己报的“能不能连上”。出处：3a 第 5 步。
+        - alert: MySQLDown
+          expr: mysql_up == 0
+          for: 2m
+          # 条件不成立之后再多响 5 分钟：它是抑制的源，要比被它压着的告警晚走（和 OtelGatewayDown 同一个道理）。
+          # 被压着的那几条恢复得比它慢一点（从库重连要等下一次重试，Pod 的就绪要等探针和下一次抓取），
+          # 源先走，中间轮到分组刷新的就漏出去。代价是恢复的通知晚 5 分钟。
+          keep_firing_for: 5m
+          labels:
+            severity: critical
+            component: mysql
+            # 下面三个标签是给 Alertmanager 的抑制用的（alertmanager.yaml）：实例连不上或者复制停了，它的 Pod 会变成 NotReady
+            # （就绪探针查的就是这些），15 分钟后 chart 自带的 KubePodNotReady、KubeStatefulSetReplicasMismatch 会说同一件事。
+            # 自带的那两条带的是 namespace、pod、statefulset，我们的指标带的是 instance（就是 Pod 名）和 cluster（就是 StatefulSet 名），
+            # 对不上就压不住，所以在这里补成同名的标签。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
+          annotations:
+            summary: "MySQL {{ $labels.instance }} 连不上（mysql_up = {{ $value }}）"
+            description: "exporter 连不上这个 MySQL 实例（exporter 本身还活着，所以 up 是 1，要看 mysql_up）。落在它上面的写入和读取会失败。出处：3a 第 5 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-down.md
+
+        # 复制的 SQL 线程停了。critical：从库不再追主库，读从库的流量读到的是旧数据，主库再坏就丢数据。
+        # 3a 验证 7 里停复制是实际做过的故障实验。指标名 replica_sql_running 在 Prometheus 上核对过。
+        - alert: MySQLReplicaSQLThreadStopped
+          expr: mysql_slave_status_replica_sql_running == 0
+          for: 2m
+          # 抑制的源要后走，见 MySQLDown。
+          keep_firing_for: 5m
+          labels:
+            severity: critical
+            component: mysql
+            # 给抑制用的三个标签，见 MySQLDown。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
+          annotations:
+            summary: "MySQL 从库 {{ $labels.instance }} 的 SQL 线程停了（值 {{ $value }}）"
+            description: "从库不再应用主库的变更，数据在变旧；这个时候主库再出问题，从库上缺的那部分就丢了。停了以后延迟指标会消失，所以不会再有“主从延迟大”的告警，以这条为准。出处：3a 验证 7。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-replication.md
+
+        # 复制的 IO 线程停了（连不上主库或者读不到 binlog）。同上。
+        - alert: MySQLReplicaIOThreadStopped
+          expr: mysql_slave_status_replica_io_running == 0
+          for: 2m
+          # 抑制的源要后走，见 MySQLDown。
+          keep_firing_for: 5m
+          labels:
+            severity: critical
+            component: mysql
+            # 给抑制用的三个标签，见 MySQLDown。
+            namespace: mysql
+            pod: "{{ $labels.instance }}"
+            statefulset: "{{ $labels.cluster }}"
+          annotations:
+            summary: "MySQL 从库 {{ $labels.instance }} 的 IO 线程停了（值 {{ $value }}）"
+            description: "从库收不到主库的 binlog，数据在变旧。停了以后延迟指标会消失，所以不会再有“主从延迟大”的告警，以这条为准。出处：3a 验证 7。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-replication.md
+
+        # 主从延迟超过 30 秒持续 5 分钟。延迟是实际量到过的：平时是 0；复制线程停了序列就没了，不在这条的范围里。
+        - alert: MySQLReplicaLagHigh
+          expr: mysql_slave_status_seconds_behind_source > 30
+          for: 5m
+          labels:
+            severity: warning
+            component: mysql
+          annotations:
+            summary: "MySQL 从库 {{ $labels.instance }} 落后主库 {{ $value }} 秒"
+            description: "从库在追，但落后超过 30 秒。读从库的接口会读到旧数据（订单列表、对账）；落后继续拉大会变成数据风险。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-replication.md
+
+        # 清单里的从库没有延迟的序列，SQL 线程的状态也没有：exporter 不报了，或者连不上、或者复制被拆掉了。
+        # 与“复制停了”互补：线程状态在（值是 0）归那两条管。for 5m 是设计规定的。出处：设计 1.3 第 3 条。
+        # absent() 的结果带着等式匹配器里的 instance 标签，所以告警能指出是哪个从库。
+        - alert: MySQLReplicaMetricsMissing
+          expr: |
+            (
+              absent(mysql_slave_status_seconds_behind_source{instance="mysql-order-0-1"})
+              and
+              absent(mysql_slave_status_replica_sql_running{instance="mysql-order-0-1"})
+            )
+            or
+            (
+              absent(mysql_slave_status_seconds_behind_source{instance="mysql-order-1-1"})
+              and
+              absent(mysql_slave_status_replica_sql_running{instance="mysql-order-1-1"})
+            )
+          for: 5m
+          labels:
+            severity: warning
+            component: mysql
+          annotations:
+            summary: "MySQL 从库 {{ $labels.instance }} 的延迟和复制状态指标都没有了（absent = {{ $value }}）"
+            description: "该有主从延迟指标的从库 5 分钟没有延迟的序列，SQL 线程的状态也没有。可能是复制被拆了、从库没了，或者 exporter 读不到复制状态。“延迟大”的阈值规则在这种情况下不会响。出处：设计 1.3 第 3 条。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-replication.md
+
+        # 连接数超过 max_connections 的 80%。出处：round-6 4.3（没有撞上，但配置上没有东西保证不撞：order 的连接池按副本数乘上去
+        # 能到订单库的上限，所以把池从 50 改成了 40）；真的报过 1040 的是本机的 compose（设计 1d：各服务的池加起来超过默认的 151）。
+        # 注意 order 扩到上限且池用满时（4 个 Pod × 40 = 160）正好压在这条线上，那时响是对的：余量确实没有了。
+        - alert: MySQLConnectionsHigh
+          expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            component: mysql
+          annotations:
+            summary: "MySQL {{ $labels.instance }} 的连接数用了 {{ $value | humanizePercentage }}（上限 max_connections）"
+            description: "连接数超过 max_connections 的 80%，再涨会拿不到连接，写入报 Too many connections。出处：round-6 4.3。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-connections.md
+
+        # 备份的 CronJob 上次成功距今超过 26 小时（每天一次，留 2 小时余量）。
+        # 两种情况：成功过但太久了；从来没成功过（kube_cronjob_status_last_successful_time 没有序列，用创建时间代替）。
+        # 暂停的 CronJob（suspend = 1）不报。
+        - alert: MySQLBackupStale
+          expr: |
+            (
+              time() - kube_cronjob_status_last_successful_time{namespace="mysql",cronjob=~".*-backup"} > 26 * 3600
+              unless on (namespace, cronjob) kube_cronjob_spec_suspend == 1
+            )
+            or
+            (
+              time() - kube_cronjob_created{namespace="mysql",cronjob=~".*-backup"} > 26 * 3600
+              unless on (namespace, cronjob) kube_cronjob_status_last_successful_time
+              unless on (namespace, cronjob) kube_cronjob_spec_suspend == 1
+            )
+          for: 10m
+          labels:
+            severity: warning
+            component: mysql
+          annotations:
+            summary: "MySQL 备份 {{ $labels.cronjob }} 上次成功是 {{ $value | humanizeDuration }} 前（或从未成功）"
+            description: "备份的 CronJob 超过 26 小时没有成功。备份是丢数据之后唯一的退路，没有它主库和从库一起坏就没法恢复。出处：设计 4.4。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/mysql-backup.md
+
+    - name: middleware.redis
+      interval: 30s
+      rules:
+        # Redis 的数据节点（缓存集群、闸门的主从）exporter 连不上它。同样看 redis_up 不看 up。出处：3a 第 5 步。
+        # 不含 Sentinel（2026-11-23 改）：exporter 的目标里 Sentinel 和数据节点长得一样，原来不分，少两个 Sentinel 就发两条
+        # “Redis 连不上”的 critical（告警质量检查第 10 项）。Sentinel 不在的后果是“主库坏了切不了”，数据面不受影响，
+        # 归 RedisSentinelDown（warning，少一个就报）和 RedisSentinelBelowQuorum 管。
+        - alert: RedisDown
+          expr: redis_up{instance!~"redis-gate-sentinel-.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: redis
+          annotations:
+            summary: "Redis {{ $labels.instance }}（{{ $labels.cluster }}）连不上（redis_up = {{ $value }}）"
+            description: "exporter 连不上这个 Redis 实例（exporter 还活着，up 是 1）。缓存实例掉了会走降级；闸门实例掉了会触发 Sentinel 的切换，下单入口的限流和库存预扣受影响。出处：3a 第 5 步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-down.md
+
+        # 闸门 Redis（cluster="redis-gate"）内存超过 maxmemory 的 70%。
+        # 上限用 redis_memory_max_bytes（现在是 768 MiB）。策略是 noeviction，到 85% 是停止受理的水位（ADR-0033、ADR-0034），
+        # 所以 70% 是提前量，80%（下一条）是还有一点时间处理。出处：round-9 2.2。
+        - alert: RedisGateMemoryHigh
+          expr: |
+            redis_memory_used_bytes{cluster="redis-gate"} / redis_memory_max_bytes{cluster="redis-gate"} > 0.7
+          for: 5m
+          labels:
+            severity: warning
+            component: redis
+          annotations:
+            summary: "闸门 Redis {{ $labels.instance }} 内存用了 maxmemory 的 {{ $value | humanizePercentage }}"
+            description: "闸门 Redis 的策略是 noeviction，满了不会淘汰数据而是拒绝写入；85% 是停止受理新订单的水位。持续上涨说明闸门里的数据没有被及时清理。出处：round-9 2.2、ADR-0033、ADR-0034。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-gate-memory.md
+
+        - alert: RedisGateMemoryCritical
+          expr: |
+            redis_memory_used_bytes{cluster="redis-gate"} / redis_memory_max_bytes{cluster="redis-gate"} > 0.8
+          for: 2m
+          labels:
+            severity: critical
+            component: redis
+          annotations:
+            summary: "闸门 Redis {{ $labels.instance }} 内存用了 maxmemory 的 {{ $value | humanizePercentage }}，离 85% 停止受理的水位很近"
+            description: "闸门到 85% 会停止受理新订单（用户直接受影响），noeviction 下满了写入失败。现在就要看是谁在占内存。出处：round-9 2.2、ADR-0033、ADR-0034。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-gate-memory.md
+
+        # 从库和主库的链路断了。3a 里 redis-cache-5 断了 3 小时没人发现。
+        - alert: RedisReplicaLinkDown
+          expr: redis_master_link_up == 0
+          for: 2m
+          labels:
+            severity: warning
+            component: redis
+          annotations:
+            summary: "Redis 从库 {{ $labels.instance }}（{{ $labels.cluster }}）和主库的链路断了（{{ $value }}）"
+            description: "从库不再同步主库。主库这时坏了，从库接手拿到的是旧数据，或者没有可用的副本。出处：3a（redis-cache-5 断了 3 小时那次）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-replication.md
+
+        # 缓存 Redis 集群状态不是 ok，或者有槽位不是 ok（16384 个槽全部 ok 才是正常；fail、pfail、未分配都会让 ok 变少）。
+        - alert: RedisClusterUnhealthy
+          expr: |
+            redis_cluster_state == 0
+            or
+            redis_cluster_slots_ok < 16384
+          for: 2m
+          labels:
+            severity: critical
+            component: redis
+          annotations:
+            summary: "缓存 Redis 集群 {{ $labels.cluster }} 不正常（{{ $labels.instance }} 上的值是 {{ $value }}：cluster_state 为 0，或 ok 的槽位不足 16384）"
+            description: "集群状态不是 ok，或者有槽位处于 fail、pfail、未分配。落在这些槽位上的缓存读写会失败，业务走降级（回源数据库）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-cluster.md
+
+        # Sentinel 能看到的（正常）Sentinel 数少于配置的法定数（redis_sentinel_master_setting_ckquorum，现在是 2）。
+        # 少于法定数就选不出新主，故障切换不会发生。两个指标的 instance、master_name 能对上，用 on() 比较。
+        - alert: RedisSentinelBelowQuorum
+          expr: |
+            redis_sentinel_master_ok_sentinels
+              < on (instance, master_name)
+            redis_sentinel_master_setting_ckquorum
+          for: 2m
+          labels:
+            severity: warning
+            component: redis
+          annotations:
+            summary: "{{ $labels.instance }} 只看到 {{ $value }} 个正常的 Sentinel，少于法定数"
+            description: "能看到的 Sentinel 少于法定数，主库坏了的时候选不出新主，闸门 Redis 不会自动切换。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-sentinel.md
+
+        # 某个 Sentinel 连不上。RedisDown 从 2026-11-23 起不看 Sentinel，少一个 Sentinel 要有地方报：
+        # 3 个掉到 2 个时上一条不响（2 等于法定数），但已经没有余量，再掉一个就切不了；
+        # 三个全不在时上一条也不响（没有还活着的 Sentinel 来报自己看到几个同伴），这条三个实例各响一条、合成一条通知。
+        # warning：数据面不受影响。for 5 分钟：Sentinel 的 Pod 重启一次不报。
+        - alert: RedisSentinelDown
+          expr: redis_up{instance=~"redis-gate-sentinel-.*"} == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: redis
+          annotations:
+            summary: "闸门 Redis 的 Sentinel {{ $labels.instance }} 连不上"
+            description: "少了一个 Sentinel。现在的主从不受影响，下单照常；但 3 个里只剩 2 个时已经没有余量，再少一个就不够法定数，主库坏了不会自动切换。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/redis-sentinel.md
+
+    - name: middleware.kafka
+      interval: 30s
+      rules:
+        # 有分区的副本不足（ISR 少于副本数）。Kafka Exporter 的 kafka_topic_partition_under_replicated_partition 是 0/1。
+        - alert: KafkaUnderReplicatedPartitions
+          expr: sum by (topic) (kafka_topic_partition_under_replicated_partition) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Kafka topic {{ $labels.topic }} 有 {{ $value }} 个分区副本不足"
+            description: "副本没有跟上 leader。这时再掉一个 broker，这个 topic 可能写入失败或丢消息（min.insync.replicas）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-partitions.md
+
+        # 有分区没有 leader（离线分区）。用控制器的 OfflinePartitionsCount：只有当前的活动控制器报非 0，
+        # 所以取 max。比 Exporter 的 leader 标签可靠（没有 leader 时那个指标的值没有确切的约定）。
+        - alert: KafkaPartitionsOffline
+          expr: max(kafka_controller_kafkacontroller_offlinepartitionscount) > 0
+          for: 2m
+          labels:
+            severity: critical
+            component: kafka
+          annotations:
+            summary: "Kafka 有 {{ $value }} 个分区没有 leader"
+            description: "没有 leader 的分区不能读写：生产者发不出去（outbox 积压），消费者停住。出处：设计 4.4。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-partitions.md
+
+        # broker 少于 3 个（kafka_brokers 是 Exporter 看到的 broker 数）。Exporter 连不上 Kafka 时这个序列可能直接没有，
+        # 所以另用 absent 补上。
+        - alert: KafkaBrokerMissing
+          expr: |
+            kafka_brokers < 3
+            or
+            absent(kafka_brokers)
+          for: 2m
+          # 条件不成立之后再多响 5 分钟：它压着 KafkaUnderReplicatedPartitions，源要后走。2026-11-23 停一个 broker 量过：
+          # 平时副本 30 秒就追上，比 broker 数的更新还早，不会漏；但追上要多久跟停的时候欠了多少数据走，
+          # 过载或者停得久时会比 broker 数晚（设计文档 3c 第 8 节“第 18 项”）。代价是恢复的通知晚 5 分钟。
+          keep_firing_for: 5m
+          labels:
+            severity: critical
+            component: kafka
+          annotations:
+            summary: "Kafka 的 broker 少于 3 个（现在 {{ $value }}，absent 时为 1 表示指标没有了）"
+            description: "三个 broker 才有三副本；少一个就没有余量，再掉一个就写不进（min.insync.replicas）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-brokers.md
+
+        # Strimzi 的 operator 调和 Kafka 资源一直不成功。出处：3b round-8 记录 6.3 节（宿主机重启后 operator 从启动起每次调和都失败，
+        # broker 一直正常，两天没人发现；这期间改 Kafka 的配置不生效，证书到期也不会续）。
+        # 计划里写的是“Kafka 资源的 Ready 条件”，那要给 kube-state-metrics 配自定义资源的状态；这里直接看 operator 自己的调和计数
+        # （抓取对象在 kafka-podmonitor.yaml），量的就是出过事的那件事。operator 每 2 分钟定时调和一次。
+        # 两半：成功的计数 20 分钟没有涨；或者 operator 看得到 Kafka 资源而成功的计数根本不存在
+        # （round-8 就是这种：重启之后一次都没成功过，计数器从未出现，increase() 没有结果）。
+        # 滚动三个 broker 的一次调和要几分钟，窗口 20 分钟加 for 10 分钟留出了余量。
+        - alert: KafkaOperatorNotReconciling
+          expr: |
+            sum by (namespace) (increase(strimzi_reconciliations_successful_total{kind="Kafka"}[20m])) < 1
+            or
+            (
+              sum by (namespace) (strimzi_resources{kind="Kafka"}) > 0
+              unless
+              sum by (namespace) (strimzi_reconciliations_successful_total{kind="Kafka"})
+            )
+          for: 10m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Strimzi 的 operator 已经 30 分钟没有成功调和过 Kafka 资源"
+            description: "broker 不受影响、照常收发；但 Kafka 资源的改动（配置、保留期、扩容）不会生效，证书到期不会续，broker 掉了之后的恢复可能不完整。出处：3b round-8 记录 6.3 节。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-operator.md
+
+        # operator 的指标没有了（Pod 不在、抓不到）。上一条靠这些指标，没有了它就不响，所以单独写（设计 1.3）。
+        - alert: KafkaOperatorMetricsMissing
+          expr: absent(strimzi_resources{kind="Kafka"})
+          for: 10m
+          labels:
+            severity: warning
+            component: kafka
+          annotations:
+            summary: "Strimzi operator 的指标没有了"
+            description: "operator 不在或者抓不到。broker 不受影响；但这期间 KafkaOperatorNotReconciling 不会响，Kafka 资源的改动不生效。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/kafka-operator.md
+
+    - name: middleware.otel
+      interval: 30s
+      rules:
+        # Collector 的 gateway 不在了（没有一个就绪的抓取目标）。六个服务、探针、对账的指标都经它写进 Prometheus（ADR-0030），
+        # 它不在时这些序列一起消失，按阈值写的业务规则和 SLO 全部不响（设计 1.3 第 2 条）：这是“监控瞎了”，所以是 critical。
+        # for 比各条“没有数据”（5 到 10 分钟）短：它先响，Alertmanager 里用它抑制那几条（alertmanager.yaml）。
+        # 抑制的源要“先来、后走”：先来靠 for 短，后走靠 keep_firing_for。
+        - alert: OtelGatewayDown
+          expr: absent(up{job="monitoring/otel-gateway-agent"} == 1)
+          for: 2m
+          # 条件不成立之后再多响 5 分钟。gateway 一回来这条立刻就不成立了，而被它压着的“没有数据”要等指标重新攒够一个窗口
+          # 才恢复（慢 1 到 4 分钟）；源先走，那几条就漏出去（2026-11-23 的故障注入里漏了两条，设计第 8 节“第 8 步”第 11 项）。
+          keep_firing_for: 5m
+          labels:
+            severity: critical
+            component: otel
+          annotations:
+            summary: "OpenTelemetry Collector 的 gateway 不在了，服务的指标进不来"
+            description: "六个服务、探针、对账的指标、日志和链路都经它转发。它不在时业务告警和 SLO 的燃烧率没有数据、不会响；服务本身不受影响（导出失败只丢遥测）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
+
+        # Collector 拒收：receiver 的 refused_* 有增长（spans、metric_points、log_records 三种取最大）。
+        # 拒收一般是内存限制器（memory_limiter）在起作用，被拒的数据客户端会重试或丢弃。出处：3a 的 3.3。
+        # 窗口 10m、for 2m。注意 Collector 是推送模式，指标推不上来时服务一侧没有 up（ADR-0030）。
+        - alert: OtelCollectorRefusing
+          expr: |
+            max by (job, receiver, signal) (
+                label_replace(increase(otelcol_receiver_refused_spans[10m]), "signal", "spans", "", "")
+              or label_replace(increase(otelcol_receiver_refused_metric_points[10m]), "signal", "metric_points", "", "")
+              or label_replace(increase(otelcol_receiver_refused_log_records[10m]), "signal", "log_records", "", "")
+            ) > 0
+            or
+            max by (job, receiver, signal) (
+                label_replace((otelcol_receiver_refused_spans > 0 unless otelcol_receiver_refused_spans offset 10m), "signal", "spans", "", "")
+              or label_replace((otelcol_receiver_refused_metric_points > 0 unless otelcol_receiver_refused_metric_points offset 10m), "signal", "metric_points", "", "")
+              or label_replace((otelcol_receiver_refused_log_records > 0 unless otelcol_receiver_refused_log_records offset 10m), "signal", "log_records", "", "")
+            )
+          for: 2m
+          labels:
+            severity: warning
+            component: otel
+          annotations:
+            summary: "Collector（{{ $labels.job }}）的 {{ $labels.receiver }} receiver 在拒收 {{ $labels.signal }}，10 分钟内 {{ $value }} 条"
+            description: "Collector 拒绝了收到的链路、指标或日志，通常是内存限制器在起作用。被拒的数据可能丢失：服务的指标是推上来的，丢了就是大盘和 SLO 的缺口。出处：3a 的 3.3。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
+
+        # Collector 导出失败：exporter 的 send_failed_* 有增长。目前已经观察到 send_failed_spans 的累计值在涨过（导出到 Tempo）。
+        - alert: OtelCollectorExportFailing
+          expr: |
+            max by (job, exporter, signal) (
+                label_replace(increase(otelcol_exporter_send_failed_spans[10m]), "signal", "spans", "", "")
+              or label_replace(increase(otelcol_exporter_send_failed_metric_points[10m]), "signal", "metric_points", "", "")
+              or label_replace(increase(otelcol_exporter_send_failed_log_records[10m]), "signal", "log_records", "", "")
+            ) > 0
+            or
+            max by (job, exporter, signal) (
+                label_replace((otelcol_exporter_send_failed_spans > 0 unless otelcol_exporter_send_failed_spans offset 10m), "signal", "spans", "", "")
+              or label_replace((otelcol_exporter_send_failed_metric_points > 0 unless otelcol_exporter_send_failed_metric_points offset 10m), "signal", "metric_points", "", "")
+              or label_replace((otelcol_exporter_send_failed_log_records > 0 unless otelcol_exporter_send_failed_log_records offset 10m), "signal", "log_records", "", "")
+            )
+          for: 2m
+          labels:
+            severity: warning
+            component: otel
+          annotations:
+            summary: "Collector（{{ $labels.job }}）导出 {{ $labels.signal }} 到 {{ $labels.exporter }} 失败，10 分钟内 {{ $value }} 条"
+            description: "Collector 往后端（Tempo、Prometheus、Loki）发数据失败，数据在队列里积压或被丢弃。出处：3a 的 3.3。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
+
+        # 导出队列快满了：exporter 的队列占用超过八成，持续 5 分钟。
+        # 补的是上一条盖不住的情形：agent 的导出器一直重试（retry_on_failure.max_elapsed_time: 0）、队列满了就堵住上游
+        #（block_on_overflow），所以 send_failed_* 永远不涨，“agent 发不到 gateway”时上一条不响（设计第 8 节“第 16 项”）。
+        # 平时队列是 0 到 2；agent 的容量只有 20，gateway 的是 1000，所以按比例写。
+        # gateway 整个不在时 agent 的队列必然堵满，由 OtelGatewayDown 抑制（alertmanager.yaml）。
+        - alert: OtelCollectorExportQueueFull
+          expr: |
+            max by (job, pod, exporter, data_type) (
+              otelcol_exporter_queue_size / otelcol_exporter_queue_capacity
+            ) > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            component: otel
+          annotations:
+            summary: "Collector（{{ $labels.pod }}）导出 {{ $labels.data_type }} 到 {{ $labels.exporter }} 的队列占了 {{ $value | humanizePercentage }}"
+            description: "导出的速度跟不上进来的速度，或者下一跳收不了。agent 上队列满了会堵住读日志（不丢，但日志到得晚、agent 的内存涨）；gateway 上队列满了之后新的数据被丢。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md

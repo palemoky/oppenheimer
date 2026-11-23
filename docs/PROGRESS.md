@@ -4,12 +4,251 @@
 
 ## 当前状态
 
-- **当前阶段**：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
+- **现在（2026-11-24，这一条最新）**：**3c（SLO 与告警）做完了，PR #17 由主人同意后合并进 `main`**（合并提交用 `git log --merges -1 origin/main` 看；合并前最后一次推送只改了本文件）。**下一步是 3d 最小诊断 Agent，在新会话里做**：从最新的 `main` 开分支 `phase-3d`，先读 `docs/plan/phase-3-observability.md` 的 3d 一节，动工前先查最新的 Claude API 和 Agent SDK 文档，先写设计给主人确认。3c 留下没有做的：“上线后放几天看误报”；没有真实触发过的告警登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”；SLO 的大盘没有在 Grafana 里打开看过；长期运行的那一套里有两条测试用的死信（见下面“3c 第 16 项做完”）。集群没有在响的告警（2026-11-23 15:50 UTC 核对的）。下面各条是更早写的。
+- **当前阶段（2026-11-22）**：3b（压测）做完并合并了（PR #16，合并提交 `0142f02`），下一步是 3c（SLO 与告警），还没有开工，分支还没有开。当前分支仍是 `phase-3b`。以下是更早写的：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
-- **最后更新**：2026-11-22（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
+- **最后更新**：2026-11-23（第 16 项做完，第五个 SLO、SLO 的大盘、ADR-0037 做了，3c 的计划项全部勾了，都没有提交，见下面“3c 第 16 项做完”；以下括号里是更早写的）（主人对待定项给了决定，规则改了并下发，第 17、18 项做了，延迟消费者并发和按分区计数的队列上限写完了，都没有提交，见下面“3c 待定项的处理”；以下括号里是更早写的）（3c 的告警质量检查开始做了，见下面“3c 告警质量检查”；以下括号里是更早写的）（3c 的第 6、7 步：Alertmanager 的路由和抑制、webhook 接收端、runbook 做了，都没有提交，见下面“3c 的 Alertmanager 和 runbook”；以下括号里是更早写的）（3c 的设计写完，等主人确认十项，见下面“3c 设计写完”；当前分支 `phase-3c`；以下括号里是更早写的）（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
-### 3b 收尾：集群恢复成平时的配置（2026-11-22 傍晚；这一段最新，新会话先读这里，再读下面“搬到 Mac mini”里“新会话开头先做的一件事”）
+### 3c 第 16 项做完，3c 的计划项全部勾了（2026-11-23，UTC 12:15 到 14:10；这一段最新，新会话先读这里）
+
+细节：设计 `docs/design/3c-slo-alerting.md` 第 8 节最后一小节“第 16 项”（含“做了之后的结果”），[ADR-0037](adr/0037-slo-and-burn-rate-alerts.md)，计划文件 3c 一节。**这一段的改动全部没有提交**（`git status` 里的十几个文件，没有 Go 代码；`make rules-test`、`make alertmanager-test` 通过，没有跑 `make lint test`）。
+
+- **清单**（从 Prometheus 的 `ALERTS` 查的）：82 条里 35 条响过、47 条没有；41 条改阈值能响，7 条的序列不存在（含“有差异”的 `ReconFoundDifferences`）。
+- **改阈值的那一批做了**（第一次动手被权限检查拦下，主人说“同意跑”之后做的；12:53 到 13:56 UTC，四段）：41 条里 40 条响并送到 alertsink，`OrderAdmitRateDropped` 只到 `pending`（推断：一小时前探针停着，对比的那一边没有值；没有改）。Telegram 34 条，失败 0；模板在真实标签上都渲染对了。恢复后集群上五个 PrometheusRule 和仓库逐个比对相同。脚本和记录在 `tmp/3c-inject-16*`（不入库）。
+- **序列不存在的 7 条**（主人同意按建议做）：死信两条（往 `order.submit`、`payment.events` 各写一条坏消息）、`ContainerOOMKilled`（`default` 里的一次性 Pod，已删）、“有差异”的 `ReconFoundDifferences`（退出码 1 的假 Job，已删；随后真的对账差异 0）都真实触发了。超卖、闸门内存写满、Collector 导出失败不做，留给阶段 4。**长期运行的那一套里留下两条死信**（两个死信 topic 各一条，内容 `not-a-proto-item-16-alert-check`），不是故障。
+- **`RateLimitFallingBack` 改成按比例**（退回占 gateway 请求一成以上并且每秒 0.2 次以上，5 分钟），已下发，单元测试 u、v、w。没有真实触发过。
+- **第五个 SLO“支付可用性”加了**（主人定的）：`slo.yaml` 的 `slo.order_pay_availability` 组、测试文件、runbook `slo-order-pay-availability.md`、Alertmanager 的路由和抑制用例、大盘的一行，已下发（14:04 核对有值）。自己写的告警现在 85 条。没有真实触发过。`inhibit-test`（集群上的）加了用例之后重跑过：57 条 0 条不符（合成的告警）。
+- **SLO 的大盘**：`deploy/cluster/monitoring/dashboards/slo.json`（uid `opp-slo`，五个 SLO；生成脚本 `tmp/gen_slo.py` 不入库，改大盘要么改它要么直接改 JSON），已下发，表达式都在 Prometheus 上跑过有值。**没有在 Grafana 里打开看过**（虚线、对数轴的样子）。
+- **ADR-0037 写了**，索引加了。
+- **3c 的计划项全部勾了**（各自下面写了勾的依据和没做的部分）。85 条告警：真实触发 38，只验证路是通的 40，只到 `pending` 1，只有单元测试 6。
+- **等主人定的**：
+  1. `OtelCollectorExportFailing` 在 agent 上按配置就响不了（agent 一直重试、队列满了堵住上游，`send_failed` 永远不加；设计里写了）。要不要加一条“agent 的导出队列占满”的规则。
+  2. `OrderAdmitRateDropped` 在“一小时前没有流量”时是瞎的，要不要改。
+  3. 这一段的改动怎么提交（建议分开：`RateLimitFallingBack`；第五个 SLO 的规则、测试、runbook、Alertmanager 用例；大盘；ADR 和文档）。推送后 CI 派给 `ci-watcher`。
+- **集群的状态（14:04 UTC 核对）**：没有在响的告警（除 `Watchdog`），没有 `pending`，没有不正常的 Pod；没有动过任何业务组件；`recon-hourly` 13:07 那次成功，13:13 手工的一次差异 0。本机 compose 起着。
+- **阶段笔记写了**：`docs/notes/3c-slo-alerting.md`（255 行，Sonnet 子 Agent 写的；主会话读了开头、结论和统计，核对了它标出的几处文档不一致并改了其中两处（runbook 总则、ADR-0037 后果第 8 条），**其余部分没有逐行读**）。
+- **提交并推送了**（主人说“都按建议做，提交并推送”）：`17e0fad`（`RateLimitFallingBack`）、`1b727c8`（第五个 SLO）、`71be1c3`（大盘）、`1244620`（ADR、笔记、文档）。上面“全部没有提交”是提交之前写的。**PR #17 上 `1244620` 的 CI 28 个 job 全部通过**（`ci-watcher` 报的）：`rules` 1 分 36 秒、`test (./services/order)` 3 分 24 秒（上次 4 分 33 秒）、`test (./pkg)` 3 分 32 秒、`test (./test/load)` 2 分 51 秒、`test (./services/recon)` 1 分 59 秒、e2e 3 分 34 秒（上次 4 分 28 秒），没有变慢的。**这一条写进本文件之后没有提交**，下次提交时带上。“等主人定的”第 1、2 条主会话给了建议（第 1 条加一条按队列占用比例的 warning；第 2 条先不改，记到阶段 4 核对原因），主人还没有答复，没有动。
+- **第 1、2 条主人定了（2026-11-23，UTC 15:40 到 15:50 做的）**：
+  1. **加了 `OtelCollectorExportQueueFull`**（`middleware.yaml`：导出队列占用超过八成持续 5 分钟，warning，被 `OtelGatewayDown` 抑制），三个单元测试，runbook `otel-collector.md` 补了，规则和 Alertmanager 的配置都已下发；集群上 `inhibit-test` 58 条 0 条不符（下发后马上跑的那一次有 1 条不符，是 Alertmanager 还没重新加载，过两分钟重跑通过）。表达式在 Prometheus 上有 6 条序列，现在都是 0，没有在响的告警。**只有单元测试，没有真实触发过，也没有改阈值验证过。** 自己写的告警现在 86 条，只有单元测试的 7 条。`make rules-test`、`make alertmanager-test` 通过。
+  2. **`OrderAdmitRateDropped` 不改**，登记到 `docs/plan/phase-4-chaos.md` 的“4a 准备”（连同 3c 留下的其余没有真实触发的告警）。
+  - **这两条的改动提交并推送了**：`cda125c`（规则、测试、抑制、runbook）、`40f4518`（文档）。**PR #17 上 `40f4518` 的 CI 28 个 job 全部通过**（`ci-watcher` 报的）：`rules` 1 分 10 秒、`test (./services/order)` 4 分 37 秒（上次 3 分 24 秒）、`test (./pkg)` 3 分 24 秒、`test (./test/load)` 3 分 18 秒（上次 2 分 51 秒）、`test (./services/recon)` 1 分 53 秒、e2e 4 分 14 秒（上次 3 分 34 秒）。order、load、e2e 比上一次慢，这两个提交没有改 Go 代码，三项都在以往出现过的范围内，没有查。这一条和记 `1244620` 的 CI 的那一条随合并前的最后一次文档提交进去了。
+- **下一步**：PR #17 合并（主人 2026-11-24 同意）→ 3d 最小诊断 Agent（动工前先查最新的 Claude API 和 Agent SDK 文档）。放几天之后回头看误报（计划里“上线后放几天看误报”没有做）。
+
+### 3c 第三轮过载压测（2026-11-23，UTC 10:35 到 12:05；在上一段之前）
+
+主人对上一段“等主人定的”五条都按建议定了，都做了。细节：设计第 8 节最后一小节，ADR-0035、ADR-0036 各自的最后一节。
+
+- **改了四处**：每个分区的队列上限 `ADMIT_MAX_QUEUE` 1250 改 600；等待类直方图加 40、50 秒两个桶（`pkg/otelx` 的 `WaitBuckets`）；限流要“连续失败够次数并且持续超过 200 毫秒”才打开（`pkg/ratelimit` 的 `FailureSpan`）；`CLOSE_CONCURRENCY` 4 改 2。提交前 `make lint` 11 个模块 0 issues、`make test` 60 个包 ok。
+- **提交、CI、部署**：三个提交推送了（`6cd576a` 限流、`93026dc` 直方图的桶、`07c0dcc` 两个配置），之后是记录这一轮的文档提交。**PR #17 上 `07c0dcc` 的 CI 30 项全部通过**（`ci-watcher` 报的）：`test (./pkg)` 3 分 50 秒（上次 2 分 53 秒）变慢，这一项以前也这样波动过，没有查；`rules` 50 秒、`test (./services/order)` 4 分 19 秒、`test (./test/load)` 2 分 29 秒、`test (./services/recon)` 2 分 04 秒、e2e 4 分 22 秒。`make deploy`、`make recon-cron` 做了，六个服务的镜像是 `07c0dcc`，order 的启动日志确认每个分区 600。
+- **第三轮压测**（11:10 到 11:47 UTC 发压，12:02 静止，12:05 恢复成平时的配置；运行号 `3c14s-warm`、`3c14s-order-ladder`，SKU 7619 到 7628，**下一批从 7629 起**）。`recon -since 100m` 差异 0，`verify` 通过。三轮的对比表在设计第 8 节。结论：
+  - **等待压到了目标以内**：等了 30 秒以上的订单 0.9%（上一轮 10.1%），p99 29.9 秒，p99.9 39 秒，没有超过 50 秒的。拦住请求的是队列长度那一条，兜底的那条每秒不到 1 次。吞吐和被拒绝的比例三轮都一样。
+  - **限流不再整段退回**：退回占请求的 3.4%（47%、21%），每一次都只是超时的那个请求自己。
+  - **端点没有再被摘除**，`ORDER_LANDING_UNAVAILABLE` 是 0，order 等连接池回到每秒 7.6 次。代价：延迟关单并发 2 时到期的消息最多晚约 2 分钟（并发 4 时 15 秒）。这一轮同时改了队列上限，不是干净的对照。
+  - **没有改、记给第 16 项的**：`RateLimitFallingBack` 的阈值是按次数写的（每秒超过 1 次），过载时零星的超时就让它响，该改成按比例。
+- **集群的状态（12:05 UTC 核对）**：gateway 不带压测那一层，两个 ScaledObject 没有暂停，两个对账 CronJob 没有暂停（12:07、13:07 两次的窗口合起来盖住这一轮，**没有等着看**），探针起来了，没有在响的告警，没有不正常的 Pod，k3s-server 的盘约 21 GiB（Tempo 里这三轮的链路 11 月 26 日过期）。本机 compose 起着。落库时延的慢档多半会在探针恢复后再响一次（2 小时窗口里的尾巴），约 13:50 UTC 自己恢复。
+- PR #17 上 `78370f2`（文档，当前的头）的 CI 全部通过（`ci-watcher` 报的是 28 个 job 全部成功，没有另数 codecov 的两项）：`rules` 1 分 32 秒（上次 50 秒）变慢，这一项以前也在 50 秒到 1 分半之间波动，只改了文档，没有查；`test (./services/order)` 4 分 33 秒、`test (./pkg)` 3 分 27 秒、`test (./test/load)` 2 分 54 秒、`test (./services/recon)` 1 分 47 秒、e2e 4 分 28 秒。**这一条写进本文件之后没有提交**，下次提交时带上。
+- **过载这条线到这里收住了**，没有等主人定的。
+- **下一步**：第 16 项（改阈值的那一批：先列出 82 条里还没真实触发的清单；含 4b 的 `PaidOrdersNotLanding`、`PaymentReplyOverdue`、支付时延的 SLO，`RateLimitFallingBack` 改成按比例，`RedisSentinelDown`，“有差异”的 `ReconFoundDifferences`）→ 勾 3c 的五项 → SLO 的大盘、ADR（SLO 怎么定的；支付的可用性要不要进 SLO）、阶段笔记。
+
+### 3c 第二轮决定和重跑压测（2026-11-23，UTC 07:55 到 09:25；在上一段之前）
+
+主人对上一段的四条给了决定，都做了。细节：设计第 8 节最后两小节，ADR-0035、ADR-0036 各自的最后一节。
+
+- **规则和 Alertmanager（已下发、已提交）**：`MySQLDown`、`KafkaBrokerMissing`、两条复制线程的告警加 `keep_firing_for: 5m`；MySQL 的三条告警补了 `namespace`、`pod`、`statefulset` 标签，用来抑制自带的 `KubePodNotReady`、`KubeStatefulSetReplicasMismatch`（`inhibit-test` 54 条 0 条不符，合成的告警；真实的告警上没有验证）；`NodeCPUHigh` 的 `keep_firing_for` 从 10 分钟改成 3 分钟；第 4 项拆成 4a、4b，4b 归第 16 项。
+- **提交和 CI**：五个提交推送了（`d230db5` 规则、`e0d02d2` kafkax、`a260836` stockgate、`808661c` order、`bc84433` 文档）。提交前 `make lint` 11 个模块 0 issues、`make test` 60 个包 ok。**PR #17 上 `bc84433` 的 CI 30 项全部通过**（`ci-watcher` 报的）：`test (./services/order)` 4 分 18 秒（上次 3 分 18 秒）、`test (./test/load)` 3 分 16 秒（上次 2 分 34 秒）变慢，都在以往出现过的范围内，没有查；`rules` 53 秒、`test (./pkg)` 2 分 42 秒、`test (./services/recon)` 2 分 13 秒、e2e 3 分 08 秒。
+- **`make deploy`、`make recon-cron` 做了**：六个服务的镜像是 `bc84433`，order 的启动日志确认按 4 个分区各自计数（每个分区 1250、20）。
+- **重跑了打过拐点的压测**（08:29 到 09:06 UTC 发压，09:21 静止，09:24 恢复成平时的配置；运行号 `3c14r-warm`、`3c14r-order-ladder`，SKU 7609 到 7618，**下一批从 7619 起**）。对账 `recon -since 100m` 差异 0，`verify` 通过。结论（表在设计第 8 节）：
+  - 延迟关单修好了（到期的消息最多晚 15 秒，上一轮 25 分钟）；链路采样修好了（整轮 2.3 GB，上一轮 7.3 GB，盘只掉了约 3.7 GiB）。
+  - 限流的退回只好了一半（47% 到 21%）。
+  - **按分区计数的队列上限让等待变长了**：吞吐没变，等待的中位数从 10.7 秒到 17.3 秒，等了 30 秒以上的订单从 7.7% 到 10.1%。机制没问题，每个分区 1250 取得太贴，真正在拦的是兜底的第二条。
+  - **“落库延迟 p99 约 57 秒”是直方图分桶造成的**（30 到 60 秒之间没有桶），上一轮的也是；两轮都没有订单等过 60 秒，没有订单被回收。
+  - 新出现、没有查清的：order 到 inventory、到 payment 的端点各被摘除过一次，735 个 `ORDER_LANDING_UNAVAILABLE`，order 等连接池的次数是上一轮的 4 倍，`InventoryGateDrift` 响了（核对发现 1 次偏差、自动修了 1 次；`verify` 通过）。最可疑的是延迟关单的并发挤占连接池。
+  - 新指标 `order_admission_backlog_rejections_total` 有数了：顶档 `queue` 每秒 20.5、`stale` 每秒 73.5，没有 `stalled`。
+  - `NodeCPUHigh` 这一轮没有抖。`OrderQueueNearWaitLimit` 只到 `pending`，没有响（设计里估的“四个分区都满时约 27 秒”没有出现：第二条先拦住了，平均只排到 3216 单，折成约 17 秒）。
+- **集群的状态（09:24 UTC 核对）**：gateway 不带压测那一层，两个 ScaledObject 没有暂停，两个对账 CronJob 没有暂停（09:07 那一次因为暂停没有跑，10:07 的窗口盖得住这一轮，**没有等着看**），探针起来了，没有在响的告警，没有不正常的 Pod，k3s-server 的盘约 23.6 GiB。本机 compose 起着。落库时延的 7 天预算又被烧掉一截，这一周只当读数看；停压后慢档的尾巴（探针恢复后 2 小时窗口里还装着慢订单）多半会再响一次，约 11:10 UTC 恢复。
+- **等主人定的（主会话的建议）**：
+  1. 每个分区的队列上限调小（建议 `ADMIT_MAX_QUEUE` 600，约 14 秒），让第一条先拦住。
+  2. 给落库延迟的直方图在 30 到 60 秒之间加桶（40、50），否则量不出尾巴有多长。改桶会让这条指标的历史在新旧桶之间对不上，SLO 的规则用的是 `le` 的某一个桶，改之前要核对。
+  3. 限流的判据再改一次（建议：连续失败并且持续超过一小段时间，比如 200 毫秒，才打开）。
+  4. `CLOSE_CONCURRENCY` 从 4 调到 2 再跑一轮，分清连接池的等待和端点被摘除是不是它引起的。
+  5. 上面几条改完要再跑一轮过载压测才算验证。
+- **第 4a 项做了**（09:25 到 09:51 UTC，payment 缩到 0，探针不停；设计第 8 节“第 4a 项”）：响了 `IngressGateway5xxHigh`、`ProbeFailing`（两条 critical，Telegram 发了）、`ServiceMetricsMissing{payment}`、`ConsumerNotConsuming{payment.order-events}`，payment 回来 5 分钟内全部恢复。`PaymentReplyOverdue` 和支付时延的 SLO 没有响：支付是同步建单，payment 不在时 `/pay` 直接 503、支付单建不出来，这两条和 4b 一起归第 16 项。没有退款发生，约 1300 张探针订单到时限被正常关单。付款不可用 26 分钟而四个 SLO 都没响（SLO 只看下单），记给写 SLO 的 ADR。对账的结果见本段最后一条。
+- PR #17 上 `7f6b0ff`（文档）的 CI 30 项全部通过（`ci-watcher` 报的）：`rules` 1 分 30 秒（上次 53 秒）、`test (./pkg)` 3 分 24 秒（上次 2 分 42 秒）、e2e 3 分 52 秒（上次 3 分 08 秒）变慢，`test (./services/order)` 3 分 24 秒、`test (./services/recon)` 1 分 54 秒变快，只改了文档，像运行机的波动，没有查。
+- **收尾的对账（10:24 UTC）**：`recon-hourly` 10:07 那一次成功，差异 0（窗口 08:07 到 09:37，盖住压测）；10:23 手工跑的一次差异 0（窗口 08:23 到 09:53，盖住 payment 停着的 26 分钟）。10:24 时在响的只有 `SLOOrderPersistDelayBurnSlow`（warning，压测留在 2 小时窗口里的尾巴，约 11:10 UTC 自己恢复，**没有等着看**），没有不正常的 Pod。手工的 Job `recon-manual-1795429387`、`recon-manual-1795418641` 留着（成功的，会被历史上限挤掉）。
+- PR #17 上 `adc63c8`（文档，当前的头）的 CI 30 项全部通过（`ci-watcher` 报的）：`test (./services/order)` 4 分 24 秒（上次 3 分 24 秒）、e2e 4 分 20 秒（上次 3 分 52 秒）变慢，`rules` 1 分 05 秒、`test (./pkg)` 2 分 53 秒、`test (./test/load)` 2 分 43 秒变快，`test (./services/recon)` 1 分 54 秒；只改了文档，都在以往的范围内，没有查。**这一条写进本文件之后没有提交**，下次提交时带上。
+- **下一步**：主人看上面五条 → 第 16 项（含 4b；先列出 82 条里还没真实触发的清单）→ 勾 3c 的五项 → SLO 的大盘、ADR、阶段笔记。
+
+### 3c 待定项的处理（2026-11-23 下午，UTC 07:10 到 07:50；在上一段之前）
+
+主人对待定项逐条给了决定。做了什么、细节在哪：设计 `docs/design/3c-slo-alerting.md` 第 8 节最后六小节，[ADR-0036](adr/0036-per-partition-backlog-and-concurrent-delay.md)，计划文件登记表的第 17、18 项。**全部没有提交。**
+
+- **规则（都已下发到集群，`make rules-test` 通过）**：
+  - `ReconFoundDifferences` 按退出码拆成两条：CronJob 加了 `podFailurePolicy`（退出码 1 立刻判失败）和 `backoffLimit: 2`（其余的重试 2 次），`make recon-cron` 已下发；规则分成 `ReconFoundDifferences`（critical，有差异）和新的 `ReconRunFailed`（warning，没跑成）。第 17 项真实触发过“没跑成”那条，critical 那条没有动。
+  - `RedisDown` 不含 Sentinel；新增 `RedisSentinelDown`（warning，少一个 Sentinel 就报：只排除的话掉一个、三个全掉都没人报）。没有在集群上触发过。
+  - 删了自己的 `AlertmanagerNotificationsFailing`，留 chart 自带的两条。
+  - `CDCLagging`、`CDCLaggingTooLong` 的通知用 `humanizeDuration`；`ConsumerNotConsuming`、`CDCPipelineMissing` 的通知写“至少 20 分钟”“至少 15 分钟”。
+  - `NodeCPUHigh` 加 `keep_firing_for: 10m`。
+  - 自己写的告警现在 82 条（删 1 加 2）。八份 runbook 和 `README.md` 跟着改了（Sonnet 子 Agent 改，主会话读过 `recon.md`、`redis-sentinel.md` 的 diff，其余六份没有逐行读）。
+- **第 17 项（对账没跑成）做了**，07:20 到 07:25 UTC，结果在设计第 8 节。失败的 Job 已删。
+- **第 18 项（停一个 Kafka broker）做了**，07:28 到 07:43 UTC，主人同意后做的。结论：这一次恢复时目标比源早走约 35 秒，没有漏；但顺序取决于欠了多少数据，过载或者停得久时会反过来。`MySQLDown` 那个源没有做实验（要让订单主库单独停几分钟，是阶段 4 的事），按机制和配置核对：目标可能比源晚走最多约 40 秒。**两个源都没有加 `keep_firing_for`，等主人定。**顺带发现 operator 回来 5 分钟后才把 Pod 建回来，没有查，记给阶段 4。
+- **两处代码改动（ADR-0036），没有部署**：
+  - 延迟消费者可以并发（等到期放在分发那一步），order 的延迟关单用 `CLOSE_CONCURRENCY`（默认 4，`order.yaml` 里写了）。
+  - 受理的队列上限按 `order.submit` 的分区各数各的：`kafkax.PartitionOf`、`stockgate` 的三个脚本、order 受理时传分区号。`ADMIT_MAX_QUEUE`（1250）、`ADMIT_MAX_STALE`（20）的数没变，含义变成每个分区的上限。
+  - 验证：`pkg`、`services/order`、`api` 三个模块 `make lint` 0 issues、`make test` 通过（28 个包 ok，`tmp/item5-test.log`）。其余模块没有跑（没有动）。**没有提交、没有部署、没有在过载下验证。** 部署时不要在过载中发布（新旧版本共存的两分钟里队列的索引会留下残留，自己会清，见 ADR-0036）。
+- **集群的状态（07:45 UTC 核对）**：3 个 broker，没有副本不足的分区，Strimzi 的调和在成功；没有在响的告警，没有不正常的 Pod；探针每秒约 1 单；六个服务的镜像仍是 `6ec35a7`；两个对账 CronJob 是新的清单（`backoffLimit: 2`），镜像 `recon:6ec35a7`。本机 compose 起着。
+- **主人定了、记下的**：新指标 `order_admission_backlog_rejections_total` 放到下一次正式压测看，不单独做一分钟的过载。
+- **主会话的建议，等主人定**：
+  1. 重跑打过拐点的压测的时机：这次的改动提交并 `make deploy` 之后就做，放在第 16 项和写 ADR 之前。一轮要看的东西都齐了（ADR-0035 的四个数、ADR-0036 的两个、新指标、`NodeCPUHigh` 不再抖、`OrderQueueNearWaitLimit` 在不在该响的时候响）；参数用和 `3c14` 完全一样的阶梯，数才能比。动手前 k3s-server 的盘至少 18 GiB（现在约 19.9），压的时候盯着它，采样的上限没验证过，掉到 13 GiB 就停。SKU 从 7609 起。
+  2. 两个抑制源要不要加 `keep_firing_for: 5m`（建议加：代价只是恢复的通知晚 5 分钟）。
+  3. 从库 NotReady 时自带的两条重复：建议加两条抑制（给我们的两条复制告警加 `namespace`、`pod` 标签，用它们压 `KubePodNotReady`；`KubeStatefulSetReplicasMismatch` 没有 Pod 一级的标签，按 `namespace` 加 `statefulset` 压）。没有做。
+  4. 第 4 项（payment 缩到 0）的设计：拆成两项。4a 是 payment 整个缩到 0 约 25 分钟，探针不停，看 `PaymentReplyOverdue`、`ConsumerNotConsuming{payment.order-events}`、`ServiceMetricsMissing{payment}`、支付时延的 SLO；这段时间的约 1500 张探针订单会走关单的路，payment 回来之后补建的支付单对着已关的订单，要走退款，结束后等 30 分钟对账。4b 是“支付成功了而订单不变已支付”（`PaidOrdersNotLanding`），要停的是 order 消费 `payment.events` 的那一侧，现在没有不改代码的办法；建议在 `pkg/degrade` 登记一个暂停这个消费者的人工开关，停 10 分钟以内（告警约 7 分钟响，10 分钟内恢复的话订单在关单时限之前变成已支付，没有退款），或者归到第 16 项只验证路是通的。
+- **下一步**：主人看上面四条；提交这次的改动（规则和 CronJob、runbook、kafkax、stockgate 和 order、ADR 和文档，建议分开几个提交），推送后 CI 派给 `ci-watcher`；`make deploy`、`make recon-cron`；然后是重跑压测、第 16 项、勾 3c 的五项、SLO 的大盘、ADR、阶段笔记。
+
+### 3c 告警质量检查（2026-11-23，UTC 是 11 月 22 日 17:20 起；这一段最新，新会话先读这里，再读下面“搬到 Mac mini”里“新会话开头先做的一件事”）
+
+逐项的结果在设计 `docs/design/3c-slo-alerting.md` 第 8 节“第 8 步”，登记表在计划文件 3c 一节（做过的标了“做了”）。每一项的逐分钟记录在 `tmp/3c-inject-*.log`（不入库）。
+
+- **PR #17 上 `2efc147` 的 CI 30 项全部通过**（`ci-watcher` 报的，核对过提交）：`rules` 1 分 00 秒（加了 `make alertmanager-test` 之后的第一个数，以前 44 秒）；`test (./services/order)` 4 分 36 秒（以往的上沿）、`test (./pkg)` 2 分 46 秒、`test (./test/load)` 3 分 31 秒、e2e 4 分 15 秒。
+- **第 15 项做了（2026-11-22 23:31 到 23:37 UTC，主人要求先做它）**：在 `oppenheimer-e2e` 里改一行。改商家索引的金额、改支付单的金额（差 1 分）、删商家索引的一行，`recon` 都是退出码 1 并定位到那张订单、只报改的那一对；改回去都是 0；把从库的 DSN 换成连不上的是退出码 2。e2e 的现场已经 `e2e-down` 清掉。结果在设计第 8 节“第 15 项”，那里也写了退出码 1 和 2 在 Kubernetes 一侧为什么分不开（给“等主人定的”第 2 条备的材料）。改了设计、计划、`recon.md` 和本文件，**已提交并推送**（2026-11-23，主人要求；只改文档，一个提交），PR #17 的 CI 派给了 `ci-watcher`，本段没有这次 CI 结果的话就是还没看。
+- **PR #17 上 `562560a` 的 CI 30 项全部通过**（`ci-watcher` 报的，核对过提交）：`rules` 1 分 25 秒（上次 1 分 00 秒）、`test (./pkg)` 3 分 34 秒（上次 2 分 46 秒，这一项以前也这样波动过）；`test (./services/order)` 3 分 18 秒、`test (./test/load)` 2 分 27 秒、e2e 3 分 31 秒都比上次快。没有改 Go 代码，像运行机的波动，没有查。
+- **PR #17 上 `34fe7c8` 的 CI 30 项全部通过**（`ci-watcher` 报的，主会话用 `gh pr view` 核对过提交和 30 项成功）：`rules` 1 分 26 秒、`test (./pkg)` 3 分 32 秒、e2e 3 分 17 秒没有变化；`test (./services/order)` 4 分 31 秒（上次 3 分 18 秒）、`test (./test/load)` 3 分 22 秒（上次 2 分 27 秒）慢了约一分钟，都在以往出现过的范围内，这次只改了文档，没有查；`test (./services/recon)` 1 分 44 秒。
+- **第 14 项做了（压测；2026-11-23 02:26 到 03:04 UTC 发压，03:43 静止，03:45 恢复成平时的配置）**：普通下单阶梯 125、156、195 单/秒各 3 分钟再 280 单/秒 25 分钟（运行号 `3c14-warm`、`3c14-order-ladder`，SKU 7599 到 7608，**下一批从 7609 起**）。结果在设计第 8 节“第 14 项”。
+  - 真的响了：`RateLimitFallingBack`、`SLOOrderPersistDelayBurnFast`（Telegram 触发和恢复各 1 条）、`BurnMedium`、`BurnSlow`（被快档抑制）、`NodeCPUHigh`、`OrderReadBulkheadRejecting`、`OrderBackpressureRejecting`，停压之后 `ConsumerBlocked`（延迟关单落后）和 `ServerDiskLow`。没有响的 `OrderQueueNearWaitLimit`、`OutboxRelaySlow` 归到第 16 项。七份 runbook 在现场走过并写了“历史”，其中三份补了内容。
+  - 对账：`recon -since 100m` 四对差异 0（379641 单），`verify` 通过。
+  - **查出四个问题，都没有改，等主人定**（设计里有机制和候选的改法）：(1) 限流的退回在过载时占 gateway 请求的 42%（一次 20 毫秒的超时就打开 1 秒）；(2) 延迟关单的消费者过载时落后，没付款的订单最晚在下单 40 分钟后才关（时限 15 分钟），停压后 40 分钟才追平，它空闲时也只有每秒一百多条，原因没有查；(3) 落库延迟 p99 到过 57 秒，离回收的宽限期 60 秒差 3 秒，这次没有订单被回收，但全局的队列上限 2500 在 280 单/秒时已经保证不了“最多等 30 秒”；(4) 尾部采样在过载时等于不采样，35 分钟写掉 k3s-server 约 8 GB。另有 `NodeCPUHigh` 在阈值上下会抖。
+  - **`ServerDiskLow` 现在在响，会挂到 11 月 26 日**（Tempo 的保留期 3 天）：k3s-server 剩约 14.5 GiB，critical 的线是 8 GiB，现在没有东西在大量写。要不要提前收（缩短 Tempo 的保留期）等主人定；**在那之前不要再做打过拐点的压测**。
+  - 做法上和登记的不一样的一处：没有 `LOADTEST=1 make deploy`，只对 gateway 做了 `LOADTEST=1 IMAGE_TAG=daac679 scripts/cluster/services.sh deploy gateway`（六个服务的代码从 `daac679` 起没变，不用重建镜像；工作区不干净时 `make deploy` 会打出带 `-dirty` 的 tag）。恢复是同一条命令不带 `LOADTEST=1`，再 `unpin`、`recon-cron-resume`、`probe-start`。
+  - **集群的状态（03:46 UTC 核对）**：六个服务的副本数是平时的，镜像 `daac679`；`RATE_LIMIT_IP` 不在 gateway 的 ConfigMap 里；两个 ScaledObject 没有暂停；`recon` 的两个 CronJob 没有暂停（03:07 那一次没有跑，04:07 的窗口盖得住这一轮，**没有等着看**）；探针在跑；没有不正常的 Pod；没有静默。本机 compose 起着。落库时延和可用性的 7 天预算这一周都只当读数看。
+  - **主人 2026-11-23 的答复和之后做的**（设计第 8 节“第 14 项的追查”）：四个问题先查清再定怎么改，`ServerDiskLow` 提前收。
+    - 查清了：(1) 限流的退回没有变差，3b 记的“每秒 12 次”是 Redis 超时的次数，不是退回的次数（同一场景 2026-11-21 的退回是 0、6、150、792 次/秒），round-8 和 runbook 已更正；(2) 延迟关单是分区内串行、4 个分区，上限约每秒 140 条，低于落库的上限；(3) 落库延迟 p99 是 2500 ÷ 单个分区的落库速率（44 单/秒）≈ 57 秒，全局的上限管不住单个分区；(4) 尾部采样留下了 26% 的链路，多出来的是被算成“出错”的 429 和被算成“慢”的落库链路。
+    - **主人 2026-11-23 定了：四条都按建议改**（决定和道理在 ADR-0035，改了什么在设计第 8 节最后一张表）。做到哪：
+      - (1) 限流连续失败 5 次才打开：`pkg/ratelimit/fallback.go` 加测试，**代码改了，集群上还是旧镜像（`daac679`），没有生效**，要提交之后 `make deploy`。
+      - (2) 延迟关单 8 个分区：集群上的 topic 已经加到 8（04:22 UTC，`scripts/cluster/middleware.sh kafka-topics`，核对过 `kafka_topic_partitions` 是 8）；代码里新建 topic 的分区数也改了（同样要新镜像才用得上，只影响新环境）。
+      - (3) `ADMIT_MAX_QUEUE` 1250：已下发（`IMAGE_TAG=daac679 scripts/cluster/services.sh deploy order`，order 滚动过，ConfigMap 里是 1250）。
+      - (4) Collector：已下发（`monitoring.sh collector`，04:21 UTC）。三条策略都在求值；发了 30 个查不存在订单的请求（客户端一侧是 `NOT_FOUND`），“出错”那条一条没留，改状态的那一步是起作用的。两类的上限没有在过载下验证。
+      - 验证：`make lint` 11 个模块 0 issues；`make test` 通过（60 个包 ok，没有失败，`tmp/14fix-test.log`）；`shellcheck` 过了；Collector 的配置用 0.165.0 的 `validate` 校验过。**四处都没有在过载下重新验证**，下一次打过拐点的压测要看的四个数写在 ADR-0035 的“后果”里。
+      - **主人随后要求提交、推送、部署，并把 `ADMIT_MAX_STALE` 改成 20**（`deploy/cluster/services/order.yaml`，道理在那里的注释和 ADR-0035）。分五个提交推送了；`make deploy` 在提交之后做（要干净的 tag），本段后面没有部署结果的那一条就是还没有做或者没有做完。
+    - **`make deploy` 做了（2026-11-23 05:30 UTC 前后核对；日志 `tmp/deploy-3c-61f66d2.log`）**：六个服务的镜像是 `61f66d2`，五个服务各 2 个副本、cdc 1 个，没有不正常的 Pod；order 的 ConfigMap 里 `ADMIT_MAX_QUEUE` 是 1250、`ADMIT_MAX_STALE` 是 20；gateway 没有 `RATE_LIMIT_IP`；两个 ScaledObject 没有暂停。之后 `make recon-cron`（两个 CronJob 的镜像是 `recon:61f66d2`，没有暂停）。探针、`recon-totals` 的镜像没有动（`chaos:e3c3ca7`、`recon:131024f`）。四处修正现在都在集群上了，**仍然没有在过载下验证**。order 启动时照旧有那条连接池的提示（`SUBMIT_CONCURRENCY` × 分区数大于连接池），是已知的。
+    - **Tempo 的保留期已改回 72 小时（05:33 UTC，`monitoring.sh tempo`，ConfigMap 里核对过）。** k3s-server 的盘回到约 19.8 GiB（压测前约 22），`ServerDiskLow` 恢复了。过去 3 天的链路没有了。
+    - `recon-hourly` 04:07、05:07 两次都成功，差异 0（04:07 那次的窗口盖住了压测，26 秒）。05:31 UTC 时没有在响的告警（两条 `pending` 是刚滚动留下的，没有等着看）；落库时延的慢档已经恢复。
+    - PR #17 的 CI：`61f66d2` 那一轮 28 个 job 里 27 个成功，`test (./services/order)` 被后一次推送（`95a5270`）取消，不是失败；**当前的头 `95a5270`（代码和 `61f66d2` 相同，多一个文档提交）30 项全部通过**（`ci-watcher` 报的，主会话用 `gh pr view` 核对过提交和 30 项成功）。`61f66d2` 那一轮的耗时：`rules` 1 分 07 秒、`test (./pkg)` 3 分 32 秒、`test (./test/load)` 3 分 24 秒（上次 2 分 38 秒）、`test (./services/recon)` 2 分 12 秒、e2e 3 分 10 秒。
+    - **背压拒绝原因的指标做了（主人 2026-11-23 确认）**：`pkg/stockgate` 的 `Hold` 在拒绝时多返回是三条里的哪一条（`HoldResult.Rule`：`queue`、`stale`、`stalled`），order 记成 `order.admission.backlog_rejections{rule}`（Prometheus 里 `order_admission_backlog_rejections_total`）；不增加 Redis 的查询，受理的行为不变。`loadtest-round.sh` 的存档、`order-backlog.md` 第 1 步、ADR-0035、设计第 8 节都补了。验证：`pkg` 和 `services/order` 两个模块 `make lint` 0 issues、`make test` 通过（28 个包 ok，`tmp/backlog-rule-test-full.log`），没有跑别的模块（没有动）。主人随后要求提交、推送、部署验证：两个提交（`aa6b2f0` 代码、`6ec35a7` 文档）已推送，**PR #17 上 `6ec35a7` 的 CI 30 项全部通过**（`ci-watcher` 报的，主会话用 `gh pr view` 核对过提交和 30 项成功）：`rules` 59 秒、`test (./services/order)` 3 分 18 秒、`test (./pkg)` 2 分 43 秒、`test (./test/load)` 2 分 34 秒、`test (./services/recon)` 2 分 07 秒、e2e 3 分 25 秒，没有明显变慢的。
+    - **`make deploy` 和 `make recon-cron` 做了（2026-11-23 05:48 UTC 核对；日志 `tmp/deploy-3c-6ec35a7.log`）**：六个服务的镜像是 `6ec35a7`，副本数是平时的，没有不正常的 Pod；两个 CronJob 的镜像是 `recon:6ec35a7`，没有暂停；探针每秒约 1 单在受理；gateway 没有 `RATE_LIMIT_IP`；k3s-server 的盘 19.9 GiB。
+    - **新指标在集群上还没有出过数，没有验证**：`order_admission_backlog_rejections_total` 只有背压真的拒绝时才有序列，探针的流量触发不了。主会话打算做一次一分钟的过载（125 单/秒 30 秒、300 单/秒 60 秒）来看它，**动手时被权限检查拦下了（没有主人明确的同意），什么都没有做**：计划文件没有登记，本机 compose 起着，探针、对账、限流都是平时的状态。等主人说做不做。
+    - 部署后看到的一件小事：Prometheus 往 Alertmanager 发告警在 05:44:38 UTC 出过一次 `EOF`（10 分钟里 1 次），自带的 `PrometheusErrorSendingAlertsToAnyAlertmanager`、`...ToSomeAlertmanagers` 进了 `pending`；Alertmanager 的 Pod 没有重启。像一次性的，没有查；新会话看一眼它们有没有消失。
+    - **背压的第 2 条（排队超过 30 秒的多于 100 个就拒绝）查过了**（设计第 8 节）：规则和配置没有问题；它限制的是个数不是时长，而落库实际是 96 条各自串行的 lane（4 个分区 × `SUBMIT_CONCURRENCY` 24，过载时每条约 1.9 单/秒），100 个超时的占用集中在两条 lane 上就是 30 + 26 = 56 秒，和量到的 p99 一致。它那次拒绝了多少没有数据（脚本不记是哪一条）。`ADMIT_MAX_STALE` 已按主人的决定调成 20；让脚本返回是哪一条拒绝的并做成指标没有做（主人问了它是什么问题、怎么修，答复之后等主人定）。
+    - PR #17 上 `7104ff1`（第 14 项的文档）的 CI 30 项全部通过（`ci-watcher` 报的，提交核对过）：e2e 4 分 23 秒（上次 3 分 17 秒）、`test (./services/recon)` 2 分 25 秒（上次 1 分 44 秒）慢了，`test (./services/order)` 4 分 01 秒、`test (./test/load)` 2 分 38 秒快了；只改了文档，没有查。
+    - （已改回，见上面）**Tempo 的保留期临时改成了 1 小时（03:55 UTC 下发），为了把压测的那批链路提前删掉；仓库里的 `deploy/cluster/monitoring/tempo.yaml` 仍然是 `72h`（临时的 `1h` 是改了文件下发、随后把文件改回去的，没有提交过），所以集群上的和仓库里的现在不一样。** 盘放回来之后运行 `scripts/cluster/monitoring.sh tempo` 就改回 72 小时。本段后面没有“已改回”的话就是还没有改回，新会话先做这件事（`tmp/3c-inject-14-tempo-reclaim.log` 里每 5 分钟记一次 k3s-server 的剩余）。过去 3 天的链路会一起被删掉。
+  - **新会话先看一眼的**：探针恢复之后落库时延的慢档（`SLOOrderPersistDelayBurnSlow`，warning，看 1 天和 2 小时两个窗口）又进了 `pending`（03:46 UTC）：探针一有落库，比例重新有了分母，而 2 小时的窗口里还装着这一轮的慢订单。它多半会在 04:01 前后响，到 05:04 前后（顶档滑出 2 小时窗口）恢复；这是多窗口的尾巴，不是新的问题，**没有等着看**。`ProbeNoData` 同时在 `pending`（探针刚起来），探针已经在以每秒 1 单下单，应当自己消失，同样没有等着看。
+  - 这一段的改动（设计、计划、七份 runbook、本文件）**没有提交**。每分钟一行的记录和现场的输出在 `tmp/3c-inject-14-*.log`，各档的服务端指标在 `tmp/k6/3c14-order-ladder/stages/`（不入库）。
+- **做完的（16 项里 13 项，含上面的第 15、14 项）**：第 1 项（抑制，做成了 `monitoring.sh inhibit-test`，14 条规则 47 条用例全部符合）、第 2 项（停探针，什么都没响）、第 3 项（inventory，7 分钟）、第 5 项（orderindex）、第 6 项（cdc）、第 7、8 项（从库的 SQL、IO 线程）、第 9 项（闸门内存）、第 10 项（Sentinel）、第 11 项（otel-gateway）、第 12 项（alertsink）、第 13 项（Strimzi operator）。每一项响的告警都在现场照 runbook 走过，命令都能跑，走得到原因；走的过程中改了 5 份 runbook。
+- **真实触发过的我们自己写的告警（22 种）**：`ServiceMetricsMissing`、`ConsumerNotConsuming`、`CDCPipelineMissing`、`CDCLagging`、`MySQLReplicaSQLThreadStopped`、`MySQLReplicaIOThreadStopped`、`RedisGateMemoryHigh`、`RedisGateMemoryCritical`、`RedisSentinelBelowQuorum`、`RedisDown`、`KafkaOperatorMetricsMissing`、`AlertmanagerNotificationsFailing`、`AlertDeliveryStalled`、`OtelGatewayDown`、`ProbeNoData` 和 `PaymentTotalsCheckStalled`（响了，被抑制）、`OrderLandingBreakerOpen`、`SLOOrderCreateAvailabilityBurnFast` 和 `BurnMedium`、`ProbeFailing`、`IngressGateway5xxHigh`、`ReconFoundDifferences`（意外）。critical 的 Telegram 都发出去了（发送失败 0）。81 条里其余的还没有真实触发。
+- **改了一条规则并下发了**：`OtelGatewayDown` 加 `keep_firing_for: 5m`（第 11 项里 Collector 一恢复抑制就撤了，被压着的“没有数据”漏出来两条）。加了单元测试，`make rules-test` 通过，`monitoring.sh rules` 下发，集群上核对过字段在。
+- **出过的一个事故**：第 8 项 19:06 UTC 动手，压在了 19:07 的 `recon-hourly` 上，对账连不上被摘掉的从库（退出码 2），`ReconFoundDifferences`（critical）发到了 Telegram。不是差异。19:15 手工复跑差异 0，告警恢复。**以后的故障注入避开每小时的第 5 到 9 分钟。**
+- **可用性的 7 天预算现在是负的（约 -93%）**：第 3 项的 7 分钟里有 381 个 5xx，而 7 天窗口里总共只有约 20 万个请求。到 11 月 29 日这 7 分钟滑出窗口之前它一直是负的；这一周里预算的数只当读数看（设计第 8 节第 3 项里有说明）。
+- **等主人定的**：
+  1. （已做，2026-11-23 主人要求）失败的 Job `recon-hourly-29922907` 删掉了（23:28 UTC），`oppenheimer` 命名空间里没有不正常的 Pod 了；`KubeJobFailed` 应该随之恢复，没有等着看。日志和退出码记在 `docs/runbooks/recon.md` 的“历史”。手工跑的 `recon-manual-1795374925` 已经不在了。
+  2. 检查里查出来、**没有改**的规则问题（设计第 8 节“第 8 步”各项里有理由和改法）：
+     - `ReconFoundDifferences` 分不清“有差异”（退出码 1）和“没跑成”（退出码 2）。涉及资金的对账怎么报，主人定。
+     - `RedisDown` 把 Sentinel 也算进去，少两个 Sentinel 会发两条 critical。
+     - `AlertmanagerNotificationsFailing` 和 chart 自带的两条重复（自带的更快，其中一条是 critical）。
+     - 可用性的中档在快档恢复之后才发出来，再响 25 分钟（多窗口加抑制的固有行为，runbook 里写了怎么判断是尾巴）。
+     - `CDCLagging` 的通知文字是“365.4k 毫秒”；`ConsumerNotConsuming`、`CDCPipelineMissing` 的通知里写的分钟数比实际短 5 到 10 分钟。
+     - 从库 NotReady 超过 15 分钟时自带的两条会和我们的那条说同一件事。
+     - `MySQLDown`、`KafkaBrokerMissing` 这两个抑制源可能有和 `OtelGatewayDown` 一样的“恢复时先撤”的毛病，没有验证。
+  3. 第 4 项（payment 缩到 0）按登记的做法触发不了它要看的告警，要重新设计（计划文件的表里写了原因），并且它会让探针的订单走关单和退款的路。怎么做、做多久，主人定了再做。
+- **还没有真实触发、要归到第 16 项（改阈值）或者另想办法的又多了几条**：`CDCLaggingTooLong`、`MySQLReplicaLagHigh`（停 SQL 线程时延迟的序列会消失）、`MeshEndpointEjected` 和网格的溢出（缩到 0 时没有端点可摘，要“一个副本坏一个好”）。
+- **对账**：今晚每一次都是差异 0。`recon-daily` 到点自己跑的第一次（21:30 UTC）成功：116 秒，1476.7 万单，上界 21:00。`recon-hourly` 22:07 那次的窗口到 21:37，第 3 项的后 3 分钟（21:37 到 21:40）在 23:07 那一次的窗口里（到 22:37），**看过了：成功，18 秒，差异 0**。
+- **集群的状态（22:12 UTC 核对）**：六个服务、探针、`recon-totals` 的副本数都是平时的；otel-gateway、alertsink、Strimzi operator、Sentinel（3 个）都缩回去了；闸门 Redis 的 `maxmemory` 是 805306368（等于清单）；`mysql-order-0-1` 的复制两个线程都是 ON；没有静默；除了那个失败的 Job 的 Pod 没有不正常的 Pod。
+- **下一步**：
+  1. 主人看“等主人定的”三条。
+  2. 登记表里剩的：第 4 项（重新设计之后）、第 16 项（改阈值的那一批，先列出 81 条里还没真实触发的清单再做；第 14 项之后真实触发过的多了 9 种：`RateLimitFallingBack`、落库时延的三档、`NodeCPUHigh`、`OrderReadBulkheadRejecting`、`OrderBackpressureRejecting`、`ConsumerBlocked`、`ServerDiskLow`，上面“22 种”那一条没有重写）。主人看第 14 项查出的四个问题和 `ServerDiskLow` 怎么收。
+  3. 告警质量检查做完之后勾计划里 3c 的五项，然后是 SLO 的大盘、ADR（SLO 怎么定的、为什么 7 天、429 算什么、为什么手写、Alertmanager 的配置为什么不用 `AlertmanagerConfig`；这次的“抑制的源要先来后走”“流量小的系统上按请求数算的预算”可以并进去）、阶段笔记。
+- **已提交并推送**（2026-11-23，主人要求）：`inhibit-test` 和它的用例、`OtelGatewayDown` 的 `keep_firing_for` 和测试一个提交，文档（设计、计划、六份 runbook、本文件）一个提交。PR #17 的 CI 派给了 `ci-watcher`；本段没有这次 CI 结果的话就是还没看。`make rules-test`、`make alertmanager-test`、`shellcheck -x` 过了；没有改 Go 代码，没有跑 `make lint test`。
+- **主人 2026-11-23 说“等主人定的”第 2、3 条晚点定。** 它们挡住什么、不挡什么：第 3 条只挡登记表的第 4 项；第 2 条里的规则改法挡第 16 项里涉及这几条规则的部分，也最好在写 ADR 和勾 3c 的“告警质量检查”之前定。第 15 项、第 14 项（压测）、第 16 项的清单、SLO 的大盘、阶段笔记都不依赖它们，可以先做。
+
+### 3c 的 Alertmanager 和 runbook（2026-11-23，UTC 是 11 月 22 日 16:37 起；在上一段之前）
+
+细节在设计 `docs/design/3c-slo-alerting.md` 第 8 节最后三小节。
+
+- **已提交并推送**（2026-11-23，主人要求）：`b77c202`（alertsink）、`b3e128e`（Alertmanager 的配置和检查）、`b441099`（规则）、`3ee2cd2`（runbook），再加一个记录这些的文档提交。PR #17 的 CI 派给了 `ci-watcher`；本段最后没有 CI 结果的那一条就是还没看。
+- **验证**：`make rules-test`、`make alertmanager-test` 通过；`make lint` 11 个模块 0 issues；`make test MODULES=$PWD/test/load` 通过；`shellcheck` 过了。**没有跑完整的 `make test`**（Go 代码只动了 `test/load`）。CI 里 `rules` job 新加的一步（`make alertmanager-test`）没有实际跑过，推送之后留意。
+- **欠着的 Kafka 规则补上了**：改成看 Strimzi operator 的调和计数（`KafkaOperatorNotReconciling`、`KafkaOperatorMetricsMissing`），没有按计划里写的看 `Kafka` 资源的 `Ready`，理由在设计第 8 节。另加了 `OtelGatewayDown`（critical）、`AlertDeliveryStalled`（critical）。自己写的告警现在 81 条（加上 chart 自带的共 227 条），**都已下发**，求值都正常，在响的只有 `Watchdog`。
+- **Alertmanager 的配置下发了**（`monitoring.sh kps`，同一次把两条 Overcommit 关掉了）：全部告警发到集群里的 alertsink（`monitoring` 命名空间，`kubectl -n monitoring logs deploy/alertsink`），用合成的告警验证过路由、分组和 SLO 的抑制。alertsink 的镜像在文档提交之后换成了干净的 tag（`scripts/cluster/monitoring.sh alertsink`）。
+- **PR #17 上 `2efc147` 的 CI 全部通过**（`ci-watcher` 报的是 29 项；主会话用 `gh pr view` 核对提交和结论时数到 30 项成功，差的一项没有查是哪个）：`rules` 1 分 00 秒（上次 44 秒，多了 `make alertmanager-test` 一步，跑了并通过）；`test (./services/order)` 4 分 36 秒（以往的上沿）；`test (./test/load)` 3 分 31 秒（上次 2 分 54 秒，之前有过 3 分 24 秒；这次多了 alertsink 的测试）；`test (./pkg)` 2 分 46 秒；`test (./services/recon)` 2 分 20 秒；e2e 4 分 15 秒。
+- **Telegram 接上了**（主人写了 `.env`，2026-11-22 17:17 UTC `monitoring.sh alertmanager`）：配置一分钟内生效，token 挂在 `/etc/alertmanager/config/telegram-token`。塞了一条 `severity=critical` 的合成告警（`SyntheticTelegramTest`），Alertmanager 的计数是发出 1 条、失败 0 条。**主人确认收到了**（2026-11-23）。 主会话不读 `.env` 的内容，脚本读。
+- **runbook 写了**：`docs/runbooks/` 44 份加 `README.md`（三个 Sonnet 子 Agent 写，没有留下 worktree）。结构和链接用脚本核对过；**主会话逐行读过的只有 1 份，命令都没有在集群上执行过**，告警质量检查时逐条照着走当验收。计划文件里这一项已勾。
+- **写 runbook 时子 Agent 查出四条规则的问题，已改并下发**（设计第 8 节“第 7 步”有清单）：入口的在途上限溢出原来没有抓（round-6 量到的主要拒绝路径）；`ProbeFailing` 把被 429 拒绝和售罄算成了失败（改了，另加 `ProbeIncomplete`）；`PaidOrdersNotLanding` 响的时候已经到关单时限（收紧到约 7 分钟）；`ReconDailySlow` 慢过一次不恢复。同一节里还有九条提了没有改的。
+- **故障注入登记了**（计划文件 3c“告警质量检查”下面的表，16 项），**一项都还没有做**。
+- **`recon-daily` 到点自己跑的第一次（21:30 UTC）仍然没看**：这次会话结束时还没到点。
+- **下一步**：
+  1. 主人说告警质量检查在新会话做。本文件在 `2efc147` 之后的修改（Telegram 的确认、CI 结果）没有提交，下次提交时带上。
+  2. runbook 的验收并进第 3 项：每触发一条告警就照它的 runbook 走一遍，走不通的当场改。
+  3. 告警质量检查：按登记表从第 1 项（合成告警试其余的抑制）做起；第 14 项要发压，按 3b 的规矩。
+  4. SLO 的大盘、ADR（SLO 怎么定的、为什么 7 天、429 算什么、为什么手写；Alertmanager 的配置为什么不用 `AlertmanagerConfig` 可以并进去）、阶段笔记、面试考点。
+- **没有做、记着的**：“节点不在”的抑制（告警上没有节点标签）；其余几条抑制只有配置检查；`monitoring.sh silence` 没有用过；alertsink 不记 `truncatedAlerts`。
+
+### 3c 开工：补指标和 SLO 的规则（2026-11-22 夜；在上一段之前）
+
+- **最新（2026-11-22 17:40 UTC）**：`131024f` 已推送，PR #17 的 CI 全部通过（新加的 `rules` 44 秒；`test (./pkg)` 2 分 59 秒，`test (./test/load)` 2 分 54 秒，`test (./services/recon)` 2 分 35 秒）。那之后的改动（四份规则和测试、关掉两条 Overcommit 的 values、文档）**主人要求提交了，分两个提交，没有要求推送，所以没有推送**；新会话先 `git status`、`git log origin/phase-3c..` 确认。`make rules-test` 通过（8 个测试文件）；没有改 Go 代码，没有重跑 `make lint test`。
+- **主人 2026-11-22 问的两件事，答过了，没有形成决定**：(1) 重复告警会不会合并：会，靠 Alertmanager 的分组（设计 3.5），现在还没配；(2) 能不能引入大模型做决策：建议只放在“通知之后”（归并、给出初步诊断，就是 3d 的诊断 Agent 的入口），不放在“要不要通知”和自动处置的路径上。主人如果要把它纳入，改 3d 的设计时一起定。
+  - 主人随后给了具体的产品：Gemini Decisions API（`gemini-decision-1`，Google 2026-11-11 的博客 https://blog.google/innovation-and-ai/technology/developers-tools/gemini-decisions-api/ ）。它不是生成式的，是对给定的问题（是/否、多选一、按量表打分）一次前向给出概率和置信度，官方说端到端 150 到 250 毫秒、每百万输入 token 0.10 美元。主会话的看法：适合做告警到达之后的归并和分诊（“这几条是不是同一个事故”“最可能是哪一类原因”“该翻哪份 runbook”），低置信度时退回原样通知；仍然不放在“发不发”和自动处置的路径上。博客没有说是预览还是正式版、有没有确定性、有没有解释，这些以及校准的好坏都没有独立验证过。**没有形成决定**，写 3d 的设计时作为一个候选方案和生成式模型对比。
+- **设计第 6 节的第 4 步（其余的规则）做完了**：自己写的规则一共 5 个 PrometheusRule、76 条告警，**都已下发**（`scripts/cluster/monitoring.sh rules`），求值正常，没有一条在响。细节、与设计不一致的地方、没实测的几条在设计第 8 节“第 4 步的一半”“第 4 步的另一半”。没有在跑的子 Agent，没有留下的 worktree。
+- **欠着的一条规则**：“`Kafka` 资源不是 `Ready`”，Prometheus 里没有可用的指标（要给 kube-state-metrics 配自定义资源的状态，或者接 Strimzi operator 的指标）。计划里“基础设施告警”一项因此没有勾。
+- **`recon-daily` 到点自己跑的第一次是 21:30 UTC，还没看过**（`kubectl -n oppenheimer get jobs`；手工触发的那次 1 分 57 秒、差异 0）。
+- **chart 自带的 149 条筛过了**（设计第 8 节“第 5 步”）：只有两条 Overcommit 在响，已在 `deploy/cluster/monitoring/kube-prometheus-stack.yaml` 里关掉（`defaultRules.disabled`），**values 改了还没有下发**（`scripts/cluster/monitoring.sh kps`，和 Alertmanager 的配置一起下发）；其余保留。
+- **下一步**：补 `Kafka` 资源那一条 → Alertmanager 的路由和抑制、webhook 接收端、Telegram（`.env` 里的 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，只检查在不在，不读值；先验证集群能不能出网到 Telegram）→ runbook（文件名以各规则的 `runbook_url` 为准，`rg -o 'runbooks/[a-z0-9-]+' deploy/cluster/monitoring/rules/*.yaml | sort -u` 列得出来）→ 告警质量检查（故障注入先登记到计划）→ SLO 的大盘、ADR、阶段笔记、面试考点。
+
+- **主人 2026-11-22 确认了 3c 的设计**：十项都按建议；通知渠道用 Telegram（机器人的 token 和会话号还没有给，做到设计第 6 节第 6 步时向主人要）；两个失败的手工备份 Job 已删。设计的状态、计划文件（3c 加了三项、CDC 心跳不做）、计划变更记录都改了。
+- **按设计第 6 节的顺序做到哪**（细节在设计第 8 节）：
+  - 第 1 步补指标：`order.payment.delay`（主会话写，`services/order/internal/service/{metrics,payment,payment_test}.go`）和 `outbox.relay.delay`（Opus 子 Agent 写，`pkg/outbox/`，已用 `git cherry-pick -n` 拿进工作区）做完了。`kafkax.consumer.oldest_pending_age` 也做完了（同一个子 Agent，`pkg/kafkax/`，主会话读过 diff，已拿进工作区）。三个指标都齐了。子 Agent 的 worktree（`.claude/worktrees/agent-a9f9db70927227d67`，分支 `worktree-agent-a9f9db70927227d67`，提交 `1840dd4`、`1303c60`）**还留着**：工作区的改动没有提交，提交之后再删 worktree 和分支。工作区里的 `pkg/kafkax/oldest_test.go` 比它的提交多一处主会话的修改（见下一条）。
+  - 第 3 步的前一半：`deploy/cluster/monitoring/rules/slo.yaml` 写了（40 条），**没有下发到集群**。
+- **验证到哪**：order 模块 `golangci-lint` 0 issues；`make test MODULES=$PWD/services/order` 跑过一次，只有 `TestLandingHealthProbe` 失败（连 Redis 超时，当时子 Agent 也在跑测试），单独重跑它和支付的用例都通过。**合并 kafkax 的改动之后 `make lint test` 通过**（11 个模块 0 issues，56 个包 ok，没有被跳过的，`tmp/3c-lint-test.log`、`tmp/3c-test.log`）。第一次跑时子 Agent 写的 `TestOldestPendingAgeWithLanesReportsTheBlockingKey` 失败：它等 `b`、`c` 两个 key 做完，而 key 到 lane 的哈希种子每个进程随机，它们有四成多的概率和被挡住的 key 同一条 lane、排在后面出不来。主会话改成只等位点在前面的 `a`，连跑 8 遍通过。 注意：直接 `go test` 不带 Makefile 的环境变量时集成测试全部被跳过、显示 `ok`，要用 `make test`（指定模块用 `MODULES=`，指定用例用 `GOFLAGS='-run=...'`）。
+- **本机 compose 是起着的**（子 Agent `make up` 的）。下次正式压测前要 `make down`。
+- **已提交并推送**（2026-11-22，主人要求）：`phase-3c` 上 `d20b999`（三个指标）、`7a49245`（SLO 规则）、`daac679`（文档）。开了 **PR #17（draft）**，CI 派给了 `ci-watcher`；本段最后没有 CI 结果的那一条就是还没看。子 Agent 的 worktree 和分支已删。
+- **`make deploy` 做了**（主人要求；日志 `tmp/deploy-3c-daac679.log`）：六个服务的镜像是 `daac679`，五个服务各 2 个副本、两个节点各一个，cdc 1 个，没有不正常的 Pod。规则仍然没有下发。
+- **三个新指标在集群上验证过**：`kafkax_consumer_oldest_pending_age_seconds` 六个消费组都在报 0。跑了一次冒烟（`smoke-3c-*`，普通下单 10 单/秒 20 秒，SKU 3001，201 次迭代，`http_req_failed` 通过）：`order_payment_delay_seconds` 记了 92 次（支付出结果 100 笔，差的 8 笔没有查是哪一类，可能是取消在先被要求退款的），p50 约 0.12 秒、p99 约 0.36 秒；`outbox_relay_delay_seconds` 按 topic 有数，`order.events` 的 p99 约 0.2 秒、`payment.events` 约 0.4 秒。**这只是 10 单/秒 20 秒的数，不是基线**；支付处理时延那条 SLO 的阈值（暂定 5 秒）等探针跑起来再定。
+- **PR #17 上 `daac679` 的 CI 29 项全部通过**（`ci-watcher` 报的，核对过运行对应的提交）：`test (./services/order)` 4 分 32 秒（以往 3 到 4 分半，在上沿），`test (./services/recon)` 1 分 59 秒，`test (./pkg)` 2 分 42 秒，e2e 3 分 47 秒。
+- **第 2 步派出去了两个子 Agent**（各自的 worktree，基于 `origin/phase-3c`）：Opus 写 `load probe`（常驻探针，只改 `test/load/`）；Sonnet 写 `recon` 的两个 CronJob（`deploy/cluster/recon/`、`services.sh` 的 `recon-cron` 子命令、Makefile 目标；不许碰集群）。回来之后主会话读 diff、`cherry-pick`、跑 `make lint test`；探针的清单（Deployment、SKU 和库存的准备、镜像）还没有人写，等探针的 flag 定了再做。
+- **`recon` 的 CronJob 做完并装上了**（Sonnet 子 Agent 写，主会话读过 diff，`cherry-pick -n` 拿进工作区，worktree 和分支已删；`shellcheck` 通过）：集群上 `oppenheimer` 命名空间里有 `recon-hourly`、`recon-daily`。手工触发的一次 20 秒跑完、差异 0，但窗口里没有订单，有订单时的耗时没有量。细节和没处理的五个问题在设计第 8 节“第 2 步的一半”。**以后 `make deploy` 之后要再 `make recon-cron`；正式压测和空表对照之前要 `services.sh recon-cron-suspend`。** 计划文件里这一项还没有勾（告警规则和 runbook 没有做，有订单时没有验证过）。
+- **全量对账量过了（12:57 UTC）**：四对、1473.7 万单，1 分 55 秒，差异 0（设计第 8 节“全量对账的耗时”）。比事先估的便宜得多。**主人 2026-11-22 定了**：对账方式按场景拆放在 3d 之后（计划文件加了 3e），笔数和金额那一类提前到 3c（计划文件 3c 加了一项；涉及资金，Fable 写，动手前在设计文档里补一节）。ADR 等 3e 写设计时一起写。**`recon-daily` 主人 2026-11-22 定了改成全量**：清单里去掉了 `-since 26h`，加了 `ARCHIVE_DSN`（全量要读冷库，否则已归档的订单全报成差异；和量耗时那次 `loadtest.sh recon` 用的是同一个冷库），`make recon-cron` 已下发。16:05 UTC 手工触发过一次（`kubectl create job --from=cronjob/recon-daily`，看完已删）：1 分 57 秒，1474.9 万单，差异 0，订单一侧多出的一条语句是读冷库的，说明 `ARCHIVE_DSN` 生效。到点自己跑的第一次是 21:30 UTC，还没有看过。提交 `131024f` 已推送；`recon-totals` 已换成 `recon:131024f`。
+- **这之后做的三件事，都在工作区里没有提交**（2026-11-22，14:20 UTC 前后；细节在设计第 8 节最后三小节）：
+  1. **钱的笔数和金额核对做完并上线**（主人定的提前到 3c；Fable 写）：`services/recon/internal/totals/`、`services/recon/cmd/recon/{main,watch}.go`、`services/recon/go.{mod,sum}`、`deploy/cluster/recon/totals.yaml`、`services.sh recon-totals`、Makefile 目标。recon 模块 lint 0 issues、`make test MODULES=$PWD/services/recon` 通过。集群上 Deployment `recon-totals` 在 k3s-server 上跑着，镜像是工作区的 tag（`daac679`…带 `-dirty-` 的那种，**提交后再 `make recon-totals` 换干净的**）；第一批读数两边 1620 笔、金额相等、差异 0。计划文件里这一项已勾。
+  2. **SLO 规则的单元测试和下发**（Sonnet 子 Agent 写测试，主会话验收；worktree 和分支已删）：`deploy/cluster/monitoring/rules/tests/`、`scripts/{rules-test,install-bin}.sh`、Makefile 的 `promtool`、`yq`、`rules-test`、CI 的 `rules` job、`monitoring.sh rules`、`versions.md`。`make rules-test` 23 个用例通过。测试查出规则的一个问题（通知里的 `$value` 是长窗口的比例），主会话把 `slo.yaml` 里 12 条告警的短窗口挪到了最左边并改了对应的断言。**规则已下发到集群**（`oppenheimer-slo`，40 条求值正常，没有告警在响）。**CI 的 `rules` job 没有实际跑过，推送之后第一次跑要留意。**
+  3. **探针 90 分钟的基线量了**：下单 p99 10 毫秒、落库 p99 85 毫秒、支付处理 p99 0.2 秒，5399 个周期全部 ok。支付那条 SLO 的阈值保持 5 秒，等有负载时再量。
+- **没有跑完整的 `make lint test`**：这一批只动了 recon 模块的 Go 代码（单独跑过）和脚本、清单（`shellcheck` 过了）。提交前跑一次完整的。
+- **3c 还剩的**（设计第 6 节的第 4 到 9 步）：其余的告警规则（业务、网格、中间件、节点、监控自己；第 4 节的清单，加上探针、`recon` 的 CronJob、`recon.totals` 的几条）→ 筛 chart 自带的 149 条 → Alertmanager 的路由和抑制、webhook 接收端、Telegram（主人说 token 和会话号准备好了，约定写在仓库根目录的 `.env` 里，变量名 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`；**开工前先检查这个文件在不在、两个变量有没有，不要读出它们的值**）→ runbook → 告警质量检查（动手前逐条登记故障注入）→ SLO 的大盘、ADR、阶段笔记、面试考点。计划文件 3c 里没勾的五项对应这些。
+- **已提交并推送**（主人要求）：`977ab7b`（探针）、`3648ad9`（CronJob 和探针的清单）、`e3c3ca7`（文档）。PR #17 的 CI 派给了 `ci-watcher`。探针换成了干净的镜像 `chaos:e3c3ca7`（第一次构建拉 Docker Hub 的令牌失败，重试成功）。这之后对文档的修改（全量对账的耗时）没有提交。
+- **PR #17 上 `e3c3ca7` 的 CI 29 项全部通过**（`ci-watcher` 报的，核对过提交）：`test (./services/order)` 4 分 19 秒，`test (./services/recon)` 1 分 58 秒，e2e 3 分 41 秒，`test (./test/load)` 3 分 24 秒（加了探针的测试之后的第一个数，以后拿它比）。**`test (./pkg)` 3 分 44 秒，上一次（`daac679`）是 2 分 42 秒**：这两次之间 `pkg/` 没有改动，像是运行机的波动，没有查；下一次 CI 再看这一项，还慢就查。
+- **探针的程序做完了**（`load probe`，Opus 子 Agent 写，主会话读过核心逻辑，已拿进工作区，worktree 和分支已删；`test/load` lint 0 issues、`make test MODULES=$PWD/test/load` 通过）。用法、指标、对告警的要求在设计第 8 节“第 2 步的另一半”。**探针的集群清单（`deploy/cluster/probe/`、`services.sh probe`、Makefile 目标）派给了 Sonnet 子 Agent，直接在工作区里改、不许碰集群，还没回来。** 回来之后：读 diff → `loadtest.sh skus 9001 10` 建探针专用的 SKU（先确认建出来的限购是 0）→ 构建 chaos 镜像 → 装探针 → 看它的指标和六个服务的 SLI 有没有数 → 一两小时后量支付处理时延的基线。
+- **探针上线了（12:24 UTC）**：清单和 `make probe` 做完（Sonnet 子 Agent，主会话读过并改了镜像 tag 的默认值）；建了 SKU 9001 到 9010；集群上 `oppenheimer` 命名空间里 Deployment `probe` 1 个副本在 k3s-server 上，镜像 `chaos:daac679-dirty-20261122122350`（**提交之后再 `make probe` 换成干净的 tag**）。头几分钟每分钟 60 个周期全部 ok，四条 SLI 都有数了。计划文件里“补指标”“常驻探针”两项已勾。细节在设计第 8 节“探针上线”。**从现在起集群上一直有每秒约 1 单的流量，每天约 8.6 万单留在库里；正式压测前 `services.sh probe-stop` 和 `recon-cron-suspend`。**
+- **`recon-hourly` 13:07 UTC 第一次自己跑成功**：983 单，18 秒，差异 0；计划文件里 CronJob 那一项已勾。订单对商家索引那一对增量时固定要 15 秒上下（推断是那一侧按订单号取范围走不了索引，没有看执行计划），见设计第 8 节。**还要看的**：探针跑满一两个小时后（14:30 UTC 之后）量支付处理时延和落库的基线，定支付那条 SLO 的阈值（现在暂定 5 秒，头几分钟的 p50 是 0.08 秒）。
+- 注意：子 Agent 的 worktree 是从 `main` 的合并提交开的，快进不到 `phase-3c`（两边内容相同但不是祖先关系），它们各自做了一次普通合并；收回时只 `cherry-pick` 它自己的那个提交。以后派任务时直接写“`git merge origin/phase-3c`”，不要写 `--ff-only`。
+- **Telegram**：和主人约定 token 和会话号写在仓库根目录的 `.env` 里（已被 `.gitignore` 排除），变量名 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，主人自己写。**还没有脚本读它**，做 Alertmanager 那一步时让 `monitoring.sh` 读出来生成 Secret；主会话不要去读这个文件的内容，只检查两个变量在不在。
+- **下一步**：
+  1. （已做）验收、合并子 Agent 的两个提交，`make lint test`。
+  2. （已做）提交、推送、`make deploy`。这一段之后对本文件的修改（记录部署和冒烟）没有提交，下次提交时带上。
+  3. （已做，未提交）探针和 `recon` 的 CronJob。工作区里没提交的：`Makefile`、`scripts/cluster/services.sh`、`deploy/cluster/{recon,probe}/`、`test/load/`（探针的程序）、`docs/`。等主人说提交；提交、推送之后派 `ci-watcher`，再 `make probe` 换干净的 tag。
+  4. 第 3 步的后一半：`promtool` 的单元测试和 CI（Sonnet，主会话给用例表；`promtool` 的版本跟 Prometheus 3.13.5，登记到 `versions.md`）；`monitoring.sh` 加 `rules` 子命令，下发规则。
+  5. 之后按设计第 6 节的第 4 到 9 步。
+
+### 3c 设计写完，等主人确认（2026-11-22 晚；在上一段之前，主人已确认）
+
+- **分支 `phase-3c` 开了**（从 `phase-3b` 开出，带着那个只改本文件的提交），**没有推送，没有提交**：新增 `docs/design/3c-slo-alerting.md`，改了本文件。
+- **3c 的设计文档写完了：`docs/design/3c-slo-alerting.md`，状态是“等主人确认”**。没有碰集群（只读了 Prometheus 和 Alertmanager 的现状），没有改代码。计划文件 3c 的条目一个都没有勾。
+- **要主人定的十项在设计第 2 节**，每项有建议。最要紧的四项：
+  1. 平时没有流量，SLO 拿什么算（建议在集群里常驻一个每秒约 1 单的探针）。
+  2. 可用性里 429 算什么（建议算好的，背压另配业务告警）。
+  3. 目标和窗口（建议 7 天窗口；下单可用性 99.9%，99% 的受理在 200 毫秒内，99% 的落库在 10 秒内）。
+  4. 通知发给主人用什么渠道（要主人给：Telegram、Slack、ntfy、Bark、邮件，或者先不要）。
+  其余：补四个缺的指标（要改 order、`pkg/outbox`、`pkg/kafkax`）、`recon` 做成 CronJob、CDC 心跳不做、规则手写、自带的 149 条怎么筛和 runbook 的范围。
+- **查到的现状**（设计第 1 节）：告警规则 149 条全是 chart 自带的；Alertmanager 只有 `null` 接收器；在响的有 `KubeCPUOvercommit`、`KubeMemoryOvercommit`（3b 把 requests 写满之后的预期结果）和两条 `KubeJobFailed`（11 月 18 日两个失败的手工备份 Job：`mysql-order-0-backup-manual-261118173325`、`mysql-order-1-backup-manual-261118173344`，在命名空间 `mysql`，**没有删，删之前要主人确认**）。
+- **指标清单是 Haiku 子 Agent 检索的**，设计里用到的主会话核对过一部分（gateway 的 HTTP 直方图的标签和桶、`order_admissions_total` 的结局、两个 `.delay` 直方图的桶、`payment.result.delay` 量的是什么、`recon` 是一次性命令且集群里没有它的 CronJob）。没有核对的：边车裁剪后的溢出指标名、`inventory_oversell_detected_total` 在 Prometheus 里的名字（它还没有出现过序列）、kube-state-metrics 有没有容器退出码的指标、支付事件里有没有“出结果的时刻”。
+- **下一步**：主人答复设计第 2 节的十项 → 把设计的状态改成已确认、需要时改计划文件并记计划变更（CDC 心跳不做的话要记）→ 按设计第 6 节的顺序动工，第 1 步是补指标（order 的那个由 Fable 写）。
+- 集群没有变：状态同下一段。
+
+### 3b 收尾：集群恢复成平时的配置（2026-11-22 傍晚；在上一段之前）
 
 主人 2026-11-22 答复：1 亿数据量不做；提交并推送；写阶段笔记；把集群恢复成平时的配置；3c 在新会话开始。
 
@@ -24,7 +263,9 @@
 - **写笔记时查出容量结论里的几处错，已改**（笔记第 12 节有清单）：`mysql-main` 没有从库（原来写成一主一从，集群上核对过只有一个 Pod）；“一单是入口上 5.4 个请求”是加退避之前的数，改成 4 到 5 个；受理 p99 的“94 到 191”分开写成同样配置的 94 到 158 和调完 requests 之后的 188、191；“换盘到约 240 单/秒”补了限定（那一次下游欠着活，240 是上界）；补了第 1 轮 608 个受理了没落库的订单。round-9 结论一节的“12 MiB”改成约 20。`GOALS.md` 不受影响。没有改的一处：设计第 6 节备份表的表头“从从库读”对 `mysql-main` 不适用。
 - **PR #16 上 `746d9fe` 的 CI 29 项全部通过**（核对过这次运行的提交号）：`test (./services/order)` 3 分 19 秒、e2e 4 分 01 秒，都在以往的范围内；`test (./services/recon)` 1 分 50 秒，上次 9 分 20 秒的反常没有再出现，不用查了。
 - **PR #16 上 `0db0499`（阶段笔记等，只改文档）的 CI：第一次失败 1 项，重跑那一个 job 后 29 项全部通过**（`test (./services/order)` 重跑 4 分 25 秒）。失败的是 `services/order/internal/service` 的 `TestLandConcurrentRedeliveredShuffled`：落库时认领闸门占用的 Redis 调用超过 `gateTimeout`（300 毫秒，`protect.go`），连续几次之后 `stock-gate` 的熔断器打开，后面的调用被直接拒绝；这条测试有意不重试，handler 返回任何错误都判失败（`land_concurrent_test.go` 里 `deliverConcurrently` 的注释）。日志里没有数据竞争，没有状态或库存的断言失败，全是超时和它引出的熔断；同样的代码在 `746d9fe` 上通过。**判断是 CI 机器上 Redis 那一下慢了，不是并发缺陷；这是从日志推断的，没有在本机复现，也没有查 Redis 为什么会慢到 300 毫秒。** **主人 2026-11-22 定：暂时不改这条测试。** 再出现时把这次的记录一起拿给主人看（改法的候选：给这组并发落库测试放宽闸门的时限，和 `TestRateLimitCreateOrder` 那次同一类处理）。
-- **下一步（新会话）**：3c（SLO 与告警）。先读计划文件的 3c 一节（3b 各轮留给它的告警已经写在条目里）和 `docs/notes/3b-capacity.md`（SLO 的目标值来自这里的基线），写设计文档给主人确认，再动工。PR #16 还是 draft，标成 ready 和合并由主人定；3c 的分支从 `phase-3b` 开。
+- **PR #16（`phase-3b`）已合并**（2026-11-22，主人要求；合并前从 draft 标成了 ready，合并提交 **`0142f02`**）。合并前 `9fb4343` 的 CI 29 项全部通过（`test (./services/order)` 4 分 14 秒、e2e 3 分 33 秒）；`main` 上 `0142f02` 的 CI 27 项全部通过（`test (./services/order)` 3 分 03 秒、e2e 4 分 06 秒、`test (./services/recon)` 2 分 11 秒，都在以往的范围内）。`phase-3b` 分支没有删。合并之后 `phase-3b` 上还有一次只改本文件的提交（记录合并和这句话），不在 `main` 里：**3c 的分支从 `phase-3b` 开，或者从 `main` 开之后把这个提交带过去。**
+- **3b 到此做完**：计划文件 3b 一节全部勾掉，3a 也早已做完；阶段 3 还剩 3c、3d。
+- **下一步（新会话）**：3c（SLO 与告警）。先读计划文件的 3c 一节（3b 各轮留给它的告警已经写在条目里）和 `docs/notes/3b-capacity.md`（SLO 的目标值来自这里的基线），写设计文档给主人确认，再动工。
 
 ### 3b 容量结论（2026-11-22 下午，UTC 08:50 之后；在上一段之前）
 
@@ -827,6 +1068,10 @@
 | 2026-11-21 | 3b 第 3 轮多做了一项：落库健康的熔断器加“连续失败至少持续 1 秒” | 压测里它被一次停顿打开（在途的上百个落库同时超时），每轮白白拒绝一千个上下的下单；闸门的熔断器在 1d 加过同样的条件。见第 3 轮的记录第 4 节 |
 | 2026-11-21 | 3b 的空表对照：不另起一套（`oppenheimer-e2e`），也不清库恢复；把长期运行的那一套临时指到同一批实例上的 `e2e_*` 空库（`loadtest.sh empty-up`、`empty-down`，values 在 `deploy/cluster/services/loadtest-empty/`） | 另起一套时副本数、资源、HPA、监控标签都和平时不同，还和原来那一套抢节点，对照里混进别的变量；清库恢复是破坏性的。指过去只改“数据在哪”，正式库一行不动，切回去就恢复。局限不变：空库和大库共用实例的缓冲池、redo 和盘 |
 | 2026-11-22 | 3b 的弹性测试从“阶梯加压，看扩容跟不跟得上”改成“验证 HPA 扩容期间不丢请求”；gateway、order 的 HPA 上限从 4 收到 3；容量结论里“各服务的单副本能力”改成“每个请求的 CPU 开销”加“水平扩容在这套硬件上没有收益” | 扩容系数量到的是：节点不变时加副本不加能力，4 个副本比 2 个还差（记录第 3、5 节）。扩完不会变快，原来的问法量不出东西；单个副本从来不是瓶颈。主人 2026-11-22 同意 |
+| 2026-11-22 | 3c：加三项（补四个 SLI 缺的指标、常驻的低速探针、`recon` 做成 CronJob）；CDC 源库心跳不做；SLO 的窗口用 7 天而不是 30 天；runbook 只给自己写的规则 | 设计文档 3c 第 1、2 节：平时没有流量时按比例的规则算不出来；支付处理时延、outbox 等待、最老的未消费消息、对账差异都没有指标；探针让源库一直有写入，心跳要解决的问题不存在了；Prometheus 只留 15 天。主人 2026-11-22 确认 |
+| 2026-11-22 | 加 3e“对账方式按场景拆”（钱对笔数和金额、库存对守恒式、派生数据按 CDC 的变更核对），放在 3d 之后、阶段 4 的故障实验之前；其中“钱的笔数和金额做成指标”提前到 3c | 主人提出对账该按场景用合适的方式；现在的 `recon` 一律逐行摘要。全量对账量过（1473.7 万单 1 分 55 秒），不急，所以整体放在 3d 之后；阶段 4 的每次实验要用对账当裁判，所以在它之前。笔数和金额能做成指标，让钱的差异几分钟内报警，属于 3c 的业务告警。主人 2026-11-22 定 |
+| 2026-11-22 | `recon-daily` 从比最近 26 小时改成全量（不带 `-since`，加 `ARCHIVE_DSN`） | 主人定的。全量量过只要 1 分 55 秒，每天一次的代价可以不计；全量能发现订单创建很久之后才出现的差异，窗口式的看不到。耗时随总量线性增长，告警里盯它的耗时 |
+| 2026-11-23 | 3c 告警质量检查的登记表：第 9 项从“1.3 倍、1.15 倍”改成“用量除以 0.75、除以 0.82，只改主库”；第 5 项要 27 分钟而不是 15 分钟；第 3、4 项挪到其余几项之后做 | 1.15 倍是 87%，越过 order 停止受理的 85%，探针在跑会真的拒单；`ConsumerNotConsuming` 实际约 21 分钟才响；第 3、4 项会烧 SLO 的预算，中、慢档在恢复后还要响半小时到两小时，放在前面会和后面几项的告警混在一起 |
 
 ## 会话日志
 

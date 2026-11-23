@@ -10,6 +10,12 @@ BUF_VERSION                := v1.75.0
 PROTOC_GEN_GO_VERSION      := v1.36.12
 PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
 OAPI_CODEGEN_VERSION       := v2.8.2
+# promtool 跟集群上的 Prometheus 走（scripts/cluster/cluster.env 的 PROMETHEUS_VERSION）
+PROMTOOL_VERSION           := 3.13.5
+YQ_VERSION                 := v4.54.3
+# amtool 跟集群上的 Alertmanager 走（kube-prometheus-stack 的 chart 带的版本，kubectl -n monitoring get alertmanager 看得到）
+AMTOOL_VERSION             := 0.35.0
+export PROMTOOL_VERSION YQ_VERSION AMTOOL_VERSION
 
 # go.work 里的所有模块目录
 MODULES  := $(shell go list -m -f '{{.Dir}}')
@@ -51,6 +57,18 @@ proto-plugins: ## 只安装 proto 的 Go 插件（CI 里 buf 由 action 提供�
 	GOWORK=off GOBIN=$(BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
 	GOWORK=off GOBIN=$(BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
+.PHONY: promtool
+promtool: ## 只安装 promtool（版本同集群的 Prometheus，校验 sha256）到 ./bin
+	scripts/install-bin.sh promtool
+
+.PHONY: amtool
+amtool: ## 只安装 amtool（版本同集群的 Alertmanager，校验 sha256）到 ./bin
+	scripts/install-bin.sh amtool
+
+.PHONY: yq
+yq: ## 只安装 yq（从规则清单里抽出 .spec.groups 用，校验 sha256）到 ./bin
+	scripts/install-bin.sh yq
+
 ## ---------- 代码 ----------
 
 .PHONY: proto
@@ -60,6 +78,14 @@ proto: ## 由 api/proto 生成 Go 代码到 api/gen
 .PHONY: openapi
 openapi: ## 由 api/openapi/gateway.yaml 生成 gateway 的类型和服务端接口
 	$(BIN)/oapi-codegen -config api/openapi/oapi-codegen.yaml api/openapi/gateway.yaml
+
+.PHONY: rules-test
+rules-test: promtool yq ## 检查并单元测试 Prometheus 的规则（deploy/cluster/monitoring/rules/，promtool check rules + test rules）
+	scripts/rules-test.sh
+
+.PHONY: alertmanager-test
+alertmanager-test: amtool ## 检查 Alertmanager 的配置并核对路由（deploy/cluster/monitoring/alertmanager/，amtool check-config + routes test）
+	scripts/alertmanager-test.sh
 
 .PHONY: proto-lint
 proto-lint: ## 检查 proto 的格式与规范
@@ -300,6 +326,18 @@ deploy: ## 构建并推送镜像，再用同一个 tag 把六个业务服务部�
 	@tag="$$(scripts/cluster/images.sh tag)" && \
 	IMAGE_TAG="$$tag" scripts/cluster/images.sh all $(IMAGE_SERVICES) && \
 	IMAGE_TAG="$$tag" scripts/cluster/services.sh deploy $(IMAGE_SERVICES)
+
+.PHONY: recon-cron
+recon-cron: ## 装或更新对账的两个 CronJob（recon-hourly 比最近 2 小时、recon-daily 全量，命名空间 oppenheimer，镜像 tag 取现在部署的 order，RECON_IMAGE_TAG 可覆盖）；正式压测前后用 scripts/cluster/services.sh recon-cron-suspend、recon-cron-resume；可重复执行
+	scripts/cluster/services.sh recon-cron
+
+.PHONY: probe
+probe: ## 装或更新常驻探针（Deployment probe，命名空间 oppenheimer）：从入口走下单、落库、支付、已支付，用 OTLP 报指标；PROBE_SKUS（默认 9001-9010，要先 scripts/cluster/loadtest.sh skus 9001 10 建好）、PROBE_IMAGE_TAG（默认取 order 的 tag，仓库里没有 chaos 镜像会构建推送）；压测前后用 scripts/cluster/services.sh probe-stop、probe-start；可重复执行
+	scripts/cluster/services.sh probe
+
+.PHONY: recon-totals
+recon-totals: ## 装或更新钱的笔数和金额核对（Deployment recon-totals，命名空间 oppenheimer）：每 30 秒核对一次最近 30 分钟的支付，结果是指标 recon.totals.*；镜像 tag 按当前工作区算，没有就构建；可重复执行
+	scripts/cluster/services.sh recon-totals
 
 .PHONY: cluster-e2e
 cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场

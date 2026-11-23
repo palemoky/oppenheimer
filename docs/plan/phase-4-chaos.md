@@ -33,6 +33,10 @@
 - [ ] 实验清单目录 `chaos/`，每个场景一个可重复执行的清单
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
 - [ ] 实验期间的稳态压测脚本与数据一致性检查脚本
+- [ ] 3c 留下的告警验证（[设计 3c](../design/3c-slo-alerting.md) 第 8 节“第 16 项”），做对应的实验时顺带完成：
+  - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
+  - `OtelCollectorExportQueueFull` 单独响的情形：gateway 在而 agent 发不过去（比如挡住 agent 到 gateway 的 4317）
+  - 只有单元测试的：超卖、闸门内存写满、Collector 导出失败、支付可用性的三档；`RateLimitFallingBack` 改成按比例之后没有真实触发过
 
 ## 4b 实验清单
 

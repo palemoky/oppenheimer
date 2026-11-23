@@ -1,0 +1,591 @@
+# 业务一侧的告警（设计文档 3c 的 4.1 后两条里的探针、4.2 全部，加上钱的笔数和金额的三条）。手写的。
+#
+# 读这份文件之前要知道的三件事，下面的规则反复用到：
+#
+#   1. “有增长”怎么写。计数器是第一次 Add 的时候才有序列的（平时一次都没发生过的事，比如超卖，根本没有这条序列）。
+#      increase(x[w]) 要窗口里有两个点才有值，序列从无到有的那一下它算出来是 0，第一次发生恰恰报不出来。
+#      所以这类规则都写成两半：
+#          sum(increase(x[w])) > 0                    已有的序列又涨了
+#          or
+#          sum(x unless x offset w) > 0               w 之前还没有、现在有了的序列（按每条序列各自判断，再求和）
+#      第二半必须先逐条 unless 再 sum：Pod 重启后旧序列消失、新序列从 1 开始，先 sum 的话别的 Pod 的旧值会把它盖住。
+#      告警在最后一次增长之后保持 w 这么久，然后自己恢复；w 取得比通知的重复间隔短没有关系，响过一次就在记录里了。
+#
+#   2. 只看命名空间 oppenheimer。oppenheimer-e2e 里的失败是集群 e2e 和故障注入故意制造的。
+#
+#   3. 没有流量时按比例的规则没有值、不响，这是有意的；“这条路断了”由探针的两条负责，
+#      “服务不报指标了”由最后一组负责。阈值的出处写在每条规则上面，改之前先看出处。
+#
+# 每条带 severity、service、summary（带当前的值）、description（影响）、runbook_url。标签只有有限的枚举。
+# 改完跑 make rules-test。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oppenheimer-business
+  namespace: monitoring
+  labels:
+    oppenheimer.rules: "1"
+spec:
+  groups:
+    # ---- 探针：下单到支付这条路现在通不通 ----
+    - name: business.probe
+      rules:
+        # 一半以上的周期失败或被跳过，持续 3 分钟。分子是 failed（有一步出错或超时）加 skipped：周期卡住不结束时，
+        # 新的周期因为在途上限被跳过，这时 failed 很少而 skipped 很多，同样是“路不通”。
+        # incomplete（被 429 拒绝、售罄、降级）不算在这里：背压的 429 按 SLO 的定义不是坏的（过载的压测里探针会被大量拒绝），
+        # 售罄是探针自己的 SKU 配置坏了，都不是“下单的路断了”；它们由下面的 ProbeIncomplete 报成 warning（2026-11-23 改的，
+        # 原来分子是 outcome!="ok"）。平时 90 分钟 5399 个周期全部是 ok（设计第 8 节的基线）。
+        # 阈值取一半而不是“有失败就响”：单个周期失败由 SLO 的燃烧率管，这条只管“断了”。
+        - alert: ProbeFailing
+          expr: |
+            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer",outcome=~"failed|skipped"}[5m])) or vector(0))
+              /
+            sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m]))
+              > 0.5
+          for: 3m
+          labels:
+            severity: critical
+            service: probe
+          annotations:
+            summary: "探针的下单到支付周期有 {{ $value | humanizePercentage }} 失败或被跳过"
+            description: "常驻探针每秒从入口走一次“下单、落库、支付、已支付”。一半以上不成功说明这条路对真实用户也是断的，即使 SLO 的规则因为没有流量而算不出来。看 probe_steps_total 的 step 和 outcome 定位断在哪一步。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/probe.md
+        # 一半以上的周期没走完但也没出错：被 429 拒绝（限流或背压）、售罄、带降级原因码的 503。持续 10 分钟。
+        # 三种情况的处理完全不同，看 probe_steps_total 的 outcome（rejected、sold_out、degraded）分清。
+        # 这段时间探针走不到落库和支付，那两条 SLO 实际上没有数据。
+        - alert: ProbeIncomplete
+          expr: |
+            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer",outcome="incomplete"}[5m])) or vector(0))
+              /
+            sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m]))
+              > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            service: probe
+          annotations:
+            summary: "探针的周期有 {{ $value | humanizePercentage }} 没走完（被拒绝、售罄或降级）"
+            description: "探针的下单被 429 拒绝（限流或背压）、SKU 售罄，或者接口在降级。不是出错，但探针走不到落库和支付，那两条 SLO 这段时间没有数据。压测打过拐点时响是预期的；平时响先看是不是探针的 SKU 卖完了。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/probe.md
+
+        # 探针该在跑（Deployment 的副本数大于 0）却 10 分钟没有任何周期。正式压测前 probe-stop 把副本数缩到 0，这条不响。
+        # 探针停了的后果：没有流量时 SLO 的规则算不出来，CDC 的延迟指标也没有源库写入可量，几条规则同时变瞎。
+        - alert: ProbeNoData
+          expr: |
+            (sum(rate(probe_cycles_total{k8s_namespace_name="oppenheimer"}[5m])) or vector(0)) == 0
+            and on ()
+            kube_deployment_spec_replicas{namespace="oppenheimer",deployment="probe"} > 0
+          for: 10m
+          labels:
+            severity: warning
+            service: probe
+          annotations:
+            summary: "探针 10 分钟没有报任何周期"
+            description: "探针的 Deployment 副本数大于 0，但没有周期的指标：探针自己挂了、卡住了，或者它的指标送不到 Collector。这期间“下单的路断了”没有人发现，按流量算的规则在没有真实流量时也都算不出来。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/probe.md
+
+    # ---- 对账的 CronJob（逐行的那一套） ----
+    - name: business.recon
+      rules:
+        # 每个对账 CronJob 最近一次失败的 Job 的开始时间，按失败的种类分成两条（result 标签）。告警读它。
+        #   differences  有确认的差异（recon 退出码 1）。CronJob 里的 podFailurePolicy 让这种失败的原因是 PodFailurePolicy；
+        #                kube-state-metrics（v2.20.0）只认识三种原因，别的原因它只给 kube_job_failed{condition="true"}。
+        #                所以写成“失败了，并且不是那三种原因”：认不出来的一律按有差异算，宁可错报成重的。
+        #   error        没跑成（退出码 2 重试耗尽是 BackoffLimitExceeded，撞上 Job 的时限是 DeadlineExceeded，被驱逐是 Evicted）。
+        # 用 kube_job_failed{condition="true"}（Job 的 Failed 条件）而不是 kube_job_status_failed > 0（失败的 Pod 数）：
+        # 重试期间失败的 Pod 数已经大于 0，而 Job 还没有失败。2026-11-23 在集群上用两个一次性的 Job 核对过这些序列的样子。
+        - record: oppenheimer:recon_cronjob:last_failed_start_time
+          labels:
+            result: differences
+          expr: |
+            max by (namespace, cronjob) (
+              label_replace(
+                (
+                  kube_job_status_start_time{namespace="oppenheimer"}
+                  and on (namespace, job_name) (kube_job_failed{namespace="oppenheimer",condition="true"} == 1)
+                  unless on (namespace, job_name) (kube_job_status_failed{namespace="oppenheimer",reason=~"BackoffLimitExceeded|DeadlineExceeded|Evicted"} > 0)
+                )
+                  * on (namespace, job_name) group_left (owner_name)
+                kube_job_owner{namespace="oppenheimer",owner_kind="CronJob",owner_name=~"recon-(hourly|daily)"},
+                "cronjob", "$1", "owner_name", "(.+)"
+              )
+            )
+        - record: oppenheimer:recon_cronjob:last_failed_start_time
+          labels:
+            result: error
+          expr: |
+            max by (namespace, cronjob) (
+              label_replace(
+                (
+                  kube_job_status_start_time{namespace="oppenheimer"}
+                  and on (namespace, job_name) (kube_job_status_failed{namespace="oppenheimer",reason=~"BackoffLimitExceeded|DeadlineExceeded|Evicted"} > 0)
+                )
+                  * on (namespace, job_name) group_left (owner_name)
+                kube_job_owner{namespace="oppenheimer",owner_kind="CronJob",owner_name=~"recon-(hourly|daily)"},
+                "cronjob", "$1", "owner_name", "(.+)"
+              )
+            )
+        # 最近一次“有差异”的失败之后还没有成功过。不直接看失败的 Job 在不在：失败的 Job 为了留日志会保留 5 个，
+        # 那样写的话告警在人删掉 Job 之前一直响，下一次对上了也不恢复。
+        - alert: ReconFoundDifferences
+          expr: |
+            oppenheimer:recon_cronjob:last_failed_start_time{result="differences"}
+            unless on (namespace, cronjob)
+            (kube_cronjob_status_last_successful_time{namespace="oppenheimer"} > on (namespace, cronjob) oppenheimer:recon_cronjob:last_failed_start_time{result="differences"})
+          for: 1m
+          labels:
+            severity: critical
+            service: recon
+          annotations:
+            summary: "对账 {{ $labels.cronjob }} 查出了差异，之后还没有成功过"
+            description: "对账的 Job 以退出码 1 结束：复查之后仍然存在的差异（订单对支付单、对库存预占、对从库、对商家索引中的某一对）。差异的明细在失败的 Job 的日志里（kubectl -n oppenheimer logs job/<名字>，也在 Loki 里）。Job 以认不出的原因失败时也按这一条报。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
+        # 最近一次“没跑成”的失败之后还没有成功过：连不上库、超时，重试 2 次仍然不行。这一次对账没有结论，不是有差异。
+        # warning：数据没有被证明不一致，只是这一个周期没人看着；一直跑不成由 ReconNotRunning（2.5 小时）接着报。
+        - alert: ReconRunFailed
+          expr: |
+            oppenheimer:recon_cronjob:last_failed_start_time{result="error"}
+            unless on (namespace, cronjob)
+            (kube_cronjob_status_last_successful_time{namespace="oppenheimer"} > on (namespace, cronjob) oppenheimer:recon_cronjob:last_failed_start_time{result="error"})
+          for: 1m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "对账 {{ $labels.cronjob }} 最近一次没有跑成，之后还没有成功过"
+            description: "对账的 Job 运行出错（退出码 2：连不上某个库、超时；或者被杀、撞上 Job 的时限），重试之后仍然失败。这一次没有对账结果，不代表有差异。先看是哪个库连不上（kubectl -n oppenheimer logs job/<名字>），修好之后手工复跑一次。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
+        # 上次成功距今超过两个周期多一点（每小时的 2.5 小时，每天的 50 小时）。从来没成功过时用创建时间顶上。
+        # 人为暂停的（正式压测前 recon-cron-suspend）不报。
+        - alert: ReconNotRunning
+          expr: |
+            (
+              time() - (kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-hourly"} or on (namespace, cronjob) kube_cronjob_created{namespace="oppenheimer",cronjob="recon-hourly"}) > 2.5 * 3600
+              or
+              time() - (kube_cronjob_status_last_successful_time{namespace="oppenheimer",cronjob="recon-daily"} or on (namespace, cronjob) kube_cronjob_created{namespace="oppenheimer",cronjob="recon-daily"}) > 50 * 3600
+            )
+            unless on (namespace, cronjob)
+            kube_cronjob_spec_suspend{namespace="oppenheimer"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "对账 {{ $labels.cronjob }} 已经 {{ $value | humanizeDuration }} 没有成功过"
+            description: "对账没有在跑或者一直失败。这段时间里数据不一致不会被发现。先看 CronJob 有没有被暂停后忘了恢复、Job 是不是调度不上或者拉不到镜像。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
+        # 每天的全量对账耗时随总量线性增长：2026-11-22 是 1474.9 万单 1 分 57 秒，时限是 55 分钟。
+        # 超过 20 分钟就该换成按场景的对账（阶段计划的 3e），不要等到它撞上时限才知道。
+        # 只看最近开始的那一个 Job：做完的 Job 会留几天，取所有 Job 里最长的话，慢过一次之后下一次变快了也不恢复。
+        - alert: ReconDailySlow
+          expr: |
+            max by (namespace) (
+              (kube_job_status_completion_time{namespace="oppenheimer",job_name=~"recon-daily-.*"} - kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"})
+              and on (namespace, job_name)
+              (
+                kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"}
+                == on (namespace) group_left ()
+                max by (namespace) (kube_job_status_start_time{namespace="oppenheimer",job_name=~"recon-daily-.*"})
+              )
+            ) > 20 * 60
+          for: 5m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "每天的全量对账用了 {{ $value | humanizeDuration }}（时限 55 分钟）"
+            description: "全量对账的耗时随订单总量线性增长。还没有到时限，但余量在变少；到了时限 Job 会失败，那时报出来的是“对账失败”而不是“有差异”。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon.md
+
+    # ---- 钱的笔数和金额（recon watch-totals，规则见 services/recon/internal/totals 的包注释） ----
+    - name: business.payment_totals
+      rules:
+        # 封口的段两边必须精确相等，没封口的段支付一侧不能多；违反了才不是 0，没有“正常的小差异”，所以阈值是 0。
+        # for 取 1 分钟（两轮）：核对是先读支付库再读订单库，顺序保证了不会读出假的差异，两轮都在就是真的。
+        # max by (kind)：核对的 Pod 重启后旧 Pod 的序列还会留 5 分钟，两条都在时取大的。
+        - alert: PaymentTotalsMismatch
+          expr: max by (kind) (recon_totals_mismatch{k8s_namespace_name="oppenheimer"}) > 0
+          for: 1m
+          labels:
+            severity: critical
+            service: recon
+          annotations:
+            summary: "支付和订单两边的{{ if eq $labels.kind \"amount\" }}金额差了 {{ $value }} 分{{ else }}笔数差了 {{ $value }} 笔{{ end }}"
+            description: "支付一侧“成功且订单已答复”的支付单，和订单一侧记下的“已接受”的支付结果，按一分钟一段比对不上。这是钱的账不平：有支付成功而订单没有记，或者反过来。是哪一分钟在 recon-totals 的日志里（payment totals mismatch，带 bucket_start），拿这个时间范围去跑逐行对账定位到单。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/payment-totals.md
+        # 核对自己 5 分钟没有成功过一轮（平时 30 秒一轮）。这时上面那条读的是旧值或者没有值，“不响”不等于“账是平的”。
+        - alert: PaymentTotalsCheckStalled
+          expr: (sum(increase(recon_totals_runs_total{k8s_namespace_name="oppenheimer",outcome="ok"}[5m])) or vector(0)) < 1
+          for: 5m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "钱的笔数和金额核对 5 分钟没有成功过一轮"
+            description: "recon-totals 没有在跑、连不上支付库或订单库，或者它的指标送不出来。这期间 PaymentTotalsMismatch 发现不了差异；每小时的逐行对账还在兜底。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/payment-totals.md
+        # 有支付单 20 分钟了还没封口（还在处理中，或者成功了但订单的答复没有到）。支付的时限是 15 分钟，到时限的会被置成失败，
+        # 所以超过 20 分钟的只能是“成功了、订单一直没答复”。核对的窗口是 30 分钟：这一笔再过 10 分钟就滑出窗口，
+        # 这条会自己恢复而问题还在，所以 for 取得短，响过就要去查，不能等它自己好。
+        - alert: PaymentReplyOverdue
+          expr: max(recon_totals_oldest_open_age{k8s_namespace_name="oppenheimer"}) > 20 * 60
+          for: 2m
+          labels:
+            severity: warning
+            service: payment
+          annotations:
+            summary: "有支付单创建 {{ $value | humanizeDuration }} 了，订单的答复还没有到支付服务"
+            description: "支付成功的事件发出去了，订单服务的答复（接受或者要求退款）一直没有回来：order 的 payment.events 消费者被挡住，或者 order 的 outbox 发不出去。用户可能已经付了钱而订单还是待支付。注意这条在 30 分钟之后会因为支付单滑出核对窗口而自己恢复，恢复不代表问题没了。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/payment-totals.md
+
+    # ---- 库存 ----
+    - name: business.inventory
+      rules:
+        # 扣减落库时发现库存账不够扣（闸门放过了不该放的）。一次都不该有。
+        - alert: InventoryOversellDetected
+          expr: |
+            sum(increase(inventory_oversell_detected_total{k8s_namespace_name="oppenheimer"}[15m])) > 0
+            or
+            sum(inventory_oversell_detected_total{k8s_namespace_name="oppenheimer"} unless inventory_oversell_detected_total{k8s_namespace_name="oppenheimer"} offset 15m) > 0
+          labels:
+            severity: critical
+            service: inventory
+          annotations:
+            summary: "最近 15 分钟发现了超卖（{{ $value | humanize }} 次）"
+            description: "inventory 把预占落到库存账上时发现可用量不够：闸门（Redis 里的可售量）放行的比库存账上有的多。已经受理的订单可能无货可发。先停掉相关 SKU 的受理，再查闸门和库存账是怎么对不上的。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/inventory-anomaly.md
+        # 闸门和库存账的定时核对发现了偏差。它会自己修（inventory_reconcile_repairs_total），所以是 warning；
+        # 但偏差本身说明有一条路径在漏，反复出现要查。
+        - alert: InventoryGateDrift
+          expr: |
+            sum(increase(inventory_reconcile_drifts_total{k8s_namespace_name="oppenheimer"}[30m])) > 0
+            or
+            sum(inventory_reconcile_drifts_total{k8s_namespace_name="oppenheimer"} unless inventory_reconcile_drifts_total{k8s_namespace_name="oppenheimer"} offset 30m) > 0
+          labels:
+            severity: warning
+            service: inventory
+          annotations:
+            summary: "最近 30 分钟闸门的可售量和库存账对不上（{{ $value | humanize }} 次）"
+            description: "inventory 的定时核对发现 Redis 闸门里的可售量和 MySQL 库存账不一致，并按库存账修了。偏向多放会超卖，偏向少放是少卖。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/inventory-anomaly.md
+
+    # ---- 受理（下单的同步那一段） ----
+    - name: business.admission
+      rules:
+        # 闸门 Redis 的内存到了停止受理的水位（85%，ADR-0034），所有下单都被拒。策略是 noeviction，不处理不会自己好。
+        - alert: OrderGateMemoryFull
+          expr: |
+            sum(increase(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="gate_memory_full"}[5m])) > 0
+            or
+            sum(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="gate_memory_full"} unless order_admissions_total{k8s_namespace_name="oppenheimer",outcome="gate_memory_full"} offset 5m) > 0
+          labels:
+            severity: critical
+            service: order
+          annotations:
+            summary: "闸门 Redis 内存到了水位，下单在被拒（最近 5 分钟 {{ $value | humanize }} 次）"
+            description: "闸门 Redis 的内存超过了停止受理的水位，order 拒绝所有新的下单（返回 503，原因码 STOCK_GATE_UNAVAILABLE）。内存是被没有回收的占用和幂等键占着的，见 ADR-0033、ADR-0034 和 3b round-9。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-gate-memory.md
+        # 背压拒绝的占受理请求的 5% 以上，持续 10 分钟。压测打过拐点时它本来就该响（这是保护在起作用），所以是 warning。
+        - alert: OrderBackpressureRejecting
+          expr: |
+            sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="backlogged"}[5m]))
+              /
+            sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer"}[5m]))
+              > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            service: order
+          annotations:
+            summary: "下单有 {{ $value | humanizePercentage }} 被背压拒绝"
+            description: "已受理、还没落库的订单超过了队列上限或者等待上限，order 在拒绝新的下单（429）。落库跟不上受理：看落库的速率、订单库的写入和 order.submit 的消费者。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-backlog.md
+        # 队列里的订单按现在的落库速率要等多久，超过等待上限（ADMIT_MAX_WAIT，30 秒）的八成。
+        # 落库速率是 0 而队列里有东西时比值是无穷大，同样响：那是落库停了。队列的长度只有回收任务的 leader 报，取 max。
+        - alert: OrderQueueNearWaitLimit
+          expr: |
+            max(order_gate_unclaimed_holds{k8s_namespace_name="oppenheimer"})
+              /
+            sum(rate(order_persists_total{k8s_namespace_name="oppenheimer"}[5m]))
+              > 0.8 * 30
+          for: 5m
+          labels:
+            severity: warning
+            service: order
+          annotations:
+            summary: "已受理的订单按现在的落库速率要等 {{ $value | humanizeDuration }}（等待上限 30 秒）"
+            description: "受理的队列在变长，再长下去背压会开始拒绝下单。显示成 +Inf 时是落库的速率为 0：order.submit 的消费者停了。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-backlog.md
+        # 受理成功的比例比一小时前低了一半以上。分母去掉业务上正常的拒绝（售罄、限购、重复提交、参数不对），
+        # 这样大促时售罄变多不会响。要求现在和一小时前都有流量（每秒不低于 0.2 个）。
+        # 它和可用性的 SLO 互补：这里连 429、409 之外的“非 5xx 的失败”也算，比如降级。
+        - alert: OrderAdmitRateDropped
+          expr: |
+            (
+              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}[10m]))
+                /
+              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome!~"insufficient_stock|purchase_limit_exceeded|duplicate|invalid_argument|sku_not_found|idempotency_key_reused"}[10m]))
+            )
+              < 0.5 *
+            (
+              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}[10m] offset 1h))
+                /
+              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome!~"insufficient_stock|purchase_limit_exceeded|duplicate|invalid_argument|sku_not_found|idempotency_key_reused"}[10m] offset 1h))
+            )
+            and
+            sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer"}[10m])) >= 0.2
+          for: 10m
+          labels:
+            severity: warning
+            service: order
+          annotations:
+            summary: "下单的受理成功率降到了 {{ $value | humanizePercentage }}，不到一小时前的一半"
+            description: "不算售罄、限购这些业务上正常的拒绝，受理成功的比例比一小时前低了一半以上。按 order_admissions_total 的 outcome 看是哪一种拒绝变多了（背压、闸门不可用、库存服务不可用、降级开关）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-admit-rate.md
+
+    # ---- 异步的那一段：消费者、outbox、支付、CDC ----
+    - name: business.pipeline
+      rules:
+        # 已受理的订单进了死信：这一单没有落库，用户拿着“已受理”却永远查不到订单。只有 handler 标成 Permanent 的才进死信（ADR-0021）。
+        - alert: OrderSubmitDeadLettered
+          expr: |
+            sum(increase(kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name="order.submit"}[15m])) > 0
+            or
+            sum(kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name="order.submit"} unless kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name="order.submit"} offset 15m) > 0
+          labels:
+            severity: critical
+            service: order
+          annotations:
+            summary: "最近 15 分钟有 {{ $value | humanize }} 条已受理的下单进了死信"
+            description: "order.submit 上的消息被判定为重试也不会成功，进了死信 topic：这些订单已经对用户返回了“已受理”，但没有落库。闸门里的占用会被回收任务收回，订单要人工处理。看死信 topic 里的消息和 order 的错误日志。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-dead-letter.md
+        # 其他 topic 上的死信：数据本身有问题的消息被跳过了，对应的那一步没有做（没发的事件、没更新的索引）。
+        - alert: ConsumerDeadLettered
+          expr: |
+            sum by (service_name, messaging_destination_name) (increase(kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name!="order.submit"}[15m])) > 0
+            or
+            sum by (service_name, messaging_destination_name) (kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name!="order.submit"} unless kafkax_consumer_dead_lettered_total{k8s_namespace_name="oppenheimer",messaging_destination_name!="order.submit"} offset 15m) > 0
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.service_name }} 在 {{ $labels.messaging_destination_name }} 上最近 15 分钟有 {{ $value | humanize }} 条消息进了死信"
+            description: "消息被 handler 判定为重试也不会成功，跳过并写进了死信 topic。这条消息代表的那一步没有做。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-dead-letter.md
+        # 消费者对普通错误不设重试上限（ADR-0021），依赖坏了时分区停住等它恢复。停住的时间就是这个指标：
+        # 最老的一条还没处理完的消息在进程里待了多久。10 分钟 warning；2 小时 critical：
+        # topic 的保留期是 24 小时，过了保留期还没消费的消息会被删掉，那是丢数据（3b round-9 的 3.4）。
+        - alert: ConsumerBlocked
+          expr: |
+            max by (service_name, messaging_consumer_group_name, messaging_destination_name) (kafkax_consumer_oldest_pending_age_seconds{k8s_namespace_name="oppenheimer"}) > 10 * 60
+          for: 5m
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.messaging_consumer_group_name }} 最老的一条消息已经处理了 {{ $value | humanizeDuration }} 还没成功"
+            description: "消费者在同一条消息上反复重试，它后面同一分区（或同一个键）的消息都被挡着。通常是它依赖的库或服务不可用；如果是消息本身有问题，handler 应当把错误标成 Permanent。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-blocked.md
+        - alert: ConsumerBlockedTooLong
+          expr: |
+            max by (service_name, messaging_consumer_group_name, messaging_destination_name) (kafkax_consumer_oldest_pending_age_seconds{k8s_namespace_name="oppenheimer"}) > 2 * 3600
+          for: 5m
+          labels:
+            severity: critical
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.messaging_consumer_group_name }} 被同一条消息挡了 {{ $value | humanizeDuration }}，topic 的保留期是 24 小时"
+            description: "消费者被挡住超过 2 小时。topic 只保留 24 小时，超过之后没消费的消息会被 Kafka 删掉，那时丢的是数据。现在就要决定：修好依赖，或者人工把这条消息移走。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-blocked.md
+        # 有积压而已提交的位点 10 分钟没有前进：消费者不在、卡在再均衡里，或者进程活着但不拉消息（上面那条量不到这种）。
+        # order.close.delay 不看：它的“积压”是还没到期的延迟关单消息，是机制本身。指标来自 Kafka Exporter，按组名限定这一套。
+        - alert: ConsumerNotConsuming
+          expr: |
+            sum by (consumergroup, topic) (kafka_consumergroup_lag{consumergroup=~"order\\.order-submit|order\\.payment-events|inventory\\.order-events|payment\\.order-events|orderindex\\.cdc-orders"}) > 0
+            and
+            sum by (consumergroup, topic) (delta(kafka_consumergroup_current_offset{consumergroup=~"order\\.order-submit|order\\.payment-events|inventory\\.order-events|payment\\.order-events|orderindex\\.cdc-orders"}[10m])) == 0
+          for: 10m
+          labels:
+            severity: warning
+            service: kafka-consumer
+          annotations:
+            # “至少 20 分钟”：位点停下 10 分钟后 delta 才是 0，再加 for 的 10 分钟（实测从停掉到通知约 21 分钟）。
+            summary: "消费组 {{ $labels.consumergroup }} 在 {{ $labels.topic }} 上有 {{ $value }} 条积压，位点至少 20 分钟没有动"
+            description: "有消息等着而这个组没有提交过新的位点。消费者的 Pod 不在、反复再均衡，或者被一条消息挡住（那种情况 ConsumerBlocked 也会响）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/consumer-blocked.md
+        # outbox 里的消息从写进表到 Kafka 确认的时间。平时是几十毫秒；3b round-1 里中继跟不上时到过分钟级。
+        # 这条只在“发得出去但是慢”时有数；完全发不出去时没有新的观测值，由下面那条和消费者一侧的规则发现。
+        - alert: OutboxRelaySlow
+          expr: |
+            histogram_quantile(0.99, sum by (le, service_name, messaging_destination_name) (rate(outbox_relay_delay_seconds_bucket{k8s_namespace_name="oppenheimer"}[5m]))) > 30
+          for: 5m
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.service_name }} 的 outbox 发到 {{ $labels.messaging_destination_name }} 的等待时间 p99 是 {{ $value | humanizeDuration }}"
+            description: "本地消息表里的事件要等很久才发到 Kafka。下游（支付、库存落账、订单变成已支付）都跟着晚。看中继的批量和轮询间隔、库的写入压力、Kafka 的生产延迟。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/outbox.md
+        # 窗口 5 分钟加 for 2 分钟：链路断了之后约 7 分钟响。不能更长：待支付的订单 15 分钟后被关单并退款，
+        # 要给人留出处理的时间（原来是 10 分钟加 5 分钟，响的时候第一批订单已经到关单的时限了，2026-11-23 改）。
+        # 支付一直在出成功的结果，而订单 5 分钟没有一单变成已支付：两者之间的链路（payment 的 outbox、payment.events、
+        # order 的消费者）整个断了。支付处理时延的 SLO 这时没有观测值、算不出来，所以单独写。
+        - alert: PaidOrdersNotLanding
+          expr: |
+            sum(increase(payment_results_total{k8s_namespace_name="oppenheimer",result="succeeded"}[5m])) > 10
+            and
+            (sum(increase(order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}[5m])) or vector(0)) < 1
+          for: 2m
+          labels:
+            severity: critical
+            service: order
+          annotations:
+            summary: "最近 5 分钟有 {{ $value | humanize }} 笔支付成功，没有一个订单变成已支付"
+            description: "用户付了钱而订单停在待支付。支付结果到订单的链路断了：payment 的 outbox 发不出去、payment.events 不可用，或者 order 的 payment.events 消费者停了。下单 15 分钟后关单任务会把这些订单关掉并触发退款；这条在断了约 7 分钟时响，最早的一批订单离关单还有几分钟。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/outbox.md
+        # 支付单从创建到出结果的时间。模拟的支付渠道是秒级的；p99 到 60 秒说明处理支付单的进程跟不上（round-1）。
+        # 支付的时限是 15 分钟，到了时限订单会被关掉。
+        - alert: PaymentResultSlow
+          expr: |
+            histogram_quantile(0.99, sum by (le) (rate(payment_result_delay_seconds_bucket{k8s_namespace_name="oppenheimer"}[5m]))) > 60
+          for: 5m
+          labels:
+            severity: warning
+            service: payment
+          annotations:
+            summary: "支付单从创建到出结果的 p99 是 {{ $value | humanizeDuration }}"
+            description: "支付单在排队。再慢下去会撞上 15 分钟的支付时限，订单被关掉。看 payment 处理支付单的并发和 payment 库。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/payment-backlog.md
+        # CDC 落后：商家维度的订单索引是从 binlog 派生的，落后多少商家看到的订单就旧多少。
+        # 这个指标量的是“最后一条处理的变更距它发生有多久”，源库没有写入时不动；探针保证了一直有写入。
+        - alert: CDCLagging
+          # 除以 1000 换成秒再比：$value 是秒，通知里才能用 humanizeDuration（原来是“365.4k 毫秒”）。
+          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) / 1000 > 60
+          for: 5m
+          labels:
+            severity: warning
+            service: cdc
+          annotations:
+            summary: "CDC 的 {{ $labels.pipeline }} 落后 {{ $value | humanizeDuration }}"
+            description: "订单库的变更到商家索引的延迟超过 1 分钟。商家查到的订单列表是旧的；买家一侧不受影响。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
+        # 落后超过 1 小时：binlog 只留 1 天，再落后下去位点会被清掉，那时只能重做全量（3b round-9）。
+        - alert: CDCLaggingTooLong
+          expr: max by (pipeline) (cdc_lag_ms{k8s_namespace_name="oppenheimer"}) / 1000 > 3600
+          for: 5m
+          labels:
+            severity: critical
+            service: cdc
+          annotations:
+            summary: "CDC 的 {{ $labels.pipeline }} 落后 {{ $value | humanizeDuration }}，binlog 只保留 1 天"
+            description: "再落后下去，CDC 的位点对应的 binlog 会被源库清掉，那之后只能停下来重做全量快照。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
+        # 管道不报延迟了：cdc 挂了或者这条管道退出了。延迟的规则这时没有值，不会响，所以按管道的清单显式地查。
+        # 订单库加分片时这里要跟着加（现在是 order-0、order-1）。
+        - alert: CDCPipelineMissing
+          expr: |
+            absent(cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-0"})
+            or
+            absent(cdc_lag_ms{k8s_namespace_name="oppenheimer",pipeline="order-1"})
+          for: 10m
+          labels:
+            severity: warning
+            service: cdc
+          annotations:
+            # “至少 15 分钟”：cdc 停了之后它的序列还要约 5 分钟才从查询结果里消失（指标是推上来的，Prometheus 对不再更新的
+            # 序列回看 5 分钟），absent() 那时才成立，再加 for 的 10 分钟（实测从停掉到通知约 16 分钟）。
+            summary: "CDC 的 {{ $labels.pipeline }} 至少 15 分钟没有报延迟"
+            description: "这条管道没有在跑，或者 cdc 的指标送不出来。商家索引停在它停下的那一刻。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/cdc.md
+
+    # ---- 保护机制在起作用 ----
+    - name: business.protection
+      rules:
+        # 熔断器不在闭合状态（1 是打开，2 是半开）持续 2 分钟。写成 >= 1：打开和半开来回切时“等于 1”会不断重新计时。
+        # 落库健康的那几个单独一条：它打开时这个分片的下单在被拒。
+        - alert: BreakerOpen
+          expr: max by (service_name, breaker) (breaker_state{k8s_namespace_name="oppenheimer",breaker!~"landing-db-.*"}) >= 1
+          for: 2m
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.service_name }} 的熔断器 {{ $labels.breaker }} 打开了 2 分钟以上"
+            description: "这个依赖（缓存 Redis、闸门 Redis、冷库这一类边车看不到的）连续失败，调用被直接拒绝或者走降级的路径。功能还在，但变慢或者变少了；看被熔断的那个依赖。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/breaker.md
+        - alert: OrderLandingBreakerOpen
+          expr: max by (service_name, breaker) (breaker_state{k8s_namespace_name="oppenheimer",breaker=~"landing-db-.*"}) >= 1
+          for: 2m
+          labels:
+            severity: critical
+            service: order
+          annotations:
+            summary: "落库健康检查的熔断器 {{ $labels.breaker }} 打开了 2 分钟以上"
+            description: "order 判定这个订单库不能落库，落到这个分片上的下单在受理时就被拒绝（503，ORDER_LANDING_UNAVAILABLE），免得受理了却落不了。约一半的用户下不了单。看这个订单库的主库。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/breaker.md
+        # 降级开关关着超过 1 小时：自动降级一般几分钟就恢复，关这么久多半是实验做完忘了开回来。
+        - alert: DegradeSwitchLeftOff
+          expr: max by (service_name, switch) (degrade_switch_off{k8s_namespace_name="oppenheimer"}) == 1
+          for: 1h
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.service_name }} 的降级开关 {{ $labels.switch }} 已经关了 1 小时以上"
+            description: "这个功能处在降级状态：对应的读走不了缓存或从库，或者接口直接返回降级的响应。是有意的就加静默并写明原因。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/degrade.md
+        # 限流的 Redis 不可用，gateway 退回每个进程各算各的：限额实际变宽（副本数倍）。
+        # 按比例报：退回占 gateway 请求的一成以上并持续 5 分钟。2026-11-23 之前是按次数（每秒超过 1 次），
+        # 过载时零星的超时就够它响（第三轮过载压测：每秒 60.8 次退回只是 3.4% 的请求，每一次只是超时的那个请求自己）。
+        # 一成的来由：限流没有整段退回时过载最重的一档是 3.4%；整段退回（旧的判据）是 21% 到 47%；Redis 真的不在是接近 100%。
+        # 后一半（每秒 0.2 次以上）是流量很小时的下限：只有几个请求、其中一个超时也能算出一成。
+        # 分母是 gateway 的全部 HTTP 请求（一个请求最多退回一次）。
+        - alert: RateLimitFallingBack
+          expr: |
+            sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer"}[5m]))
+            > 0.1
+            and
+            sum(rate(gateway_ratelimit_fallbacks_total{k8s_namespace_name="oppenheimer"}[5m])) > 0.2
+          for: 5m
+          labels:
+            severity: warning
+            service: gateway
+          annotations:
+            summary: "限流有 {{ $value | humanizePercentage }} 的请求退回进程内计数"
+            description: "gateway 读不到限流的 Redis（或者调用超过 20 毫秒），这些请求改用进程内的计数。每个副本各算各的，总的限额变成了配置的几倍。一成以上说明不是零星的超时：先看限流的 Redis 好不好，再看 gateway 所在节点的 CPU。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/ratelimit-fallback.md
+        # 展示读的并发名额在拒绝。长稳时平时每分钟十来次（每秒 0.2 上下，round-9），阈值取每秒 1 次。
+        - alert: OrderReadBulkheadRejecting
+          expr: sum by (name) (rate(order_bulkhead_rejected_total{k8s_namespace_name="oppenheimer"}[5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+            service: order
+          annotations:
+            summary: "order 的并发名额 {{ $labels.name }} 每秒拒绝 {{ $value | humanize }} 次"
+            description: "这一类读的并发到了上限，多出来的直接返回“忙”（429）。说明这类读变慢了（它读的库或缓存慢），名额是在保护下单不被拖累。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-read-busy.md
+
+    # ---- 服务不报指标了 ----
+    # 指标是服务自己推给 Collector 的，没有 up 这个序列（ADR-0030）；服务挂了、推不出去时，上面按指标算的规则全都没有值、都不响。
+    # 每个服务挑一个只要进程活着就一定在报的运行时指标（go_goroutine_count），按服务的清单显式地查。加服务时这里要跟着加。
+    - name: business.telemetry
+      rules:
+        - alert: ServiceMetricsMissing
+          expr: |
+            absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="gateway"})
+            or absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="order"})
+            or absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="inventory"})
+            or absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="payment"})
+            or absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="orderindex"})
+            or absent(go_goroutine_count{k8s_namespace_name="oppenheimer",service_name="cdc"})
+          for: 5m
+          labels:
+            severity: warning
+            service: "{{ $labels.service_name }}"
+          annotations:
+            summary: "{{ $labels.service_name }} 已经 10 分钟没有报任何指标"
+            description: "这个服务的指标没有了（序列过期 5 分钟，加这条规则等的 5 分钟）：服务整个不在，或者它推不到 Collector。这期间按它的指标算的告警都不会响。先看 Pod 在不在，再看 Collector。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/service-metrics-missing.md

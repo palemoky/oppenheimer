@@ -62,6 +62,7 @@ type rateLimitConfig struct {
 //     是同一个实例），它也没设时用 127.0.0.1:6380；设成空字符串表示不用 Redis，全部在进程内。
 //   - RATE_LIMIT_REDIS_PREFIX：键前缀。没设时用 REDIS_PREFIX（e2e 和压测靠它隔离每一轮的键）。
 //   - RATE_LIMIT_REDIS_TIMEOUT（默认 20ms）、RATE_LIMIT_REDIS_COOLDOWN（默认 1s）：见 ratelimit.Fallback。
+//     连续失败 ratelimit.DefaultFailures（5）次才打开，这个数没有做成配置。
 //   - TRUSTED_PROXIES：逗号分隔的 CIDR 或 IP，默认空，见 httpapi.ParseTrustedProxies。
 //
 // RATE_LIMIT=off 时其余变量照样校验：写错了的配置在关掉限流时也应当被发现，而不是等打开那天才启动失败。

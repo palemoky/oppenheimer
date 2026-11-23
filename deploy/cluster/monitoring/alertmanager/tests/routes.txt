@@ -1,0 +1,15 @@
+# 路由的核对表（scripts/alertmanager-test.sh）：每行是“期望的接收端 | 告警的标签”，用 amtool config routes test 核对。
+# 只核对路由树（哪类告警去哪个接收端）；分组和抑制 amtool 测不了，在集群上人为触发时看（设计第 5 节第 2 层）。
+webhook  | alertname=Watchdog severity=none
+null     | alertname=InfoInhibitor severity=none
+null     | alertname=KubeQuotaAlmostFull severity=info namespace=oppenheimer
+critical | alertname=ProbeFailing severity=critical service=probe
+critical | alertname=SLOOrderCreateAvailabilityBurnFast severity=critical slo=order_create_availability burn=fast
+critical | alertname=SLOOrderPayAvailabilityBurnFast severity=critical slo=order_pay_availability burn=fast
+critical | alertname=MySQLDown severity=critical component=mysql instance=mysql-order-0-0
+critical | alertname=KubeNodeNotReady severity=critical node=k3s-agent-1
+webhook  | alertname=SLOOrderCreateLatencyBurnSlow severity=warning slo=order_create_latency burn=slow
+webhook  | alertname=BreakerOpen severity=warning service=order
+webhook  | alertname=KubePodCrashLooping severity=warning namespace=oppenheimer
+# 没有 severity 的告警（不该有，但别人的规则可能漏写）：走默认的 webhook，不丢。
+webhook  | alertname=SomethingWithoutSeverity

@@ -1,0 +1,435 @@
+# 下单可用性 SLO 的单元测试（用例 a 到 k，外加 p）。目标 99.9%，预算 0.001：
+#   快：1h 和 5m 的错误比例都 > 14.4 × 0.001 = 1.44%，持续 for 2m
+#   中：6h 和 30m 都 > 6 × 0.001 = 0.6%，持续 for 5m
+#   慢：1d 和 2h 都 > 3 × 0.001 = 0.3%，持续 for 15m
+#   每档还要求 5 分钟的有效事件速率 >= 0.2 个/秒。
+#
+# 用 promtool test rules 跑（scripts/rules-test.sh，make rules-test）。rule_files 写 ../slo.yaml：
+# 脚本把清单里的 .spec.groups 抽到临时目录的 slo.yaml，把这里的文件拷到临时目录的 tests/ 下。
+#
+# 读这些测试之前要知道的几件事：
+#   - 序列的间隔 interval 是 30s（和集群里的抓取间隔一样），evaluation_interval 也是 30s。
+#     一个 1 次/秒的计数器每步加 30：'0+30x240' 是 241 个点（0 到 2h）。
+#   - 判断“哪些档在响”用 sum by (burn) (ALERTS{...,alertstate="firing"})：一档一条样本，空表示没有任何一档在响。
+#     判断“根本没进入过 pending”用 count_over_time(ALERTS{...}[窗口])，没有样本就是从没进入过。
+#   - 数据是从 t=0 开始的，6h 和 1d 窗口里没有更早的数据：rate() 只按窗口里实际有数据的那一段算，
+#     所以数据开始不到 6 小时（或 1 天）时，长窗口的比例不会被“更早的干净数据”冲淡，会和短窗口一样高。
+#     要测中、慢两档的时刻，必须先给够 6 小时、24 小时的干净数据；只测快的一档时 2 小时的干净数据就够，
+#     但这时中、慢两档会因为这个原因提前响，断言只看快的一档（见 d、e）。
+#   - 这个文件里的序列只有 _count，没有 _bucket。下单延迟规则读同一个 _count 但找不到 le="0.2" 的桶，
+#     错误比例会是 1（见 slo_order_create_latency_test.yaml 的 n），所以这里的断言都按 slo 标签只看可用性这一组。
+#   - 浮点：rate() 有外推，不拿它的结果做精确相等，用 round()、> bool 这类比较。
+rule_files:
+  - ../slo.yaml
+evaluation_interval: 30s
+
+tests:
+  # a. 完全没有序列。错误比例是 (or vector(0) 的 0) ÷ (空)，除以空向量没有值，所以没有样本；
+  #    告警规则读不到记录规则，不响（设计 1.3：没有请求就没有人受影响，下单整条路断了由探针负责）。
+  - name: a_no_series
+    interval: 30s
+    input_series: []
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate5m
+        eval_time: 1h
+        exp_samples: []
+      - expr: slo:order_create_availability:valid_rate5m
+        eval_time: 1h
+        exp_samples: []
+      - expr: count_over_time(ALERTS[1h])
+        eval_time: 1h
+        exp_samples: []
+    alert_rule_test:
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 1h
+        exp_alerts: []
+
+  # b. 每秒 1 个 202、一个 5xx 都没有，跑 2 小时。分子的选择器匹配不到任何序列，rate 的 sum 没有值，
+  #    靠 or vector(0) 补成 0：错误比例是 0（不是没有值），大盘上的剩余预算才不会断。
+  #    分母 1 次/秒，valid_rate5m = 1。没有告警，也没进入过 pending。
+  - name: b_clean_traffic_ratio_is_zero_not_absent
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_availability:error_ratio_rate5m"}'
+            value: 0
+      - expr: slo:order_create_availability:error_ratio_rate1d
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_availability:error_ratio_rate1d"}'
+            value: 0
+      - expr: round(slo:order_create_availability:valid_rate5m)
+        eval_time: 2h
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count_over_time(ALERTS{slo="order_create_availability"}[2h])
+        eval_time: 2h
+        exp_samples: []
+
+  # c. 每秒 1 个请求，其中只有 1 次 503（第 1 小时过后出现）。5 分钟窗口里是 1 ÷ 300 ≈ 0.33%，
+  #    低于 1.44%，快的一档不响；1h 窗口只有 1 ÷ 3600 ≈ 0.03%。三档都不响，连 pending 都不进。
+  #    有探针时平时每 5 分钟约 300 个请求，一次失败就是这个量级，这条保证单个失败不叫人。
+  - name: c_single_503_does_not_fire
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x120 1x119'
+    promql_expr_test:
+      # 失败发生在 1h 到 1h00m30s 之间。1h02m 时 5m 窗口里有这一次失败，比例在 0.3% 到 0.4% 之间（有外推），低于 1.44%。
+      - expr: slo:order_create_availability:error_ratio_rate5m > bool 0.003
+        eval_time: 1h2m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: slo:order_create_availability:error_ratio_rate5m > bool 0.0144
+        eval_time: 1h2m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+      - expr: count_over_time(ALERTS{slo="order_create_availability"}[2h])
+        eval_time: 2h
+        exp_samples: []
+    alert_rule_test:
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 1h2m
+        exp_alerts: []
+
+  # d. 干净跑 2 小时，之后（T0 = 2h）持续 5% 的 503（每秒 1 个请求，202 是 0.95、503 是 0.05）。
+  #    5m 窗口：0.05 × t/5min > 0.0144，t > 86 秒就超过。
+  #    1h 窗口：0.05 × t/60min > 0.0144，t > 17.3 分钟才超过。两个窗口都超过之后还要 for 2m：约 19.3 分钟起 firing。
+  #    断言：T0+10m 没有（1h 窗口只有 0.05 × 10/60 = 0.83%）；T0+18m 没有（刚过 17.3 分钟，for 还没满）；
+  #    T0+25m、T0+30m 在 firing。中、慢两档因为上面说的“数据从 t=0 开始”提前响，这里只看快的一档。
+  - name: d_five_percent_503_fast_fires_after_about_19_minutes
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240 7228.5+28.5x59'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x240 1.5+1.5x59'
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate5m > bool 0.0144
+        eval_time: 2h10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: slo:order_create_availability:error_ratio_rate1h > bool 0.0144
+        eval_time: 2h10m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+      - expr: slo:order_create_availability:error_ratio_rate1h > bool 0.0144
+        eval_time: 2h18m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h10m
+        exp_samples: []
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h18m
+        exp_samples: []
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h25m
+        exp_samples:
+          - labels: '{burn="fast"}'
+            value: 1
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h30m
+        exp_samples:
+          - labels: '{burn="fast"}'
+            value: 1
+
+  # e. 接 d，但故障只持续 30 分钟（2h 到 2h30m），之后恢复成 1 次/秒的干净流量。
+  #    停止时 1h 窗口里有 90 个 503，约 3600 个请求，是 2.5%，高于 1.44%，要等 1 小时才会掉下去；
+  #    5m 窗口里故障占的部分每分钟少 20%：停止后 t 分钟，比例是 0.05 × (5 − t)/5，t > 3.6 分钟就低于 1.44%。
+  #    所以停止后 2 分钟（3%）还在 firing；5 分钟、10 分钟时 5m 窗口清空，快的一档不再 firing，尽管 1h 窗口还高。
+  #    这就是短窗口的用处：故障一停，告警很快就停。
+  - name: e_fast_stops_when_the_short_window_clears
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240 7228.5+28.5x59 8940+30x29'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x240 1.5+1.5x59 90x30'
+    promql_expr_test:
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h30m
+        exp_samples:
+          - labels: '{burn="fast"}'
+            value: 1
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h32m
+        exp_samples:
+          - labels: '{burn="fast"}'
+            value: 1
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h35m
+        exp_samples: []
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 2h40m
+        exp_samples: []
+      # 2h40m 时：5m 窗口是 0，1h 窗口还是 2.5% 左右（高于 1.44%）。只靠长窗口会继续响，短窗口把它拉掉了。
+      - expr: slo:order_create_availability:error_ratio_rate5m
+        eval_time: 2h40m
+        exp_samples:
+          - labels: '{__name__="slo:order_create_availability:error_ratio_rate5m"}'
+            value: 0
+      - expr: slo:order_create_availability:error_ratio_rate1h > bool 0.0144
+        eval_time: 2h40m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+    alert_rule_test:
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 2h40m
+        exp_alerts: []
+
+  # f. 100% 的 503（1 小时干净流量之后，202 不再增长，每秒 1 个 503）。
+  #    5m 窗口 x ÷ 5min > 1.44%：x > 4.3 秒；1h 窗口 x ÷ 60min > 1.44%：x > 52 秒；约 1 分钟两个窗口都超过，
+  #    再 for 2m，约 3 到 4 分钟时 firing。断言：故障后 2 分钟还在 pending（没有 firing），5 分钟时 firing，
+  #    带 severity=critical、slo、burn=fast 三个标签。
+  #    description 里的“5m 窗口里现在是 X”，X 是 $value，也就是 and 表达式最左边那一项的值。规则把短窗口写在最左边，
+  #    所以这里是 100%。这条断言同时钉住这个顺序：把长窗口挪回左边的话，这里会变成 1h 窗口的 8.3%（5 ÷ 60），
+  #    全部失败时通知里却只显示 8%（第一版就是这样，写这条用例时查出来的）。
+  - name: f_total_outage_fast_fires_within_four_minutes
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x120 3600x29'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x120 30+30x29'
+    alert_rule_test:
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 1h2m
+        exp_alerts: []
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 1h5m
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              slo: order_create_availability
+              burn: fast
+            exp_annotations:
+              summary: "下单可用性的错误预算在以 14.4 倍以上的速度消耗（快的一档，1h 和 5m 两个窗口）"
+              description: "POST /api/v1/orders 上 5xx 的比例（499 不计入；409 和 429 算好的），5m 窗口里现在是 100%，目标允许的是 99.9% 之外的部分。按这个速度，一周的预算约 12 小时烧完。"
+              runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/slo-order-create-availability.md
+    promql_expr_test:
+      - expr: round(slo:order_create_availability:error_ratio_rate5m)
+        eval_time: 1h5m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # g. 流量太少：每 10 秒 1 个请求（0.1 个/秒），全部是 503，持续 2 小时。错误比例一直是 100%，
+  #    但 valid_rate5m = 0.1 < 0.2（5 分钟只有 30 个），三档都被 valid_rate5m >= 0.2 挡住：连 pending 都不进。
+  - name: g_low_traffic_is_gated_by_valid_rate
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0+3x240'
+    promql_expr_test:
+      - expr: round(slo:order_create_availability:error_ratio_rate5m)
+        eval_time: 2h
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: round(slo:order_create_availability:valid_rate5m * 100)
+        eval_time: 2h
+        exp_samples:
+          - labels: '{}'
+            value: 10
+      - expr: count_over_time(ALERTS{slo="order_create_availability"}[2h])
+        eval_time: 2h
+        exp_samples: []
+    alert_rule_test:
+      - alertname: SLOOrderCreateAvailabilityBurnFast
+        eval_time: 2h
+        exp_alerts: []
+      - alertname: SLOOrderCreateAvailabilityBurnMedium
+        eval_time: 2h
+        exp_alerts: []
+      - alertname: SLOOrderCreateAvailabilityBurnSlow
+        eval_time: 2h
+        exp_alerts: []
+
+  # h. 慢的一档：先 24 小时干净流量，之后（T0 = 24h）持续 0.4% 的 503（每秒 1 个请求，202 是 0.996、503 是 0.004）。
+  #    0.4% 高于 3 倍预算 0.3%，低于 6 倍 0.6%，所以只有慢的一档可能响。
+  #    1d 窗口：0.004 × t/24h > 0.003，t > 18 小时才超过；2h 窗口 0.4% 一直超过；再 for 15m：约 18 小时 15 分钟起 firing。
+  #    快（1h 和 5m 都是 0.4% < 1.44%）和中（6h 窗口 0.4% < 0.6%）永远不响。
+  #    断言：T0+12h（1d 窗口 0.2%）什么都不响；T0+17h 不响；T0+19h、T0+20h 只有慢的一档，severity=warning。
+  - name: h_slow_burn_fires_only_the_slow_tier_after_18_hours
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x2880 86429.88+29.88x2399'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x2880 0.12+0.12x2399'
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate1d > bool 0.003
+        eval_time: 36h
+        exp_samples:
+          - labels: '{}'
+            value: 0
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 36h
+        exp_samples: []
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 41h
+        exp_samples: []
+      - expr: slo:order_create_availability:error_ratio_rate1d > bool 0.003
+        eval_time: 43h
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 43h
+        exp_samples:
+          - labels: '{burn="slow", severity="warning"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 44h
+        exp_samples:
+          - labels: '{burn="slow", severity="warning"}'
+            value: 1
+
+  # i. 409 和 429 算好的，499 不进分母。
+  #    第一段：每 30 秒 202 +15、409 +14、429 +1，没有 5xx：错误比例是 0（分子 vector(0)）。
+  - name: i1_409_and_429_are_not_errors
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+15x120'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="409"}'
+        values: '0+14x120'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="429"}'
+        values: '0+1x120'
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate5m
+        eval_time: 1h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_availability:error_ratio_rate5m"}'
+            value: 0
+      - expr: count_over_time(ALERTS{slo="order_create_availability"}[1h])
+        eval_time: 1h
+        exp_samples: []
+
+  #    第二段：每 30 秒 202 +9、499 +10、503 +1。499 不进分母，比例 = 503 ÷ (202 + 503) = 1 ÷ 10 = 10%。
+  #    （499 如果被算进分母是 1 ÷ 20 = 5%，如果被算成坏的是 11 ÷ 20 = 55%。）
+  #    有效事件速率 = (9 + 1) ÷ 30 秒 = 1/3 个/秒，乘 30 是 10。
+  - name: i2_499_is_not_in_the_denominator
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+9x120'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="499"}'
+        values: '0+10x120'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0+1x120'
+    promql_expr_test:
+      - expr: round(slo:order_create_availability:error_ratio_rate5m * 1000)
+        eval_time: 1h
+        exp_samples:
+          - labels: '{}'
+            value: 100
+      - expr: round(slo:order_create_availability:valid_rate5m * 30)
+        eval_time: 1h
+        exp_samples:
+          - labels: '{}'
+            value: 10
+
+  # j. 不算的范围。oppenheimer 命名空间里只有干净的 202（每秒 1 个）；
+  #    oppenheimer-e2e 命名空间里全是 503（集群 e2e 和故障注入故意制造的）；
+  #    oppenheimer 里别的路由（/api/v1/orders/:order_id）和别的方法（GET）上的 5xx 也不算；别的服务名上的同名指标也不算。
+  #    错误比例是 0，没有告警。
+  - name: j_other_namespace_route_method_service_do_not_count
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer-e2e",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders/:order_id",http_request_method="POST",http_response_status_code="503"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="GET",http_response_status_code="503"}'
+        values: '0+30x240'
+      - series: 'http_server_request_duration_seconds_count{service_name="order",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0+30x240'
+    promql_expr_test:
+      - expr: slo:order_create_availability:error_ratio_rate5m
+        eval_time: 2h
+        exp_samples:
+          - labels: '{__name__="slo:order_create_availability:error_ratio_rate5m"}'
+            value: 0
+      - expr: round(slo:order_create_availability:valid_rate5m)
+        eval_time: 2h
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: count_over_time(ALERTS{slo="order_create_availability"}[2h])
+        eval_time: 2h
+        exp_samples: []
+
+  # k. 中的一档：先 24 小时干净流量，之后（T0 = 24h）持续 1% 的 503（202 是 0.99、503 是 0.01 个/秒）。
+  #    1% 在 0.6%（6 倍）和 1.44%（14.4 倍）之间：快的一档（1h 窗口 1% < 1.44%）永远不响。
+  #    6h 窗口：0.01 × t/6h > 0.006，t > 3.6 小时；30m 窗口 1% 一直超过；再 for 5m：约 3 小时 41 分钟起 firing。
+  #    慢的一档要 1d 窗口 0.01 × t/24h > 0.003，t > 7.2 小时，5 小时时还没到。
+  #    断言：T0+2h、T0+3h30m 什么都不响；T0+4h、T0+5h 只有中的一档（severity=critical），快的不响。
+  - name: k_one_percent_fires_only_the_medium_tier
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x2880 86429.7+29.7x599'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x2880 0.3+0.3x599'
+    promql_expr_test:
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 26h
+        exp_samples: []
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 27h30m
+        exp_samples: []
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 28h
+        exp_samples:
+          - labels: '{burn="medium", severity="critical"}'
+            value: 1
+      - expr: sum by (burn, severity) (ALERTS{slo="order_create_availability",alertstate="firing"})
+        eval_time: 29h
+        exp_samples:
+          - labels: '{burn="medium", severity="critical"}'
+            value: 1
+      - expr: slo:order_create_availability:error_ratio_rate1h > bool 0.0144
+        eval_time: 29h
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+  # p. （额外）推上来的指标断更：100% 的 503 持续 10 分钟之后，数据不再上来（gateway 挂了、采集链路断了都是这样）。
+  #    rate() 的窗口里只剩不到 2 个点之后记录规则没有值，告警条件不再成立：故障还在，告警却在断更后约 5 分钟内自己消失。
+  #    这是规则的盲区：设计里由探针和入口的 5xx 告警盖住（设计 3.2 的取舍），这里把行为钉下来。
+  - name: p_metrics_going_silent_resolves_the_alert
+    interval: 30s
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="202"}'
+        values: '0+30x120 3600x20'
+      - series: 'http_server_request_duration_seconds_count{service_name="gateway",k8s_namespace_name="oppenheimer",http_route="/api/v1/orders",http_request_method="POST",http_response_status_code="503"}'
+        values: '0x120 30+30x19 _x60'
+    promql_expr_test:
+      # 1h10m 是最后一个有数据的点：快的一档在响。
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 1h10m
+        exp_samples:
+          - labels: '{burn="fast"}'
+            value: 1
+      # 断更之后 10 分钟：202 的序列还在被抓（值不变），503 的序列没有新点；窗口里 503 的点被挤出去，比例回到 0，告警消失。
+      - expr: sum by (burn) (ALERTS{slo="order_create_availability",burn="fast",alertstate="firing"})
+        eval_time: 1h20m
+        exp_samples: []

@@ -377,17 +377,15 @@ func TestConcurrencyIsValidated(t *testing.T) {
 	if _, err := kafkax.NewConsumer(ctx, cfg, noop); err == nil {
 		t.Error("negative concurrency accepted")
 	}
-	// 延迟消费者依赖分区内按到期时间有序，不能并发。
-	delay := kafkax.DelayConsumerConfig{ConsumerConfig: concurrentConfig(t, e, 2)}
+	// 延迟消费者也可以并发（等到期在分发时做，见 delay_test.go 的三个并发测试），负数同样拒绝。
+	delay := kafkax.DelayConsumerConfig{ConsumerConfig: concurrentConfig(t, e, -1)}
 	if _, err := kafkax.NewDelayConsumer(ctx, delay, noop); err == nil {
-		t.Error("delay consumer with concurrency 2 accepted")
-	} else if !strings.Contains(err.Error(), "delay") {
-		t.Errorf("unexpected error: %v", err)
+		t.Error("delay consumer with negative concurrency accepted")
 	}
-	delay.Concurrency = 1
+	delay.Concurrency = 2
 	c, err := kafkax.NewDelayConsumer(ctx, delay, noop)
 	if err != nil {
-		t.Fatalf("delay consumer with concurrency 1: %v", err)
+		t.Fatalf("delay consumer with concurrency 2: %v", err)
 	}
 	if err := c.Stop(ctx); err != nil {
 		t.Errorf("stop: %v", fmt.Errorf("%w", err))

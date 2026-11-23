@@ -2,6 +2,7 @@ package kafkax
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"strconv"
 	"time"
@@ -137,8 +138,8 @@ func (c *Consumer) metricAttrs(topic string, extra ...attribute.KeyValue) metric
 //   - 延迟消费者：link。消息在到期之后才处理（延迟关单是支付时限之后），给一条早已结束的链路再添 span，
 //     后端按“链路已结束”做的处理都会出错。所以开一条新的链路，只带一个指向生产者的引用。
 //
-// 每次尝试一个 span，不是整条消息一个：消费者对普通错误不设重试上限，依赖坏着时一条消息可以重试几分钟，
-// 而 span 结束了才会被导出。整条消息一个 span 的话，分区停住的那段时间里什么也看不到。
+// 每次尝试一个 span，不是整条消息一个：各服务的主要消费者把 MaxAttempts 设成最大值（ADR-0021；库的默认值是 5），
+// 对普通错误实际上不设重试上限，依赖坏着时一条消息可以重试几分钟，而 span 结束了才会被导出。整条消息一个 span 的话，分区停住的那段时间里什么也看不到。
 func (c *Consumer) startProcess(ctx context.Context, rec *kgo.Record, msg Message, attempt int) (context.Context, trace.Span) {
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
@@ -240,4 +241,75 @@ func (c *Consumer) startBatch(ctx context.Context, recs []*kgo.Record, msgs []Me
 			attribute.Int64("messaging.kafka.offset", first.Offset),
 			attribute.Int("messaging.batch.message_count", len(recs)),
 		))
+}
+
+// oldestPendingAge 回答的是“有没有一条消息把分区挡住了、挡了多久”：消费者手里已经拉到、还没处理完的消息里，
+// 最老的那条等了多少秒。一条消息一直失败、原地重试时（各服务的主要消费者不设重试上限），它所在的分区停住，
+// 这个数随时间一直涨；Kafka 只保留 24 小时，告警要在那之前很久报出来。
+//
+// 它不是整体的落后量，整体落后多少看 Kafka Exporter 的积压：
+//   - 只看进了进程的消息。积压到高水位、等延迟消息到期时这个分区暂停了拉取，broker 上没拉到的消息看不到，
+//     所以它是下界。
+//   - 并发消费时“最老”指位点最小的未完成消息（它挡着位点提交），不保证是时间戳最老的：
+//     生产者打的时间戳在不同 key 之间不单调。
+//   - 每个 topic 一个值，取各分区里的最大值。不按分区打标签。
+//   - 延迟消费者从到期时刻算起，没到期的记 0（等到期是正常的）。队首没到期时整个分区都在等它，
+//     后面即使有已经到期的消息也记 0：分区内的到期时间随位点递增，只有混入了更长的延迟才会这样（见 NewDelayConsumer）。
+//   - 时间戳是生产者打的（CreateTime），生产者的时钟偏了，这个数跟着偏。
+var oldestPendingAge = func() metric.Int64ObservableGauge {
+	g, err := meter.Int64ObservableGauge("kafkax.consumer.oldest_pending_age",
+		metric.WithUnit("s"),
+		metric.WithDescription("已拉到、还没处理完的消息里最老的那条等了多久（延迟消息从到期时刻算起）"))
+	if err != nil {
+		panic(err) // 只有名字不合法才会出错，是写代码时的错误。
+	}
+	return g
+}()
+
+// registerOldestPending 登记 oldestPendingAge 的回调，返回注销函数。
+//
+// 回调在导出的 goroutine 里跑：先用 allWorkers 拿 c.mu 取一份 worker 的快照（随即释放），再逐个拿 w.mu 读一下，
+// 两把锁不同时持有，和 worker 自己的加锁顺序排不成环。没有 IO，不等任何东西。
+// 收回的分区在 retire 里从 workers 里移除，之后就不再算在这个消费者头上。
+func (c *Consumer) registerOldestPending() (unregister func(), err error) {
+	// 标签按 topic 预先建好，每次导出不分配。
+	opts := make(map[string]metric.ObserveOption, len(c.cfg.Topics))
+	for _, t := range c.cfg.Topics {
+		opts[t] = metric.WithAttributes(topicAttr(t), attribute.String("messaging.consumer.group.name", c.cfg.Group))
+	}
+	reg, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		now := time.Now()
+		if c.clock != nil {
+			now = c.clock.Now()
+		}
+		ages := make(map[string]int64, len(opts))
+		for _, w := range c.allWorkers() {
+			if rec := w.oldestPending(); rec != nil {
+				ages[w.tp.topic] = max(ages[w.tp.topic], c.pendingAge(rec, now))
+			}
+		}
+		// 订阅的每个 topic 都报，没有待处理的消息时报 0：告警分得清“一直是 0”和“没有数据”。
+		for t, opt := range opts {
+			o.ObserveInt64(oldestPendingAge, ages[t], opt)
+		}
+		return nil
+	}, oldestPendingAge)
+	if err != nil {
+		return nil, fmt.Errorf("kafkax: register oldest pending age: %w", err)
+	}
+	return func() { _ = reg.Unregister() }, nil
+}
+
+// pendingAge 返回 rec 在 now 时已经等了多少整秒。延迟消费者从到期时刻算起，没到期的是 0。
+func (c *Consumer) pendingAge(rec *kgo.Record, now time.Time) int64 {
+	from := rec.Timestamp
+	if c.clock != nil {
+		if due, ok := dueAt(rec); ok {
+			from = due
+		}
+	}
+	if from.IsZero() {
+		return 0
+	}
+	return int64(max(now.Sub(from), 0) / time.Second)
 }
