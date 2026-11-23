@@ -123,7 +123,7 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 | [kafka-partitions.md](kafka-partitions.md) | `KafkaUnderReplicatedPartitions`、`KafkaPartitionsOffline` |
 | [kafka-brokers.md](kafka-brokers.md) | `KafkaBrokerMissing` |
 | [kafka-operator.md](kafka-operator.md) | `KafkaOperatorNotReconciling`、`KafkaOperatorMetricsMissing` |
-| [otel-collector.md](otel-collector.md) | `OtelGatewayDown`、`OtelCollectorRefusing`、`OtelCollectorExportFailing` |
+| [otel-collector.md](otel-collector.md) | `OtelGatewayDown`、`OtelCollectorRefusing`、`OtelCollectorExportFailing`、`OtelCollectorExportQueueFull` |
 
 ### 节点、Kubernetes、监控自己（`rules/platform.yaml`）
 

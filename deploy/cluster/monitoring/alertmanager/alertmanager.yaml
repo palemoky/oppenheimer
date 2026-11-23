@@ -114,9 +114,10 @@ inhibit_rules:
   - source_matchers: [alertname = "KafkaBrokerMissing"]
     target_matchers: [alertname = "KafkaUnderReplicatedPartitions"]
   # Collector 的 gateway 不在：经它进来的指标都没有了，各条“没有数据”不用再报。
-  # 被压住的只有“没有数据”这一类；阈值类的规则这时本来就不响（没有数据），这正是 OtelGatewayDown 定成 critical 的原因。
+  # 被压住的是“没有数据”这一类，加上 agent 的导出队列堵满（gateway 不在时 agent 必然发不出去）；
+  # 其余阈值类的规则这时本来就不响（没有数据），这正是 OtelGatewayDown 定成 critical 的原因。
   - source_matchers: [alertname = "OtelGatewayDown"]
-    target_matchers: [alertname =~ "ServiceMetricsMissing|ProbeNoData|CDCPipelineMissing|PaymentTotalsCheckStalled|AlertDeliveryStalled"]
+    target_matchers: [alertname =~ "ServiceMetricsMissing|ProbeNoData|CDCPipelineMissing|PaymentTotalsCheckStalled|AlertDeliveryStalled|OtelCollectorExportQueueFull"]
   # operator 的指标没有了：靠这些指标的那一条不会响，不用抑制；这里没有规则。
   #
   # 设计 3.5 里的“节点不在 → 抑制这个节点上的 Pod、中间件实例的告警”没有写：我们的告警上没有 node 标签

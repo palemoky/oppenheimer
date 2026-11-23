@@ -920,3 +920,52 @@ tests:
         exp_samples:
           - labels: '{alertname="OtelCollectorExportFailing", job="monitoring/otel-gateway-agent", exporter="otlp_grpc", signal="metric_points"}'
             value: 1
+
+  # agent 到 gateway 发不过去：队列从 t=10m 起 20/20，for 5m，16m 在响；send_failed 一直不涨（上一条不响）。
+  - name: otel_export_queue_full_fires
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_queue_size{job="monitoring/otel-agent-agent",pod="otel-agent-agent-857t4",exporter="otlp_grpc",data_type="logs"}'
+        values: '0x9 20x30'
+      - series: 'otelcol_exporter_queue_capacity{job="monitoring/otel-agent-agent",pod="otel-agent-agent-857t4",exporter="otlp_grpc",data_type="logs"}'
+        values: '20x40'
+      - series: 'otelcol_exporter_send_failed_log_records{job="monitoring/otel-agent-agent",exporter="otlp_grpc"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, pod, exporter, data_type) (ALERTS{alertname="OtelCollectorExportQueueFull",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (alertname, job, pod, exporter, data_type) (ALERTS{alertname="OtelCollectorExportQueueFull",alertstate="firing"})
+        eval_time: 16m
+        exp_samples:
+          - labels: '{alertname="OtelCollectorExportQueueFull", job="monitoring/otel-agent-agent", pod="otel-agent-agent-857t4", exporter="otlp_grpc", data_type="logs"}'
+            value: 1
+      - expr: count(ALERTS{alertname="OtelCollectorExportFailing"})
+        eval_time: 16m
+        exp_samples: []
+
+  # 满了 3 分钟就排空（gateway 重启一次）：不响。
+  - name: otel_export_queue_short_spike_silent
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_queue_size{job="monitoring/otel-agent-agent",pod="otel-agent-agent-857t4",exporter="otlp_grpc",data_type="logs"}'
+        values: '0x9 20x2 0x20'
+      - series: 'otelcol_exporter_queue_capacity{job="monitoring/otel-agent-agent",pod="otel-agent-agent-857t4",exporter="otlp_grpc",data_type="logs"}'
+        values: '20x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, pod, exporter, data_type) (ALERTS{alertname="OtelCollectorExportQueueFull",alertstate="firing"})
+        eval_time: 20m
+        exp_samples: []
+
+  # gateway 的队列 700/1000（七成，没到八成）一直挂着：不响。
+  - name: otel_export_queue_below_threshold_silent
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_queue_size{job="monitoring/otel-gateway-agent",pod="otel-gateway-0",exporter="otlp_http/loki",data_type="logs"}'
+        values: '700x40'
+      - series: 'otelcol_exporter_queue_capacity{job="monitoring/otel-gateway-agent",pod="otel-gateway-0",exporter="otlp_http/loki",data_type="logs"}'
+        values: '1000x40'
+    promql_expr_test:
+      - expr: count by (alertname, job, pod, exporter, data_type) (ALERTS{alertname="OtelCollectorExportQueueFull",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []

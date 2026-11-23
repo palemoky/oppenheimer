@@ -76,6 +76,7 @@ inhibited | alertname=ProbeNoData severity=warning service=probe
 inhibited | alertname=CDCPipelineMissing severity=warning service=cdc k8s_namespace_name=oppenheimer pipeline=order-0
 inhibited | alertname=PaymentTotalsCheckStalled severity=warning service=recon
 inhibited | alertname=AlertDeliveryStalled severity=critical component=monitoring
+inhibited | alertname=OtelCollectorExportQueueFull severity=warning component=otel job=monitoring/otel-agent-agent pod=otel-agent-agent-857t4 exporter=otlp_grpc data_type=logs
 # 不是“没有数据”这一类的照报：
 active    | alertname=ProbeFailing severity=critical service=probe
 

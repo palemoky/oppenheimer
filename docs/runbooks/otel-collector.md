@@ -1,6 +1,6 @@
 # OpenTelemetry Collector
 
-覆盖的告警：`OtelGatewayDown`（critical）、`OtelCollectorRefusing`（warning）、`OtelCollectorExportFailing`（warning）
+覆盖的告警：`OtelGatewayDown`（critical）、`OtelCollectorRefusing`（warning）、`OtelCollectorExportFailing`（warning）、`OtelCollectorExportQueueFull`（warning）
 
 ## 这条告警在说什么
 
@@ -8,11 +8,12 @@ Collector 在命名空间 `monitoring`：`otel-gateway`（Deployment，一个副
 
 - `OtelGatewayDown`：`absent(up{job="monitoring/otel-gateway-agent"} == 1)`，2 分钟。没有一个就绪的抓取目标。`for` 比各条“没有数据”（5 到 10 分钟）短，让它先响。
 - `OtelCollectorRefusing`：receiver 的 `otelcol_receiver_refused_{spans,metric_points,log_records}` 在 10 分钟内有增长（三种取最大），`for: 2m`。含“从不存在到第一次出现”那一半（`x > 0 unless x offset 10m`）。一般是内存限制器（`memory_limiter`，限额是容器上限 1Gi 的 80%，突发 20%）在起作用，被拒的数据客户端会重试或丢弃。
-- `OtelCollectorExportFailing`：exporter 的 `otelcol_exporter_send_failed_{spans,metric_points,log_records}` 在 10 分钟内有增长，`for: 2m`。往后端（Tempo、Prometheus、Loki）发失败，数据在队列里积压或被丢。
+- `OtelCollectorExportFailing`：exporter 的 `otelcol_exporter_send_failed_{spans,metric_points,log_records}` 在 10 分钟内有增长，`for: 2m`。往后端（Tempo、Prometheus、Loki）发失败，数据在队列里积压或被丢。**它在 agent 上响不了**：agent 的导出器一直重试、队列满了堵住上游，`send_failed` 不涨。
+- `OtelCollectorExportQueueFull`：`otelcol_exporter_queue_size / otelcol_exporter_queue_capacity` 超过 0.8，`for: 5m`，按 Pod、exporter、数据类型分。补的就是上一条在 agent 上盖不住的“gateway 在、但 agent 发不过去”。agent 的队列容量是 20（只有日志走它），gateway 的是 1000；平时都是 0 到 2。agent 上满了是堵住读日志（不丢，到得晚，agent 的内存涨，到过 204 Mi、上限 256 Mi）；gateway 上满了之后新的数据被丢。
 
 出处：[3a 笔记第 10 节](../notes/3a-observability.md)（Collector 停机实验）、[设计 1.3 第 2 条、4.4](../design/3c-slo-alerting.md)。
 
-抑制：`OtelGatewayDown` 在响时，`ServiceMetricsMissing`、`ProbeNoData`、`CDCPipelineMissing`、`PaymentTotalsCheckStalled`、`AlertDeliveryStalled` 这些“没有数据”的告警不通知（它们是它的结果）。
+抑制：`OtelGatewayDown` 在响时，`ServiceMetricsMissing`、`ProbeNoData`、`CDCPipelineMissing`、`PaymentTotalsCheckStalled`、`AlertDeliveryStalled` 这些“没有数据”的告警不通知（它们是它的结果）；`OtelCollectorExportQueueFull` 同样被它压住（gateway 不在时 agent 的队列必然堵满）。
 
 ## 影响
 
@@ -59,13 +60,14 @@ Collector 在命名空间 `monitoring`：`otel-gateway`（Deployment，一个副
 ## 怎么确认恢复了
 
 - `scripts/cluster/monitoring.sh promql 'up{job="monitoring/otel-gateway-agent"}'` 是 1；`OtelGatewayDown` 在下一个求值周期消失，被它抑制的“没有数据”类告警也随之恢复或自己消失。
+- 队列：`scripts/cluster/monitoring.sh promql 'otelcol_exporter_queue_size'` 回到个位数；gateway 回来后 agent 要追读积压的日志，队列会再满一小会儿。
 - 拒收、导出失败：`increase(...[10m])` 回到 0，窗口过去后告警消失（`increase` 的窗口是 10 分钟）。
 - gateway 回来后看业务序列回来了：服务的指标在大盘上续上、`ProbeNoData` 这类被抑制的告警没有留下；日志的补齐要等几分钟。
 - Collector 不丢业务数据，所以不需要对账；但这期间发生的业务问题没有告警记录，回看这段时间的探针和对账结果：`KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%H%M)`，差异应为 0。
 
 ## 怎么人为触发它
 
-按[设计 5 节第 2 层](../design/3c-slo-alerting.md)的“可用性”一类办法，3a 验证 5 做过 Collector 停机：`kubectl -n monitoring scale deploy/otel-gateway --replicas=0`，2 分钟后 `OtelGatewayDown` 响，再缩回 1；同时验证抑制（`ProbeNoData` 等不通知）。`OtelCollectorExportFailing`：停掉 Tempo 或 Loki（设计 3a 把“停 Loki 时看 gateway 到 Loki 的重试”留给阶段 4，待定，会丢数据）。`OtelCollectorRefusing`：把 `memory_limiter` 的限额临时调低，或加压（待定，没有专门压过）。不想真的弄坏时，改阈值验证“路是通的”并写明。故障注入动手前要先登记到 [phase-3-observability.md](../plan/phase-3-observability.md)；删 PVC、清数据这类破坏性操作要先问主人。
+按[设计 5 节第 2 层](../design/3c-slo-alerting.md)的“可用性”一类办法，3a 验证 5 做过 Collector 停机：`kubectl -n monitoring scale deploy/otel-gateway --replicas=0`，2 分钟后 `OtelGatewayDown` 响，再缩回 1；同时验证抑制（`ProbeNoData` 等不通知）。`OtelCollectorExportFailing`：停掉 Tempo 或 Loki（设计 3a 把“停 Loki 时看 gateway 到 Loki 的重试”留给阶段 4，待定，会丢数据）。`OtelCollectorExportQueueFull`：gateway 缩到 0 超过 5 分钟时 agent 的队列会满（2026-11-23 第 11 项时三个 agent 各满了约 18 分钟，那时还没有这条规则），但这时它被 `OtelGatewayDown` 压着；要看它单独响，得让 gateway 在而 agent 发不过去（比如 NetworkPolicy 挡住 agent 到 gateway 的 4317），没做过，留给阶段 4。`OtelCollectorRefusing`：把 `memory_limiter` 的限额临时调低，或加压（待定，没有专门压过）。不想真的弄坏时，改阈值验证“路是通的”并写明。故障注入动手前要先登记到 [phase-3-observability.md](../plan/phase-3-observability.md)；删 PVC、清数据这类破坏性操作要先问主人。
 
 ## 历史
 

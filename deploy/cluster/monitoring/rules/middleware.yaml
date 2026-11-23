@@ -412,3 +412,22 @@ spec:
             summary: "Collector（{{ $labels.job }}）导出 {{ $labels.signal }} 到 {{ $labels.exporter }} 失败，10 分钟内 {{ $value }} 条"
             description: "Collector 往后端（Tempo、Prometheus、Loki）发数据失败，数据在队列里积压或被丢弃。出处：3a 的 3.3。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
+
+        # 导出队列快满了：exporter 的队列占用超过八成，持续 5 分钟。
+        # 补的是上一条盖不住的情形：agent 的导出器一直重试（retry_on_failure.max_elapsed_time: 0）、队列满了就堵住上游
+        #（block_on_overflow），所以 send_failed_* 永远不涨，“agent 发不到 gateway”时上一条不响（设计第 8 节“第 16 项”）。
+        # 平时队列是 0 到 2；agent 的容量只有 20，gateway 的是 1000，所以按比例写。
+        # gateway 整个不在时 agent 的队列必然堵满，由 OtelGatewayDown 抑制（alertmanager.yaml）。
+        - alert: OtelCollectorExportQueueFull
+          expr: |
+            max by (job, pod, exporter, data_type) (
+              otelcol_exporter_queue_size / otelcol_exporter_queue_capacity
+            ) > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            component: otel
+          annotations:
+            summary: "Collector（{{ $labels.pod }}）导出 {{ $labels.data_type }} 到 {{ $labels.exporter }} 的队列占了 {{ $value | humanizePercentage }}"
+            description: "导出的速度跟不上进来的速度，或者下一跳收不了。agent 上队列满了会堵住读日志（不丢，但日志到得晚、agent 的内存涨）；gateway 上队列满了之后新的数据被丢。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/otel-collector.md
