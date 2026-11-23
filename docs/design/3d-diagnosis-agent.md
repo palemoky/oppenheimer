@@ -280,3 +280,33 @@ runs/<运行号>/            运行号：UTC 时间加 4 位随机，例 2026112
 - 发生拒绝回退时，费用只算了最后作答的那一次（`usage` 顶层），被拒绝的那一次在 `usage.iterations` 里，没有算。
 - 程序只核对“引用的步骤存在并且没有出错”，核对不了这一步的结果是否真的支持那条结论。
 - 手动提问的人断开之后，那次诊断照常做完并落盘（钱照花）。
+
+### 第 3 步：三组工具（2026-11-24，UTC 是 11 月 23 日 17:00 前后）
+
+三个 Opus 子 Agent 各在一个 worktree 里写，主会话读了 diff（`prom` 全部非测试代码、`loki` 的查询和裁剪、`kube` 的白名单和脱敏；`kube` 的 `project.go` 900 多行的各类型投影**没有逐行读**）、跑了测试和 lint 之后 cherry-pick 进来。十个工具，名字和参数同 3.3 的表。加了一个子命令 `agent tool <工具名> '<JSON 参数>'`：手工调一次工具，打印模型会看到的那份结果，不调模型。
+
+**对着真的后端核对过**（Prometheus、Loki 经 `kubectl port-forward`，Kubernetes 用本机的 kubeconfig；都是只读）：十个工具里试了 `prom_alerts`、`prom_rule`、`prom_query`、`prom_query_range`、`loki_labels`、`loki_query`（日志和指标两种）、`kube_get`、`kube_describe`、`kube_events`、`kube_logs`，还有写错的 PromQL、LogQL 和不允许的类型（Secret）。**没有经过模型**：模型会不会用、裁剪的数合不合适，要等有了密钥试跑才知道。
+
+核对查出来、单元测试没有发现的：
+
+- **Loki 里每一行日志自成一条流。** Collector 写进来的每一行都带 `observed_timestamp`（每行不同）、`k8s_pod_uid` 这些结构化元数据，Loki 把它们和标签一起返回。结果是行首的标记比日志本身还长，连续相同的行也永远合并不了。改成先去掉一组对诊断没用的标签（`loki/query.go` 的 `noiseLabels`）。子 Agent 的测试数据是按文档里的响应形状造的，造不出这个。
+- **Loki 的指标查询返回 61 个点。** step 按“区间 ÷ 60”算，点数是区间 ÷ step 再加一。改成除以 59 并向上取到整秒。Prometheus 那一组是对的（它一开始就按 `maxPoints-1` 算）。
+
+和 3.3、3.4 不一样的地方：
+
+- **工具的 Schema 都不是 strict 的**：strict 要求字段全部 required，而这些工具有可选参数。`additionalProperties` 仍是 false，`tool.Decode` 拒绝多出来的字段。只有 `submit_report` 是 strict。
+- **3.4 里日志的两个数合不上**：300 行 × 500 字符约 150 KB，远超单次结果 20 KB 的上限。`loki_query` 自己按约 18 KB 装行，并写明装了多少、没装多少（否则是 `tool.Cap` 从末尾悄悄截，行数的说明会丢）。
+- **时间的相对写法多认一种“天”**（`-1d`）：模型常这么写，`time.ParseDuration` 不认。
+- **裁序列时留哪些**：即时查询超过 50 条时按值从大到小留（没超过时保持 Prometheus 给的顺序，查询里可能用了 `sort()`）；范围查询超过 20 条时留峰值最高的。自动选的 step 取整齐的值（1 小时的区间是 2 分钟、31 个点）。
+- **`prom_rule` 找不到告警名时返回错误**，并列出名字相近的最多 10 条。
+- **`kube_describe` 不给命名空间时在所有命名空间里按名字找**，唯一就用，多个就报错并列出来。
+- **`kube_events` 的 `kind` 只是事件的过滤条件，不在白名单里的也接受**（比如看 Ingress 的事件）；它不读那个对象本身。
+- **落盘的原始结果里多抹了两样**：`kubectl.kubernetes.io/last-applied-configuration` 注解（里面是一份完整的旧对象，环境变量的值也在）；命令行参数里名字像密钥的值和带用户名密码的地址（尽力而为，`--password x` 这种分成两个参数的认不出来）。
+
+留下的限制：
+
+- `kube_logs` 的原始结果就是日志原文，应用打了什么就落盘什么。
+- `tool.TrimLines` 按整行比较，带时间戳的行合并不了；`loki_query` 自己按“不含时间的内容”合并，`kube_logs` 没有做（容器日志每行开头就是时间，重复行不会合并）。
+- 20 KB 的总上限截断 50 条的列表时，只说截了多少字节，不说留下了几条。
+- client-go 的 fake 不认字段选择器，“服务端按对象过滤事件”只在真集群上走到过。
+
