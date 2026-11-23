@@ -676,7 +676,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 启动阶段连 Kafka（探活、建 topic、检查死信 topic）的总时限。这些 ctx 只在构造时使用。
 	kctx, kcancel := context.WithTimeout(ctx, kafkaStartTimeout)
 	defer kcancel()
-	if err := ensureTopics(kctx, kcfg, ordersTopic, paymentsTopic, submitTopic, closeTopic); err != nil {
+	partitions := map[string]int32{closeTopic: eventx.CloseDelayPartitions}
+	if err := ensureTopics(kctx, kcfg, partitions, ordersTopic, paymentsTopic, submitTopic, closeTopic); err != nil {
 		return err
 	}
 
@@ -959,7 +960,8 @@ func releaseLeaders(ctx context.Context, logger *slog.Logger, leaders map[string
 
 // ensureTopics 创建本服务发布和消费的 topic 及其死信 topic。
 // broker 关闭了自动建 topic，消费者要求死信 topic 已存在。
-func ensureTopics(ctx context.Context, kcfg kafkax.Config, topics ...string) error {
+// partitions 里有的 topic 用那里的分区数，其余的（包括所有死信 topic）用 eventx.Partitions。
+func ensureTopics(ctx context.Context, kcfg kafkax.Config, partitions map[string]int32, topics ...string) error {
 	client, err := kafkax.NewClient(ctx, kcfg)
 	if err != nil {
 		return err
@@ -967,8 +969,12 @@ func ensureTopics(ctx context.Context, kcfg kafkax.Config, topics ...string) err
 	defer client.Close()
 	specs := make([]kafkax.TopicSpec, 0, 2*len(topics))
 	for _, t := range topics {
+		n, ok := partitions[t]
+		if !ok {
+			n = eventx.Partitions
+		}
 		specs = append(specs,
-			kafkax.TopicSpec{Name: t, Partitions: eventx.Partitions},
+			kafkax.TopicSpec{Name: t, Partitions: n},
 			kafkax.TopicSpec{Name: t + eventx.DLQSuffix, Partitions: eventx.Partitions},
 		)
 	}

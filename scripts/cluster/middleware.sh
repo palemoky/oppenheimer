@@ -4,6 +4,7 @@
 #   middleware.sh mysql   三个 MySQL 实例：Secret、chart，最后只读地核对并打印主从状态
 #   middleware.sh redis   两套 Redis：redis-gate（主从加 Sentinel）、redis-cache（Cluster）
 #   middleware.sh kafka   Strimzi 的 Operator 和 3 节点的 Kafka（含指标：broker 的 JMX exporter 规则、Kafka Exporter；改动指标配置会滚动重启 broker）
+#   middleware.sh kafka-topics  只做 topic 一级的维护：死信 topic 的保留期、延迟关单 topic 的分区数；不碰 Operator 和 broker，可重复执行
 #   middleware.sh all     redis、kafka、mysql 依次执行
 #   middleware.sh mysql-backup [release...]   立刻手工跑一次 MySQL 备份并等它完成（不带参数是三个实例）
 #   middleware.sh mysql-backup-list           列出 NAS 上每个实例的备份（轮转的和钉住的）
@@ -367,6 +368,35 @@ kafka_dlq_retention() {
   done
 }
 
+# 延迟关单的 topic 要 8 个分区（api/eventx 的 CloseDelayPartitions，理由在那里）。服务只在 topic 不存在时按这个数建，
+# 已经存在的要在这里加。只增不减（Kafka 不能减分区），已经够了就不动，可重复执行。
+# 只管长期运行的那一套（没有前缀的 topic）；e2e 的 topic 每次都是新建的，按代码里的数来。
+# 加完之后消费者要等下一次刷新元数据（几分钟内）才分到新分区，这期间发到新分区的消息留在那里，不会丢。
+CLOSE_DELAY_PARTITIONS=8
+kafka_topic_partitions() {
+  local pod topic="order.close.delay" have
+  pod="$(kubectl -n kafka get pods -l strimzi.io/broker-role=true -o jsonpath='{.items[0].metadata.name}')"
+  have="$(kubectl -n kafka exec "$pod" -- env KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --describe --topic "$topic" 2>/dev/null |
+    sed -n 's/.*PartitionCount: *\([0-9][0-9]*\).*/\1/p' | head -1)"
+  if [[ -z "$have" ]]; then
+    echo "    $topic: not there yet (order creates it on first start with $CLOSE_DELAY_PARTITIONS partitions)"
+  elif [[ "$have" -ge "$CLOSE_DELAY_PARTITIONS" ]]; then
+    echo "    $topic: $have partitions"
+  else
+    kubectl -n kafka exec "$pod" -- env KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server localhost:9092 --alter --topic "$topic" --partitions "$CLOSE_DELAY_PARTITIONS" >/dev/null
+    echo "    $topic: partitions $have -> $CLOSE_DELAY_PARTITIONS"
+  fi
+}
+
+# 只做 topic 一级的维护（死信的保留期、延迟关单的分区数），不碰 Operator 和 broker。
+cmd_kafka_topics() {
+  echo "==> kafka topics"
+  kafka_dlq_retention
+  kafka_topic_partitions
+}
+
 cmd_kafka() {
   echo "==> kafka (namespace kafka): strimzi $STRIMZI_VERSION"
   ensure_namespace kafka
@@ -385,6 +415,7 @@ cmd_kafka() {
   kubectl apply -f "$ROOT/deploy/cluster/kafka/kafka.yaml"
   kubectl -n kafka wait kafka/kafka --for=condition=Ready --timeout=15m
   kafka_dlq_retention
+  kafka_topic_partitions
   kubectl -n kafka get pods -o wide
   kubectl -n kafka get kafka kafka \
     -o jsonpath='{"    version "}{.status.kafkaVersion}{", bootstrap "}{.status.listeners[0].bootstrapServers}{"\n"}'
@@ -407,6 +438,10 @@ mysql-backup)
   shift
   cmd_mysql_backup "$@"
   ;;
+kafka-topics)
+  common
+  cmd_kafka_topics
+  ;;
 mysql-backup-list)
   cmd_mysql_backup_list
   ;;
@@ -421,7 +456,7 @@ all)
   cmd_mysql
   ;;
 *)
-  echo "usage: $0 mysql | redis | kafka | all | mysql-backup [release...] | mysql-backup-list | mysql-backup-pin <name> [<release>=<timestamp>...]" >&2
+  echo "usage: $0 mysql | redis | kafka | kafka-topics | all | mysql-backup [release...] | mysql-backup-list | mysql-backup-pin <name> [<release>=<timestamp>...]" >&2
   exit 2
   ;;
 esac

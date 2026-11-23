@@ -37,6 +37,21 @@ const (
 // Partitions 是本机创建 topic 时使用的分区数。
 const Partitions = 4
 
+// CloseDelayPartitions 是延迟关单 topic（OrderCloseDelay）的分区数，比别的 topic 多。
+//
+// 延迟消费者在分区内只能串行（kafkax.NewDelayConsumer：队首没到期整个分区等着，并发会让后面的越过队首），
+// 所以它同时处理的消息数就是分区数。4 个分区时量到的上限是每秒约 140 条（每条 26 到 30 毫秒，空闲时），
+// 过载时 40 到 110 条，低于落库的上限（约 190 单/秒）：2026-11-23 的压测里订单以每秒 190 张进来，
+// 到期的消息越排越晚，没付款的订单最晚在下单 40 分钟后才关（时限 15 分钟），见设计文档 3c 第 8 节
+// “第 14 项的追查”第 2 条。8 个分区把上限翻一倍，高于落库的上限。
+// 没有取更大：每个分区的 worker 关单时占一条订单库的连接，order 的连接池在过载时本来就贴着上限
+// （deploy/cluster/services/order.yaml 的 MYSQL_MAX_OPEN_CONNS）。
+//
+// 已经存在的 topic 不会被 EnsureTopics 改分区数：集群上用 scripts/cluster/middleware.sh kafka-topics 加。
+// 加分区是安全的：每张订单只有一条消息，没有按 key 的顺序要求；老分区里没到期的消息照常在原来的分区里
+// 到期、处理；新分区没有已提交的位点，消费者从头读（kafkax 的 ConsumeResetOffset 是 AtStart），不会漏。
+const CloseDelayPartitions = 8
+
 // DLQSuffix 是死信 topic 的后缀，与 kafkax 的默认值一致。
 const DLQSuffix = ".dlq"
 
