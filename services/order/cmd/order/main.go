@@ -54,6 +54,22 @@ const redisStartTimeout = 5 * time.Second
 // 10 次在 RetryMax 5 秒下合计约 20 秒，再长就交给 sweeper。
 const closeDelayMaxAttempts = 10
 
+// defaultCloseConcurrency 是 CLOSE_CONCURRENCY 的默认值：延迟关单的消费者在一个分区内同时处理的到期消息数。
+//
+// 原来是分区内串行（延迟消费者当时不支持并发），处理能力是“分区数 ÷ 单条耗时”：4 个分区、每条约 30 毫秒时
+// 每秒约 140 条，低于落库的上限（约 190 单/秒）。2026-11-23 的压测里订单以每秒 190 张进来，到期的消息越排越晚，
+// 没付款的订单最晚在下单 40 分钟后才关（时限 15 分钟）。当天先把分区加到 8（eventx.CloseDelayPartitions），
+// 随后让延迟消费者在“队首到期之后”按 key 并发（kafkax.NewDelayConsumer 的说明），这个数就是并发度。
+//
+// 可以并发的理由和落库一样：消息的 key 是订单号，关一张订单只碰这张订单的行和它的 outbox 事件；
+// 关单本身是带状态前置条件的更新，和支付、取消、sweeper 并发时只有一方得手，重复投递是空操作。
+//
+// 取 4：8 个分区 × 4 = 同时 32 张，过载时每条约 90 毫秒也有每秒约 350 张，高于落库的上限。
+// 没有取更大：每张在关单的事务里占一条订单库的连接，一个副本拿 4 个分区时是 16 条，
+// 而 order 的连接池在过载时本来就贴着上限（deploy/cluster/services/order.yaml 的 MYSQL_MAX_OPEN_CONNS）。
+// 1 就是原来的串行。
+const defaultCloseConcurrency = 4
+
 // defaultRedisPoolSize 是 REDIS_POOL_SIZE 的默认值：闸门 Redis 的连接池大小。
 //
 // 原来用 redisx 的默认值 32。受理、落库（并发度乘分区数个在途）、回收和查询共用这个池子，开环每秒 2000 个
@@ -188,20 +204,22 @@ type config struct {
 	submitConcurrency int
 	// paymentEventsConcurrency 是支付结果的消费者每个分区的并发度，见 defaultPaymentEventsConcurrency。
 	paymentEventsConcurrency int
-	workerID                 int64
-	inventoryAddr            string
-	paymentTimeout           time.Duration
-	idempotencyTTL           time.Duration
-	sweeper                  service.SweeperConfig
-	reaper                   service.ReaperConfig
-	gateMemoryPercent        int
-	gateMemoryInterval       time.Duration
-	backlog                  stockgate.BacklogLimit
-	kafkaBrokers             []string
-	kafkaPrefix              string
-	outboxInterval           time.Duration
-	redisAddr                string
-	redisPrefix              string
+	// closeConcurrency 是延迟关单的消费者每个分区的并发度，见 defaultCloseConcurrency。
+	closeConcurrency   int
+	workerID           int64
+	inventoryAddr      string
+	paymentTimeout     time.Duration
+	idempotencyTTL     time.Duration
+	sweeper            service.SweeperConfig
+	reaper             service.ReaperConfig
+	gateMemoryPercent  int
+	gateMemoryInterval time.Duration
+	backlog            stockgate.BacklogLimit
+	kafkaBrokers       []string
+	kafkaPrefix        string
+	outboxInterval     time.Duration
+	redisAddr          string
+	redisPrefix        string
 	// cacheRedisAddr 是查询缓存的 Redis，不设时与 redisAddr 相同（复用同一个客户端）。
 	cacheRedisAddr string
 	// orderCacheTTL 为 0 表示关闭订单查询缓存。
@@ -332,6 +350,14 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("PAYMENT_EVENTS_CONCURRENCY must be at least 1")
 	}
 	cfg.paymentEventsConcurrency = int(concurrency)
+	concurrency, err = envInt("CLOSE_CONCURRENCY", defaultCloseConcurrency)
+	if err != nil {
+		return cfg, err
+	}
+	if concurrency < 1 {
+		return cfg, errors.New("CLOSE_CONCURRENCY must be at least 1")
+	}
+	cfg.closeConcurrency = int(concurrency)
 	for b := range strings.SplitSeq(cmp.Or(os.Getenv("KAFKA_BROKERS"), "127.0.0.1:9092"), ",") {
 		if b = strings.TrimSpace(b); b != "" {
 			cfg.kafkaBrokers = append(cfg.kafkaBrokers, b)
@@ -414,6 +440,9 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("ADMIT_MAX_STALE must not be negative")
 	}
 	cfg.backlog.MaxStale = stale
+	// 每条落库队列的索引里比这更老的条目当成残留丢掉（stockgate.BacklogLimit.IndexHorizon）。
+	// 未认领的占用最晚在“宽限期 + 回收任务的一个间隔”时被回收，取两倍宽限期再加一个间隔，还在排队的不会被漏数。
+	cfg.backlog.IndexHorizon = 2*cfg.reaper.Grace + cfg.reaper.Interval
 	// 闸门内存的水位（ADR-0034）：已用内存占 maxmemory 的百分比到这个数就停止受理，0 表示不检查。
 	// 闸门没有设 maxmemory（本机）时这项检查不起作用。
 	percent, err := envInt("GATE_MEMORY_WATERMARK_PERCENT", service.DefaultGateMemoryWatermarkPercent)
@@ -680,6 +709,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := ensureTopics(kctx, kcfg, partitions, ordersTopic, paymentsTopic, submitTopic, closeTopic); err != nil {
 		return err
 	}
+	// 受理端的背压按落库的分区分队列（ADR-0036），要知道 order.submit 实际有几个分区。读集群上的，不用建 topic 时的常数：
+	// 已经存在的 topic 分区数可能被改过。只在启动时读一次：之后再加分区，各队列会数得不准（不影响订单本身），
+	// 而加了分区 ADMIT_MAX_QUEUE 本来就要重算、重新部署。
+	submitPartitions, err := topicPartitions(kctx, kcfg, submitTopic)
+	if err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "admission backlog is counted per landing partition",
+		"topic", submitTopic, "partitions", submitPartitions,
+		"max_queue_per_partition", cfg.backlog.MaxQueue, "max_stale_per_partition", cfg.backlog.MaxStale)
 
 	producer, err := kafkax.NewProducer(kctx, kcfg)
 	if err != nil {
@@ -730,6 +769,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		OrderCacheTTL:     cfg.orderCacheTTL,
 		OrderCacheNullTTL: cfg.orderCacheNullTTL,
 		Backlog:           cfg.backlog,
+		SubmitPartitions:  submitPartitions,
 		// ADR-0034：闸门内存到水位时停止受理，采样由下面的 gateMemory 组件做。
 		GateMemoryWatermarkPercent: cfg.gateMemoryPercent,
 		ReadMode:                   cfg.readMode,
@@ -804,7 +844,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// 由它的行锁保护（1a 起有并发测试），不在这个消费者里。同一个用户的不同订单共用的只有
 	// (user_id, idempotency_key) 唯一键，由数据库保证。
 	// 代价是重启和再平衡后重复投递变成常态（提交的是连续完成的前缀），handler 本来就按至少一次设计。
-	// 支付结果的消费者也按 key 并发（defaultPaymentEventsConcurrency）；延迟关单的保持串行：延迟消费者不允许并发。
+	// 支付结果的消费者也按 key 并发（defaultPaymentEventsConcurrency）；延迟关单的在队首到期之后也按 key 并发（defaultCloseConcurrency）。
 	checkSubmitConcurrency(logger, cfg)
 	submitConsumer, err := kafkax.NewConsumer(kctx, kafkax.ConsumerConfig{
 		Config:      kcfg,
@@ -833,6 +873,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		Group:       eventx.Group(cfg.kafkaPrefix, eventx.GroupOrderCloseDelay),
 		Topics:      []string{closeTopic},
 		Logger:      logger,
+		Concurrency: cfg.closeConcurrency,
 		MaxAttempts: closeDelayMaxAttempts,
 	}, svc.CloseDueHandler(service.DefaultEventTimeout))
 	if err != nil {
@@ -961,6 +1002,16 @@ func releaseLeaders(ctx context.Context, logger *slog.Logger, leaders map[string
 // ensureTopics 创建本服务发布和消费的 topic 及其死信 topic。
 // broker 关闭了自动建 topic，消费者要求死信 topic 已存在。
 // partitions 里有的 topic 用那里的分区数，其余的（包括所有死信 topic）用 eventx.Partitions。
+// topicPartitions 返回 topic 在集群上现有的分区数。
+func topicPartitions(ctx context.Context, kcfg kafkax.Config, topic string) (int32, error) {
+	client, err := kafkax.NewClient(ctx, kcfg)
+	if err != nil {
+		return 0, err
+	}
+	defer client.Close()
+	return kafkax.TopicPartitions(ctx, client, topic)
+}
+
 func ensureTopics(ctx context.Context, kcfg kafkax.Config, partitions map[string]int32, topics ...string) error {
 	client, err := kafkax.NewClient(ctx, kcfg)
 	if err != nil {

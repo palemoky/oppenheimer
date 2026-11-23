@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -88,6 +89,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *orderv1.SubmitOrderReque
 		Now:            accepted,
 		IdempotencyTTL: s.idemTTL,
 		Backlog:        s.backlog,
+		Queue:          s.landingQueue(orderID),
 	}
 	res, err := s.hold(ctx, hreq)
 	if err != nil {
@@ -254,6 +256,18 @@ func (s *Service) abandon(ctx context.Context, orderID int64) (r stockgate.ReapR
 		return err
 	})
 	return r, err
+}
+
+// landingQueue 返回这张订单在闸门里排哪一条落库队列：它的 order.submit 消息会进的分区号。
+// 没有配置分区数时返回空串，背压不分队列。
+//
+// 消息还没有发（先扣库存、后发消息），所以是算出来的：key 和 publish 用的是同一个（eventx.OrderKey），
+// 分区按 Producer 的算法算（kafkax.PartitionOf）。算错了只影响背压数哪条队列，见 Config.SubmitPartitions。
+func (s *Service) landingQueue(orderID int64) string {
+	if s.submitParts <= 0 {
+		return ""
+	}
+	return strconv.Itoa(int(kafkax.PartitionOf(eventx.OrderKey(orderID), s.submitParts)))
 }
 
 // publish 在一次 Send 里发出 order.submit 和 order.close.delay。

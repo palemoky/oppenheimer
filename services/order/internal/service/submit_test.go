@@ -566,3 +566,57 @@ func TestSubmitConcurrentWarmUpIsCoalesced(t *testing.T) {
 	}
 	e.wantGate(t, skuA, 1000-buyers, buyers)
 }
+
+// 背压按落库的分区分队列（Config.SubmitPartitions，ADR-0036）：每个分区的队列上限是 1、没有一单落库时，
+// 4 个分区各受理一单，其余的被第一条规则拒绝；全局只数一个总数的话只会受理一单。
+// 同时核对受理时算出来的队列就是消息实际的 key 按 Producer 的算法会去的分区。
+func TestSubmitBackpressurePerPartition(t *testing.T) {
+	t.Parallel()
+	const partitions = 4
+	e := newEnv(t)
+	ids, err := idgen.New(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := mustNew(t, Deps{Store: e.store, Gate: e.gate, Sender: e.sender, Inventory: e.inv, IDs: ids, Logger: e.svc.logger},
+		Config{
+			Clock: e.clock.Now, OrderEventsTopic: testEventsTopic, SubmitTopic: testSubmitTopic, CloseDelayTopic: testCloseTopic,
+			Backlog: stockgate.BacklogLimit{MaxQueue: 1}, SubmitPartitions: partitions,
+		})
+
+	accepted := map[int64]bool{}
+	rejected := 0
+	for i := range 60 {
+		resp, err := svc.SubmitOrder(t.Context(), submitReq(int64(100+i), "k", items(skuA, 1)))
+		if err != nil {
+			wantErr(t, err, codes.ResourceExhausted, errx.ReasonBacklogged)
+			rejected++
+			continue
+		}
+		accepted[resp.GetOrder().GetOrderId()] = true
+	}
+	if len(accepted) != partitions || rejected != 60-partitions {
+		t.Fatalf("accepted %d, rejected %d; want %d accepted (one per partition) and the rest rejected", len(accepted), rejected, partitions)
+	}
+
+	seen := map[string]bool{}
+	recs := e.sender.records(testSubmitTopic)
+	if len(recs) != partitions {
+		t.Fatalf("submit messages %d, want %d", len(recs), partitions)
+	}
+	for _, r := range recs {
+		id, err := strconv.ParseInt(string(r.Key), 10, 64)
+		if err != nil || !accepted[id] {
+			t.Fatalf("submit message with key %q does not belong to an accepted order (%v)", r.Key, err)
+		}
+		want := strconv.Itoa(int(kafkax.PartitionOf(r.Key, partitions)))
+		got, err := e.rdb.HGet(t.Context(), e.prefix+"gate:hold:"+string(r.Key), "q").Result()
+		if err != nil || got != want {
+			t.Fatalf("order %d is queued in %q (%v), its message goes to partition %s", id, got, err, want)
+		}
+		if seen[got] {
+			t.Fatalf("two accepted orders share queue %s although its limit is 1", got)
+		}
+		seen[got] = true
+	}
+}
