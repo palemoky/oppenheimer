@@ -159,7 +159,7 @@ func TestReconcileWithUnappliedDeltas(t *testing.T) {
 	}
 
 	// 真实的偏差：有人把 MySQL 的 available 直接改小了 5（模拟盘点、手工修数据），增量仍未应用。
-	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = available - 5 WHERE sku_id = 1`)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = available - 5, stocked = available + reserved + sold WHERE sku_id = 1`)
 	e.totals[1] -= 5 // 入库总量随之变了，结束时的检查按新总量核对
 	for range 3 {
 		if err := r.Round(t.Context()); err != nil {
