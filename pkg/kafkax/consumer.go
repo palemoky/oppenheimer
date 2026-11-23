@@ -78,7 +78,10 @@ type ConsumerConfig struct {
 	// （设计文档 1d 的 2.2、ADR-0017）。
 	//
 	// 打开之后提交的是“连续完成的前缀”（见 prefixTracker），前缀之后已经完成的消息在重启或
-	// 再平衡后会重复投递，handler 必须幂等。延迟消费者不支持。
+	// 再平衡后会重复投递，handler 必须幂等。
+	//
+	// 延迟消费者也可以打开：等到期的是分发的那一个 goroutine，不是 lane，所以“队首没到期，
+	// 后面的都不动”照旧成立，并发的只是已经到期的那些（见 NewDelayConsumer）。
 	Concurrency int
 	// MaxUncommitted 只在 Concurrency > 1 时有意义：一个分区里已分发、位点还不能提交的消息数上限，
 	// 默认 1024。到达上限时停止分发，等最前面那条完成。
@@ -215,10 +218,6 @@ func newConsumer(ctx context.Context, cfg ConsumerConfig, handler Handler, clock
 		return nil, fmt.Errorf("kafkax: consumer concurrency %d is negative", cfg.Concurrency)
 	}
 	cfg.Concurrency = max(cfg.Concurrency, 1)
-	if cfg.Concurrency > 1 && clock != nil {
-		// 延迟 topic 依赖“分区内按到期时间有序、队首没到期就整个分区等着”，并发会让后面的消息越过队首。
-		return nil, errors.New("kafkax: a delay consumer cannot process a partition concurrently")
-	}
 	if cfg.MaxUncommitted <= 0 {
 		cfg.MaxUncommitted = defaultMaxUncommitted
 	}
@@ -772,6 +771,13 @@ func (w *worker) runLanes(ctx context.Context) {
 		w.mu.Lock()
 		w.tracker.add(rec)
 		w.mu.Unlock()
+		// 延迟消费者：在这里等到期，到期之后才交给 lane。分发是按位点顺序一条一条来的，
+		// 所以队首没到期时它后面的一条都分发不出去，已经分发出去的都是到期了的。
+		// 等之前就登记：它没有完成，可提交的前缀到不了它；oldestPending 也看得见它（没到期的年龄是 0）。
+		// 被打断时它留在 tracker 里，位点不会越过它，下次重新读到。
+		if w.c.clock != nil && !w.c.waitDue(ctx, w, rec) {
+			return
+		}
 		select {
 		case w.lanes[w.c.laneOf(rec.Key)] <- rec:
 		case <-w.stop:
@@ -924,7 +930,8 @@ func (w *worker) setCommitted(next int64) {
 // process 处理一条消息直到成功、进入死信或被打断。返回 false 表示被打断，消息没有处理完。
 func (c *Consumer) process(ctx context.Context, w *worker, rec *kgo.Record) bool {
 	log := w.log.With("offset", rec.Offset)
-	if c.clock != nil && !c.waitDue(ctx, w, rec, log) {
+	// 并发消费时到期已经在分发的时候等过了（runLanes），lane 里不再等。
+	if c.clock != nil && len(w.lanes) == 0 && !c.waitDue(ctx, w, rec) {
 		return false
 	}
 
