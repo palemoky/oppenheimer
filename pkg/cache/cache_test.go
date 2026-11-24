@@ -42,6 +42,29 @@ func newCache(t *testing.T, client redis.Cmdable, prefix string, mutate ...func(
 	return c
 }
 
+// warmPool 用 n 个并发的 PING 把连接池建满，直到有一轮全部成功而且都很快：
+// 慢的那一轮里超时的连接会被丢掉，池子还是不满。
+func warmPool(ctx context.Context, t *testing.T, client redis.Cmdable, n int) {
+	t.Helper()
+	for range 10 {
+		var slow atomic.Int64
+		var wg sync.WaitGroup
+		for range n {
+			wg.Go(func() {
+				start := time.Now()
+				if err := client.Ping(ctx).Err(); err != nil || time.Since(start) > 50*time.Millisecond {
+					slow.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+		if slow.Load() == 0 {
+			return
+		}
+	}
+	t.Log("the connection pool did not warm up cleanly; the test may see slow reads")
+}
+
 // loader 返回固定结果并统计调用次数。
 type loader struct {
 	calls atomic.Int64
@@ -182,7 +205,14 @@ func TestZeroTTLIsNotCached(t *testing.T) {
 func TestConcurrentColdKeyLoadsOnceInProcess(t *testing.T) {
 	client, prefix := testredis.New(t)
 	ctx := testCtx(t)
-	c := newCache(t, client, prefix)
+	// 这里验的是“都没命中的并发请求只回源一次”，前提是没有一个请求读缓存超时：超时的那个按设计自己回源，
+	// 那时第一趟已经结束，回源次数就成了 2。两件事保证这个前提：
+	//   - 先把连接池建满。100 个请求同时落在一个新建的池子上会同时建几十条连接，本机经容器的端口转发时
+	//     偶尔有一条的握手被丢、1 秒后才重传（实测：新建的客户端上 100 个并发的首次 GET，约一成超过 150 毫秒，
+	//     集中在 1 秒；8 个并发时没有）。
+	//   - 读的时限放长，机器忙的时候不至于碰到默认的 200 毫秒。
+	warmPool(ctx, t, client, 100)
+	c := newCache(t, client, prefix, func(cfg *Config) { cfg.ReadTimeout = 5 * time.Second })
 	l := &loader{res: Loaded[string]{Value: "v", Found: true, TTL: time.Minute}, delay: 100 * time.Millisecond}
 
 	var wg sync.WaitGroup
