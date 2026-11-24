@@ -167,12 +167,15 @@ func (t *queryTool) Call(ctx context.Context, input jsontext.Value) (tool.Result
 		if err := json.Unmarshal(resp.Data.Result, &streams); err != nil {
 			return tool.Result{}, fmt.Errorf("the Loki response could not be parsed: %w", err)
 		}
+		// 隐藏的命名空间的流当它不存在（tool.Hidden）。Raw 是落盘给人看的，不筛。
+		streams = slices.DeleteFunc(streams, func(s stream) bool { return t.c.hidden.Labels(s.Stream) })
 		text, err = formatStreams(streams, info)
 	case "matrix":
 		var ss []series
 		if err := json.Unmarshal(resp.Data.Result, &ss); err != nil {
 			return tool.Result{}, fmt.Errorf("the Loki response could not be parsed: %w", err)
 		}
+		ss = slices.DeleteFunc(ss, func(s series) bool { return t.c.hidden.Labels(s.Metric) })
 		text, err = formatMatrix(ss, info)
 	default:
 		return tool.Result{}, fmt.Errorf("the Loki server returned result type %q, which this tool does not handle; use a log query or a range metric query", resp.Data.ResultType)

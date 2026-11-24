@@ -177,7 +177,7 @@ chaos/
 6. **等静止，验数据**：`make recon-check FROM=<开始> TO=<结束>`，加上三个常驻核对的告警没有响、超卖是 0。结果写进运行目录。
 7. **`chaos-reveal`**：复盘时打开答案，按模板生成一份 `docs/postmortems/` 的草稿，把 `truth.md` 的三栏填进“评测用标注”。
 
-**Agent 看不到答案**：答案在开发机上；Agent 的 kube、loki 工具拒绝 `chaos-mesh` 命名空间（权限也改成不含它），日志采集不收这个命名空间；故障开关的名字不出现在日志里。主人这一边靠自觉：不看 `chaos/scenarios/`，不 `kubectl get` Chaos Mesh 的对象。
+**Agent 看不到答案**：答案在开发机上；Agent 的 kube、loki 工具拒绝 `chaos-mesh` 命名空间（权限也改成不含它），日志采集不收这个命名空间；故障开关的名字不出现在日志里。（实现时改了两处：不是“拒绝”而是“当它不存在”，权限没有收，Prometheus 的工具也筛。理由见第 6 节“第 5 步”。）主人这一边靠自觉：不看 `chaos/scenarios/`，不 `kubectl get` Chaos Mesh 的对象。
 
 ### 3.6 稳态的压测和数据检查
 
@@ -244,6 +244,29 @@ chaos/
   3. 这个集群的上游 DNS 在代理后面，**不存在的域名也会解析出一个假地址**（198.18.0.0/15）。所以 DNSChaos 用“让能解析的名字失败”来验，不能用“让不存在的名字解析出来”。以后设计 DNS 类的场景、写“解析失败”的告警时也要记得这一点：外部域名在这里永远不会 NXDOMAIN。
 - **没有验的**：HTTPChaos（设计里就不用）；节点级的故障（关虚拟机不经过 Chaos Mesh）；同时有两个实验对象；controller-manager 挂掉时已注入的故障怎么收回；长期运行的那一套（`oppenheimer`）上一次都没有注入过。
 - **顺带**：e2e 这一套（`E2E_KEEP=1 make cluster-e2e`）这次也跑了，通过。删命名空间时那些 `PodNetworkChaos` 对象没有挡住删除。
+
+### 第 5 步：Agent 看不到注入工具（2026-11-24；主会话写；代码和配置写了，**没有部署**）
+
+- **做了的**：
+  - `services/agent/internal/tool/hidden.go`：`tool.Hidden`，一份“对模型不存在”的名单（命名空间 `chaos-mesh`、API 组 `chaos-mesh.org`；`agent serve` 和 `agent tool` 的 `-hidden-namespaces`、`-hidden-api-groups`，默认就是这两个，给空串关掉）。
+  - 十个工具里和它有关的都接上了：
+    - `kube_get`、`kube_describe`、`kube_events`、`kube_logs`：指名读隐藏的命名空间，回答和一个不存在的命名空间**一字不差**（有测试钉住）；跨命名空间的列表里没有它。事件多筛一层：事件说的对象（`involvedObject`、`related`）属于隐藏的 API 组的也丢掉，这是第 1 步发现的“目标命名空间里的 `PodNetworkChaos`、`PodIOChaos` 事件”。按 API 组认，不按 kind 的名字。
+    - `prom_query`、`prom_query_range`：结果里标签（`namespace`、`k8s_namespace_name`、`exported_namespace`）指着隐藏命名空间的序列丢掉；`prom_alerts`、`prom_rule` 里这样的告警丢掉。
+    - `loki_query`：同样按流的标签丢；`loki_labels` 问命名空间标签的值时不给它。
+  - 日志采集：`otel-agent.yaml` 加了 `filter/hidden_namespaces` 处理器，`chaos-mesh` 的日志不进 Loki。`services/agent/deploy_test.go` 核对它和 Agent 的默认名单一致。
+- **为什么是“不存在”而不是“拒绝”**：一句“不允许读这个命名空间”本身就告诉模型这里有东西，而且告诉它这是一次演练。所以指名去读得到的是找不到，列表里没有。
+- **验证了的**：`make lint`、`make test`（`services/agent`）通过。本机的 `agent tool` 对着真的集群（管理员的 kubeconfig，只读）：`kube_get pod` 全命名空间的列表里没有 `chaos-mesh` 的 5 个 Pod；指名列 `chaos-mesh` 和列一个不存在的命名空间输出一样；关掉名单（`-hidden-namespaces=`）时看得到。Loki 里装命名空间的标签确实是 `k8s_namespace_name`，Prometheus 里现在有 144 个指标名带 `namespace="chaos-mesh"`（kubelet、cAdvisor、kube-state-metrics），都在名单认的三个标签里。
+- **和 3.5 不一样的地方**：
+  1. **权限没有收**（3.5 写的是“权限也改成不含它”）。RBAC 只有允许、没有拒绝：要让一个 ClusterRole 不含某一个命名空间，只能改成在每个允许的命名空间里各建一个 RoleBinding。那样跨命名空间的列表（`kubectl get pods -A` 这一类，Agent 的工具默认就是这样查的）会整个 403，工具要改成逐个命名空间查，以后每加一个命名空间还要记得加一份绑定。这里防的是“模型无意中读到答案”，不是一个存心绕过的调用方，放在工具里就够了。真要在权限上隔开，路子是另一头：给注入工具单独的集群，或者用准入策略，都不值得在这里做。
+  2. Prometheus 也要筛（3.5 只写了 kube 和 loki）：kube-state-metrics 和 cAdvisor 的指标带着 `chaos-mesh` 的 Pod 名和资源用量。
+- **挡不住的（知道，接受）**：
+  1. **聚合掉命名空间标签的查询**：`sum(container_memory_working_set_bytes)` 把它算在里面；`count by (pod) (...)` 会露出 `chaos-daemon-xxxx` 这样的 Pod 名；LogQL 里 `| drop k8s_namespace_name` 之后流就认不出来了。露出的是“装着 Chaos Mesh”，不是“注入了什么”；后者在日志和 `Pod*Chaos` 对象里，日志不再收，对象读不到（kind 白名单里没有）。
+  2. **已经在 Loki 里的日志**：冒烟那一次（08:30 UTC）`chaos-controller-manager` 的日志还在，到保留期才没。工具按流的标签筛掉了，上一条说的绕法读得到。
+  3. **StressChaos 的痕迹在目标自己的指标里**：`stress-ng` 是放进目标容器的 cgroup 里跑的，目标 Pod 的 CPU、内存会涨，但进程列表 Agent 看不到。这是症状，不是答案，本来就该让它看到。
+  4. **关于 `chaos-mesh` 自己的告警**会经 Alertmanager 发给 Agent（比如 `chaos-daemon` 的内存到了 limit），问题里就带着这个命名空间。触发那一层没有筛。现在这样的告警没有响过。
+  5. `loki_labels` 问别的标签（`k8s_pod_name`、`service_name`）的值时，一小时内有过日志的 `chaos-mesh` 的 Pod 名还在；日志停收一小时后自己没有。
+  6. 主人这一侧仍然只靠约定：Grafana 里不再搜得到它的日志了（顺带的好处），但 `kubectl` 什么都看得到。
+- **没有做的**：部署（Agent 的镜像、Collector 的 `helm upgrade`）要动集群，登记在计划文件“4a 准备”里，等主人同意。部署后要核对的：Agent 用**自己的身份**在集群里查不到 `chaos-mesh`；Loki 里 `chaos-mesh` 不再有新的日志。
 
 ### 第 3 步：`pprof_capture`（2026-11-24；Opus 写，主会话评审；Role 没有 apply，集群里的 Agent 还是旧镜像）
 

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/yaml"
+
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool"
 )
 
 // 只读的边界划在 deploy/cluster/monitoring/agent.yaml 的 ClusterRole 里：这里核对它没有被放宽。
@@ -140,5 +143,44 @@ func TestPprofRoleIsNarrow(t *testing.T) {
 	if len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" ||
 		binding.Subjects[0].Name != "agent" || binding.Subjects[0].Namespace != "monitoring" {
 		t.Errorf("RoleBinding subjects = %+v, want only ServiceAccount monitoring/agent", binding.Subjects)
+	}
+}
+
+// 对模型隐藏的命名空间（tool.Hidden 的默认名单）有两处：Agent 的工具把它当成不存在，日志采集不收它的日志。
+// 只做前一处的话 Loki 里仍然有那些日志，聚合掉命名空间标签的查询读得到；这里核对后一处没有漏。
+func TestHiddenNamespacesAreNotCollected(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/cluster/monitoring/otel-agent.yaml")
+	if err != nil {
+		t.Fatalf("read collector values: %v", err)
+	}
+	var values struct {
+		Config struct {
+			Processors map[string]struct {
+				Logs struct {
+					LogRecord []string `json:"log_record"`
+				} `json:"logs"`
+			} `json:"processors"`
+			Service struct {
+				Pipelines struct {
+					Logs struct {
+						Processors []string `json:"processors"`
+					} `json:"logs"`
+				} `json:"pipelines"`
+			} `json:"service"`
+		} `json:"config"`
+	}
+	if err := yaml.Unmarshal(raw, &values); err != nil {
+		t.Fatalf("parse collector values: %v", err)
+	}
+	const name = "filter/hidden_namespaces"
+	if !slices.Contains(values.Config.Service.Pipelines.Logs.Processors, name) {
+		t.Errorf("processor %s is not in the logs pipeline", name)
+	}
+	conditions := values.Config.Processors[name].Logs.LogRecord
+	for ns := range strings.SplitSeq(tool.DefaultHiddenNamespaces, ",") {
+		want := `resource.attributes["k8s.namespace.name"] == "` + ns + `"`
+		if !slices.Contains(conditions, want) {
+			t.Errorf("processor %s does not drop namespace %q: want the condition %s, have %q", name, ns, want, conditions)
+		}
 	}
 }

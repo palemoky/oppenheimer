@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,7 +64,7 @@ func (t *queryTool) Call(ctx context.Context, input jsontext.Value) (tool.Result
 		return tool.Result{}, err
 	}
 	var b strings.Builder
-	if err := formatData(&b, resp.data, "at "+at.UTC().Format(time.RFC3339)); err != nil {
+	if err := formatData(&b, resp.data, "at "+at.UTC().Format(time.RFC3339), t.c.hidden); err != nil {
 		return tool.Result{}, err
 	}
 	appendNotes(&b, resp.notes)
@@ -145,7 +146,7 @@ func (t *rangeTool) Call(ctx context.Context, input jsontext.Value) (tool.Result
 	}
 	var b strings.Builder
 	header := fmt.Sprintf("from %s to %s, %s", start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339), stepNote)
-	if err := formatData(&b, resp.data, header); err != nil {
+	if err := formatData(&b, resp.data, header, t.c.hidden); err != nil {
 		return tool.Result{}, err
 	}
 	appendNotes(&b, resp.notes)
@@ -245,7 +246,8 @@ func (p *point) float() float64 {
 }
 
 // formatData 按结果的类型写出给模型看的文本。header 说明查的时间（即时查询的时刻或范围查询的区间）。
-func formatData(b *strings.Builder, data jsontext.Value, header string) error {
+// 标签指着隐藏的命名空间的序列当它不存在（tool.Hidden）；聚合掉了命名空间标签的结果认不出来，照常给。
+func formatData(b *strings.Builder, data jsontext.Value, header string, hidden *tool.Hidden) error {
 	var d queryData
 	if err := json.Unmarshal(data, &d); err != nil {
 		return fmt.Errorf("cannot parse the Prometheus query result: %w", err)
@@ -270,6 +272,7 @@ func formatData(b *strings.Builder, data jsontext.Value, header string) error {
 	if err := json.Unmarshal(d.Result, &ss); err != nil {
 		return fmt.Errorf("cannot parse the Prometheus %s result: %w", d.ResultType, err)
 	}
+	ss = slices.DeleteFunc(ss, func(s series) bool { return hidden.Labels(s.Metric) })
 	if len(ss) == 0 {
 		fmt.Fprintf(b, "%s %s: %s\n", d.ResultType, header, emptyText)
 		return nil

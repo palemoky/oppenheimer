@@ -85,5 +85,9 @@ func toolFlags(fs *flag.FlagSet, cfg *serveConfig) {
 	fs.StringVar(&cfg.kubeconfig, "kubeconfig", "", "kubeconfig path for the kube_* and pprof_capture tools (local use)")
 	fs.BoolVar(&cfg.inCluster, "in-cluster", false, "use the pod's ServiceAccount for the kube_* and pprof_capture tools")
 	fs.StringVar(&cfg.pprofNamespace, "pprof-namespace", pprof.DefaultNamespace, "the only namespace pprof_capture may port-forward into")
+	fs.StringVar(&cfg.hiddenNamespaces, "hidden-namespaces", tool.DefaultHiddenNamespaces,
+		"comma-separated namespaces every tool treats as nonexistent (the fault injection tooling); empty hides none")
+	fs.StringVar(&cfg.hiddenAPIGroups, "hidden-api-groups", tool.DefaultHiddenAPIGroups,
+		"comma-separated API groups whose objects' events kube tools drop; empty hides none")
 	fs.IntVar(&cfg.pprofPort, "pprof-port", pprof.DefaultPort, "debug (pprof) port on the pod's loopback, as in the services' DEBUG_ADDR")
 }

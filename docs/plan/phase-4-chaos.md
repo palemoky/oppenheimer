@@ -42,6 +42,23 @@
   - CPU profile 对被诊断的进程有开销，不算纯只读：每个 Pod 的抓取频率和时长设上限，pprof 只开在内部端口上，每次抓取都留痕
 - [x] 实验清单目录 `chaos/`，每个场景一个可重复执行的清单
   - 2026-11-24：格式定了（`chaos/README.md`，`scripts/cluster/chaos-run.sh lint` 检查），三个场景 `s001` 到 `s003`。**主人在实验之前不读 `chaos/scenarios/`**
+- [ ] Agent 看不到注入工具（设计 3.5 的最后一段；2026-11-24 加的一项，原来只写在设计里）
+  - 2026-11-24：代码和配置写了（`tool.Hidden`，十个工具里有关的都接上；Collector 不收 `chaos-mesh` 的日志；[设计第 6 节“第 5 步”](../design/4a-chaos-prep.md)），对着真的集群只读核对过。**没有部署**，部署后用 Agent 自己的身份核对过再勾
+  - **登记（2026-11-24；主人同一天同意了）**：
+    1. `make agent`：重建 Agent 的镜像并重新部署（Recreate，几秒钟收不到 webhook）；同一份清单里的 Role `oppenheimer-agent-pprof`（`oppenheimer` 里 `pods/portforward` 的 create）第一次 apply。
+    2. `scripts/cluster/monitoring.sh collector`：`helm upgrade` 日志采集的 DaemonSet（三个节点上的 `otel-agent` 逐个重启；读到哪里有检查点，重启期间的日志不丢）。
+    3. 核对：`kubectl -n monitoring exec deploy/agent -- /app/agent tool ...` 查不到 `chaos-mesh`、能对 `order` 的一个 Pod 抓 goroutine 剖析（验 Role）；Loki 里 `chaos-mesh` 没有新日志。只读。
+- [ ] 走通一遍（设计第 4 节第 6 步）：一个不盲的第一档场景和第一个故障点，从检查稳态到生成复盘草稿
+  - **登记（2026-11-24；主人同一天同意了）**。都在长期运行的 `oppenheimer` 上，这是它第一次被注入。
+    1. **换成带故障代码的镜像**：`GO_TAGS=faults make deploy`，五个服务（gateway、order、inventory、payment、orderindex）滚动更新成 `-faults` 后缀的镜像。故障代码进了集群，开关默认全关。阶段 4 期间一直用这套镜像；结束后换回平时的。
+    2. **发压**（从本机经 Mac mini 上的 k6；期间本机不跑测试、lint、构建）：先 `loadtest.sh skus` 备 20 个新 SKU、每个 2.5 万库存（写 `inventory` 的表，只增不改已有的），再 `make chaos-steady ARGS=start`：mixed，570 请求/秒（3b 拐点的三成，其中下单约 46 单/秒），最长 2 小时，两个场景做完就停。
+    3. **场景一，`s002`**（第一档，`make chaos-inject SCENARIO=s002`）：Chaos Mesh 的 PodChaos，杀 `inventory` 两个副本里的一个，Deployment 自己补上。给 `oppenheimer` 命名空间加注入的注解，结束时去掉。
+    4. **场景二，`s001`**（第二档，故障开关 `f01`，目标是 `gateway`）：经端口转发打开开关，最长 30 分钟，到时自己关；恢复时脚本滚动重启 `gateway`。内容主人不看，主会话知道。
+    5. 每个场景之后 `make chaos-recover`：撤注入、等回到稳态、`recon-check`（对账差异要是 0）；再 `make chaos-reveal` 生成复盘草稿。走通的目的是验脚本，所以两个场景都不盲。
+    6. **Agent**：两个场景期间响了告警它会自己诊断（DeepSeek，现在是低谷价；一次约 0.01 到 0.05 美元，每天预算 20 美元）。没有告警响的话主会话手动问一次（`agent ask`），看它用不用 `pprof_capture`。
+    7. **顺带量的**（都是只读）：`mysql-main` 的 `MALLOC_ARENA_MAX=4` 在这次发压下的内存（570 请求/秒到不了 200 个连接，大概只能看到“没有变差”，真正的验证要等更大的一轮）。
+    8. **不做的**：mutex、block 采样先不开（要用 3b 的压测量开销，另外登记）；第三档的场景；盲测。
+    9. **出了岔子**：`make chaos-recover ALL=1 RESTART=1` 是总闸（删所有 Chaos Mesh 对象、关所有开关、去注解、重启五个服务）；`make chaos-steady ARGS=stop` 停压测。影响范围：`inventory` 少一个副本几十秒；`gateway` 在 `s001` 期间有预期的症状、之后重启一次；发压期间探针和 SLO 可能有抖动，告警可能发到 Telegram。
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
   - 2026-11-24：`scripts/cluster/chaos-run.sh`（`make chaos-blind|chaos-inject|chaos-recover|chaos-reveal`）写了，主会话评审过。**连集群的路径一条都没有真的跑过**（只用假的 `kubectl` 走过逻辑），第 6 步走通一遍之后再勾
 - [ ] 实验期间的稳态压测脚本与数据一致性检查脚本
@@ -132,6 +149,8 @@
 ## 面试考点
 
 4a 装 Chaos Mesh 补的（[设计 4a](../design/4a-chaos-prep.md) 第 6 节“第 1 步”）：Chaos Mesh 的几类故障各自在哪一层动手（NetworkChaos 是目标 Pod 网络命名空间里的 tc/netem 和 iptables，所以延迟加在出方向、一来一回是两倍；StressChaos 是往目标容器的 cgroup 里放 stress-ng；IOChaos 是把卷换成一层 FUSE；TimeChaos 是 ptrace 进去改 vDSO 里取时间的函数，所以只对注入时已经在跑的进程、经过 vDSO 取时间的进程有效；DNSChaos 是把 Pod 的 DNS 指到它自己的 DNS 服务）；`chaos-daemon` 为什么要特权、生产里这意味着什么（它能进任何 Pod 的命名空间，装它等于多了一个能动所有业务的入口，要配命名空间过滤、RBAC、审计）；为什么默认谁都不能被注入（`enableFilterNamespace` 加注解）；冒烟为什么要先验“没开的时候不生效”；验证一类故障要量“生效、到时恢复、留下什么痕迹”三件事。
+
+4a“Agent 看不到注入工具”补的（[设计 4a](../design/4a-chaos-prep.md) 第 6 节“第 5 步”）：Kubernetes 的 RBAC 为什么只有允许没有拒绝、想“除了某个命名空间都能读”时有哪几条路（逐个命名空间绑定、准入策略、分集群）各自的代价；权限的粒度到不了时在应用层拦，要说清楚它防的是谁（无意读到，还是存心绕过）；为什么“拒绝”本身是信息泄漏、返回要做成和不存在一样（和登录接口不区分“用户不存在”“密码错”是同一个道理）；按结果筛标签挡不住聚合查询，多租户的 Prometheus、Loki 是怎么做的（在查询进后端之前改写选择器强加租户标签，如 prom-label-proxy，或者干脆分租户存）。
 
 4a 故障开关补的（[设计 4a](../design/4a-chaos-prep.md) 第 3.3 节和第 6 节、[ADR-0041](../adr/0041-two-fault-injection-paths.md)）：哪些故障从外面造不出来、只能预埋；Go 的构建标签怎么用（`//go:build` 写错了会被当成普通注释，文件就进了平时的构建）、怎么证明一段代码没有进二进制（`go tool nm`，以及这种检查为什么要“反过来确认一次”防止空转）；为什么不靠“常量为 false 的分支会被编译器删掉”；故障开关为什么必须自己会关（ttl）；带缓冲和不带缓冲的 channel 在“先返回、后台还在跑”这种写法里差在哪；shell 里 `pipefail` 加 `grep -q` 的 SIGPIPE 陷阱。
 

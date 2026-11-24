@@ -51,6 +51,16 @@ config:
       check_interval: 1s
       limit_percentage: 80
       spike_limit_percentage: 20
+    # 故障注入工具（命名空间 chaos-mesh）的日志不收（设计 4a 的 3.5 和第 6 节“第 5 步”）：它的日志里直接写着
+    # 注入了什么，盲测时人在 Grafana 里搜日志、诊断 Agent 查 Loki 都会读到答案。要看它自己的日志用 kubectl logs。
+    # 用 filter 处理器而不是 filelog 的 exclude：exclude 是列表，Helm 合并时会把 preset 生成的那一项
+    # （不读 Collector 自己的日志）整体覆盖掉。代价是这些文件照样被读一遍再丢，量很小。
+    # 命名空间名和 Agent 的 -hidden-namespaces 要一致（services/agent/deploy_test.go 核对）。
+    filter/hidden_namespaces:
+      error_mode: ignore
+      logs:
+        log_record:
+          - resource.attributes["k8s.namespace.name"] == "chaos-mesh"
     # 每批最多 2000 条（约 1.7 MB）。默认没有上限：gateway 回来之后 filelog 一口气追读积压的日志，
     # batch 会合出 7000 多条的一批，超过 gateway 的 gRPC 接收上限（4 MiB），这是不可重试的错误，整批被丢（2026-11-17 实测）。
     batch:
@@ -129,5 +139,5 @@ config:
       logs:
         # receivers 写空：chart 默认的 [otlp] 会被保留，preset 只往后追加 file_log。
         receivers: []
-        processors: [memory_limiter, transform/json, transform/drop_attrs, transform/service_name, batch]
+        processors: [memory_limiter, filter/hidden_namespaces, transform/json, transform/drop_attrs, transform/service_name, batch]
         exporters: [otlp_grpc]

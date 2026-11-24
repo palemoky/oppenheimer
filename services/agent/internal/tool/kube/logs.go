@@ -88,6 +88,9 @@ func (k *kube) logs(ctx context.Context, input jsontext.Value) (tool.Result, err
 		opts.SinceTime = &metav1.Time{Time: t}
 	}
 
+	if k.hidden.Namespace(args.Namespace) {
+		return tool.Result{}, notFound(where("Pod", args.Namespace, args.Pod))
+	}
 	pods := k.client.CoreV1().Pods(args.Namespace)
 	pod, err := pods.Get(ctx, args.Pod, metav1.GetOptions{})
 	if err != nil {

@@ -89,6 +89,9 @@ type serveConfig struct {
 	// pprofNamespace、pprofPort 是 pprof_capture 能连的命名空间和 Pod 回环上的调试端口。
 	pprofNamespace string
 	pprofPort      int
+	// hiddenNamespaces、hiddenAPIGroups 是对模型不存在的命名空间和 API 组（逗号分隔），见 tool.Hidden。
+	hiddenNamespaces string
+	hiddenAPIGroups  string
 }
 
 func serveCmd(args []string, stderr io.Writer) int {
@@ -259,12 +262,13 @@ func envOr(key, fallback string) string {
 func buildTools(cfg serveConfig, logger *slog.Logger) (*tool.Registry, error) {
 	// 工具自己不设超时：每次调用的时限由循环经 ctx 给（loop.Limits.ToolTimeout）。
 	client := &http.Client{}
+	hidden := tool.NewHidden(cfg.hiddenNamespaces, cfg.hiddenAPIGroups)
 	var tools []tool.Tool
 	if cfg.prometheusURL != "" {
-		tools = append(tools, prom.New(prom.Config{BaseURL: cfg.prometheusURL, HTTP: client})...)
+		tools = append(tools, prom.New(prom.Config{BaseURL: cfg.prometheusURL, HTTP: client, Hidden: hidden})...)
 	}
 	if cfg.lokiURL != "" {
-		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client})...)
+		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client, Hidden: hidden})...)
 	}
 	kubeCfg, err := kubeConfig(cfg)
 	if err != nil {
@@ -275,7 +279,7 @@ func buildTools(cfg serveConfig, logger *slog.Logger) (*tool.Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("kubernetes client: %w", err)
 		}
-		tools = append(tools, kube.New(kube.Config{Client: cs})...)
+		tools = append(tools, kube.New(kube.Config{Client: cs, Hidden: hidden})...)
 		tools = append(tools, pprof.New(pprof.Config{
 			Pods:      cs,
 			Forwarder: pprof.NewKubeForwarder(kubeCfg, cs),

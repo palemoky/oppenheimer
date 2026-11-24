@@ -36,11 +36,13 @@ type Config struct {
 	HTTP *http.Client
 	// Now 为 nil 时用 time.Now。相对时间（-15m）按它算。
 	Now func() time.Time
+	// Hidden 是对模型不存在的命名空间（故障注入工具），nil 时什么都不隐藏。见 tool.Hidden。
+	Hidden *tool.Hidden
 }
 
 // New 返回 loki_query 和 loki_labels。
 func New(cfg Config) []tool.Tool {
-	c := &client{base: strings.TrimRight(cfg.BaseURL, "/"), http: cfg.HTTP, now: cfg.Now}
+	c := &client{base: strings.TrimRight(cfg.BaseURL, "/"), http: cfg.HTTP, now: cfg.Now, hidden: cfg.Hidden}
 	if c.http == nil {
 		c.http = http.DefaultClient
 	}
@@ -52,9 +54,10 @@ func New(cfg Config) []tool.Tool {
 
 // client 建好之后只读，可以并发使用。
 type client struct {
-	base string
-	http *http.Client
-	now  func() time.Time
+	base   string
+	http   *http.Client
+	now    func() time.Time
+	hidden *tool.Hidden
 }
 
 // get 发一次 GET，返回 2xx 的响应体。错误信息是写给模型看的：不带内部地址，带 Loki 的原话。
