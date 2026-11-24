@@ -20,10 +20,11 @@ import (
 
 // watchTotalsCommand 是常驻核对的子命令：
 //
-//	recon watch-totals [-interval 30s] [-window 30m] [-skip 1m] [-query-timeout 10s]
+//	recon watch-totals [-interval 30s] [-window 30m] [-skip 1m] [-query-timeout 10s] [-drill-timeout 10s]
 //
 // 每隔 interval 按笔数和金额核对一次最近 window 里的支付（internal/totals 的包注释写了规则），结果报成指标，
-// 有差异时每一轮打一条 Error 日志。它不退出：库连不上、查询超时都只记一次失败，等下一轮。
+// 有差异时每一轮打一条 Error 日志；同一分钟连续两轮对不上时逐笔比一次那一分钟，把是哪几笔支付打进日志。
+// 它不退出：库连不上、查询超时都只记一次失败，等下一轮。
 //
 // 环境变量：MYSQL_DSNS（订单库的主库，与 order 服务相同）、PAYMENT_DSN，以及 OpenTelemetry 的那几个
 // （没设 OTEL_EXPORTER_OTLP_ENDPOINT 时不导出，只有日志）。
@@ -50,14 +51,15 @@ func runWatchTotals(ctx context.Context, logger *slog.Logger, args []string) err
 	fs.DurationVar(&cfg.Window, "window", 30*time.Minute, "check payments created within this long before now")
 	fs.DurationVar(&cfg.Skip, "skip", time.Minute, "leave out payments created within this long before now")
 	fs.DurationVar(&cfg.QueryTimeout, "query-timeout", 10*time.Second, "time limit of one check")
+	fs.DurationVar(&cfg.DrillTimeout, "drill-timeout", 10*time.Second, "time limit of one per-payment drill-down into a mismatching minute")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected arguments %q", fs.Args())
 	}
-	if cfg.Interval <= 0 || cfg.Window <= 0 || cfg.Skip <= 0 || cfg.QueryTimeout <= 0 {
-		return errors.New("-interval, -window, -skip and -query-timeout must be positive")
+	if cfg.Interval <= 0 || cfg.Window <= 0 || cfg.Skip <= 0 || cfg.QueryTimeout <= 0 || cfg.DrillTimeout <= 0 {
+		return errors.New("-interval, -window, -skip, -query-timeout and -drill-timeout must be positive")
 	}
 
 	shutdownTelemetry, err := otelx.Setup(ctx, serviceName, logger)

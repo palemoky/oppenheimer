@@ -52,7 +52,7 @@ func (e *env) seed(sku, available int64) {
 // setMySQL 直接改 MySQL 的数量，制造偏差（模拟漏掉的结清、丢数据等）。
 func (e *env) setMySQL(sku, available, reserved int64) {
 	e.t.Helper()
-	testdb.MustExec(e.t, e.db, `UPDATE sku_stock SET available = ?, reserved = ? WHERE sku_id = ?`, available, reserved, sku)
+	testdb.MustExec(e.t, e.db, `UPDATE sku_stock SET available = ?, reserved = ?, stocked = available + reserved + sold WHERE sku_id = ?`, available, reserved, sku)
 }
 
 // round 推进一个间隔并执行一轮。
@@ -102,7 +102,7 @@ func TestStableDeviationCorrectedOnThirdRound(t *testing.T) {
 
 	// SKU 1 偏大 2（闸门比 MySQL 多），SKU 2 偏小 3。
 	e.setMySQL(1, 8, 0)
-	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 13 WHERE sku_id = 2`)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 13, stocked = available + reserved + sold WHERE sku_id = 2`)
 
 	e.round()
 	e.round()
@@ -176,7 +176,7 @@ func TestRedisDataLoss(t *testing.T) {
 	e.assertAvail("one released", 1, 8)
 
 	// 一个支付（reserved 转 sold，结清同样什么都不做），一个关闭。
-	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 9, reserved = 0, sold = 1 WHERE sku_id = 1`)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 9, reserved = 0, sold = 1, stocked = available + reserved + sold WHERE sku_id = 1`)
 	for range 3 {
 		e.round()
 	}

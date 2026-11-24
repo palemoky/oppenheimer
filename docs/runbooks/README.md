@@ -82,6 +82,8 @@ KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n monitoring exec alertmanager-kps-
 |---|---|
 | [probe.md](probe.md) | `ProbeFailing`、`ProbeIncomplete`、`ProbeNoData` |
 | [recon.md](recon.md) | `ReconFoundDifferences`、`ReconRunFailed`、`ReconNotRunning`、`ReconDailySlow` |
+| [recon-stock.md](recon-stock.md) | `StockLedgerMismatch`、`StockReservationsStuck`、`StockCheckStalled` |
+| [recon-changes.md](recon-changes.md) | `DerivedDataMismatch`、`DerivedDataLagging`、`DerivedDataCheckStalled` |
 | [payment-totals.md](payment-totals.md) | `PaymentTotalsMismatch`、`PaymentTotalsCheckStalled`、`PaymentReplyOverdue` |
 | [inventory-anomaly.md](inventory-anomaly.md) | `InventoryOversellDetected`、`InventoryGateDrift` |
 | [order-gate-memory.md](order-gate-memory.md) | `OrderGateMemoryFull` |

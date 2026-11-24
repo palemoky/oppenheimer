@@ -315,7 +315,7 @@ func TestOversoldSKUIsStuckAndOthersProceed(t *testing.T) {
 	}
 
 	// 人把库存补上；到了重试的时间，增量被应用，SKU 恢复。
-	testdb.MustExec(t, f.db, `UPDATE sku_stock SET available = 10 WHERE sku_id = 1`)
+	testdb.MustExec(t, f.db, `UPDATE sku_stock SET available = 10, stocked = available + reserved + sold WHERE sku_id = 1`)
 	if err := a.Round(t.Context()); err != nil {
 		t.Fatal(err)
 	}

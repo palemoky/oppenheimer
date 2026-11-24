@@ -65,3 +65,4 @@
 | [0036](0036-per-partition-backlog-and-concurrent-delay.md) | 受理的队列上限按落库的分区各数各的（闸门里另记一份可以重建的索引，上限 ÷ 速率就是最坏的等待）；延迟消费者在队首到期之后按 key 并发（等到期放在分发那一步） | 已采纳 |
 | [0037](0037-slo-and-burn-rate-alerts.md) | SLO 用 7 天窗口和三档多窗口燃烧率告警，规则手写；429 不算坏；平时的流量由常驻探针提供；Alertmanager 的配置不用 `AlertmanagerConfig`；支付可用性是后加的第五个 SLO | 已采纳 |
 | [0038](0038-diagnosis-agent-own-loop.md) | 诊断 Agent 自己写循环（Messages API，历史收在接口后面只能追加）；上限是软的，撞到之后用已有证据交报告；报告经 `submit_report` 交，证据由程序按步骤号从运行记录里渲染 | 已采纳 |
+| [0039](0039-reconciliation-by-scenario.md) | 对账按数据的性质拆三类，各用一个不靠时间容差的判据：钱用支付单的状态，库存用一个一致性快照（总量守恒交给 CHECK），派生数据用行的版本号跟着 CDC 的变更核对；逐行的树留作下钻和独立的一路 | 已采纳 |

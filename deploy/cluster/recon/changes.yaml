@@ -1,0 +1,101 @@
+# 派生数据的变更核对（recon watch-changes）：常驻的一个 Pod，用自己的消费组读订单的 CDC 变更（和 orderindex 读同一个 topic，
+# 互不影响位点），每条变更提交满 10 秒之后去派生端（商家索引、订单从库、冷库）按主键读那一行，用行的版本号判定，
+# 结果报成指标（recon.changes.*），不一致和落后各打一条日志。规则在 services/recon/internal/changes 的包注释里，
+# 设计文档 3e 第 4.3 节、ADR-0039。由 scripts/cluster/services.sh recon-changes 把 __IMAGE__、__IMAGE_TAG__ 填上后 apply。
+#
+# 和同目录的 cronjob.yaml 的分工：这个跟着每一条变更核对，几十秒内知道某一行有没有传到派生端；
+# CronJob 的逐行对账每小时一轮，能发现这里看不到的（不经过 binlog 的改动、CDC 自己漏掉的、不在 CDC 里的表）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recon-changes
+  labels:
+    app.kubernetes.io/name: recon-changes
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  # 一个就够：它只读；两个副本会在同一个消费组里分掉分区，各自的 verified_through 只覆盖一半的变更。
+  replicas: 1
+  # 先停后起：同上，不让新旧两个同时报。停的那十几秒没有数据，告警的 for 盖得住。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: recon-changes
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: recon-changes
+        app.kubernetes.io/part-of: oppenheimer
+      annotations:
+        # 不进网格：只连 Kafka、MySQL 和 Collector，都不经边车（和业务服务的出站排除一致；Kafka 这一条是照 recon-totals 类推的，没有在集群上验证）。
+        sidecar.istio.io/inject: "false"
+    spec:
+      # 收到 SIGTERM 之后只是停下循环、把最后一批指标推出去（otelx 关闭最多 5 秒）。
+      terminationGracePeriodSeconds: 15
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          # 软性地放在控制面节点上，和 Prometheus、探针一样：阶段 4 要关的是工作节点，
+          # 而“派生数据跟没跟上”正是关节点的实验里最想一直看着的数。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: recon-changes
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          # 镜像的 ENTRYPOINT 是 recon，这里只给子命令。参数都用默认值：
+          #   -delay 10s           每条变更提交满这么久再核对；只影响要复查多少次，不影响对错
+          #   -recheck-every 5s    没追上的变更每隔多久复查一次
+          #   -lag-after 2m        第一次核对之后过了这么久派生端还没追上，才算“落后”
+          #   -check-timeout 5s    核对一批变更对一个派生端的时限
+          args: ["watch-changes"]
+          ports:
+            # 内部端口：/healthz、/readyz、/degrade（开关 changes_check）。不建 Service：只在集群内用 port-forward 或 exec 访问。
+            - {name: http, containerPort: 8086}
+          env:
+            # 密码来自 Secret oppenheimer-mysql（app 账号，和 cronjob.yaml 一样）。$(VAR) 由 Kubernetes 展开，密码的变量写在前面。
+            - {name: MYSQL_ORDER_0_PASSWORD, valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: order-0-app-password}}}
+            - {name: MYSQL_ORDER_1_PASSWORD, valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: order-1-app-password}}}
+            - {name: MYSQL_MAIN_PASSWORD, valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}}
+            # 和 orderindex 读同一个 topic，消费组不同（代码里是 recon 自己的组），KAFKA_PREFIX 不设：和正式的那一套一样没有前缀。
+            - {name: KAFKA_BROKERS, value: "kafka-kafka-bootstrap.kafka.svc:9092"}
+            # 三个派生端，和 cronjob.yaml 的逐行对账、order 和 orderindex 的配置同一套库。从库的个数和顺序要与 order 的 MYSQL_DSNS 一致。
+            - {name: MYSQL_REPLICA_DSNS, value: "app:$(MYSQL_ORDER_0_PASSWORD)@tcp(mysql-order-0-replica.mysql.svc:3306)/order_db_0,app:$(MYSQL_ORDER_1_PASSWORD)@tcp(mysql-order-1-replica.mysql.svc:3306)/order_db_1"}
+            - {name: MERCHANT_INDEX_DSNS, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_1"}
+            - {name: ARCHIVE_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"}
+            - {name: HTTP_ADDR, value: ":8086"}
+            # pprof 只在回环上监听，经 kubectl port-forward 访问。
+            - {name: DEBUG_ADDR, value: "127.0.0.1:6060"}
+            # 指标推给 Collector，和六个服务一样；资源属性里带上命名空间、Pod、节点（Prometheus 把它们提成了标签）。
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-gateway.monitoring:4317"}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"}
+          resources:
+            # 估的，上线后按实测改：每条订单变更对每个派生端几次主键点查；等着复查的变更放在内存里，压测时会多。
+            requests: {cpu: 50m, memory: 64Mi}
+            # CPU 上限 1 核：新消费组（或者位点丢了）会从头重放整个 topic，等于把每个订单核对一遍。2026-11-24 第一次
+            # 启动时没有上限，它在控制面节点（4 核，etcd 也在上面）占了约 2.8 核、5 分钟放完 1670 万条。重放留着，只是放慢。
+            limits: {cpu: "1", memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # 只配存活探针：卡死了重启它。不配就绪探针：它不接收业务请求，没有 Service，就绪与否没有人看。
+          # 核对自己没在前进（派生端读不到而停在一批上、开关被关）不是进程坏了，重启也没用，由 DerivedDataCheckStalled 报出来。
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3

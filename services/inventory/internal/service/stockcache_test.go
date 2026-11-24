@@ -45,7 +45,7 @@ func (e *cacheEnv) get(t *testing.T, skuID int64) (*inventoryv1.GetStockResponse
 
 func (e *cacheEnv) setAvailable(t *testing.T, skuID, n int64) {
 	t.Helper()
-	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = ? WHERE sku_id = ?`, n, skuID)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = ?, stocked = available + reserved + sold WHERE sku_id = ?`, n, skuID)
 }
 
 // insert 不经 seed：这些测试直接改库里的数量，会破坏 seed 的恒等式检查。
@@ -187,7 +187,7 @@ func TestGetStockCacheSwitchOff(t *testing.T) {
 	}
 
 	// 改库之后关掉：不读缓存（拿到库里的 11，不是缓存里的 10），也不覆盖缓存。
-	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 11 WHERE sku_id = 1`)
+	testdb.MustExec(t, e.db, `UPDATE sku_stock SET available = 11, stocked = available + reserved + sold WHERE sku_id = 1`)
 	mustOK(t, set.SetMode(SwitchCache, degrade.ModeOff))
 	if got := get(); got != 11 {
 		t.Fatalf("available = %d, want 11 from mysql while switched off", got)

@@ -1,0 +1,84 @@
+# 库存的计数对流水核对（recon watch-stock）：常驻的一个 Pod，每分钟在库存库的一个一致性快照里核对
+# “预占的计数 = 状态是 RESERVED 的预占数量合计”（快的一轮）；每隔一段（集群上 5 分钟）再核对“已售的计数 = CONFIRMED 的数量合计”
+# 并数出卡住的预占（完整的一轮）。结果报成指标（recon.stock.*），有差异时每一轮打 Error 日志。规则在
+# services/recon/internal/stock 的包注释里，设计文档 3e 第 4.2 节、ADR-0039。
+# 由 scripts/cluster/services.sh recon-stock 把 __IMAGE__、__IMAGE_TAG__ 填上后 apply。
+#
+# 和同目录的 cronjob.yaml 的分工：这个只回答“库存的计数和自己的流水对不对得上”，一分钟一轮；
+# CronJob 的 stock 那一对比的是订单和预占，定位到具体是哪一单。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recon-stock
+  labels:
+    app.kubernetes.io/name: recon-stock
+    app.kubernetes.io/part-of: oppenheimer
+spec:
+  # 一个就够：它只读，两个副本会各报各的一份同样的数，告警里还得去重。
+  replicas: 1
+  # 先停后起：同上，不让新旧两个同时报。停的那十几秒没有数据，告警的 for 盖得住。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: recon-stock
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: recon-stock
+        app.kubernetes.io/part-of: oppenheimer
+      annotations:
+        # 不进网格：只连 MySQL 和 Collector，两者都不经边车（和业务服务的出站排除一致）。
+        sidecar.istio.io/inject: "false"
+    spec:
+      # 收到 SIGTERM 之后只是停下循环、把最后一批指标推出去（otelx 关闭最多 5 秒）。
+      terminationGracePeriodSeconds: 15
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          # 软性地放在控制面节点上，和 Prometheus、探针一样：阶段 4 要关的是工作节点，
+          # 而“库存的账对不对得上”正是关节点的实验里最想一直看着的数。
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: recon-stock
+          image: "__IMAGE__"
+          imagePullPolicy: IfNotPresent
+          # 镜像的 ENTRYPOINT 是 recon，这里只给子命令。参数都用默认值：
+          #   -interval 1m         两轮之间的间隔
+          #   -full-every 5m       （程序的默认值是 1h；2026-11-24 改的：完整的一轮实测不到 1 分钟，一小时一轮让 recon-check 收尾最长等 1 小时）多久做一次完整的一轮（已售的等式要对全部 CONFIRMED 求和，是一次全表扫描，随订单总量变慢）
+          #   -reserved-window 2h  快的一轮往回看多久的预占；要比支付时限（15 分钟）长得多
+          #   -stuck-after 1h      RESERVED 超过这么久算卡住；不能比 -reserved-window 长
+          #   -quick-timeout 5s    快的一轮的时限（同时限制了快照事务开多久）
+          #   -full-timeout 2m     完整的一轮的时限
+          args: ["watch-stock", "-full-every=5m"]
+          env:
+            # 密码来自 Secret oppenheimer-mysql（app 账号，和 cronjob.yaml 一样）。$(VAR) 由 Kubernetes 展开，密码的变量写在前面。
+            - {name: MYSQL_MAIN_PASSWORD, valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}}
+            # 库存库在 mysql-main 的主库上，没有从库；读主库，因为等式要在一个一致性快照里核对，不能有复制延迟。
+            - {name: INVENTORY_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/inventory_db"}
+            # 指标推给 Collector，和六个服务一样；资源属性里带上命名空间、Pod、节点（Prometheus 把它们提成了标签）。
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-gateway.monitoring:4317"}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"}
+          resources:
+            # 估的，上线后按实测改：每分钟一条按主键范围的聚合，每 5 分钟一次全表的聚合，其余时间在睡。
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # 没有就绪和存活探针：它不接收请求；卡住了的表现是 recon.stock.runs 不再增长，由告警报出来。

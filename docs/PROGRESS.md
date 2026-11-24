@@ -4,7 +4,11 @@
 
 ## 当前状态
 
-- **现在（2026-11-24，UTC 是 11 月 23 日 17:40；这一条最新）**：**3d 的程序部分写完了**：核心（主循环、SDK 适配、报告、触发、留痕、命令行）加三组只读工具，都已提交，PR #18（draft）。**没有部署，没有对真的 Claude API 跑过**（主人现在没有 API 密钥）。见下面“3d 三组工具写完”。
+- **现在（2026-11-24 03:00 UTC，这一条最新）**：**3e 的第 6 步做完了，计划里 3e 的四项都勾了，只剩第 7 步（阶段笔记、面试考点）。** 造差异验证在 `oppenheimer-e2e` 里做完并清理了（e2e 整套、临时规则都删了；Alertmanager 里还有一条匹配 `env=e2e` 的静默，到 06:20 UTC 前后自己过期，匹配不到任何正式的告警）。九条告警里八条真实触发过，`DerivedDataCheckStalled` 没有（登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”）。结果在设计 3e 第 9 节“第 6 步：造差异验证”和三篇 runbook 的最后一节。集群 e2e 这次也跑了，通过。已提交并推送到 `6b115e4`（PR #19 的 CI 全过）；**之后写的文档（runbook、设计、两个计划文件、本文件）没有提交**，主人还没有说。长期运行的那一套：inventory 是 `4cf911d-dirty-20261124014241`（代码就是 `4cf911d`），另外五个服务 `07c0dcc`，`recon-totals` 和两个 CronJob 是 `recon:4cf911d`，`recon-stock`、`recon-changes` 是 `recon:6b115e4`。**下一步**：主人说提交之后提交、推送；第 7 步；PR #19 从 draft 转正、合并由主人定；3d 等 API 密钥。
+- **现在（2026-11-24 02:00 UTC）**：**PR #18（3d）已合并进 `main`（`1ec99b9`，主人要求）；PR #19（3e，draft）的 CI 全过；3e 第 6 步的部署和只读核对做完了，剩“造差异验证告警”，它的具体做法还要给主人看过再动。** 见下面“3e 第 6 步：部署”。工作区有没提交的改动（`watch_changes.go` 和 `changes.yaml` 加调试端口、`recon-check.sh` 修窗口、三个文档），主人还没有说提交。
+- **现在（2026-11-24，在上一条之前）**：**主人确认了 3e 等着定的几件事，第 3、4、5 步已提交并推送**：`2827002`（钱的分组和下钻）、`d23bf6d`（`watch-changes`）、`5016318`（清单、规则、脚本、runbook），加一个文档提交（`git log -1` 看）。下一条里“没有提交”“没有推送”“主人没有确认过”的说法到这里作废。主人的答复：“都按建议做”（下钻不用树、第 4 步的七件事都照现在的做法）；单个模块怎么跑测试写进了 `AGENTS.md`。3e 开了 draft PR（号码用 `gh pr list --head phase-3e` 看；它带着 3d 的提交，PR #18 合并后会变干净）。**主人问 3d 能不能先合并、密钥到了再试跑**：主会话答可以（PR #18 的 CI 全过、可合并，Agent 没有部署、第二个 webhook 地址默认不带，合并不改变集群上的任何东西；没做的两项“触发”“试跑”留在计划里不勾），**等主人说一句才合并**。**没有动集群**，第 6 步仍然要先登记、先拿同意。
+- **现在（2026-11-24，UTC 是 11 月 23 日 24:00 前后）**：**3e 的代码部分（第 0 到 5 步）都写完了，剩部署验证（第 6 步）和笔记（第 7 步）**。第 0、1、2 步已提交（`1502d8e`、`336cdb9`、`14fccc1`）；**第 3、4、5 步没有提交**（`git status` 里的全部改动）。整个仓库 `make lint test`（12 个模块 0 issues，73 个包）、`make rules-test`、`make alertmanager-test` 通过。分支 `phase-3e`（从 `phase-3d` 开的，**没有推送**），**没有动集群**。见下面“3e 代码写完”。3d 停在“等 API 密钥”，状态见下一条。
+- **3d（2026-11-24，UTC 是 11 月 23 日 17:40）**：**3d 的程序部分写完了**：核心（主循环、SDK 适配、报告、触发、留痕、命令行）加三组只读工具，都已提交，PR #18（draft）。**没有部署，没有对真的 Claude API 跑过**（主人现在没有 API 密钥）。见下面“3d 三组工具写完”。
 
 - **2026-11-24 早些时候**：**3c（SLO 与告警）做完了，PR #17 由主人同意后合并进 `main`**（合并提交用 `git log --merges -1 origin/main` 看；合并前最后一次推送只改了本文件）。**下一步是 3d 最小诊断 Agent，在新会话里做**：从最新的 `main` 开分支 `phase-3d`，先读 `docs/plan/phase-3-observability.md` 的 3d 一节，动工前先查最新的 Claude API 和 Agent SDK 文档，先写设计给主人确认。3c 留下没有做的：“上线后放几天看误报”；没有真实触发过的告警登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”；SLO 的大盘没有在 Grafana 里打开看过；长期运行的那一套里有两条测试用的死信（见下面“3c 第 16 项做完”）。集群没有在响的告警（2026-11-23 15:50 UTC 核对的）。下面各条是更早写的。
 - **当前阶段（2026-11-22）**：3b（压测）做完并合并了（PR #16，合并提交 `0142f02`），下一步是 3c（SLO 与告警），还没有开工，分支还没有开。当前分支仍是 `phase-3b`。以下是更早写的：2d 必做的部分（服务之间的流量治理迁到 Istio）做完并合并了（PR #12，2026-11-15，合并提交 `4005fa6`）。2c 已完成并合并（PR #11，合并提交 `d36449f`）。集群在 2026-11-16 又从空虚拟机重建过一次（带 Istio），六个服务在上面跑着，除 cdc 外各 2 个副本。2b 已完成并合并（PR #10，合并提交 `65adb85`，最后一次推送 `e8eafe5` 的 CI 27 项全部通过）。2a、阶段 1 早已合并。
@@ -12,7 +16,94 @@
 - **最后更新**：2026-11-23（第 16 项做完，第五个 SLO、SLO 的大盘、ADR-0037 做了，3c 的计划项全部勾了，都没有提交，见下面“3c 第 16 项做完”；以下括号里是更早写的）（主人对待定项给了决定，规则改了并下发，第 17、18 项做了，延迟消费者并发和按分区计数的队列上限写完了，都没有提交，见下面“3c 待定项的处理”；以下括号里是更早写的）（3c 的告警质量检查开始做了，见下面“3c 告警质量检查”；以下括号里是更早写的）（3c 的第 6、7 步：Alertmanager 的路由和抑制、webhook 接收端、runbook 做了，都没有提交，见下面“3c 的 Alertmanager 和 runbook”；以下括号里是更早写的）（3c 的设计写完，等主人确认十项，见下面“3c 设计写完”；当前分支 `phase-3c`；以下括号里是更早写的）（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
-### 3d 三组工具写完（2026-11-24，UTC 是 11 月 23 日 16:50 到 17:40；这一段最新，新会话先读这里）
+### 3e 第 6 步：部署（2026-11-24 02:00 UTC；这一段最新，新会话先读这里）
+
+主人说“同意第6步的操作”。登记在计划文件 3e 一节末尾。细节和数：设计第 9 节“第 6 步”。
+
+- **做了的**（都在长期运行的那一套上）：
+  - `make deploy IMAGE_SERVICES=inventory`：只滚了 inventory（另外五个服务从 `07c0dcc` 到现在代码没有变，仍是 `07c0dcc`）。迁移 00006 执行了，599 个 SKU 的 `stocked` 都等于三个数之和。inventory 的镜像 tag 是 `4cf911d-dirty-20261124014241`（部署时计划文件有没提交的改动，代码就是 `4cf911d`）。
+  - `recon-totals`、`recon-stock` 用 `recon:4cf911d`；`recon-changes` 用带调试端口的 dirty tag（见下）；`recon-hourly`、`recon-daily` 两个 CronJob 用 `RECON_IMAGE_TAG=4cf911d make recon-cron` 换成了 `4cf911d`（`recon-check` 的 Job 是照 `recon-hourly` 的模板建的，旧镜像没有 `-from`）。规则下发了。
+  - 规则、脚本、runbook 里用到的指标名在 Prometheus 上都有，除了 `recon_totals_drilldowns_total`（没有下钻过就没有序列，正常）。
+- **量到的**：
+  - `recon-changes` 第一次启动从 topic 开头读（kafkax 的新消费组都是这样），`cdc.order.orders` 是压缩保留的，等于把每个订单核对一遍：约 5 分钟核对了商家索引 1648 万次、从库 1677 万次，**全部通过，没有不一致、没有没追上**。期间它自己占约 2.8 核（没有 CPU 上限，调度在 `k3s-server` 上），两个从库各约 0.3 核，没有新的告警。追上之后占 4m CPU、14 Mi，`verified_through` 落后现在约 45 秒，`pending` 是 0。冷库那一个目标一次都没有核对（没有归档产生的变更）。
+  - `recon-stock`：599 个 SKU，完整的一轮在启动后 60 秒内做完，两类不一致都是 0，卡住的预占 0。
+  - `recon-totals`：两组（`succeeded`、`refunded`）差异都是 0。
+  - 每天的全量对账（11 月 23 日 21:30 UTC，2 分 09 秒）：五个 MySQL 实例各有一个 2 分钟的点到 0.65 到 1.1 核（平时 0.01 到 0.08），gateway 的 p99 没有变（约 20 毫秒）。**只有探针的流量（每秒 2 单）时量的，有负载时没有量。**
+  - `make recon-check FROM= TO=` 真跑了：逐行对账那一步 24 分钟的窗口约 15 秒，差异 0；整体退出码 3（“已售”那一轮每小时一次，还没越过 TO），符合预期。
+- **主会话的一次误判**：看到 `recon-changes` 占 2.8 核、以为指标停了，先把它缩到 0，加了调试端口重新部署去抓剖析。其实指标没有停（查询的时间点看错了），它只是在重放。被停的那一次差 22 万条没放完，第二次接着放完了。调试端口留下了（别的服务都有）。
+- **查出并改了的**：`recon-check.sh` 在 TO 之后不到 4 分半钟时，`increase` 的窗口里不够两个点，被读成“没有成功的一轮”；加了 `MIN_RATE_WINDOW=150`，窗口不够时明说。
+- **主人 2026-11-24 的答复（下面四件都定了）**：1 提交并推送（做了，`git log` 看）；2 保留重放（加了 CPU 上限 1 核；**没有把它挪出 `k3s-server`**：清单里“软性放在控制面节点”是有意的，阶段 4 要关的是工作节点，主会话原先的建议和它冲突，按清单的）；3 “已售”改成 5 分钟一轮（`stock.yaml` 的 `-full-every=5m`，规则的注释、runbook、`recon-check.sh` 的说法跟着改了）；4 造差异的做法同意了。
+- **当时等主人定的**：
+  1. 没提交的改动要不要提交、推送（调试端口、`recon-check.sh`、文档）。提交后 `make recon-changes` 一次换成干净的 tag。
+  2. `recon-changes` 第一次启动（或者消费组的位点丢了）会全量重放，没有 CPU 上限。建议：留着重放（等于白得一次逐行核对），给它加 CPU 上限 1 核，并且不让它调度到 `k3s-server`。
+  3. “已售”的完整一轮每小时一次，`recon-check` 收尾最长等 1 小时；完整一轮实测不到 1 分钟，建议 `-full-every` 改成 5 分钟。
+  4. 造差异验证六条告警和下钻的具体做法（主会话给了方案，见会话里的最后一条回复；**没有同意之前不做**）。
+- **下一步**：主人定上面四件 → 造差异验证 → 勾计划里 3e 的四项 → 第 7 步（阶段笔记、面试考点）。3d 等 API 密钥（见下面 3d 的“下一步”）。
+
+### 3e 代码写完（2026-11-24；在上一段之前）
+
+细节：设计 `docs/design/3e-reconciliation-by-scenario.md` 第 9 节“第 3 步”“第 4 步”。
+
+- **第 4 步 `recon watch-changes` 写完了**（没有提交）：
+  - `services/recon/internal/changes`：`changes.go`、`checker.go`（解码、判定、延迟核对、复查、指标，主会话写的）；`targets.go`（商家索引、从库、冷库三个派生端，Opus 子 Agent 写的，主会话逐行读了实现，**测试 `targets_test.go` 没有逐行读**）。
+  - `cmd/recon/watch_changes.go`：消费组 `recon.cdc-orders`（加在 `api/eventx`）、开关 `changes_check`、内部端口 `:8086`。
+  - `services/recon/go.mod` 跑过 `go mod tidy`（新依赖 `api` 模块、protobuf），`GOWORK=off go build` 通过。
+  - 实现时定的七件事和子 Agent 指出的六个设计问题都在设计第 9 节，**主人都没有确认过**。最要紧的：等着复查的变更只在内存里（重启会丢）；冷库里没有那一行直接算不一致；派生端整体落后时复查没有限流。
+  - **没有对着真的 Kafka 和真的 CDC 输出跑过**：消费、等待、位点提交只有假的派生端加 `synctest` 的测试；派生端只有对着真实表结构、手工造映像的测试。
+- **第 5 步写完了**（Sonnet 子 Agent，没有提交；主会话读了 `services.sh`、`Makefile`、`changes.yaml` 的 diff 和规则的表达式，重跑了检查，**两篇 runbook、`stock.yaml`、`recon-check.sh`、规则的测试用例没有逐行读**）：
+  - 清单 `deploy/cluster/recon/stock.yaml`、`changes.yaml`；`make recon-stock`、`make recon-changes`（`services.sh` 里三个常驻核对的安装抽成了一个函数 `install_recon_watcher`，`recon-totals` 的行为应当不变，没有运行过）。
+  - 六条告警（`business.yaml` 的 `business.recon_stock`、`business.recon_changes`）：`StockLedgerMismatch`、`StockReservationsStuck`、`StockCheckStalled`、`DerivedDataMismatch`、`DerivedDataLagging`、`DerivedDataCheckStalled`，17 个单元测试用例。Alertmanager 没有改。
+  - runbook `recon-stock.md`、`recon-changes.md`。
+  - `make recon-check FROM= TO=`（`scripts/cluster/recon-check.sh`，退出码 0 通过、1 有差异、2 出错、3 没有差异但还没核对到 TO）。**只跑过 dry-run。**
+  - **规则、脚本、runbook 里的 Prometheus 指标名都是照 `recon_totals_*` 类推的，没有在 Prometheus 上核对。**
+  - 子 Agent 指出的问题（没有处理）：`DerivedDataCheckStalled` 的“源库有写入”用的是订单状态流转的计数器，订单创建算不算一次流转没有核对；`DerivedDataMismatch` 响过 5 分钟后自己恢复而那一行可能还没修；“已售”和“卡住”只在每小时的完整一轮更新，`recon-check` 收尾最长要多等 1 小时；`verified_through` 只在有新变更时往前走。
+- **验证时犯的一个错**：主会话在模块目录里直接跑 `go test`，没有 `OPPENHEIMER_TEST_MYSQL_DSN`，对着库的用例全部被跳过而输出是 `ok`。子 Agent 带着环境变量跑、报出 `TestDrill` 失败才发现。失败的是一条写错的期望值（代码没错），已改，原因见设计第 9 节。**单个模块用 `make test MODULES=$PWD/services/<模块>` 跑。** 已写进 `AGENTS.md`（主人同意的）。
+- **等主人定的**（**2026-11-24 主人答复：第 1、2 项都按建议做，已提交并推送；第 3 项还没有谈**）：
+  1. 第 3、4、5 步要不要提交、怎么分（建议四个：钱的分组和下钻；`watch-changes`；清单、规则、脚本、runbook；文档）。提交后要不要推送、开 PR（3d 的 PR #18 还没合并，3e 的 PR 会带着 3d 的提交）。
+  2. 下钻不用 `payment` 那一对的树（下一段）；第 4 步的七件事。
+  3. 第 6 步动集群的具体做法（下面“下一步”），每一项先拿同意。
+- **下一步**（第 6 步，都要动集群，先登记到计划文件、先拿同意）：
+  1. `make deploy`（会执行库存库的迁移 00006，`sku_stock` 加列重建表）→ `make recon-totals`（换成带 `group` 和下钻的版本）、`make recon-stock`、`make recon-changes` → 规则下发。
+  2. 在 Prometheus 上核对指标名，量“已售对流水”的完整一轮要多久、`watch-changes` 平时的 `pending` 和派生端的查询量。
+  3. 在 `oppenheimer-e2e` 里造差异验证六条告警和下钻（要另起指向 e2e 库的实例，清单现在对着正式库）。
+  4. 补量每天全量对账期间数据库和探针受不受影响（21:30 UTC 那次，只看指标）。
+  5. 之后第 7 步：阶段笔记、面试考点、勾计划里 3e 的四项。
+
+### 3e 做到钱（2026-11-24；在上一段之前）
+
+细节：设计 `docs/design/3e-reconciliation-by-scenario.md` 第 9 节“第 3 步”。
+
+- **主人说的**：“提交代码，然后根据进度继续”。第 0、1、2 步分三个提交进了 `phase-3e`（库存的迁移和夹具、`recon` 的两样、文档），提交前跑了整个仓库的 `make lint test`：12 个模块 0 issues，72 个包通过（上一段写的“没有跑整个仓库的”到这里补上了；e2e 仍然没有跑）。没有推送。
+- **第 3 步写完了**（`services/recon/internal/totals`，主会话写的，**没有提交**）：
+  - 退款单独一组：支付一侧 `REFUNDED` 且已答复，对订单一侧“支付成功但要求退款”，套用和“成功”一组同样的两条规则。指标 `recon.totals.mismatch` 多了标签 `group`（`succeeded`、`refunded`），别的指标含义没变，现有的告警规则不用改。
+  - 下钻：一段连续两轮对不上时逐笔比一次那一分钟，每笔打一条日志，每段只做一次，一轮最多 3 段。指标 `recon.totals.drilldowns{outcome}`。`recon watch-totals` 多了 `-drill-timeout`。
+  - **重读了支付和订单两边处理答复的代码，退款的包含关系成立**。发现一条第 0 步没看到的例外：订单已归档时要求退款不写记录。它够不着这里的窗口（归档至少 30 天，核对只看 30 分钟），理由写在包注释和设计里。
+  - **和设计不一样**：下钻没有用 `payment` 那一对的树，直接比那一分钟两边的每一笔支付（树比的不是同一件事、看不到退款、在那个时刻会把在途的报成差异）。设计 4.1 加了一行指向第 9 节。**这是主会话定的，主人没有确认过**。
+- **验证**：写这一段时说的“`go test -race ./...` 通过”对其中对着库的用例不成立（被跳过了，见上一段“验证时犯的一个错”）；之后带着环境变量重跑并跑了整个仓库的 `make lint test`，通过。没有部署，集群上的 `recon-totals` 还是旧版本。
+- **文档**：runbook `payment-totals.md` 补了分组和下钻的日志（里面 `recon_totals_drilldowns_total` 这个名字是推的，没有在 Prometheus 上核对）；计划文件“钱”那一项加了说明，没有勾（没有部署）。
+- **顺带**：在模块目录里跑 `golangci-lint fmt` 或 `go build` 之后 `go.work.sum` 被改了（少了 60 多行），和这次的改动无关，已经用 `git checkout` 还原；还原之后构建和测试照常通过。哪条命令改的没有查。
+- **下一步**：第 4 步 `recon watch-changes`（设计 4.3；判定和消费主会话写）。之后的顺序见下一段“还没做的”第 2 到 5 条。
+
+### 3e 做到库存（2026-11-24；在上一段之前）
+
+设计 [`docs/design/3e-reconciliation-by-scenario.md`](design/3e-reconciliation-by-scenario.md)（第 9 节是做到哪、量到什么、和设计不一样的地方），决定 [ADR-0039](adr/0039-reconciliation-by-scenario.md)。
+
+- **思路**：对账按数据的性质拆三类，各找一个不靠“等一会儿再比”的判据。钱用支付单的状态（3c 已做）；库存在库存库的一个一致性快照里核对“计数对得上流水”；派生数据跟着 CDC 的变更逐条核对，用行的版本号区分“没追上”和“不一致”。逐行的树留作下钻和不经过 CDC 的独立一路。
+- **做完的**（设计第 7 节的第 0、1、2 步）：
+  - 第 0 步：三个前提读代码核对都成立（预占的状态和库存增量同一个事务；预占的流水从不删除；退款两边的状态，这一条没有重读支付服务处理答复的代码）。
+  - 第 1 步：`recon -from`、`-to`（RFC 3339 的绝对时刻），给下钻和阶段 4“只比实验那一段”用。
+  - 第 2 步：迁移 `services/inventory/migrations/00006_sku_stocked.sql`（`stocked` 列，默认值是表达式，加 CHECK `available + reserved + sold = stocked`；先在本机 MySQL 9.7.4 上验证了行为）；八处直接改库存数字的测试夹具跟着改了；`services/recon/internal/stock` 和 `recon watch-stock`。
+- **验证**：`services/inventory`、`services/recon`、`test/load` 三个模块对着本机的 MySQL、Redis、Kafka 跑测试（`-race`）和 lint 通过。**没有跑整个仓库的 `make lint test`，e2e 没有跑**（e2e 建 SKU 的语句不写 `stocked`，按默认值应当不受影响，没有实际验证）。
+- **下一次 `make deploy` 会执行库存库的迁移**（`inventory` 启动时跑）：`sku_stock` 加一列并重建表，表小。迁移时每一行的 `stocked` 取当时三个数之和。**这个迁移没有在集群上跑过。** 之后手工改 `sku_stock` 的一个数会被拒绝，要连 `stocked` 一起改。
+- **还没做的**（设计第 7 节）：
+  1. 第 3 步，钱：退款单独一组、对不上时自动下钻（主会话写；先重读支付服务处理答复的代码核对退款的包含关系）。
+  2. 第 4 步，派生数据：`recon watch-changes`（判定和消费主会话写，三个目标的读取可以分给 Opus）。
+  3. 第 5 步：三个常驻程序的清单、告警规则和单元测试、runbook、`make recon-check`（Sonnet）。
+  4. 第 6 步：部署、在 `oppenheimer-e2e` 里造差异验证、量“已售对流水”那条查询和全量期间对数据库的影响。动集群之前先拿同意。
+  5. 第 7 步：阶段笔记、面试考点。
+- **下一步**：主人说要不要提交这一段 → 第 3 步。（主人说了提交，已提交；第 3 步也做了，见上一段。）
+
+### 3d 三组工具写完（2026-11-24，UTC 是 11 月 23 日 16:50 到 17:40；在上一段之前）
 
 细节：设计 `docs/design/3d-diagnosis-agent.md` 第 8 节“第 3 步”。
 
@@ -25,7 +116,7 @@
   - **对着真的后端只读核对过**（Prometheus、Loki 经 port-forward，已关；Kubernetes 用本机 kubeconfig）。查出两个问题并修了、加了回归测试：Loki 里每行日志带每行不同的元数据标签，重复行合并不了；Loki 指标查询多一个点。
   - 落盘的 Kubernetes 对象多抹了命令行参数里像密钥的值。
 - **验证**：`services/agent` 里 `go test -race ./...` 十个包通过，lint 0 issues，`GOWORK=off go build` 和 `make build` 通过。**没有跑整个仓库的 `make lint test`。**
-- **CI**：PR #18 上 `8be9b74`（只有核心部分）30 个 job 加 codecov 两项全部通过（`ci-watcher` 报的）：新的 `lint (./services/agent)` 54 秒、`test (./services/agent)` 2 分 29 秒；`rules` 2 分 24 秒（以往 50 秒到 1 分半）、`test (./services/recon)` 2 分 24 秒（上次 1 分 53 秒）变慢，这次没有动规则和 recon，没有查；order 4 分 10 秒、pkg 3 分 29 秒、load 3 分 18 秒、e2e 3 分 58 秒。**之后的提交（三组工具等）推送后的 CI 结果，本段没有写的话就是还没看。**
+- **CI**：PR #18 上 `8be9b74`（只有核心部分）30 个 job 加 codecov 两项全部通过（`ci-watcher` 报的）：新的 `lint (./services/agent)` 54 秒、`test (./services/agent)` 2 分 29 秒；`rules` 2 分 24 秒（以往 50 秒到 1 分半）、`test (./services/recon)` 2 分 24 秒（上次 1 分 53 秒）变慢，这次没有动规则和 recon，没有查；order 4 分 10 秒、pkg 3 分 29 秒、load 3 分 18 秒、e2e 3 分 58 秒。之后：`0b1d0ee` 那一轮被下一次推送取消了（29 个通过，e2e 被取消）。**PR #18 上 `91b0288`（3d 当前的头）30 个 job 全部通过**（`ci-watcher` 报的）：`lint (./services/agent)` 2 分 02 秒（只有核心时 54 秒）、`test (./services/agent)` 5 分 31 秒（只有核心时 2 分 29 秒），加了三组工具和 client-go 之后慢了一倍多，**现在是 CI 里最慢的 test job，没有拆开看时间花在哪**（依赖下载、带 `-race` 编译 client-go、还是测试本身）；`rules` 1 分 48 秒、order 4 分 05 秒、pkg 3 分 30 秒、load 2 分 40 秒、recon 2 分 09 秒、e2e 4 分 01 秒，都在以往的范围内。
 - **顺带看到的（集群，没有动）**：`PrometheusErrorSendingAlertsToAnyAlertmanager`（critical）和 `...ToSomeAlertmanagers` 时不时进 `pending`。Prometheus 发给 Alertmanager 的请求 24 小时里失败 22 次（`EOF` 或 `connection reset by peer`，每次 1 条），平时只有 `Watchdog` 在发（约 90 秒一次），一次失败在 5 分钟窗口里就是三到五成，超过规则的阈值；`for` 是 15 分钟，7 天里只到过 `pending`、没有响过。两个 Pod 都是 Running。**原因没有查**（推断是空闲的长连接被对端关掉时正好在发）。这是 3c 留下的“放几天看误报”该看的一条：连续两三次失败挨得近就会真的响一条 critical。
 - **第 4 步（部署用的清单和脚本）也写了**（Sonnet 子 Agent，主会话读了 RBAC 和 `cmd_agent`、重跑了检查后合并；设计第 8 节“第 4 步”）：`deploy/cluster/monitoring/agent.yaml`、`scripts/cluster/monitoring.sh agent`（`make agent`）、Alertmanager 的第二个 webhook 地址（默认不带，`AGENT_WEBHOOK=1` 才渲染进去）、RBAC 的测试。**只写了文件：清单没有 apply 过，`cmd_agent` 没有运行过。**
 - **修了主会话引入的镜像构建问题**：新模块进 `go.work` 之后三个 Dockerfile 要多复制它的 `go.mod`，否则所有镜像构建失败。CI 不构建镜像，发现不了；是写第 4 步的任务说明时读 Dockerfile 看出来的。修后本机构建 order、recon、agent 三个镜像通过（没有推送）。**从 `4e6460e` 到修复之前的提交上 `make images`、`make deploy` 是坏的。**

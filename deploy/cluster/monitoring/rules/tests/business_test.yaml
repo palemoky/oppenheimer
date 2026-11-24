@@ -5,6 +5,7 @@
 #   k-l  钱的核对：有差异、核对自己停了
 #   m-n  队列：落库速率为 0 时是无穷大也响；支付成功而订单不变成已支付
 #   o-q  序列消失：CDC 的管道、服务的指标、消费者不消费
+#   x-    3e 的两个常驻核对：库存的计数对流水（x1-x4）、派生数据的变更（x5-x12）
 #   u-w  限流的退回按比例：过载时零星的超时不响、Redis 不在时探针的流量也响、流量太小时不响
 # 断言都用 ALERTS：exp_alerts 要逐字对注解，注解改一个字就得改测试。
 rule_files:
@@ -611,4 +612,258 @@ tests:
     promql_expr_test:
       - expr: count(ALERTS{alertname="RateLimitFallingBack"})
         eval_time: 12m
+        exp_samples: []
+
+  # x1. 库存的预占那条等式有 3 个 SKU 对不上（t=5m 起），已售那条是 0；旧 Pod 留下的序列是 0，取 max 不受影响。
+  #     for 2 分钟：6 分钟时还没响，8 分钟时只有 reserved 一条，critical。
+  - name: x1_stock_mismatch_fires_on_reserved_only
+    interval: 30s
+    input_series:
+      - series: 'recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer",check="reserved",k8s_pod_name="new"}'
+        values: '0x10 3x30'
+      - series: 'recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer",check="sold",k8s_pod_name="new"}'
+        values: '0x40'
+      - series: 'recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer",check="reserved",k8s_pod_name="old"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="StockLedgerMismatch",alertstate="firing"})
+        eval_time: 6m
+        exp_samples: []
+      - expr: count by (check, severity) (ALERTS{alertname="StockLedgerMismatch",alertstate="firing"})
+        eval_time: 8m
+        exp_samples:
+          - labels: '{check="reserved", severity="critical"}'
+            value: 1
+
+  # x2. 差异是 0 不响；一个序列都没有（核对没起来）这两条也不响，那种情况由 StockCheckStalled 报。
+  - name: x2_stock_zero_and_absent_are_quiet
+    interval: 30s
+    input_series:
+      - series: 'recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer",check="reserved"}'
+        values: '0x40'
+      - series: 'recon_stock_stuck_reservations{k8s_namespace_name="oppenheimer"}'
+        values: '0x40'
+      - series: 'recon_stock_runs_total{k8s_namespace_name="oppenheimer",kind="quick",outcome="ok"}'
+        values: '0+1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname=~"StockLedgerMismatch|StockReservationsStuck|StockCheckStalled"})
+        eval_time: 15m
+        exp_samples: []
+  - name: x2b_stock_no_series_only_stalled_fires
+    interval: 30s
+    input_series:
+      - series: 'unrelated_metric'
+        values: '1x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname=~"StockLedgerMismatch|StockReservationsStuck",alertstate="firing"})
+        eval_time: 15m
+        exp_samples: []
+      - expr: count by (alertname) (ALERTS{alertname="StockCheckStalled",alertstate="firing"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="StockCheckStalled"}'
+            value: 1
+
+  # x3. 卡住的预占：t=5m 起是 2。for 10 分钟：t=14m 还没响，t=16m 响，warning。值回到 0 之后恢复。
+  - name: x3_stock_reservations_stuck
+    interval: 30s
+    input_series:
+      - series: 'recon_stock_stuck_reservations{k8s_namespace_name="oppenheimer",k8s_pod_name="new"}'
+        values: '0x10 2x30 0x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="StockReservationsStuck",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="StockReservationsStuck",alertstate="firing"})
+        eval_time: 16m
+        exp_samples:
+          - labels: '{severity="warning"}'
+            value: 1
+      - expr: count(ALERTS{alertname="StockReservationsStuck",alertstate="firing"})
+        eval_time: 30m
+        exp_samples: []
+
+  # x4. 库存核对自己停了：成功的轮次不再涨（只剩 error），5 分钟加 for 5 分钟之后响；快的和完整的轮次（kind）加起来算。
+  #     平时只有完整的在涨（比如快的一轮都失败、完整的成功）也算活着。
+  - name: x4_stock_check_stalled
+    interval: 30s
+    input_series:
+      - series: 'recon_stock_runs_total{k8s_namespace_name="oppenheimer",kind="quick",outcome="ok"}'
+        values: '0+1x20 20x40'
+      - series: 'recon_stock_runs_total{k8s_namespace_name="oppenheimer",kind="quick",outcome="error"}'
+        values: '_x20 0+1x40'
+      - series: 'recon_stock_runs_total{k8s_namespace_name="oppenheimer",kind="full",outcome="ok"}'
+        values: '0x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="StockCheckStalled",alertstate="firing"})
+        eval_time: 12m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="StockCheckStalled",alertstate="firing"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # x5. 派生数据的变更对不上：index 上的计数器 t=5m 第一次出现，值是 2（increase 在那一刻是 0，靠 unless offset 那一半）。
+  #     没有 for：5 分钟时就响，critical，只有 index；replica 的 mismatch 是 0 不响。窗口滑过去之后（12m）恢复。
+  - name: x5_derived_mismatch_first_appearance
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="index",result="mismatch",k8s_pod_name="new"}'
+        values: '_x10 2x50'
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="replica",result="mismatch",k8s_pod_name="new"}'
+        values: '0x60'
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="replica",result="ok",k8s_pod_name="new"}'
+        values: '0+100x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 4m
+        exp_samples: []
+      - expr: count by (target, severity) (ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 6m
+        exp_samples:
+          - labels: '{target="index", severity="critical"}'
+            value: 1
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 12m
+        exp_samples: []
+
+  # x6. 已有的序列又涨：archive 上 mismatch 在 t=15m 从 4 变成 5。序列在开头就有，“第一次出现”那一半在头 5 分钟里
+  #     也成立（和 a 一样是测试起点的假象，所以起点之后留了 10 分钟再涨）。
+  - name: x6_derived_mismatch_increase
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="archive",result="mismatch"}'
+        values: '4x30 5x30'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+      - expr: count by (target) (ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 16m
+        exp_samples:
+          - labels: '{target="archive"}'
+            value: 1
+
+  # x7. 核对的 Pod 重启：旧 Pod 的序列停在 5（之后消失）、新 Pod 的序列从 0 开始，一直是 0：不响。
+  #     旧 Pod 的序列自己消失（计数没有增加）也不能被当成“第一次出现”。
+  - name: x7_derived_mismatch_restart_quiet
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="index",result="mismatch",k8s_pod_name="old"}'
+        values: '5x20 stale'
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="index",result="mismatch",k8s_pod_name="new"}'
+        values: '_x20 0x40'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 9m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 14m
+        exp_samples: []
+  - name: x7b_derived_mismatch_zero_and_absent_quiet
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="index",result="ok"}'
+        values: '0+10x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname=~"DerivedDataMismatch|DerivedDataLagging"})
+        eval_time: 20m
+        exp_samples: []
+
+  # x8. 落后：replica 上的 lagging 计数器 t=5m 第一次出现，值是 1。for 2 分钟：6 分钟时还没响，8 分钟时响，warning。
+  #     mismatch 同时是 0，不响 DerivedDataMismatch。
+  - name: x8_derived_lagging
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="replica",result="lagging"}'
+        values: '_x10 1x50'
+      - series: 'recon_changes_checked_total{k8s_namespace_name="oppenheimer",target="replica",result="mismatch"}'
+        values: '0x60'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataLagging",alertstate="firing"})
+        eval_time: 6m
+        exp_samples: []
+      - expr: count by (target, severity) (ALERTS{alertname="DerivedDataLagging",alertstate="firing"})
+        eval_time: 8m
+        exp_samples:
+          - labels: '{target="replica", severity="warning"}'
+            value: 1
+      - expr: count(ALERTS{alertname="DerivedDataMismatch",alertstate="firing"})
+        eval_time: 8m
+        exp_samples: []
+
+  # x9. 变更核对停了而源库在写：verified_through 停在 600 秒，订单状态流转还在涨。
+  #     落后超过 5 分钟是 t=900s，再加 for 5 分钟，t=1100s 还没响，t=1300s 响。
+  - name: x9_derived_check_stalled_with_writes
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_verified_through{k8s_namespace_name="oppenheimer",k8s_pod_name="new"}'
+        values: '0+30x20 600x80'
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '0+10x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled",alertstate="firing"})
+        eval_time: 1100s
+        exp_samples: []
+      - expr: count by (severity) (ALERTS{alertname="DerivedDataCheckStalled",alertstate="firing"})
+        eval_time: 1300s
+        exp_samples:
+          - labels: '{severity="warning"}'
+            value: 1
+
+  # x10. 同样停了，但源库没有写入（流转的计数器不动）：verified_through 本来就不会动，不响。
+  - name: x10_derived_check_idle_source_quiet
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_verified_through{k8s_namespace_name="oppenheimer"}'
+        values: '0+30x20 600x80'
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '100x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled"})
+        eval_time: 1500s
+        exp_samples: []
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled"})
+        eval_time: 2000s
+        exp_samples: []
+
+  # x11. 没有 verified_through 的序列（核对没起来）：源库有写入时响，没有写入时不响。
+  - name: x11_derived_check_never_reported
+    interval: 30s
+    input_series:
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '0+10x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled",alertstate="firing"})
+        eval_time: 3m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled",alertstate="firing"})
+        eval_time: 8m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+  - name: x11b_derived_check_never_reported_idle_source
+    interval: 30s
+    input_series:
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '100x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled"})
+        eval_time: 10m
+        exp_samples: []
+
+  # x12. 核对的 Pod 重启后新旧两个序列并存：旧的停在 600 秒，新的跟着时间走。取 max，不响。
+  - name: x12_derived_check_restart_both_series_quiet
+    interval: 30s
+    input_series:
+      - series: 'recon_changes_verified_through{k8s_namespace_name="oppenheimer",k8s_pod_name="old"}'
+        values: '0+30x20 600x80'
+      - series: 'recon_changes_verified_through{k8s_namespace_name="oppenheimer",k8s_pod_name="new"}'
+        values: '_x20 600+30x80'
+      - series: 'order_transitions_total{k8s_namespace_name="oppenheimer",from="pending_payment",to="paid"}'
+        values: '0+10x100'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="DerivedDataCheckStalled"})
+        eval_time: 1500s
         exp_samples: []

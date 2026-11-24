@@ -337,7 +337,7 @@ func TestCollectScopedReadsOnlyTheRun(t *testing.T) {
 	}
 
 	// 把范围内一个 SKU 的已售数改大一个：库存不再守恒，必须报出来。
-	exec(t, e.src.InventoryDB, "UPDATE sku_stock SET sold = sold + 1 WHERE sku_id = ?", scopeSKU1)
+	exec(t, e.src.InventoryDB, "UPDATE sku_stock SET sold = sold + 1, stocked = available + reserved + sold WHERE sku_id = ?", scopeSKU1)
 	snap, err = CollectScoped(ctx, e.src, run.initial, sc)
 	if err != nil {
 		t.Fatal(err)

@@ -238,6 +238,111 @@ spec:
             description: "支付成功的事件发出去了，订单服务的答复（接受或者要求退款）一直没有回来：order 的 payment.events 消费者被挡住，或者 order 的 outbox 发不出去。用户可能已经付了钱而订单还是待支付。注意这条在 30 分钟之后会因为支付单滑出核对窗口而自己恢复，恢复不代表问题没了。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/payment-totals.md
 
+    # ---- 库存的计数对流水（recon watch-stock，规则见 services/recon/internal/stock 的包注释） ----
+    - name: business.recon_stock
+      rules:
+        # 库存的计数和自己的流水在一个一致性快照里比，没有在途的量，所以没有“正常的小差异”，阈值是 0。
+        # for 取 2 分钟（两轮快的）：快照里读出来的差就是真的差，两轮都在只是防住核对 Pod 刚重启那一轮的偶然读数。
+        # check 是 reserved（预占，每分钟更新）或 sold（已售，只在完整的一轮更新，集群上 5 分钟一次，两轮之间保持上一次的值，所以它响了之后最长 5 分钟才能确认恢复）。
+        # max by (check)：核对的 Pod 重启后旧 Pod 的序列还会留 5 分钟，两条都在时取大的。不按 SKU 分组：SKU 在日志里，不进标签。
+        - alert: StockLedgerMismatch
+          expr: max by (check) (recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer"}) > 0
+          for: 2m
+          labels:
+            severity: critical
+            service: recon
+          annotations:
+            summary: "库存的{{ if eq $labels.check \"sold\" }}已售{{ else }}预占{{ end }}计数和流水对不上，有 {{ $value }} 个 SKU 不一致"
+            description: "库存库里 sku_stock 的计数（含 stock_pending 里还没应用的增量）和预占流水（reservation、reservation_item）对不上：同一条增量被应用了两次、丢了一条增量，或者改了预占的状态而没有记增量。库存的账不再可信，超卖或少卖都有可能。哪些 SKU、差多少在 recon-stock 的日志里（stock mismatch，带 sku_id、counter、ledger）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-stock.md
+        # 卡住的预占：状态还是 RESERVED，已经比支付时限（15 分钟）老得多（默认 1 小时）。既没有被确认也没有被释放，占着库存。
+        # 这个数只在完整的一轮更新（集群上 5 分钟一次），两轮之间保持上一次的值。for 取 10 分钟：连着两次完整的一轮都数到；
+        # 这条在问题解决之后要等下一次完整的一轮（最长 5 分钟）才会自己恢复。
+        # 快的一轮只看最近 2 小时的预占，窗口之外的卡住只有完整的一轮看得到，所以这条单独写，不并进 StockLedgerMismatch。
+        - alert: StockReservationsStuck
+          expr: max(recon_stock_stuck_reservations{k8s_namespace_name="oppenheimer"}) > 0
+          for: 10m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "有 {{ $value }} 个库存预占卡住了：状态还是 RESERVED，已经超过 1 小时"
+            description: "订单在支付时限内要么付款（确认预占）要么关单（释放预占），超过 1 小时还是 RESERVED 说明确认或释放的那一步没有发生：inventory 的 order.events 消费者被挡住或消息进了死信，或者关单没有触发。这些预占一直占着库存，用户看到的可售量比实际的少。最老的一单在 recon-stock 的日志里（stuck reservations，带 oldest_order_id）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-stock.md
+        # 核对自己 5 分钟没有成功过一轮（平时每分钟一轮；第一轮是完整的，kind 不分）。这时上面两条读的是旧值或者没有值，
+        # “不响”不等于“账是平的”。完整的一轮超时（2 分钟）会让每一轮都接着重试完整的，也会走到这条。
+        - alert: StockCheckStalled
+          expr: (sum(increase(recon_stock_runs_total{k8s_namespace_name="oppenheimer",outcome="ok"}[5m])) or vector(0)) < 1
+          for: 5m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "库存的计数对流水核对 5 分钟没有成功过一轮"
+            description: "recon-stock 没有在跑、连不上库存库、完整的一轮超时，或者它的指标送不出来。这期间 StockLedgerMismatch 和 StockReservationsStuck 发现不了问题；每小时的逐行对账（订单对库存预占）还在兜底，但它比的是订单和预占，不是计数和流水。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-stock.md
+
+    # ---- 派生数据的变更核对（recon watch-changes，规则见 services/recon/internal/changes 的包注释） ----
+    - name: business.recon_changes
+      rules:
+        # 同一个版本号两边内容不一样：不会自己好，第一次看到就报，所以没有 for，窗口 5 分钟只是让它响够久能被看到。
+        # 计数器的序列是第一次出现时才有的，那一刻 increase 是 0，所以和别的“有增长”的规则一样加 unless offset 的那一半。
+        # 按 target 分（index、replica、archive；解不开的消息 target 是 none，result 是 skipped，不在这里）。
+        # 恢复靠 5 分钟的窗口滑过去，不代表那一行修好了：这条响过就要去查，见 runbook。
+        - alert: DerivedDataMismatch
+          expr: |
+            sum by (target) (increase(recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="mismatch"}[5m])) > 0
+            or
+            sum by (target) (recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="mismatch"} unless recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="mismatch"} offset 5m) > 0
+          labels:
+            severity: critical
+            service: recon
+          annotations:
+            summary: "{{ $labels.target }} 上有 {{ $value | humanize }} 行和订单库的变更对不上（最近 5 分钟）"
+            description: "订单的一条变更和派生端（index 是商家索引，replica 是订单从库，archive 是冷库）上同一个版本的那一行内容不一样。这不是延迟：版本号相同而内容不同，不会自己好。哪个订单、哪一列、两边各是什么在 recon-changes 的日志里（带 order_id）。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-changes.md
+        # 第一次核对之后 2 分钟（-lag-after）派生端仍然没有追上这一行。每条变更只计一次。
+        # for 取 2 分钟：一次落后的计数之后窗口里会留 5 分钟，2 分钟滤掉“只落后了一两条、很快就追平”的偶发。
+        # 这是 warning：落后不是坏了，CDC 或复制落后时本来就会有（那时 CDCLagging、MySQLReplicaLagHigh 也会响）；
+        # 但持续落后下去，商家看到的订单就是旧的。
+        - alert: DerivedDataLagging
+          expr: |
+            sum by (target) (increase(recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="lagging"}[5m])) > 0
+            or
+            sum by (target) (recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="lagging"} unless recon_changes_checked_total{k8s_namespace_name="oppenheimer",result="lagging"} offset 5m) > 0
+          for: 2m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "{{ $labels.target }} 在最近 5 分钟有 {{ $value | humanize }} 行超过 2 分钟还没有追上订单库的变更"
+            description: "派生端上的行比订单库的变更旧，第一次核对之后过了 2 分钟还是这样。看对应的管道：index 看 orderindex 的消费者和 CDC（CDCLagging），replica 看从库的复制延迟，archive 看归档任务。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-changes.md
+        # 核对到的提交时刻落后现在超过 5 分钟，并且源库这段时间有写入。“源库有写入”用 order 的状态流转的计数器近似
+        # （不是 binlog 本身，见 runbook）：没有写入时 verified_through 本来就不动，不该响。
+        # 还有一种情况也要响：核对的指标一个都没有（核对没起来、从来没核对过一批变更），而源库有写入。
+        # for 取 5 分钟：停了一阵之后第一笔写入进来的那一刻，verified_through 还是旧的，要给它几十秒追上；5 分钟盖得住。
+        # max：核对的 Pod 重启后旧 Pod 的序列还会留 5 分钟，取新的那条。
+        # and on ()：absent() 的结果带着 k8s_namespace_name 标签，右边没有标签，不写 on () 两边对不上。
+        # 开关 changes_check 关掉时它也会响，这是有意的：核对被人关了，“差异是 0”就不是证据；计划内关掉要加静默。
+        - alert: DerivedDataCheckStalled
+          expr: |
+            (
+              (time() - max(recon_changes_verified_through{k8s_namespace_name="oppenheimer"}) > 5 * 60)
+              or
+              absent(recon_changes_verified_through{k8s_namespace_name="oppenheimer"})
+            )
+            and on ()
+            (sum(increase(order_transitions_total{k8s_namespace_name="oppenheimer"}[5m])) or vector(0)) > 0
+          for: 5m
+          labels:
+            severity: warning
+            service: recon
+          annotations:
+            summary: "变更核对没有在前进：订单库在写，核对到的时刻落后现在超过 5 分钟（或者根本没有这个指标）"
+            description: "recon-changes 没有在跑、卡在读不到的派生端或 Kafka 上、被开关 changes_check 关了，或者 CDC 自己停了（CDCLagging 也会响）。这期间 DerivedDataMismatch 和 DerivedDataLagging 发现不了问题，“没有不一致”不等于“数据是一致的”。每小时的逐行对账还在兜底。"
+            runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-changes.md
+
     # ---- 库存 ----
     - name: business.inventory
       rules:
