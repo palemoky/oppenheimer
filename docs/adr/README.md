@@ -64,3 +64,4 @@
 | [0035](0035-overload-corrections.md) | 过载压测查出的四处修正：限流连续失败 5 次才退回进程内；延迟关单的 topic 8 个分区；受理的队列上限按单个分区的落库速率算（1250）；gRPC 客户端的拒绝不算出错，采样的“出错”“慢”加每秒上限 | 已采纳 |
 | [0036](0036-per-partition-backlog-and-concurrent-delay.md) | 受理的队列上限按落库的分区各数各的（闸门里另记一份可以重建的索引，上限 ÷ 速率就是最坏的等待）；延迟消费者在队首到期之后按 key 并发（等到期放在分发那一步） | 已采纳 |
 | [0037](0037-slo-and-burn-rate-alerts.md) | SLO 用 7 天窗口和三档多窗口燃烧率告警，规则手写；429 不算坏；平时的流量由常驻探针提供；Alertmanager 的配置不用 `AlertmanagerConfig`；支付可用性是后加的第五个 SLO | 已采纳 |
+| [0038](0038-diagnosis-agent-own-loop.md) | 诊断 Agent 自己写循环（Messages API，历史收在接口后面只能追加）；上限是软的，撞到之后用已有证据交报告；报告经 `submit_report` 交，证据由程序按步骤号从运行记录里渲染 | 已采纳 |

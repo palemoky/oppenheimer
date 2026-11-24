@@ -1,4 +1,4 @@
-# Alertmanager 的 webhook 接收端：只打日志的接收端（3c 设计 3.1、第 2 节第 9 项），3d 的诊断 Agent 做出来之后换成它。
+# Alertmanager 的 webhook 接收端：只打日志的接收端（3c 设计 3.1、第 2 节第 9 项）。3d 的诊断 Agent（agent.yaml）加在它旁边，不替换它：Watchdog 的心跳只走这里。
 # 每条告警打一行 JSON 日志（人为触发告警时用 kubectl logs 确认“确实送到了”），并报两个指标：
 #   alertsink.alerts                 按 status、severity 计数
 #   alertsink.watchdog.last_received 最近一次收到 firing 的 Watchdog 的 Unix 时间，用来写“告警这条路断了”的规则

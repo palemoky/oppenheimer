@@ -3,6 +3,7 @@ go 1.27
 use (
 	./api
 	./pkg
+	./services/agent
 	./services/cdc
 	./services/gateway
 	./services/inventory

@@ -313,6 +313,10 @@ mesh-check: ## 检查边车注入在这批节点上能用：临时起一对 Pod�
 monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometheus-stack、Loki、Tempo、OpenTelemetry Collector、MySQL 和 Redis 的 exporter、Istio 边车和 istiod 的抓取对象），再装 KEDA 到命名空间 keda；要在 make middleware-up 之后、make deploy 之前（exporter 要连 MySQL，gateway 和 order 的 chart 里有 KEDA 的 ScaledObject）；可重复执行
 	scripts/cluster/monitoring.sh up
 
+.PHONY: agent
+agent: ## 部署诊断 Agent 到命名空间 monitoring（只读 RBAC、存记录的卷、Secret agent-anthropic 来自 .env 的 ANTHROPIC_API_KEY；不在 monitoring-up 里；Alertmanager 的 webhook 另用 AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager 打开）
+	scripts/cluster/monitoring.sh agent
+
 .PHONY: monitoring-status
 monitoring-status: ## 看可观测后端的状态：Pod 在哪个节点、卷、不健康的抓取目标、连不上的数据库（mysql_up、redis_up 为 0）
 	scripts/cluster/monitoring.sh status
