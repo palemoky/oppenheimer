@@ -243,7 +243,7 @@ spec:
       rules:
         # 库存的计数和自己的流水在一个一致性快照里比，没有在途的量，所以没有“正常的小差异”，阈值是 0。
         # for 取 2 分钟（两轮快的）：快照里读出来的差就是真的差，两轮都在只是防住核对 Pod 刚重启那一轮的偶然读数。
-        # check 是 reserved（预占，每分钟更新）或 sold（已售，每小时更新一次，两轮之间保持上一次的值，所以它响了之后最长一小时才能确认恢复）。
+        # check 是 reserved（预占，每分钟更新）或 sold（已售，只在完整的一轮更新，集群上 5 分钟一次，两轮之间保持上一次的值，所以它响了之后最长 5 分钟才能确认恢复）。
         # max by (check)：核对的 Pod 重启后旧 Pod 的序列还会留 5 分钟，两条都在时取大的。不按 SKU 分组：SKU 在日志里，不进标签。
         - alert: StockLedgerMismatch
           expr: max by (check) (recon_stock_mismatch_skus{k8s_namespace_name="oppenheimer"}) > 0
@@ -256,8 +256,8 @@ spec:
             description: "库存库里 sku_stock 的计数（含 stock_pending 里还没应用的增量）和预占流水（reservation、reservation_item）对不上：同一条增量被应用了两次、丢了一条增量，或者改了预占的状态而没有记增量。库存的账不再可信，超卖或少卖都有可能。哪些 SKU、差多少在 recon-stock 的日志里（stock mismatch，带 sku_id、counter、ledger）。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/recon-stock.md
         # 卡住的预占：状态还是 RESERVED，已经比支付时限（15 分钟）老得多（默认 1 小时）。既没有被确认也没有被释放，占着库存。
-        # 这个数只在每小时的完整一轮更新，两轮之间保持上一次的值。for 取 10 分钟：值一旦大于 0 至少保持到下一次完整一轮，
-        # 10 分钟只是滤掉核对 Pod 刚重启的那一次读数；这条在问题解决之后最长一小时才会自己恢复。
+        # 这个数只在完整的一轮更新（集群上 5 分钟一次），两轮之间保持上一次的值。for 取 10 分钟：连着两次完整的一轮都数到；
+        # 这条在问题解决之后要等下一次完整的一轮（最长 5 分钟）才会自己恢复。
         # 快的一轮只看最近 2 小时的预占，窗口之外的卡住只有完整的一轮看得到，所以这条单独写，不并进 StockLedgerMismatch。
         - alert: StockReservationsStuck
           expr: max(recon_stock_stuck_reservations{k8s_namespace_name="oppenheimer"}) > 0

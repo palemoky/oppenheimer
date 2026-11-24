@@ -214,7 +214,12 @@ func runWatchChanges(ctx context.Context, logger *slog.Logger, args []string) er
 
 	logger.InfoContext(ctx, "watching row changes against derived data", "targets", strings.Join(names, ","),
 		"delay", cfg.Delay.String(), "recheck_every", cfg.RecheckEvery.String(), "lag_after", cfg.LagAfter.String())
-	return app.Run(ctx, logger, httpServer, newRecheckLoop(checker), consumer)
+	// 调试端口（pprof）：DEBUG_ADDR 没设就不开，集群里只在回环上监听，经 kubectl port-forward 访问。
+	debugServer, err := app.ListenDebug(ctx, logger)
+	if err != nil {
+		return err
+	}
+	return app.Run(ctx, logger, app.WithDebug(debugServer, httpServer, newRecheckLoop(checker), consumer)...)
 }
 
 // recheckLoop 把 Checker.Run（复查和瞬时值）包成 app.Component。

@@ -9,12 +9,12 @@
 `recon-stock`（Deployment，命名空间 `oppenheimer`，`make recon-stock` 装）在库存库（`inventory_db`，读主库）的一个一致性快照里核对两条等式，按 SKU：
 
 - **预占**：`sku_stock.reserved`（加上 `stock_pending` 里还没应用的增量）等于状态是 `RESERVED` 的预占的数量合计（`reservation_item`）。每分钟一轮（快的一轮），只扫最近 2 小时创建的预占。
-- **已售**：`sku_stock.sold`（同样含没应用的增量）等于状态是 `CONFIRMED` 的预占的数量合计。要对全部 `CONFIRMED` 求和，是一次全表扫描，所以每小时才做一次（完整的一轮），顺带数出卡住的预占。
+- **已售**：`sku_stock.sold`（同样含没应用的增量）等于状态是 `CONFIRMED` 的预占的数量合计。要对全部 `CONFIRMED` 求和，是一次全表扫描，所以不是每轮都做：集群上每 5 分钟做一次（完整的一轮，`-full-every`，程序的默认值是 1 小时），顺带数出卡住的预占。
 
 计数和流水在同一个库里、改状态和记增量在同一个事务里，所以快照里读到的两边是同一时刻，没有在途的量，不设容差，也不复查。它不管总量守恒（`available + reserved + sold = stocked` 由表上的 CHECK 保证），也发现不了流水本身记错了（数量记成别的数，那要和订单的明细比，是 `recon` 的 stock 那一对的事）。
 
-- **`StockLedgerMismatch`**：`max by (check) (recon_stock_mismatch_skus) > 0`，持续 2 分钟（两轮快的）。`check` 是 `reserved` 或 `sold`，值是对不上的 SKU 个数；差的件数是 `recon_stock_mismatch_quantity`。**`sold` 只在每小时的完整的一轮更新，两轮之间保持上一次的值**，所以它响了之后最长一小时才能确认恢复。
-- **`StockReservationsStuck`**：`max(recon_stock_stuck_reservations) > 0`，持续 10 分钟。卡住的预占是状态还是 `RESERVED`、却比 1 小时（`-stuck-after`）还老的：既没有被确认也没有被释放。这个数也只在完整的一轮更新，**问题解决之后最长一小时才会自己恢复**。
+- **`StockLedgerMismatch`**：`max by (check) (recon_stock_mismatch_skus) > 0`，持续 2 分钟（两轮快的）。`check` 是 `reserved` 或 `sold`，值是对不上的 SKU 个数；差的件数是 `recon_stock_mismatch_quantity`。**`sold` 只在完整的一轮（5 分钟一次）更新，两轮之间保持上一次的值**，所以它响了之后最长 5 分钟才能确认恢复。
+- **`StockReservationsStuck`**：`max(recon_stock_stuck_reservations) > 0`，持续 10 分钟。卡住的预占是状态还是 `RESERVED`、却比 1 小时（`-stuck-after`）还老的：既没有被确认也没有被释放。这个数也只在完整的一轮更新，**问题解决之后要等下一次完整的一轮（最长 5 分钟）才会自己恢复**。
 - **`StockCheckStalled`**：5 分钟内 `recon_stock_runs_total{outcome="ok"}` 的增量小于 1（平时每分钟一轮），持续 5 分钟。
 
 指标名是照 `recon_totals_*` 的导出方式类推的（点变下划线、计数器加 `_total`、没有单位后缀），**没有在 Prometheus 上核对过**。
@@ -62,7 +62,7 @@
 
 ## 怎么确认恢复了
 
-- `recon_stock_mismatch_skus` 两个 `check` 都回到 0。`reserved` 至少两轮（2 分钟）；`sold` 要等下一次完整的一轮（最长 1 小时），在那之前它显示的是旧值。同时 `recon_stock_runs_total{outcome="ok"}` 在涨：核对自己失败时瞬时值停在上一次成功的结果上。
+- `recon_stock_mismatch_skus` 两个 `check` 都回到 0。`reserved` 至少两轮（2 分钟）；`sold` 要等下一次完整的一轮（最长 5 分钟），在那之前它显示的是旧值。同时 `recon_stock_runs_total{outcome="ok"}` 在涨：核对自己失败时瞬时值停在上一次成功的结果上。
 - `recon_stock_stuck_reservations` 回到 0，同样要等下一次完整的一轮。`StockReservationsStuck` 自己恢复不算数：确认卡住的那些订单已经确认或释放（用 `oldest_order_id` 查）。
 - 最后以对账差异为 0 收尾：`make recon-check FROM=<RFC3339> TO=<RFC3339>`（对 `[FROM, TO)` 读三个常驻核对的指标并跑一次逐行对账，没有验证过），或 `KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%s)`，退出码 0。
 

@@ -1,5 +1,5 @@
 # 库存的计数对流水核对（recon watch-stock）：常驻的一个 Pod，每分钟在库存库的一个一致性快照里核对
-# “预占的计数 = 状态是 RESERVED 的预占数量合计”（快的一轮）；每小时再核对“已售的计数 = CONFIRMED 的数量合计”
+# “预占的计数 = 状态是 RESERVED 的预占数量合计”（快的一轮）；每隔一段（集群上 5 分钟）再核对“已售的计数 = CONFIRMED 的数量合计”
 # 并数出卡住的预占（完整的一轮）。结果报成指标（recon.stock.*），有差异时每一轮打 Error 日志。规则在
 # services/recon/internal/stock 的包注释里，设计文档 3e 第 4.2 节、ADR-0039。
 # 由 scripts/cluster/services.sh recon-stock 把 __IMAGE__、__IMAGE_TAG__ 填上后 apply。
@@ -55,12 +55,12 @@ spec:
           imagePullPolicy: IfNotPresent
           # 镜像的 ENTRYPOINT 是 recon，这里只给子命令。参数都用默认值：
           #   -interval 1m         两轮之间的间隔
-          #   -full-every 1h       多久做一次完整的一轮（已售的等式要对全部 CONFIRMED 求和，是一次全表扫描，随订单总量变慢）
+          #   -full-every 5m       （程序的默认值是 1h；2026-11-24 改的：完整的一轮实测不到 1 分钟，一小时一轮让 recon-check 收尾最长等 1 小时）多久做一次完整的一轮（已售的等式要对全部 CONFIRMED 求和，是一次全表扫描，随订单总量变慢）
           #   -reserved-window 2h  快的一轮往回看多久的预占；要比支付时限（15 分钟）长得多
           #   -stuck-after 1h      RESERVED 超过这么久算卡住；不能比 -reserved-window 长
           #   -quick-timeout 5s    快的一轮的时限（同时限制了快照事务开多久）
           #   -full-timeout 2m     完整的一轮的时限
-          args: ["watch-stock"]
+          args: ["watch-stock", "-full-every=5m"]
           env:
             # 密码来自 Secret oppenheimer-mysql（app 账号，和 cronjob.yaml 一样）。$(VAR) 由 Kubernetes 展开，密码的变量写在前面。
             - {name: MYSQL_MAIN_PASSWORD, valueFrom: {secretKeyRef: {name: oppenheimer-mysql, key: main-app-password}}}
@@ -73,7 +73,7 @@ spec:
             - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
             - {name: OTEL_RESOURCE_ATTRIBUTES, value: "service.version=__IMAGE_TAG__,k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.node.name=$(NODE_NAME)"}
           resources:
-            # 估的，上线后按实测改：每分钟一条按主键范围的聚合，每小时一次全表的聚合，其余时间在睡。
+            # 估的，上线后按实测改：每分钟一条按主键范围的聚合，每 5 分钟一次全表的聚合，其余时间在睡。
             requests: {cpu: 20m, memory: 32Mi}
             limits: {memory: 128Mi}
           securityContext:

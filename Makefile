@@ -344,7 +344,7 @@ recon-totals: ## 装或更新钱的笔数和金额核对（Deployment recon-tota
 	scripts/cluster/services.sh recon-totals
 
 .PHONY: recon-stock
-recon-stock: ## 装或更新库存的计数对流水核对（Deployment recon-stock，命名空间 oppenheimer）：每分钟核对预占的计数，每小时再核对已售的计数并数出卡住的预占，结果是指标 recon.stock.*；镜像 tag 按当前工作区算，没有就构建；可重复执行
+recon-stock: ## 装或更新库存的计数对流水核对（Deployment recon-stock，命名空间 oppenheimer）：每分钟核对预占的计数，每 5 分钟再核对已售的计数并数出卡住的预占，结果是指标 recon.stock.*；镜像 tag 按当前工作区算，没有就构建；可重复执行
 	scripts/cluster/services.sh recon-stock
 
 .PHONY: recon-changes

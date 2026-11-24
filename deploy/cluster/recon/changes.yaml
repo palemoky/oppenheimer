@@ -73,6 +73,8 @@ spec:
             - {name: MERCHANT_INDEX_DSNS, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_0,app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/merchant_index_db_1"}
             - {name: ARCHIVE_DSN, value: "app:$(MYSQL_MAIN_PASSWORD)@tcp(mysql-main-primary.mysql.svc:3306)/order_archive_db"}
             - {name: HTTP_ADDR, value: ":8086"}
+            # pprof 只在回环上监听，经 kubectl port-forward 访问。
+            - {name: DEBUG_ADDR, value: "127.0.0.1:6060"}
             # 指标推给 Collector，和六个服务一样；资源属性里带上命名空间、Pod、节点（Prometheus 把它们提成了标签）。
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-gateway.monitoring:4317"}
             - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
@@ -82,7 +84,9 @@ spec:
           resources:
             # 估的，上线后按实测改：每条订单变更对每个派生端几次主键点查；等着复查的变更放在内存里，压测时会多。
             requests: {cpu: 50m, memory: 64Mi}
-            limits: {memory: 256Mi}
+            # CPU 上限 1 核：新消费组（或者位点丢了）会从头重放整个 topic，等于把每个订单核对一遍。2026-11-24 第一次
+            # 启动时没有上限，它在控制面节点（4 核，etcd 也在上面）占了约 2.8 核、5 分钟放完 1670 万条。重放留着，只是放慢。
+            limits: {cpu: "1", memory: 256Mi}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

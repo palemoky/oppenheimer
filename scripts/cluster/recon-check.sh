@@ -20,7 +20,7 @@
 #   - 指标的窗口取 [FROM, 现在]，不是 [FROM, TO]：一条在 TO 之前提交的变更，核对发生在 TO 之后（延迟 10 秒起），
 #     计数器是在核对的那一刻增加的，窗口停在 TO 会漏掉。代价是 TO 之后别的原因造成的不一致也会算进来。
 #   - 钱的核对每一轮看“最近 30 分钟，去掉最新的一分钟”，所以要有一轮在 TO 之后至少 2 分钟开始并且成功，才算覆盖到了 TO。
-#   - 库存的“已售”那条等式只有完整的一轮（每小时一次）才核对，所以覆盖要等到 TO 之后有一次完整的一轮成功，最长一小时。
+#   - 库存的“已售”那条等式只有完整的一轮（集群上 5 分钟一次，recon-stock 的 -full-every）才核对，所以覆盖要等到 TO 之后有一次完整的一轮成功。
 #   - 变更核对的 verified_through 只在有新的变更时往前走；TO 之后订单库没有写入的话它永远不会越过 TO（探针一直在写，平时不会）。
 #   - 起的 Job 去掉了 ownerReferences，不属于 CronJob：失败了不会触发 ReconFoundDifferences（没有验证过这一点）。
 #
@@ -35,6 +35,7 @@ NS="${APP_NAMESPACE:-oppenheimer}"
 SEL="k8s_namespace_name=\"$NS\""
 STEP=15s            # 子查询的步长
 CHECK_MARGIN=120    # 钱的核对要在 TO 之后多少秒开始的一轮才算覆盖到 TO（去掉最新一分钟，再留一轮）
+MIN_RATE_WINDOW=150 # increase 的窗口至少这么长：指标每 60 秒导出一次，窗口里要有两个点以上
 JOB_TIMEOUT="${RECON_CHECK_TIMEOUT:-35m}" # 等逐行对账的 Job（模板的 activeDeadlineSeconds 是 30 分钟，重试最多再加一点）
 
 FROM="" TO="" DRY=0 ROWS=1
@@ -132,9 +133,10 @@ elif is_pos "$v"; then say "  变更    有差异：mismatch 增加了 ${v}（�
 else say "  变更    mismatch 没有增加"; fi
 
 # ---- 核对到了 TO ----
-if [[ "$SINCE_CHECKED" -lt 60 ]]; then
-  # 窗口太短，increase 量不准；也一定还没有核对到。
-  say "  钱、库存  距 TO 才 ${SINCE_TO} 秒，核对还没有越过 TO（要 TO 之后 ${CHECK_MARGIN} 秒以上）"
+if [[ "$SINCE_CHECKED" -lt "$MIN_RATE_WINDOW" ]]; then
+  # 窗口太短：指标每 60 秒导出一次，increase 要窗口里至少两个点，不够时没有结果，会被读成“没有成功的一轮”
+  # （2026-11-24 真跑时遇到的：TO 在 3 分钟前，窗口只有 60 秒）。
+  say "  钱、库存  距 TO 才 ${SINCE_TO} 秒，还量不出 TO 之后有没有成功的一轮（要 TO 之后 $((CHECK_MARGIN + MIN_RATE_WINDOW)) 秒以上）"
   PENDING=1
 else
   R="${SINCE_CHECKED}s"
@@ -151,7 +153,7 @@ else
   v="$(promql "库存：TO 之后成功的完整的一轮" "sum(increase(recon_stock_runs_total{$SEL,kind=\"full\",outcome=\"ok\"}[$R]))")" || ERR=1
   if [[ "$DRY" -eq 1 ]]; then :
   elif is_pos "$v"; then say "  库存    已售：TO 之后有成功的完整的一轮"
-  else say "  库存    已售还没核对到 TO：完整的一轮每小时一次，最长再等 1 小时"; PENDING=1; fi
+  else say "  库存    已售还没核对到 TO：完整的一轮 5 分钟一次（-full-every），等下一轮"; PENDING=1; fi
 fi
 
 v="$(promql "变更：核对到的提交时刻（Unix 秒）" "max(recon_changes_verified_through{$SEL})")" || ERR=1

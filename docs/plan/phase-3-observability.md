@@ -149,6 +149,13 @@
 - [ ] 全量对账的位置：现在 1473.7 万单 1 分 55 秒，便宜；随总量线性增长。定它跑多频繁、到多大换成“封账加离线”
   - 2026-11-24：判据写在设计 4.4 和 ADR-0039（单次超过 30 分钟或者量到影响线上就换成“封账加离线”）；`make recon-check` 写了（只跑过 dry-run）。全量期间对数据库的影响还没有量，所以不勾
 
+**3e 第 6 步：动集群的操作（2026-11-24 登记，主人同一天同意）**
+
+1. `make deploy IMAGE_SERVICES=inventory`：inventory 启动时执行迁移 00006（`sku_stock` 加 `stocked` 列和 CHECK，表只有几行）。只滚 inventory：从现在部署的 `07c0dcc` 到现在，另外五个服务的代码没有变。旧的 Pod 在迁移之后继续写不会被 CHECK 拒绝（预占、确认、释放三个数之和不变）。
+2. `make recon-totals`（换成带 `group` 和下钻的版本）、`make recon-stock`、`make recon-changes`、`scripts/cluster/monitoring.sh rules`。都是只读核对：`recon-changes` 多一个 Kafka 消费组 `recon.cdc-orders`，对从库、商家索引、冷库按主键点查。
+3. 只读地核对：Prometheus 上的指标名、“已售对流水”完整一轮的耗时、`watch-changes` 的 `pending` 和查询量、每天全量对账（21:30 UTC）期间数据库和探针的指标。
+4. 造差异验证六条告警和下钻：**只在 `oppenheimer-e2e` 和 `e2e_*` 库里做，不碰正式库**；具体改哪几行、怎么恢复，动手之前再给主人看一次。
+
 ## 验收标准
 
 - 任意一个慢请求，能从大盘下钻到链路再到日志，定位到具体的服务和调用。
