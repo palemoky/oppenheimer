@@ -2,10 +2,14 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"runtime"
+	"strconv"
+	"time"
 )
 
 // DebugAddrEnv 是调试端口（pprof）监听地址的环境变量名。不设就不开调试端口。
@@ -24,6 +28,37 @@ import (
 // 代码里不给默认值：本机同时跑几个服务时会抢同一个端口。
 const DebugAddrEnv = "DEBUG_ADDR"
 
+// mutex、block 剖析的采样（设计 4a 的 3.4）。不设或设成 0 就不采样（和 Go 的默认一样），
+// 只在调试端口开着（DEBUG_ADDR 设了）时生效：没有端口就取不走剖析，采了也白采。
+//
+//   - DEBUG_MUTEX_FRACTION：整数 n，平均每 n 次锁争用记 1 次（runtime.SetMutexProfileFraction）。
+//   - DEBUG_BLOCK_RATE：Go 的时长（例如 1ms），平均每阻塞这么久记 1 次阻塞事件（runtime.SetBlockProfileRate
+//     的参数是纳秒，这里写成时长，免得把 1 毫秒写成 1、变成每次阻塞都记）。
+//
+// 两者都是进程级的全局设置，进程活着就一直采。开销要实测（3b 的压测对比吞吐和 p99）再定值。
+const (
+	DebugMutexFractionEnv = "DEBUG_MUTEX_FRACTION"
+	DebugBlockRateEnv     = "DEBUG_BLOCK_RATE"
+)
+
+// debugSampling 读 mutex、block 采样的两个环境变量。值不合法时返回错误：写错了就悄悄不采样，
+// 要用的时候才发现剖析是空的。
+func debugSampling() (mutexFraction int, blockRate time.Duration, err error) {
+	if v := os.Getenv(DebugMutexFractionEnv); v != "" {
+		mutexFraction, err = strconv.Atoi(v)
+		if err != nil || mutexFraction < 0 {
+			return 0, 0, fmt.Errorf("%s=%q: want a non-negative integer (sample 1 in n contention events)", DebugMutexFractionEnv, v)
+		}
+	}
+	if v := os.Getenv(DebugBlockRateEnv); v != "" {
+		blockRate, err = time.ParseDuration(v)
+		if err != nil || blockRate < 0 {
+			return 0, 0, fmt.Errorf("%s=%q: want a non-negative duration such as 1ms", DebugBlockRateEnv, v)
+		}
+	}
+	return mutexFraction, blockRate, nil
+}
+
 // DebugMux 返回只挂 pprof 的 mux，路径和 net/http/pprof 往 DefaultServeMux 上注册的一致（只接受 GET）：
 //
 //	/debug/pprof/          索引；/debug/pprof/<名字> 取 runtime/pprof 的各个剖析
@@ -36,9 +71,9 @@ const DebugAddrEnv = "DEBUG_ADDR"
 // 处理函数显式挂在自己的 mux 上。导入 net/http/pprof 时它的 init 仍会往 DefaultServeMux 上注册一份，
 // 所以任何端口都不能用 DefaultServeMux 服务（ListenHTTP 拒绝 nil handler）。
 //
-// block 和 mutex 剖析默认不采样，取到的是空的。这里不打开：采样有开销，也会改变被观察的程序。
-// 要用时在进程里调用 runtime.SetBlockProfileRate(1)（每次阻塞都记）或 runtime.SetMutexProfileFraction(5)
-// （每 5 次争用记 1 次），诊断完设回 0；需要的话再加一个开关，不要默认打开。
+// block 和 mutex 剖析默认不采样，取到的是空的。要采样时用环境变量 DEBUG_MUTEX_FRACTION、DEBUG_BLOCK_RATE
+// 在启动时打开（见 ListenDebug），不提供运行中开关的接口：采样有开销，也会改变被观察的程序，
+// 打开它是部署时的决定，不能由来抓剖析的一方（人或诊断 Agent）顺手打开。
 func DebugMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -59,12 +94,24 @@ func ListenDebug(ctx context.Context, logger *slog.Logger) (*HTTPServer, error) 
 	if addr == "" {
 		return nil, nil
 	}
+	mutexFraction, blockRate, err := debugSampling()
+	if err != nil {
+		return nil, err
+	}
 	s, err := ListenHTTP(ctx, "debug", addr, DebugMux())
 	if err != nil {
 		return nil, err
 	}
 	s.closeOnStop = true
-	logger.InfoContext(ctx, "debug server listening", "debug_addr", s.Addr().String())
+	// 端口绑上之后再打开采样：绑不上时进程会退出，没必要先改全局设置。
+	if mutexFraction > 0 {
+		runtime.SetMutexProfileFraction(mutexFraction)
+	}
+	if blockRate > 0 {
+		runtime.SetBlockProfileRate(int(blockRate.Nanoseconds()))
+	}
+	logger.InfoContext(ctx, "debug server listening", "debug_addr", s.Addr().String(),
+		"mutex_profile_fraction", mutexFraction, "block_profile_rate", blockRate.String())
 	return s, nil
 }
 

@@ -36,6 +36,7 @@ import (
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/kube"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/loki"
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool/pprof"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/prom"
 	"github.com/palemoky/oppenheimer/services/agent/internal/trigger"
 )
@@ -85,6 +86,9 @@ type serveConfig struct {
 	lokiURL       string
 	kubeconfig    string
 	inCluster     bool
+	// pprofNamespace、pprofPort 是 pprof_capture 能连的命名空间和 Pod 回环上的调试端口。
+	pprofNamespace string
+	pprofPort      int
 }
 
 func serveCmd(args []string, stderr io.Writer) int {
@@ -169,7 +173,7 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	tools, err := buildTools(cfg)
+	tools, err := buildTools(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
@@ -251,7 +255,8 @@ func envOr(key, fallback string) string {
 
 // buildTools 登记只读工具。没有给地址（或者没有给 Kubernetes 的连接方式）的那一组不登记；
 // 一组都没有时 Agent 只有循环自己加的 submit_report，仍然能启动。
-func buildTools(cfg serveConfig) (*tool.Registry, error) {
+// pprof_capture 跟着 kube_* 一起登记：它经 apiserver 的端口转发连 Pod。
+func buildTools(cfg serveConfig, logger *slog.Logger) (*tool.Registry, error) {
 	// 工具自己不设超时：每次调用的时限由循环经 ctx 给（loop.Limits.ToolTimeout）。
 	client := &http.Client{}
 	var tools []tool.Tool
@@ -271,6 +276,13 @@ func buildTools(cfg serveConfig) (*tool.Registry, error) {
 			return nil, fmt.Errorf("kubernetes client: %w", err)
 		}
 		tools = append(tools, kube.New(kube.Config{Client: cs})...)
+		tools = append(tools, pprof.New(pprof.Config{
+			Pods:      cs,
+			Forwarder: pprof.NewKubeForwarder(kubeCfg, cs),
+			Namespace: cfg.pprofNamespace,
+			Port:      cfg.pprofPort,
+			Logger:    logger,
+		}))
 	}
 	return tool.NewRegistry(tools...)
 }

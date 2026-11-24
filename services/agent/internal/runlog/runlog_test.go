@@ -39,8 +39,8 @@ func TestRunRoundTrip(t *testing.T) {
 		wg.Go(func() { run.Event("tool_call", map[string]int{"n": i}) })
 	}
 	wg.Wait()
-	run.Raw("s1", []byte(`{"data":1}`))
-	run.Raw("s2", nil) // 空的不写
+	run.Raw("s1.json", []byte(`{"data":1}`))
+	run.Raw("s2.json", nil) // 空的不写
 	run.WriteFile("report.md", []byte("# r"))
 
 	// 没有 summary.json 之前，列表里它是没有正常结束的。

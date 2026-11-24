@@ -27,6 +27,16 @@ type Result struct {
 	Text string
 	// Raw 是裁剪前的原始结果（通常是后端返回的 JSON），可以为空。
 	Raw []byte
+	// RawExt 是 Raw 落盘时的扩展名（带点，例如 ".pb.gz"），空的是 ".json"。
+	RawExt string
+}
+
+// RawFile 返回步骤 step 的原始结果落盘的文件名（运行记录的 raw/ 下）。
+func (r Result) RawFile(step string) string {
+	if r.RawExt == "" {
+		return step + ".json"
+	}
+	return step + r.RawExt
 }
 
 // Tool 是一个只读工具。Call 必须可以并发调用。

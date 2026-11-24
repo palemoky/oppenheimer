@@ -92,7 +92,8 @@ func DefaultLimits() Limits {
 // Recorder 接收一次运行的每一步，*runlog.Run 实现它。方法要能并发调用。
 type Recorder interface {
 	Event(kind string, data any)
-	Raw(step string, raw []byte)
+	// Raw 保存一步的原始结果。file 是文件名（步骤号加扩展名，见 tool.Result.RawFile）。
+	Raw(file string, raw []byte)
 }
 
 // Runner 跑诊断。建好之后只读，可以并发跑多次运行。
@@ -184,6 +185,8 @@ type run struct {
 	now   func() time.Time
 	start time.Time
 	res   Result
+	// scope 是这次运行里工具共享的状态（tool.Scope），经 ctx 交给每次调用。
+	scope *tool.Scope
 
 	wrapUp      bool
 	wrapUpSends int
@@ -199,7 +202,11 @@ func (r *Runner) Run(ctx context.Context, question string, rec Recorder) Result 
 	if now == nil {
 		now = time.Now
 	}
-	st := &run{Runner: r, rec: rec, now: now, start: now()}
+	runID := ""
+	if idr, ok := rec.(interface{ ID() string }); ok {
+		runID = idr.ID()
+	}
+	st := &run{Runner: r, rec: rec, now: now, start: now(), scope: tool.NewScope(runID)}
 	st.res.Steps = make(map[string]report.Step)
 	st.res.Calls = make(map[string]map[string]int)
 
@@ -443,7 +450,8 @@ func (st *run) count(name, outcome string) {
 
 // execute 执行一次工具调用。在自己的 goroutine 里跑，不碰 st 的可变状态。
 func (st *run) execute(ctx context.Context, stepID string, t tool.Tool, call llm.ToolCall) (step report.Step, outcome string) {
-	callCtx, cancel := context.WithTimeout(ctx, st.Limits.ToolTimeout)
+	timeout := tool.TimeoutOf(t, st.Limits.ToolTimeout)
+	callCtx, cancel := context.WithTimeout(tool.WithCall(ctx, st.scope, stepID), timeout)
 	defer cancel()
 	began := st.now()
 
@@ -456,14 +464,14 @@ func (st *run) execute(ctx context.Context, stepID string, t tool.Tool, call llm
 	case errors.Is(err, context.DeadlineExceeded):
 		outcome = CallTimeout
 		step.Failed = true
-		step.Text = fmt.Sprintf("Timed out after %s. Narrow the time range or make the query cheaper.", st.Limits.ToolTimeout)
+		step.Text = fmt.Sprintf("Timed out after %s. Narrow the time range or make the query cheaper.", timeout)
 	default:
 		outcome = CallError
 		step.Failed = true
 		step.Text = tool.Cap("Error: " + err.Error())
 	}
 
-	st.rec.Raw(stepID, res.Raw)
+	st.rec.Raw(res.RawFile(stepID), res.Raw)
 	st.rec.Event("tool_call", evToolCall{
 		Step: stepID, Turn: st.res.Turns, Tool: call.Name, Input: call.Input,
 		Result: outcome, RawBytes: len(res.Raw), Text: step.Text,
