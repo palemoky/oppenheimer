@@ -418,6 +418,17 @@ go run ./cmd/agent ask ...      # 另开一个终端，参数见 agent ask -h
 - 第三次的结论（没有另外核实）：`PrometheusErrorSendingAlertsToSomeAlertmanagers` 反复进 pending，是因为通知量很小（5 分钟约 3 次），一次失败的 POST 就让错误率远超阈值，持续约 5 分钟后自己退掉，到不了 `for: 15m`；失败本身是连接层的（EOF、reset），Alertmanager 一侧只有 200。这正是 3c 留下的“这两条只到 pending”那件事，可以当作排查的起点。
 - 费用是按高峰价估的。
 
+### 9.6 在集群里经告警触发的一次（2026-11-24，主人同意部署后）
+
+- **怎么触发的**：`make agent` 部署（DeepSeek、`deepseek-flash`、`-peak=defer`），`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager` 打开第二个地址，08:46 UTC 用 `amtool alert add` 加了一条试跑的告警（`AgentWebhookTrial`，warning，说明里写“核对 gateway 过去一小时是否健康”）。当时在高峰里。
+- **走通了的**：Alertmanager 30 秒后把它发到了 Agent（`queued=true`）；Agent 把它留着（`held until 2026-11-24T10:00:00Z`）；**10:00:00 UTC 整自己开始跑**，运行号 `20261124T100000Z-igur`，70 秒，14 轮，38 次工具调用，结果 `reported`，按低谷价算 0.011 美元，缓存读 23 万 token。Pod 里到 `api.deepseek.com` 是通的，集群里的三组工具都能用。问题里带上了“这次诊断是推迟的、现在几点、先看告警还在不在”那段话，模型第一步确实先查了告警的现状。
+- **结论对不对**：对。它报告的是“这条告警背后没有真的故障，是直接塞进 Alertmanager 的试跑通知（Prometheus 里没有对应的规则和 `ALERTS` 序列），已经恢复；gateway 这一小时一直健康”，置信度高，证据是零个非 2xx、延迟平、Pod 没有重启、探针每分钟 `failed=0`。它还注意到 08:37 前后 `oppenheimer-e2e` 里有过一个 `chaos-smoke` 的 Pod（当时在做 Chaos Mesh 的冒烟），并说明它没有影响 gateway。
+- **看到的两个现象**：
+  1. 第一次交报告被程序退回了一次（引用了一个出错的步骤当证据），模型改了之后第二次通过。退回的机制在起作用。
+  2. 一次 PromQL 写错了（`vector cannot contain metrics with the same labelset`），模型自己换了写法。
+- **一处没有弄清的**：问题里那条告警的 `firing since` 是 08:56:28，比通知到达的时刻（08:46:58）还晚，正好等于 `amtool alert add --end` 给的结束时刻。是 `amtool` 只给 `--end` 时的行为、Alertmanager 的行为，还是 Agent 解析的问题，没有查。由 Prometheus 规则产生的真告警有没有这个现象也没有看过。
+- **仍然没有验的**：由真的告警规则触发（这次是手工加的告警）；一组里有多条告警；冷却、队列满、每天预算这几条在集群里的表现；高峰里攒了多条之后依次跑；带 pprof 工具的新镜像（这次部署的是 `355f2ea`，没有 pprof）。
+
 ## 10. 躲开高峰价（2026-11-24 加，主人要求：“现在是 DeepSeek 的高峰价格，我想在相关的调用放在低谷价格处理”）
 
 DeepSeek 的高峰是 UTC 周一到周五 01:00 到 04:00、06:00 到 10:00（北京时间工作日 09:00 到 12:00、14:00 到 18:00），其余时间半价。

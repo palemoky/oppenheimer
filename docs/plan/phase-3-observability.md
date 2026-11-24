@@ -124,7 +124,8 @@
   - 用 client-go，单独的 ServiceAccount，只给 get、list、watch；不给 exec、不给任何写权限，权限写在清单里入库
 - [x] 工具输出的裁剪，控制上下文长度
   - 2026-11-24：各工具自己裁，裁了什么写在结果里，原始结果另存。对着真的后端看过输出；**数合不合适没有经过模型验证**（没有密钥）
-- [ ] 触发方式：Alertmanager webhook 和命令行手动提问
+- [x] 触发方式：Alertmanager webhook 和命令行手动提问
+  - 2026-11-24（晚些时候）：部署了，Alertmanager 的第二个地址打开了，一条手工加的告警经 Alertmanager 触发了一次诊断并跑完；手动提问在高峰里被拒绝（按设计）。[设计 9.6](../design/3d-diagnosis-agent.md)。**没有验的**：由真的告警规则触发
   - 2026-11-24：程序这一侧写了（`internal/trigger`、`agent serve` 的 `/alerts` 和 `/ask`、`agent ask`），有测试。部署用的清单和脚本也写了（`make agent`，Alertmanager 的第二个地址带开关）。**没有部署，Alertmanager 还没有加这个地址**，所以不勾
 - [x] 输出 Markdown 报告：根因判断、证据（每条结论附查询和结果）、置信度
   - 2026-11-24：`internal/report`。证据由程序按步骤号从运行记录里渲染（ADR-0038）
@@ -133,6 +134,7 @@
 - [x] 模型的后端可换（2026-11-24 加，主人要求；计划变更见 `PROGRESS.md`）：`-provider` 选 `anthropic`、`deepseek`、`openai`、`openai-compatible`
   - 2026-11-24：`internal/llm/openai.go`、`provider.go`，[设计第 9 节](../design/3d-diagnosis-agent.md)、[ADR-0040](../adr/0040-llm-providers-behind-one-interface.md)。有单元测试。**没有对真的 API 跑过**，主人说稍后用 DeepSeek 试
 - [ ] 用 3c 里人为触发告警的场景试跑几次，确认链路通
+  - 2026-11-24（晚些时候）：集群里经 Alertmanager 触发跑通了一次（[设计 9.6](../design/3d-diagnosis-agent.md)），但用的是手工加的告警，不是 3c 那些人为触发的场景，也只有一次，所以仍然不勾。阶段 4 的每次实验都会触发它，到时自然补上
   - 2026-11-24：用 DeepSeek 在本机手动提问跑通了三次（[设计 9.5](../design/3d-diagnosis-agent.md)），模型、工具、报告、留痕这一段是通的。**没有在集群里部署，没有经告警触发**，所以不勾
 
 这一版不追求准确率，目标是把骨架和留痕做好，阶段 4 开始就能积累真实运行记录。
