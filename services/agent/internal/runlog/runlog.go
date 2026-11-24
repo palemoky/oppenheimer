@@ -43,16 +43,18 @@ const OutcomeIncomplete = "incomplete"
 
 // Meta 是一次运行开始时就知道的事。
 type Meta struct {
-	ID        string         `json:"id"`
-	Trigger   string         `json:"trigger"`
-	Question  string         `json:"question"`
-	Alert     jsontext.Value `json:"alert,omitzero"`
-	Model     string         `json:"model"`
-	Effort    string         `json:"effort"`
-	Limits    any            `json:"limits"`
-	Version   string         `json:"version"`
-	Prompt    string         `json:"prompt_sha256"`
-	StartedAt time.Time      `json:"started_at"`
+	ID       string         `json:"id"`
+	Trigger  string         `json:"trigger"`
+	Question string         `json:"question"`
+	Alert    jsontext.Value `json:"alert,omitzero"`
+	// Provider 是模型的后端（anthropic、deepseek 等）。加这个字段之前的记录里没有它。
+	Provider  string    `json:"provider,omitzero"`
+	Model     string    `json:"model"`
+	Effort    string    `json:"effort"`
+	Limits    any       `json:"limits"`
+	Version   string    `json:"version"`
+	Prompt    string    `json:"prompt_sha256"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 // Summary 是一次运行结束时的统计。

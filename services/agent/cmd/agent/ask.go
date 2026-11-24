@@ -24,6 +24,8 @@ func askCmd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var addr string
+	var force bool
+	fs.BoolVar(&force, "force", false, "run now even during the model's peak pricing hours")
 	fs.StringVar(&addr, "addr", "http://127.0.0.1:8080", "base URL of a running agent (kubectl port-forward in the cluster case)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -33,7 +35,7 @@ func askCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if question == "" {
-		fmt.Fprintln(stderr, `usage: agent ask [-addr URL] "question"`)
+		fmt.Fprintln(stderr, `usage: agent ask [-addr URL] [-force] "question"`)
 		return 2
 	}
 
@@ -42,7 +44,7 @@ func askCmd(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(ctx, askTimeout)
 	defer cancel()
 
-	reply, err := ask(ctx, addr, question)
+	reply, err := ask(ctx, addr, question, force)
 	if err != nil {
 		fmt.Fprintln(stderr, "ask failed:", err)
 		return 1
@@ -52,9 +54,9 @@ func askCmd(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func ask(ctx context.Context, addr, question string) (trigger.Reply, error) {
+func ask(ctx context.Context, addr, question string, force bool) (trigger.Reply, error) {
 	var reply trigger.Reply
-	body, err := json.Marshal(map[string]string{"question": question})
+	body, err := json.Marshal(map[string]any{"question": question, "force": force})
 	if err != nil {
 		return reply, fmt.Errorf("encode question: %w", err)
 	}

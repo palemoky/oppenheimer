@@ -433,3 +433,38 @@ func TestRunWrapUpKeepsLastParseableReport(t *testing.T) {
 		t.Fatalf("outcome = %s, unverified = %v", res.Outcome, res.Unverified)
 	}
 }
+
+// 参数不是合法 JSON 的调用（OpenAI 兼容的后端、没开严格模式时会有）不执行，错误还给模型；
+// 报告这样坏掉一次不占“打回”的名额：之后内容上不合格的报告仍然能被打回一次。
+func TestRunMalformedArgumentsGoBackToModel(t *testing.T) {
+	bad := func(id, name string) llm.ToolCall {
+		return llm.ToolCall{ID: id, Name: name, Input: jsontext.Value(`"{\"a\": \"x\"y\"}"`), Malformed: "invalid character 'y'"}
+	}
+	q := &fakeTool{name: "q"}
+	model := &scripted{t: t, replies: []func(llm.Turn) (*llm.Reply, error){
+		calls(bad("1", "q"), call("2", "q", `{}`)),
+		calls(bad("3", report.ToolName)),
+		calls(call("4", report.ToolName, reportInput("s9"))),
+		calls(call("5", report.ToolName, reportInput("s1"))),
+	}}
+	res := newRunner(t, model, q).Run(t.Context(), "why", &memRecorder{})
+
+	if res.Outcome != OutcomeReported || res.Unverified {
+		t.Fatalf("outcome = %s, unverified = %v, err = %v", res.Outcome, res.Unverified, res.Err)
+	}
+	if q.n.Load() != 1 {
+		t.Errorf("tool ran %d times, want 1 (the malformed call must not run)", q.n.Load())
+	}
+	first := model.turns[1].Results
+	if len(first) != 2 || !first[0].IsError || !strings.Contains(first[0].Content, "not valid JSON") ||
+		first[1].IsError || !strings.HasPrefix(first[1].Content, "[s1]") {
+		t.Errorf("results after turn 1 = %+v", first)
+	}
+	if r := model.turns[2].Results; len(r) != 1 || !r[0].IsError || !strings.Contains(r[0].Content, "not valid JSON") {
+		t.Errorf("malformed report result = %+v", r)
+	}
+	// 第三轮的报告引用了不存在的步骤：被打回（名额还在），第四轮才收下。
+	if r := model.turns[3].Results; len(r) != 1 || !r[0].IsError || strings.Contains(r[0].Content, "not valid JSON") {
+		t.Errorf("rejected report result = %+v", r)
+	}
+}

@@ -145,20 +145,29 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # 模型 API 的密钥：Secret agent-llm 由 monitoring.sh agent 从 .env 建，键名就是环境变量名
+          # （ANTHROPIC_API_KEY、DEEPSEEK_API_KEY 等，.env 里有哪个放哪个）。optional：Secret 不存在也能起来，
+          # 只是每次诊断都以 api_error 结束。密钥不入库、不写在这里。
+          envFrom:
+            - secretRef:
+                name: agent-llm
+                optional: true
           env:
             # 查询工具的后端，都是只读的。
             - name: PROMETHEUS_URL
               value: http://kps-prometheus.monitoring:9090
             - name: LOKI_URL
               value: http://loki.monitoring:3100
-            # Claude API 的密钥：Secret agent-anthropic 由 monitoring.sh agent 从 .env 建。optional：Secret 不存在也能起来，
-            # 只是每次诊断都以 api_error 结束。密钥不入库、不写在这里。
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: agent-anthropic
-                  key: api-key
-                  optional: true
+            # 模型的后端（anthropic、deepseek、openai、openai-compatible，见设计 3d 第 9 节、ADR-0040）。这四个值由
+            # monitoring.sh agent 从 .env 的同名变量填进来；空着的用程序里的默认值（后端是 anthropic，模型是那个后端的默认模型）。
+            - name: AGENT_PROVIDER
+              value: "__AGENT_PROVIDER__"
+            - name: AGENT_MODEL
+              value: "__AGENT_MODEL__"
+            - name: AGENT_BASE_URL
+              value: "__AGENT_BASE_URL__"
+            - name: AGENT_PRICE
+              value: "__AGENT_PRICE__"
             # OTLP 接收端：monitoring 命名空间的 Collector（Service otel-gateway，gRPC 4317），和六个服务一样。
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-gateway.monitoring:4317

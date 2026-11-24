@@ -63,7 +63,7 @@ func (echoTool) Call(_ context.Context, input jsontext.Value) (tool.Result, erro
 	return tool.Result{Text: "up{job=\"mysql\"} 0", Raw: []byte(input)}, nil
 }
 
-func newTestApp(t *testing.T, dailyBudget float64) (*app, *fakeModel, *httptest.Server) {
+func newTestApp(t *testing.T, dailyBudget float64, opts ...func(*app)) (*app, *fakeModel, *httptest.Server) {
 	t.Helper()
 	// 日志打到测试的输出里：留痕写失败只打日志，测试失败时要看得到。
 	logger := slog.New(slog.NewTextHandler(t.Output(), nil))
@@ -79,10 +79,13 @@ func newTestApp(t *testing.T, dailyBudget float64) (*app, *fakeModel, *httptest.
 	model := &fakeModel{}
 	budget := trigger.NewDailyBudget(dailyBudget, 0, nil)
 	a := &app{
-		cfg:    serveConfig{model: "claude-opus-5-5", effort: "high", runsDir: store.Dir(), limits: loop.DefaultLimits()},
+		cfg:    serveConfig{model: "claude-opus-5-5", effort: "high", runsDir: store.Dir(), limits: loop.DefaultLimits(), queueSize: 2},
 		logger: logger, store: store, budget: budget,
 		runner:     &loop.Runner{LLM: model, Tools: tools, System: systemPrompt, Limits: loop.DefaultLimits(), Price: price},
 		dispatcher: trigger.NewDispatcher(trigger.Config{Cooldown: time.Hour, QueueSize: 2, Budget: budget}),
+	}
+	for _, opt := range opts {
+		opt(a)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -213,7 +216,7 @@ func TestAskEndToEnd(t *testing.T) {
 	if code, _ := post(t, srv.URL+"/ask", `{}`); code != http.StatusBadRequest {
 		t.Errorf("empty question: status %d", code)
 	}
-	reply, err := ask(t.Context(), srv.URL, "is anything wrong?")
+	reply, err := ask(t.Context(), srv.URL, "is anything wrong?", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +231,93 @@ func TestAskEndToEnd(t *testing.T) {
 
 func TestAskOverBudget(t *testing.T) {
 	_, _, srv := newTestApp(t, 0)
-	if _, err := ask(t.Context(), srv.URL, "q"); err == nil || !strings.Contains(err.Error(), "429") {
+	if _, err := ask(t.Context(), srv.URL, "q", false); err == nil || !strings.Contains(err.Error(), "429") {
 		t.Errorf("err = %v, want 429", err)
 	}
+}
+
+func TestModelPrice(t *testing.T) {
+	deepseek, _ := llm.PriceOf("deepseek-v4-pro")
+	for _, tc := range []struct {
+		name, model, flag string
+		want              llm.Price
+		wantErr           bool
+	}{
+		{name: "from the table", model: "deepseek-v4-pro", want: deepseek},
+		{name: "unknown model needs -price", model: "qwen-local", wantErr: true},
+		{name: "unknown model with -price", model: "qwen-local", flag: "0,0", want: llm.Price{}},
+		{name: "-price must not shadow the table", model: "deepseek-v4-pro", flag: "1,1", wantErr: true},
+		{name: "bad -price", model: "qwen-local", flag: "cheap", wantErr: true},
+	} {
+		got, err := modelPrice(serveConfig{model: tc.model, price: tc.flag})
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("%s: price = %+v, err = %v", tc.name, got, err)
+		}
+	}
+}
+
+// 高峰时段（-peak=defer，模型分时段计价）：告警的诊断留着不跑，高峰结束才跑；手动提问被拒，带 force 才跑。
+func TestPeakHoursDeferAlertsAndGateAsk(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 11, 24, 7, 0, 0, 0, time.UTC) // 周二，DeepSeek 的高峰是 06:00 到 10:00
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	wake := make(chan time.Time)
+	waits := make(chan time.Duration, 1)
+	a, model, srv := newTestApp(t, 20, func(a *app) {
+		price, err := llm.PriceOf("deepseek-flash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.runner.Price = price
+		a.cfg.model, a.cfg.peak = "deepseek-flash", peakDefer
+		a.now = clock
+		a.after = func(d time.Duration) <-chan time.Time { waits <- d; return wake }
+	})
+	asked := func() int { model.mu.Lock(); defer model.mu.Unlock(); return len(model.questions) }
+
+	if code, _ := post(t, srv.URL+"/alerts", webhookBody); code != http.StatusOK {
+		t.Fatalf("webhook status = %d", code)
+	}
+	// 工作协程收下了这一个并定了闹钟：等到 10:00，也就是 3 小时。
+	if d := <-waits; d != 3*time.Hour {
+		t.Errorf("wait = %s, want 3h", d)
+	}
+	if n := asked(); n != 0 {
+		t.Fatalf("model was called %d times during peak hours", n)
+	}
+
+	code, body := post(t, srv.URL+"/ask", `{"question":"anything wrong?"}`)
+	if code != http.StatusConflict || !strings.Contains(body, "2026-11-24T10:00:00Z") {
+		t.Errorf("ask during peak = %d %q", code, body)
+	}
+	if code, body := post(t, srv.URL+"/ask", `{"question":"anything wrong?","force":true}`); code != http.StatusOK || !strings.Contains(body, "reported") {
+		t.Errorf("forced ask = %d %q", code, body)
+	}
+	if n := asked(); n != 1 {
+		t.Fatalf("model calls after the forced ask = %d, want 1 (the held alert must still be waiting)", n)
+	}
+
+	// 高峰结束：留着的那一个现在跑，问题里写明了它是被推迟的、现在几点。
+	mu.Lock()
+	now = time.Date(2026, 11, 24, 10, 0, 1, 0, time.UTC)
+	mu.Unlock()
+	wake <- now
+	deadline := time.Now().Add(10 * time.Second)
+	for asked() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the held diagnosis did not run after the peak ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	model.mu.Lock()
+	q := model.questions[1]
+	model.mu.Unlock()
+	if !strings.Contains(q, "MySQLDown") || !strings.Contains(q, "held back during peak pricing hours") || !strings.Contains(q, "2026-11-24T10:00:01Z") {
+		t.Errorf("deferred question = %q", q)
+	}
+	// 低谷：提问不用 force。
+	if code, _ := post(t, srv.URL+"/ask", `{"question":"and now?"}`); code != http.StatusOK {
+		t.Errorf("ask off-peak = %d", code)
+	}
+	_ = a
 }

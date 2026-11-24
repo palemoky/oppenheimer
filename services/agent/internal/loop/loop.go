@@ -320,7 +320,7 @@ func (st *run) send(ctx context.Context, conv llm.Conversation, turn llm.Turn) (
 		return nil, fmt.Errorf("turn %d: %w", n, err)
 	}
 
-	cost := llm.CostOf(reply.Model, st.Price, reply.Usage)
+	cost := llm.CostOf(reply.Model, st.Price, reply.Usage, st.now())
 	st.res.Turns = n
 	st.res.Usage.Add(reply.Usage)
 	st.res.CostUSD += cost
@@ -352,6 +352,11 @@ func (st *run) handleCalls(ctx context.Context, calls []llm.ToolCall, truncated 
 		case truncated:
 			results[i].IsError = true
 			results[i].Content = "Your previous response was cut off by the output limit, so this call was not executed."
+		case c.Malformed != "":
+			// 参数不是合法的 JSON：不执行，也不算一次“报告被打回”（那个名额留给内容上的问题）。
+			results[i].IsError = true
+			results[i].Content = fmt.Sprintf("The arguments of this %s call were not valid JSON (%s), so it was not executed. "+
+				"A common cause is an unescaped double quote inside a string value. Send the call again with valid JSON.", c.Name, c.Malformed)
 		case c.Name == report.ToolName:
 			if submit >= 0 {
 				results[i].IsError = true

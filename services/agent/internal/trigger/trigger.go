@@ -32,6 +32,8 @@ const (
 	SkipCooldown    = "cooldown"
 	SkipQueueFull   = "queue_full"
 	SkipDailyBudget = "daily_budget"
+	// SkipPeakFull 是高峰时段里留着等低谷再跑的诊断已经满了，这一个丢掉。
+	SkipPeakFull = "peak_hold_full"
 )
 
 // ErrBusy 表示队列满了或者当天的预算用完了，Ask 没有被接受。

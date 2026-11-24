@@ -20,7 +20,8 @@
 #                                   下发前先 amtool check-config（要 make amtool）。kps 会先调用它（Secret 要先于 Alertmanager 存在）
 #   monitoring.sh alertsink         告警的 webhook 接收端（Deployment alertsink，只打日志、记数；chaos 镜像，仓库里没有就构建）
 #   monitoring.sh agent             诊断 Agent（设计文档 3d，Deployment agent，services/agent；镜像仓库里没有就构建）：只读的 RBAC、存诊断记录的卷、
-#                                   Secret agent-anthropic（ANTHROPIC_API_KEY 从 .env 读，没有就不建，Agent 照常起来但每次诊断都以 api_error 结束）。
+#                                   Secret agent-llm（.env 里的 ANTHROPIC_API_KEY、DEEPSEEK_API_KEY 等，
+#                                   一个都没有就不建，Agent 照常起来但每次诊断都以 api_error 结束）；模型的后端由 .env 的 AGENT_PROVIDER、AGENT_MODEL 选。
 #                                   不在 up 里。Alertmanager 的第二个 webhook 地址要另外打开：AGENT_WEBHOOK=1 monitoring.sh alertmanager
 #   monitoring.sh alerts            只读：Alertmanager 里现在的告警（含被抑制、被静默的）
 #   monitoring.sh silence '<匹配>' <时长> '<原因>'
@@ -170,12 +171,16 @@ cmd_alertsink() {
 
 # 诊断 Agent（设计文档 3d、ADR-0038）。镜像是 deploy/docker/Dockerfile 的 SERVICE=agent，tag 按当前工作区算，
 # 仓库里没有才构建并推送。不在 up 里：要显式运行，而且 Alertmanager 的第二个 webhook 地址默认不下发（见 cmd_alertmanager）。
-# 密钥：Secret agent-anthropic 的 api-key 来自 .env 的 ANTHROPIC_API_KEY。值经文件（umask 077）交给 kubectl，
-# 不出现在命令行参数里，也不打印；服务端 apply，不留 last-applied 注解。没有这个变量就不建 Secret
-# （清单里的 secretKeyRef 是 optional），Agent 能起来，但每次诊断都以 api_error 结束。
+# 模型的后端：.env 的 AGENT_PROVIDER（anthropic、deepseek、openai、openai-compatible，不写就是 anthropic）、
+# AGENT_MODEL、AGENT_BASE_URL、AGENT_PRICE，原样填进清单的环境变量；空着的用程序里的默认值。
+# 密钥：Secret agent-llm，键名就是环境变量名，.env 里有哪个放哪个（见 AGENT_KEY_VARS）。值经文件（umask 077）交给 kubectl，
+# 不出现在命令行参数里，也不打印；服务端 apply，不留 last-applied 注解。一个都没有就不建 Secret
+# （清单里的 secretRef 是 optional），Agent 能起来，但每次诊断都以 api_error 结束。
+AGENT_KEY_VARS=(ANTHROPIC_API_KEY DEEPSEEK_API_KEY OPENAI_API_KEY LLM_API_KEY)
 cmd_agent() {
   ensure_ns
-  local tag="${AGENT_IMAGE_TAG:-}" image dir key rc=0
+  local tag="${AGENT_IMAGE_TAG:-}" image dir var val rc=0
+  local -a from=() found=()
   [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
   if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
     "http://$REGISTRY_ADDR/v2/oppenheimer/agent/manifests/$tag" >/dev/null 2>&1; then
@@ -185,23 +190,37 @@ cmd_agent() {
     IMAGE_TAG="$tag" "$HERE/images.sh" all agent
   fi
   image="$REGISTRY_ADDR/oppenheimer/agent:$tag"
-  key="$(dotenv ANTHROPIC_API_KEY)"
-  if [[ -n "$key" ]]; then
-    dir="$(mktemp -d)"
-    (umask 077 && printf '%s' "$key" >"$dir/api-key")
-    echo "==> secret agent-anthropic (from ANTHROPIC_API_KEY in .env)"
-    kubectl -n "$NS" create secret generic agent-anthropic --from-file=api-key="$dir/api-key" --dry-run=client -o yaml |
+  dir="$(mktemp -d)"
+  for var in "${AGENT_KEY_VARS[@]}"; do
+    val="$(dotenv "$var")"
+    [[ -n "$val" ]] || continue
+    (umask 077 && printf '%s' "$val" >"$dir/$var")
+    from+=("--from-file=$var=$dir/$var")
+    found+=("$var")
+  done
+  val=""
+  if [[ ${#found[@]} -gt 0 ]]; then
+    echo "==> secret agent-llm (from .env: ${found[*]})"
+    kubectl -n "$NS" create secret generic agent-llm "${from[@]}" --dry-run=client -o yaml |
       kubectl apply --server-side --force-conflicts --field-manager=monitoring-sh -f - >/dev/null || rc=$?
-    rm -rf "${dir:?}"
-    [[ $rc -eq 0 ]] || return "$rc"
   else
-    echo "==> note: ANTHROPIC_API_KEY is not set in .env; secret agent-anthropic is not created." >&2
-    echo "    The agent will run, but every diagnosis will end in api_error until the key is added and this command is run again." >&2
+    echo "==> note: none of ${AGENT_KEY_VARS[*]} is set in .env; secret agent-llm is not created." >&2
+    echo "    The agent will run, but every diagnosis will end in api_error until a key is added and this command is run again." >&2
   fi
+  rm -rf "${dir:?}"
+  [[ $rc -eq 0 ]] || return "$rc"
+  local provider model base_url price
+  provider="$(dotenv AGENT_PROVIDER)"
+  model="$(dotenv AGENT_MODEL)"
+  base_url="$(dotenv AGENT_BASE_URL)"
+  price="$(dotenv AGENT_PRICE)"
+  echo "==> agent backend: provider ${provider:-anthropic (default)}, model ${model:-provider default}"
   echo "==> agent (image $image)"
-  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$DEPLOY/agent.yaml" | kubectl apply -f - >/dev/null
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" \
+    -e "s|__AGENT_PROVIDER__|$provider|g" -e "s|__AGENT_MODEL__|$model|g" \
+    -e "s|__AGENT_BASE_URL__|$base_url|g" -e "s|__AGENT_PRICE__|$price|g" "$DEPLOY/agent.yaml" | kubectl apply -f - >/dev/null
   # 密钥是在启动时从 Secret 读进环境变量的：Secret 变了而 Pod 没变时，要重启才能用上新密钥。
-  if [[ -n "$key" ]]; then
+  if [[ ${#found[@]} -gt 0 ]]; then
     kubectl -n "$NS" rollout restart deployment/agent >/dev/null
   fi
   kubectl -n "$NS" rollout status deployment/agent --timeout=3m
