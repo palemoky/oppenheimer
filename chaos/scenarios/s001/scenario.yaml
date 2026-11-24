@@ -1,16 +1,17 @@
-# 场景的格式见设计 docs/design/4a-chaos-prep.md 的 3.5（chaos/README.md 在 4a 第 4 步写）。
-# 主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
 id: s001
 method: fault-switch
 risk: 2
+category: app
 target:
-  namespace: oppenheimer
   workload: gateway
 duration: 30m
 requires:
   - 镜像是带 -faults 后缀的构建
   - 稳态的压测在跑（没有读流量时这个场景几乎没有表现）
 recover:
-  - 关掉开关（到 ttl 也会自己关）
-  - 滚动重启目标工作负载（已经产生的后果关了开关不会消失）
+  restart: [gateway]
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做
+    - 已经泄漏的 goroutine 关了开关不会消失，滚动重启目标工作负载（脚本做）
 expected_alerts: []
