@@ -79,7 +79,7 @@ Oppenheimer 是一个用于练习的高并发分布式订单系统，目的是�
 **Go**
 
 - Go 1.27，多模块用 go workspace。模块间的依赖要在 `go.mod` 里加指向本地目录的 `replace`（`go mod tidy` 不读 `go.work`）。
-- 常用命令都在 `Makefile` 里，`make help` 查看。`make test` 和 `make e2e` 需要先 `make up`。proto 改动后运行 `make proto` 并把 `api/gen` 一起提交。
+- 常用命令都在 `Makefile` 里，`make help` 查看。`make test` 和 `make e2e` 需要先 `make up`。只验证一个模块时用 `make test MODULES=$PWD/services/<模块>`（指定用例加 `GOFLAGS='-run=...'`），不要在模块目录里直接 `go test`：没有 Makefile 导出的 `OPPENHEIMER_TEST_MYSQL_DSN` 等环境变量时，对着 MySQL、Redis、Kafka 的用例全部被跳过，输出仍然是 `ok`。proto 改动后运行 `make proto` 并把 `api/gen` 一起提交。
 - 对外 HTTP 接口规范先行（ADR-0005）：先改 `api/openapi/gateway.yaml`，运行 `make openapi`，把生成的 `services/gateway/internal/httpapi/oas/oas.gen.go` 一起提交，再改 handler。
 - 对外 HTTP（gin），服务间 gRPC。不引入 go-zero、Kratos 等重框架。
 - 尽可能使用新版语言和标准库特性，例如 `sync.WaitGroup.Go`、`encoding/json/v2`、`for range n`、range-over-func 迭代器、`min`/`max`/`clear`、`slices` 和 `maps` 包、`log/slog`、`testing/synctest`、`b.Loop()`、`t.Context()`、`os.Root`。写之前用 `go doc` 确认该特性在当前 Go 版本可用，不凭记忆；有新写法时不用旧写法。
