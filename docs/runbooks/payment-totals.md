@@ -55,7 +55,7 @@
 
 ## 怎么人为触发它
 
-设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。`PaymentTotalsMismatch`：待定，建议在 `oppenheimer-e2e` 里把一条 `payment_results` 的金额改掉（recon-totals 要指向 e2e 的库，现在清单对着正式库，要另起一个实例，没有验证过）；`PaymentTotalsCheckStalled`：`kubectl -n oppenheimer scale deploy/recon-totals --replicas=0`，5 分钟加 5 分钟后响，用完缩回 1；`PaymentReplyOverdue`：停 order 的 `payment.events` 消费者（3a 用过停消费者的办法）20 分钟以上，同时有支付成功的订单。
+设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。**2026-11-24 在 `oppenheimer-e2e` 里验证过**（做法见 [recon-stock.md](recon-stock.md) 最后一节）：把一笔成功支付的 `payments.amount` 加 1、把另一笔在订单一侧的 `payment_results.succeeded` 改成 0，两轮之后 `kind="amount"`、`kind="count"` 都 firing；下钻只做了一次，日志 `payment totals drill-down: differing payment` 列出这两笔（`kind` 分别是 `amount` 和 `payment_only`，带两边的金额和状态），`recon_totals_drilldowns_total{outcome="found"}` 是 1。改回去之后差异回到 0，告警自己恢复。`PaymentTotalsCheckStalled`：实例缩到 0，约 10 分钟后 firing。以下是验证之前写的：`PaymentTotalsMismatch`：待定，建议在 `oppenheimer-e2e` 里把一条 `payment_results` 的金额改掉（recon-totals 要指向 e2e 的库，现在清单对着正式库，要另起一个实例，没有验证过）；`PaymentTotalsCheckStalled`：`kubectl -n oppenheimer scale deploy/recon-totals --replicas=0`，5 分钟加 5 分钟后响，用完缩回 1；`PaymentReplyOverdue`：停 order 的 `payment.events` 消费者（3a 用过停消费者的办法）20 分钟以上，同时有支付成功的订单。
 
 故障注入动手前要先登记到 [phase-3-observability.md](../plan/phase-3-observability.md)。
 

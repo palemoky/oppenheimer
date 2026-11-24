@@ -36,6 +36,7 @@
 - [ ] 3c 留下的告警验证（[设计 3c](../design/3c-slo-alerting.md) 第 8 节“第 16 项”），做对应的实验时顺带完成：
   - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
   - `OtelCollectorExportQueueFull` 单独响的情形：gateway 在而 agent 发不过去（比如挡住 agent 到 gateway 的 4317）
+  - 3e 留下的（2026-11-24）：`DerivedDataCheckStalled` 没有真实触发过（要“核对停了”同时“订单库有写入”，e2e 里没有流量）；`recon-changes` 的从库目标没有造过不一致；有负载时三个常驻核对的开销、每天全量对账对线上的影响没有量
   - 只有单元测试的：超卖、闸门内存写满、Collector 导出失败、支付可用性的三档；`RateLimitFallingBack` 改成按比例之后没有真实触发过
 
 ## 4b 实验清单

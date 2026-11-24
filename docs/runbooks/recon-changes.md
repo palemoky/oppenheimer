@@ -70,7 +70,7 @@
 
 ## 常见的原因和各自的处理
 
-这三条告警都没有真实触发过，下面除标明的外都是推断，没有验证。
+`DerivedDataMismatch`、`DerivedDataLagging` 2026-11-24 在 `oppenheimer-e2e` 里真实触发过，`DerivedDataCheckStalled` 没有（见最后一节）；下面的原因除标明的外仍是推断。
 
 - **`DerivedDataLagging` 单独响，`target=index`**：CDC 落后，或者 orderindex 的消费者停了、堵了。处理：看 [cdc.md](cdc.md)、[consumer-blocked.md](consumer-blocked.md)。
 - **`DerivedDataLagging`，`target=replica`**：从库复制落后或 SQL 线程停了。处理：看 [mysql-replication.md](mysql-replication.md)。
@@ -103,11 +103,18 @@ curl localhost:8086/degrade                                       # 看现在的
 - `DerivedDataMismatch`、`DerivedDataLagging` 的计数在 5 分钟里不再增加；同时 `recon_changes_checked_total{result="ok"}` 在涨、`recon_changes_verified_through` 回到贴近现在，不然只是核对没在跑。
 - `recon_changes_pending` 回到接近 0。
 - `DerivedDataMismatch` 自己恢复不算数：确认出问题的那一行（日志里的订单号）两边已经一致，再跑逐行对账。
-- 最后以对账差异为 0 收尾：`make recon-check FROM=<RFC3339> TO=<RFC3339>`（没有验证过），或 `KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%s)`，退出码 0。
+- 最后以对账差异为 0 收尾：`make recon-check FROM=<RFC3339> TO=<RFC3339>`（2026-11-24 在长期运行的那一套上跑过），或 `KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%s)`，退出码 0。
 
 ## 怎么人为触发它
 
-设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。下面都没有验证过，动手前先登记。
+设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。**2026-11-24 验证过两条**，下面“待定，建议”的做法有出入，以这一段为准。做法：`E2E_KEEP=1 make cluster-e2e` 起一套，把三个核对的清单改成指向 `e2e_*` 库（`recon-changes` 另加 `KAFKA_PREFIX=e2e-<运行号>.`）装进 `oppenheimer-e2e`；正式的规则只看 `oppenheimer`，所以另下发一份把命名空间换成 `oppenheimer-e2e`、每条加标签 `env: e2e` 的副本，先加静默 `env=e2e`；做完 `services.sh e2e-down`、删掉那份规则。细节在设计 3e 第 9 节“第 6 步：造差异验证”。
+
+  - **怎么让它重新核对一行**：它只在有变更时核对。不用去动源库：把实例缩到 0，删掉它的消费组（`kafka-consumer-groups.sh --delete --group <前缀>recon.cdc-orders`），再起来，它从头重放整个 topic，等于把每个订单核对一遍。
+  - `DerivedDataMismatch`：改商家索引里一行的 `status`、`src_version` 不动，重放后日志报 `column status: derived 4, change 5`，`target="index"` 立刻 firing。冷库：归档的 e2e 用例收尾时会删冷库里的行，热库的删除事件还在 topic 里，实例一起来就报了 6 条 `archived row not found in the cold database`，`target="archive"` firing。**从库那一个目标没有造过不一致。**
+  - `DerivedDataLagging`：删掉商家索引里的一行，重放后先等着复查，2 分钟（`-lag-after`）后日志报 `derived row not found`，`target="index"` firing。**不要用停从库复制的办法**：从库的实例是和长期运行的那一套共用的。
+  - 这两条在最后一次计数之后 5 分钟自己恢复，和那一行修没修无关（上面“已知的不足”）。
+  - `DerivedDataCheckStalled`：**没有触发过**。实例缩到 0 之后规则的前一半成立（没有 `verified_through`），但它还要求“订单库有写入”，e2e 的测试跑完后没有流量。登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”。
+
 
 - `DerivedDataMismatch`：待定，建议在 `oppenheimer-e2e` 里直接改商家索引（或从库）上某个订单的一列，再让这个订单有一次新的变更（版本号变成和你改的那一行相同的值不容易构造，先试：改列之后在订单库里对同一订单做一次状态流转，派生端若没有被覆盖就会报）。`recon-changes` 要指向 e2e 的库和 topic 前缀（`KAFKA_PREFIX`），现在清单对着正式的，要另起一个实例。
 - `DerivedDataLagging`：停掉 orderindex 的消费者（或者在 e2e 里停从库的 SQL 线程），同时订单有写入，等 2 分钟（`-lag-after`）加 2 分钟。

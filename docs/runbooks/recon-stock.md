@@ -49,7 +49,7 @@
 
 ## 常见的原因和各自的处理
 
-这三条告警都没有真实触发过，下面除标明的外都是推断，没有验证。
+三条告警 2026-11-24 都在 `oppenheimer-e2e` 里真实触发过（见最后一节）；下面的原因除标明的外仍是推断。
 
 - **同一条增量被应用了两次、丢了一条增量、改了预占的状态而没有记增量**（包注释列的几种）：这些都不破坏总量守恒，所以 CHECK 看不出来，只有这里能发现。真的出现是库存服务的代码缺陷，或者手工改过库。处理：按第 2 步的 SKU，对着 `stock_pending`、`reservation`、`reservation_item` 的行逐条看；修库要先停该 SKU 的受理，修完再让核对跑两轮。
 - **预占那条对不上，窗口外有卡住的预占**：快的一轮只看最近 2 小时的预占，窗口之外还是 `RESERVED` 的预占（卡住超过 2 小时）它看不到，却在 `reserved` 计数里，于是快的一轮会报出一个差值，完整的一轮才说明原因（包注释）。所以 `StockLedgerMismatch(check=reserved)` 和 `StockReservationsStuck` 一起响时，先按卡住的预占处理。
@@ -64,11 +64,16 @@
 
 - `recon_stock_mismatch_skus` 两个 `check` 都回到 0。`reserved` 至少两轮（2 分钟）；`sold` 要等下一次完整的一轮（最长 5 分钟），在那之前它显示的是旧值。同时 `recon_stock_runs_total{outcome="ok"}` 在涨：核对自己失败时瞬时值停在上一次成功的结果上。
 - `recon_stock_stuck_reservations` 回到 0，同样要等下一次完整的一轮。`StockReservationsStuck` 自己恢复不算数：确认卡住的那些订单已经确认或释放（用 `oldest_order_id` 查）。
-- 最后以对账差异为 0 收尾：`make recon-check FROM=<RFC3339> TO=<RFC3339>`（对 `[FROM, TO)` 读三个常驻核对的指标并跑一次逐行对账，没有验证过），或 `KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%s)`，退出码 0。
+- 最后以对账差异为 0 收尾：`make recon-check FROM=<RFC3339> TO=<RFC3339>`（对 `[FROM, TO)` 读三个常驻核对的指标并跑一次逐行对账；2026-11-24 在长期运行的那一套上跑过），或 `KUBECONFIG=~/.kube/oppenheimer.yaml kubectl -n oppenheimer create job --from=cronjob/recon-hourly recon-manual-$(date +%s)`，退出码 0。
 
 ## 怎么人为触发它
 
-设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。下面都没有验证过，动手前先登记。
+设计第 5 节第 2 层只列了“对账差异：在 `oppenheimer-e2e` 里手工改一行数据”。**2026-11-24 验证过**，下面两条里“待定，建议”的做法有出入，以这一段为准。做法：`E2E_KEEP=1 make cluster-e2e` 起一套，把三个核对的清单改成指向 `e2e_*` 库（`recon-changes` 另加 `KAFKA_PREFIX=e2e-<运行号>.`）装进 `oppenheimer-e2e`；正式的规则只看 `oppenheimer`，所以另下发一份把命名空间换成 `oppenheimer-e2e`、每条加标签 `env: e2e` 的副本，先加静默 `env=e2e`；做完 `services.sh e2e-down`、删掉那份规则。细节在设计 3e 第 9 节“第 6 步：造差异验证”。
+
+  - `StockLedgerMismatch`：`UPDATE sku_stock SET reserved = reserved + 1, available = available - 1`，下一轮快的（1 分钟内）日志报出 SKU、计数和流水，`check="reserved"` 2 分钟后 firing；把一条 `CONFIRMED` 的预占改回 `RESERVED`，下一次完整的一轮报 `check="sold"`。改回去之后两个值在下一轮（`sold` 是下一次完整的一轮）回到 0，告警自己恢复。
+  - `StockReservationsStuck`：“卡住”是按**订单号里的时间**算的，改 `created_at` 没有用。把 e2e 那个实例的 `-stuck-after` 调成 5 分钟，再把一条超过 5 分钟的预占改成 `RESERVED`：日志给出个数和最老的订单号，10 分钟后 firing。
+  - `StockCheckStalled`：把实例缩到 0，约 10 分钟后 firing。
+
 
 - `StockLedgerMismatch`：待定，建议在 `oppenheimer-e2e` 里把某个 SKU 的 `sku_stock.reserved` 手工加 1（CHECK 要求 `available + reserved + sold = stocked`，所以要同时把 `available` 减 1，否则 UPDATE 被拒绝）；`recon-stock` 要指向 e2e 的库，现在清单对着正式库，要另起一个实例。不要在正式库上做。
 - `StockReservationsStuck`：待定，建议在 e2e 里停 inventory 的 `order.events` 消费者，下一批预占不会被确认或释放，等 1 小时（`-stuck-after`）再等下一次完整的一轮；或者另起一个实例把 `-stuck-after` 调小。

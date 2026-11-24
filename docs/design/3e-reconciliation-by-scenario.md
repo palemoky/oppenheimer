@@ -349,3 +349,28 @@ CDC topic（orders 的行变更）
 - **“已售”一小时一轮太慢**。完整的一轮实测不到 1 分钟（599 个 SKU），阶段 4 每次实验收尾却可能要等 1 小时。
 - **靠 `increase` 判断“TO 之后有没有成功的一轮”依赖导出间隔**（60 秒），窗口短于两三个间隔时没有结果。现在靠最小窗口挡住；更稳的做法是像 `recon.changes.verified_through` 那样，让钱和库存也各报一个“核对到的时刻”，没有做。
 
+### 第 6 步：造差异验证（2026-11-24）
+
+在 `oppenheimer-e2e` 里做的，正式库没有碰；做法写在三篇 runbook 的最后一节。结果：
+
+| 造的差异 | 查到的 | 告警 |
+|---|---|---|
+| 一笔成功支付的金额加 1 分 | 下钻列出这一笔，两边 5998 和 5997 | `PaymentTotalsMismatch{kind=amount}` |
+| 一笔在订单一侧改成未成功 | 下钻列出这一笔，`payment_only` | `PaymentTotalsMismatch{kind=count}` |
+| 一个 SKU 的 `reserved` 加 1、`available` 减 1 | SKU、计数、流水 | `StockLedgerMismatch{check=reserved}` |
+| 一条已确认的预占改回 `RESERVED` | 已售的计数 3、流水 0；卡住 1 条（`-stuck-after` 调成 5 分钟之后） | `StockLedgerMismatch{check=sold}`、`StockReservationsStuck` |
+| 商家索引一行改状态、版本不变 | 订单号、`column status: derived 4, change 5` | `DerivedDataMismatch{target=index}` |
+| 商家索引删一行 | 2 分钟后报没追上 | `DerivedDataLagging{target=index}` |
+| 归档用例收尾删了冷库的行（不是造的） | 6 条“已归档的订单在冷库里找不到” | `DerivedDataMismatch{target=archive}` |
+| 三个核对缩到 0 | | `PaymentTotalsCheckStalled`、`StockCheckStalled` |
+
+差异改回去之后钱和库存的值回到 0，告警自己恢复。期间长期运行的那一套没有新的告警。
+
+没有验证到的和学到的：
+
+- `DerivedDataCheckStalled` 没有触发：它要“订单库有写入”，e2e 里测试跑完后没有流量。
+- 从库那一个目标没有造过不一致（从库只读，实例和长期运行的那一套共用）。
+- “卡住的预占”按订单号里的时间算，不是 `created_at`。
+- 让 `watch-changes` 重新核对一行不用动源库：删掉它的消费组，它重放整个 topic。
+- 正式的规则只看 `oppenheimer`，在 e2e 里验证告警每次都要另下发一份改了命名空间的副本。没有把它做成脚本。
+
