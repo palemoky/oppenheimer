@@ -178,6 +178,9 @@ jobs:
         with:
           go-version-file: go.work
           cache-dependency-path: '**/go.sum'
+      # 带标签的测试也有对着 MySQL、Redis、Kafka 的用例（CI 里它们不会被跳过，连不上就失败）。
+      - name: Start dependencies
+        run: make up-core
       - name: Vet and test with the faults tag
         run: make test-faults
       - name: Check the default build contains no fault code

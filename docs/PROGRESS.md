@@ -1232,7 +1232,7 @@
 
 - **`TestLandConcurrentRedeliveredShuffled` 在 CI 上偶发失败过一次**（2026-11-22，`0db0499`，重跑通过）：主人定了暂时不改，再出现时再说，见“3b 收尾”一段。
 
-- **`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在本机带 `-race` 时偶发失败**（2026-11-24 发现，`loaded 2 times, want 1`，单独跑 30 次失败 3 次，带不带 `faults` 标签都一样，和当天的改动无关，`pkg/cache` 没有动过）。原因没有查实。推测（没有验证）：`Get` 先读 Redis、没命中再进 singleflight，这两步之间没有再看一次缓存；100 个并发里有的读得慢（或者超过了读的短时限被当成 Redis 不可用），等它走到 singleflight 时第一趟回源已经结束，于是自己又回源一次。如果是这样，它是缓存本身的一个小缺口（多回源一次，不会读到错的值），不只是用例的问题。还没有决定改不改，等主人定。
+- **`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在本机带 `-race` 时偶发失败**（2026-11-24 发现，`loaded 2 times, want 1`，和当天的改动无关）。**直接原因查到了（2026-11-24 09:10 UTC，用一份带日志的临时用例，已删）**：每次失败都恰好有一个 `Get` 开头那次读 Redis 超过了 200 毫秒的短时限（`readTimeout`，日志 `cache read failed, loading from source ... context deadline exceeded`）。它被当成“Redis 不可用”，不再碰 Redis、直接回源；这时第一趟回源（100 毫秒）已经结束，singleflight 里没有可搭的，于是多回源一次。**这是代码按设计在走**（1d 的 6.18：Redis 挂住时不让请求等），不会读到错的值；用例断言的“恰好 1 次”默认了没有一次读会超过 200 毫秒。失败率：机器空闲时 30 次里 3 次，有别的编译在跑时 40 次里 6 次；先用 100 个并发的 `PING` 把连接池预热之后降到 100 次里 2 次、150 次里 2 次（仍然是同一条日志）。**没有查到的**：预热之后为什么还会有读超过 200 毫秒（连接池 32 个连接、100 个并发，带 `-race`；失败的那几轮里同时有 5 到 10 个 `Get` 慢到 190 毫秒以上，像是一批连接一起卡了一下，没有再往下查）；不带 `-race` 会不会出现没有试。**怎么改等主人定**，主会话的建议：给 `Config` 加一个 `ReadTimeout`（默认仍是 200 毫秒），这个用例把它设长，断言不动；不建议改缓存的行为。
 
 - （已定）1 亿数据量：主人 2026-11-22 定了不做，理由在 `docs/notes/3b-capacity.md` 第 8 节。
 
