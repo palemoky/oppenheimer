@@ -1,0 +1,5 @@
+switch: f07
+ttl: 30m
+# orderindex 的管理端口，注入要经端口转发，每个副本各开一次。
+# 只经这个端口打开的开关在进程内存里，进程崩了就复位：要持续的效果得同时走 FAULT_FILE（见 scenario.yaml 的 requires）。
+admin_port: 8084

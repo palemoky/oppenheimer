@@ -77,6 +77,13 @@ const (
 // decodeChange 解码一条变更。archived 表示这是一条归档产生的 DELETE（只对 kindNoMerchant、kindRow 有意义）。
 // 返回的错误包着 ErrSchema 时说明消息与表结构不符，重试不会成功。
 func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived bool, err error) {
+	return decodeChangeWith(ch, decodeRow)
+}
+
+// decodeChangeWith 是 decodeChange，行映像交给 rowOf 解码（它和 decodeRow 的约定相同）。
+func decodeChangeWith(ch *cdcv1.RowChange, rowOf func(map[string]*cdcv1.Value) (store.Row, bool, error)) (
+	row store.Row, kind changeKind, archived bool, err error,
+) {
 	if ch.GetTable() != SourceTable {
 		return store.Row{}, kindIgnored, false, nil
 	}
@@ -94,7 +101,7 @@ func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived
 	default:
 		return store.Row{}, kindIgnored, false, nil
 	}
-	row, ok, err := decodeRow(img)
+	row, ok, err := rowOf(img)
 	if err != nil {
 		return store.Row{}, 0, false, fmt.Errorf("indexer: %s op=%s slot=%d gtid=%q %s image: %w",
 			ch.GetSource(), ch.GetOp(), ch.GetSlot(), ch.GetGtid(), imgName, err)
@@ -103,6 +110,26 @@ func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived
 		return store.Row{}, kindNoMerchant, archived, nil
 	}
 	return row, kindRow, archived, nil
+}
+
+// decodedChange 是一条变更解码后的结果，含义见 decodeChange。
+type decodedChange struct {
+	row      store.Row
+	kind     changeKind
+	archived bool
+}
+
+// decodeInOrder 按顺序逐条解码一批变更，返回和 changes 一一对应的结果；遇到第一条出错的就返回它的错误。
+func decodeInOrder(changes []*cdcv1.RowChange) ([]decodedChange, error) {
+	out := make([]decodedChange, len(changes))
+	for i, ch := range changes {
+		row, kind, archived, err := decodeChange(ch)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = decodedChange{row: row, kind: kind, archived: archived}
+	}
+	return out, nil
 }
 
 // rowKey 是索引行的主键。
@@ -125,15 +152,16 @@ func (ix *Indexer) Apply(ctx context.Context, changes []*cdcv1.RowChange) (Count
 		commits []int64 // 要写进索引的消息的 commit_micros，写完后算延迟
 		indexed int64   // 有商家、要写进索引的消息数（合并前）
 	)
-	for _, ch := range changes {
-		row, kind, archived, err := decodeChange(ch)
-		if err != nil {
-			return Counts{}, err
-		}
-		if archived {
+	decoded, err := decodeChanges(changes)
+	if err != nil {
+		return Counts{}, err
+	}
+	for i, d := range decoded {
+		ch, row := changes[i], d.row
+		if d.archived {
 			c.Archived++
 		}
-		switch kind {
+		switch d.kind {
 		case kindIgnored:
 			c.Ignored++
 			continue

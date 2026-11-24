@@ -1,0 +1,60 @@
+# s012 的答案
+
+## 标准根因
+
+orderindex 的商家订单列表给“不带游标的第一页”加了一个进程内的一秒短缓存（`pageCache`），用了两把锁：
+整个缓存一把（`pageCache.mu`，保护商家表和行数合计），每个商家一把（`merchantPages.mu`，保护这个商家的页，
+并且让同一个商家同一时刻只有一个请求去查库）。两条路径拿锁的顺序相反：
+
+- 回源（`get` → `keep`）：拿着**商家锁**查库，查完在商家锁里再拿**缓存锁**更新行数合计；顺序是 商家 → 缓存。
+- 清理（`get` → `merchant` → `sweep`）：每过一秒，第一个进来的请求拿着**缓存锁**挨个商家清过期页，要拿**每个商家的锁**；顺序是 缓存 → 商家。
+
+某个商家正在回源（持有它的商家锁、在等数据库）的那几毫秒里，恰好有一个请求触发了这一秒的清理：
+清理拿着缓存锁等这个商家的锁，回源查完库后拿着商家锁等缓存锁，两边永远互相等住（经典的 AB-BA 死锁）。
+之后这个进程里**每一个**走缓存的列表请求一进来就在 `merchant` 里等缓存锁，全部永远挂住，不分商家。
+
+代码：`services/orderindex/internal/service/list_firstpage.go`，开关 `f05`。
+
+## 定位必需的关键证据
+
+- 症状只在一个（或两个）orderindex 副本上、只在 `GET /api/v1/merchants/{id}/orders` 上：调用方等满边车的路由超时 3 秒后拿到 503，
+  连续 5 次后这个 Pod 被 gateway 的边车摘除（5、10、15 秒…逐次加长），摘除期间这个接口立即 503 或者全部落到另一个副本。
+  别的接口、消费者写索引、健康探针都正常，Pod 不重启。
+- 出问题的那个副本：goroutine 数从某个时刻起只涨不降（速率等于实际打到它上面的列表请求数，摘除期间停涨），
+  而 CPU 没有上去，它对索引库的查询反而**降到零**（MySQL 正常，不是查询慢）。
+- goroutine 剖析（`/debug/pprof/goroutine?debug=2`，看等待时长；`debug=1` 看聚合）：
+  - 1 个 goroutine 停在 `sync.(*Mutex).Lock` ← `service.(*pageCache).keep` ← `(*pageCache).get`（list_firstpage.go），它刚从 `store.List` 返回；
+  - 1 个 goroutine 停在 `sync.(*Mutex).Lock` ← `service.(*pageCache).sweep` ← `(*pageCache).merchant` ← `get`；
+  - 其余越来越多的 goroutine 停在 `sync.(*Mutex).Lock` ← `service.(*pageCache).merchant`（排在被占着的缓存锁后面）；
+  - `debug=2` 里这些 goroutine 的状态是 `[sync.Mutex.Lock, N minutes]`，前两个的 N 最大且相同（死锁发生的时刻）。
+  两处 Lock 对照代码就能看出拿锁顺序相反。
+- 关掉开关后这个接口立刻恢复（新请求绕开缓存直接查库），但那个副本的 goroutine 数停在高位不回落。
+
+## 容易误判成的原因
+
+- 索引库（MySQL）慢、连接池满（`store.List` 的调用反而没有了；连接池一条也没占：卡住的 goroutine 不持有数据库连接）。
+- 网格的超时、熔断配置不对，或者 gateway 有问题（边车的摘除是结果：下游 3 秒不回才算失败）。
+- 普通的 goroutine 泄漏（忘了 ctx、channel 没人收）：这里是锁等待，调用方断开后服务端的 goroutine 仍然停在 `Mutex.Lock`，
+  `sync.Mutex` 不看 ctx。
+- 以为 Go 运行时会报死锁：`fatal error: all goroutines are asleep - deadlock!` 只在**进程里所有** goroutine 都睡着时才报，
+  这里 HTTP 服务、探针、消费者、gRPC 的其他 goroutine 都活着，运行时不会有任何提示，进程也不会退出。
+- mutex、block 剖析里找死锁：这两种剖析都是在锁被释放、阻塞结束时才记一笔，永远不释放的锁不会出现在里面
+  （而且默认不采样，见 `DEBUG_MUTEX_FRACTION`）。要看的是 goroutine 剖析。
+- 反复重启或 OOM：这个场景健康探针不受影响，Pod 不重启；内存只随堆积的 goroutine 缓慢上涨。
+
+## 备注
+
+触发的速度是按设计推的，没有在集群上量过：k6 mixed 约 570 请求/秒里商家订单列表占 5%，约 28 次/秒，
+只查商家 1、2 的第一页（`limit=20`），分到两个副本，每个副本每个商家约 7 次/秒。缓存的有效期是 1 秒，
+所以每个副本每个商家大约每秒回源一次，每次在商家锁里查库几毫秒；清理也是每秒一次。清理恰好落在某个商家回源窗口里的概率
+每次约 0.5%（两个商家 × 每秒一次 × 约 3 毫秒），**每个副本期望约 3 分钟死锁一次**，方差很大（一两分钟到十几分钟都正常）；
+两个副本各自独立，30 分钟里大概率都会卡住，都卡住之后这个接口全部失败。没有列表流量（只有探针）时永远不会发生。
+
+翻页的请求（带 cursor）不走缓存，在卡住的副本上也照常返回；k6 只查第一页，所以压测里看不到这一点，手工带 cursor 请求时能看到。
+
+goroutine 的增长受调用方超时和摘除节制：每个请求最多等 3 秒就被边车断开（服务端的 goroutine 仍然留着），
+gateway 每个 Pod 对 orderindex 在途 128 的上限不会被打满（约 14 次/秒 × 3 秒），所以预计不会有 `MeshConcurrencyLimitOverflow`。
+`MeshEndpointEjected` 按设计会响；这个接口只占全部流量的 5%，失败的比例超过 1% 时 `IngressGateway5xxHigh` 也可能响（没有写进 expected_alerts）。
+
+关了开关之后，已经卡住的那两把锁和排在后面的 goroutine 永远不会释放（没有人会解开），所以恢复要重启 Pod；
+不重启的话接口是好的，只是那些 goroutine 和它们占的内存一直留着，下次再打开开关时这个副本的缓存锁仍然是锁着的，一进来就挂。

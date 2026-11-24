@@ -1,0 +1,18 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s013
+method: fault-switch
+risk: 2
+category: app
+target:
+  workload: order
+duration: 30m
+requires:
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
+  - order 配了从库（MYSQL_REPLICA_DSNS），长期运行那一套是配了的
+  - 稳态的压测最好在跑（这个场景不靠流量触发，但诊断时要有正常的读写做对照）
+recover:
+  restart: [order]
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做
+    - 已经占住的连接关了开关也不会还回去，那个副本上的从库探测会一直失败，要滚动重启 order（脚本做）
+expected_alerts: []
