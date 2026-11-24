@@ -22,6 +22,8 @@
 
 设计：[4a-chaos-prep.md](../design/4a-chaos-prep.md)（2026-11-24 写；同一天主人确认第 2 节的十项都按建议）。进度见 `PROGRESS.md`。
 
+**4a 在 2026-11-24 收尾**（笔记：[notes/4a-chaos-prep.md](../notes/4a-chaos-prep.md)）。下面没有勾的四项不挡 4b 开始，都要发压或者要主人亲自排查，放到 4b 里做，各自在哪一步做写在“4b 实验清单”的开头。
+
 - [x] 安装 Chaos Mesh
   - **做完了（2026-11-24，主人同意后）**：`make chaos-mesh` 装、`make chaos-smoke` 冒烟，六类都生效并且到时恢复；目标命名空间里会留下 `PodNetworkChaos` / `PodIOChaos` 对象和事件（对盲测是泄漏，怎么处理在第 4、5 步里定）。结果在[设计第 6 节“第 1 步”](../design/4a-chaos-prep.md)。e2e 那一套删了，Chaos Mesh 留着，现在没有命名空间能被注入
   - 登记（2026-11-24，当时等主人对下面的具体做法说同意）：按[设计 3.2](../design/4a-chaos-prep.md)。
@@ -62,8 +64,9 @@
     7. **顺带量的**（都是只读）：`mysql-main` 的 `MALLOC_ARENA_MAX=4` 在这次发压下的内存（570 请求/秒到不了 200 个连接，大概只能看到“没有变差”，真正的验证要等更大的一轮）。
     8. **不做的**：mutex、block 采样先不开（要用 3b 的压测量开销，另外登记）；第三档的场景；盲测。
     9. **出了岔子**：`make chaos-recover ALL=1 RESTART=1` 是总闸（删所有 Chaos Mesh 对象、关所有开关、去注解、重启五个服务）；`make chaos-steady ARGS=stop` 停压测。影响范围：`inventory` 少一个副本几十秒；`gateway` 在 `s001` 期间有预期的症状、之后重启一次；发压期间探针和 SLO 可能有抖动，告警可能发到 Telegram。
-- [ ] 换上改过名字的带故障代码的镜像（2026-11-24 加）
-  - **登记（2026-11-24，等主人同意）**：`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `9dda461-faults` 滚动成 `<提交号>-p4`（tag 不再写 faults，gateway 的故障文件改了名）。和上一次一样是滚动更新，不注入、不发压。要先提交（tag 是提交号）。之后核对：五个服务的 `/fault` 列得出开关、都是关的
+- [x] 换上改过名字的带故障代码的镜像（2026-11-24 加）
+  - **做完了（2026-11-24 11:57 UTC，主人同意后）**：五个服务是 `afc5341-p4`，十个副本的 `/fault` 都读过：gateway 两个副本列出 `f01`、关着，另外四个服务是空表
+  - **登记（2026-11-24；主人同一天同意了）**：`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `9dda461-faults` 滚动成 `<提交号>-p4`（tag 不再写 faults，gateway 的故障文件改了名）。和上一次一样是滚动更新，不注入、不发压。要先提交（tag 是提交号）。之后核对：五个服务的 `/fault` 列得出开关、都是关的
 - [x] 阶段笔记（设计第 4 节第 7 步）：[notes/4a-chaos-prep.md](../notes/4a-chaos-prep.md)（2026-11-24）；ADR-0041 之前已写，这次补了两处改动
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
   - 2026-11-24：`scripts/cluster/chaos-run.sh`（`make chaos-blind|chaos-inject|chaos-recover|chaos-reveal`）写了，主会话评审过。**连集群的路径一条都没有真的跑过**（只用假的 `kubectl` 走过逻辑），第 6 步走通一遍之后再勾
@@ -80,6 +83,15 @@
   - 只有单元测试的：超卖、闸门内存写满、Collector 导出失败、支付可用性的三档；`RateLimitFallingBack` 改成按比例之后没有真实触发过
 
 ## 4b 实验清单
+
+**4a 留下的四项，在这里做**（checkbox 仍在“4a 准备”里，做完回去勾）：
+
+1. **第一次盲测**（勾“盲测脚本”）：`blind` 这条路没有真的跑过。先 `make chaos-blind POOL=1 DRY_RUN=1`，再在 `oppenheimer-e2e` 里真的跑一次（主会话看得到内容也没关系，验的是“终端不打印内容”和抽取），然后才是主人的第一次盲测。场景要先补到一档里至少有五六个，三个里抽一个谈不上盲。
+2. **mutex、block 采样**（勾“pprof 工具”）：做“死锁”“锁竞争”这两个实验之前打开（`deploy/cluster/services/<服务>.yaml` 的 `DEBUG_MUTEX_FRACTION: "100"`、`DEBUG_BLOCK_RATE: "1ms"`，会重启 Pod），打开前后各跑一次 3b 的 mixed 阶梯比吞吐和 p99。要动集群和发压，先登记。
+3. **`mysql-main` 的 `MALLOC_ARENA_MAX=4`**：要连接数到 200 以上才看得出。上一条的 mixed 阶梯或者“连接泄漏”的实验会到，那时一起看。
+4. **3c、3e 留下的告警验证**：在对应的实验里顺带做（“4a 准备”最后一项列了是哪些）。
+
+**开始 4b 之前要定的三件**（4a 走通时发现的，[设计 4a](../design/4a-chaos-prep.md) 第 6 节“第 6 步”的问题 4、5、6）：`s002` 要不要改成不给宽限期的杀法（正常的 TERM 没有造成任何失败）；给 Agent 的问题里说不说“有一条固定的压测在跑”；有负载时逐行对账慢（8 分钟的窗口 160 秒），排实验的节奏时算进去还是去优化它。
 
 **Go 代码缺陷（常见生产故障，通过故障开关注入）**
 
