@@ -17,6 +17,11 @@ mysqld:
   # 本机的连接池合计已经是 164（compose 里的注释），给到 400 留出余量。
   maxConnections: 400
   innodbBufferPoolSize: 1G
+  # 2026-11-24：常驻内存到了 limit 的 90% 而且不回落。只读查到的：缓冲池约 1000 MiB、performance_schema 约 350 MiB、
+  # malloc 的堆约 970 MiB，其中 MySQL 记到还活着的只有约 220 MiB；多出来的约 700 MiB 主要来自 3c 过载压测时
+  # 连接从 15 涨到 225 的那一次高峰（+300 MiB，之后没有回落）。先试把 arena 限到 4 个。
+  # 有没有用、p99 有没有变差要重跑一次过载压测才知道（docs/PROGRESS.md 的“mysql-main 的内存”）。
+  mallocArenaMax: "4"
 # 2026-11-18 从 1536Mi（缓冲池 768M）调上来：灌 1000 万历史订单时商家索引的消费者往这里追数，
 # 工作集涨到 1530 Mi，贴着上限（订单库在同一天被 OOMKilled 过，见 mysql-order-0.yaml）。设计文档 3b 第 6 节。
 resources:

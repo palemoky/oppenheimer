@@ -97,6 +97,11 @@ spec:
           env:
             {{- include "mysql.peerEnv" . | nindent 12 }}
             {{- include "mysql.secretEnv" . | nindent 12 }}
+            {{- with .Values.mysqld.mallocArenaMax }}
+            # glibc malloc 的 arena 个数上限，见 values.yaml 的 mysqld.mallocArenaMax。
+            - name: MALLOC_ARENA_MAX
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - name: mysql
               containerPort: 3306
