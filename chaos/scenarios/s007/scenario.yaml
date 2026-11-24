@@ -2,6 +2,7 @@
 id: s007
 method: chaos-mesh
 risk: 1
+blind: no
 category: network
 target:
   workload: inventory

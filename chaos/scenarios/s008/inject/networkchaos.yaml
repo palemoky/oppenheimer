@@ -1,18 +1,20 @@
 # 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+# 目标 Pod 到集群 DNS（kube-dns 的 ClusterIP，k3s 上是 10.43.0.10）的包全部丢掉。
+# 不用 DNSChaos：它要在目标容器里改 resolv.conf，业务镜像是 distroless，注入失败（B1 试出来的）。
 apiVersion: chaos-mesh.org/v1alpha1
-kind: DNSChaos
+kind: NetworkChaos
 metadata:
   name: c-__RUN_ID__
   namespace: chaos-mesh
   labels:
     oppenheimer.chaos/run: __RUN_ID__
 spec:
-  action: error
+  action: partition
   mode: all
   selector:
     namespaces: [__TARGET_NS__]
     labelSelectors:
       app.kubernetes.io/name: orderindex
-  # 两条：带搜索域展开的各种写法，和不展开的原样（上游 DNS 对不存在的名字会给假地址，不能让它落到那里）。
-  patterns: ["mysql-main-primary.mysql.svc.*", "mysql-main-primary.mysql.svc"]
+  direction: to
+  externalTargets: ["10.43.0.10"]
   duration: 35m

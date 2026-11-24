@@ -2,6 +2,7 @@
 id: s006
 method: chaos-mesh
 risk: 1
+blind: yes
 category: stress
 target:
   workload: gateway

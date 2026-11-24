@@ -2,43 +2,42 @@
 
 和 `docs/design/4b-experiments.md` 配套：那一份主人能读，不写内容；这里写内容。接手的 Agent 先读这里。
 
-## 现在的池（2026-11-24）
+## 现在的池（2026-11-24，B1 之后）
 
-| 编号 | 档 | 类别 | 方式 | 目标 | 是什么 | 在集群上跑过 |
+“盲”是 `scenario.yaml` 的 `blind`：`yes` 的才会被 `chaos-blind` 抽到。
+
+| 编号 | 档 | 盲 | 方式 | 目标 | 是什么 | 跑过没有 |
 |---|---|---|---|---|---|---|
-| s001 | 2 | app | fault-switch `f01` | gateway | 查库存的时限用了无缓冲 channel，超时的请求泄漏一个 goroutine | 是（4a，不盲） |
-| s002 | 1 | pod | chaos-mesh | inventory | `pod-kill`（`gracePeriod` 默认 0），“没出事”的对照 | 是（4a，不盲） |
-| s003 | 1 | network | chaos-mesh | payment | 出站延迟 100 毫秒 | 否 |
-| s004 | 1 | pod | chaos-mesh | order | `container-kill`，进程直接被 KILL | 否；这个 action 没有冒烟过 |
-| s005 | 1 | stress | chaos-mesh | order | 一个副本的容器里 3 个 CPU worker（没有 CPU limit，会挤节点） | 否 |
-| s006 | 1 | stress | chaos-mesh | gateway | 一个副本的容器里要 640 MB，超过 512 Mi 的 limit，OOM | 否；超过 limit 的情形没有冒烟过 |
-| s007 | 1 | network | chaos-mesh | inventory | 出站丢包 10% | 否 |
-| s008 | 1 | dns | chaos-mesh | orderindex | 数据库的域名解析失败，随连接到期逐渐显现，35 分钟 | 否 |
+| s001 | 2 | yes | 开关 `f01` | gateway | 查库存的时限用了无缓冲 channel，超时的请求泄漏一个 goroutine | 长期运行的那一套，带负载（4a） |
+| s002 | 1 | yes | chaos-mesh | inventory | `pod-kill`、`gracePeriod: 45`：正常下线，“没出事”的对照 | e2e（B1）；带负载的是改之前的写法 |
+| s003 | 1 | yes | chaos-mesh | payment | 出站延迟 100 毫秒 | e2e，只验了注入 |
+| s004 | 1 | yes | chaos-mesh | order | `container-kill`：进程直接被 KILL，原地重启 | e2e |
+| s005 | 1 | yes | chaos-mesh | order | 一个副本的容器里 3 个 CPU worker | e2e |
+| s006 | 1 | yes | chaos-mesh | gateway | 一个副本要 640 MB，超过 limit，OOM 一次 | e2e |
+| s007 | 1 | no | chaos-mesh | inventory | 出站丢包 10% | e2e，只验了注入。**第一次带负载时主会话带着做，恢复加 `WAIT_RECON=1`**（预占会大量超时，是对补偿的真考验） |
+| s008 | 1 | no | chaos-mesh | orderindex | Pod 到集群 DNS 的包全丢，随连接到期逐渐显现，35 分钟 | e2e，只验了解析失败。带负载半小时以上的表现没有看过，第一次主会话带着做 |
+| s009 | 2 | no | 开关 `f02` | gateway | 终态订单的详情缓存，没有上限、不淘汰（内存泄漏） | 没有。**太慢**：估计每个副本每小时 12 到 16 MB，3 小时看不出来。要调压测里“支付后再查订单”的比例，或者接受它是一个要看 heap 剖析的差值才发现的场景 |
+| s010 | 2 | no | 开关 `f03` | inventory | 查库存的整段（含 Redis、读库）罩在一把全局互斥锁里（锁竞争） | 没有。稳态下估计 p99 只到两三倍；和“缓存 Redis 变慢 3 到 5 毫秒”叠加才飙升。要 mutex、block 采样开着 |
+| s011 | 2 | no | 开关 `f04` | order | 订单列表逐行重新编译一个大正则（CPU 和 GC） | 没有。估计每个 Pod 多 0.15 到 0.3 核，可能偏弱；不要和 s005 连着做 |
+| s012 | 2 | no | 开关 `f05` | orderindex | 商家列表首页缓存，两条路径加锁顺序相反（死锁） | 没有。估计每个副本约 3 分钟撞上一次，波动很大，30 分钟里可能一次都不发生 |
+| s013 | 2 | no | 开关 `f06` | order | 兜底扫描读从库时，空结果的分支没有交还连接（连接泄漏） | 没有。只影响抢到主的那个 Pod 的从库连接池，2.5 到 5 分钟耗尽；用户无感，是个安静的场景 |
+| s014 | 2 | no | 开关 `f07` | orderindex | 并行解码的 goroutine 里对 `paid_at` 的类型断言 panic（毒消息，反复重启） | 没有。**要 `FAULT_FILE` 那条路**（还没有做：Secret 和清单）；只经管理端口开的话每个副本崩一次就好了 |
 
-每个场景自己的“没有核实的”写在它的 `truth.md` 的备注里。B1（e2e 里试）要逐条核对。
+每个场景自己的“没有核实的”写在它的 `truth.md` 的备注里。第二档新加的六个的 `risk` 是任务说明里统一写的 2：s010、s011 关了开关就恢复、不用重启，按 README 该是 1，带负载试过之后再定。
 
-## B1 里要试的（设计 4b 第 3 节）
+## B1 试出来的（2026-11-24，`oppenheimer-e2e`，没有负载）
 
-- s004：退出码、事件、边车留不留、Chaos Mesh 的 `container-kill` 要不要 `duration`。
-- s006：被杀的是整个容器还是只有 stress 的 worker；容器重启后会不会再注入。
-- s008：两条模式能不能挡住 Go 解析器发出的全部写法；e2e 里连接的寿命是 30 分钟，等不起，可以临时把目标 Pod 重启一次看新进程建连接时的错误长什么样。
-- `pod-kill` 的 `gracePeriod` 0 和 45 各一次，看进程日志里有没有排空的那几行。主人同意第 2 节第 1 项之后把 s002 改成 45。
-- Istio 故障注入的两条路（改现有的 VirtualService；EnvoyFilter）。
-- 服务到数据库的分区：NetworkChaos 的 `target` 选别的命名空间要那个命名空间也有注解（脚本只允许 `oppenheimer` 两个），试 `externalTargets` 写域名或者 Pod 的地址行不行。
+- `pod-kill` 的 `gracePeriod`：45 是正常下线（Terminating 约 10 秒，就绪探针先 503）；0 是 3 秒内 Pod 从 API 里消失，没有排空。
+- `container-kill`：退出码 137、`reason: Error`、原地重启、没有 `Killing` 事件，不用写 `duration`。
+- StressChaos：没有 CPU limit 的容器 3 个 worker 就是 3 个核；内存超过 limit 是整个容器 OOMKilled，**重启后不再注入**。
+- **DNSChaos 对 distroless 的业务容器注入不了**（辅助程序在容器里报找不到文件）；对 `istio-proxy` 也不行（原生边车是 init 容器，选不中）。s008 改成了 NetworkChaos 挡 kube-dns 的地址（`externalTargets` 写 ClusterIP 是管用的：这也说明“服务到数据库的分区”可以用同样的写法，目标写数据库 Service 的地址；headless 的要写 Pod 的地址）。
+- 盲测：`blind` 真的跑了一次，终端上没有编号、目标、方式。对账的闸（假的结果）拦得住、确认后放行。
+- **Istio 的故障注入没有试成**：主会话从本机经端口转发打 gateway 的查库存接口，被鉴权挡在 401，请求没有走到 inventory，两种写法（另加一个 VirtualService、改现有的）都看不出效果。B4 开始之前重试：要带合法的令牌，或者直接在网格里的 Pod 之间发 gRPC。
 
-## 七个故障点打算放在哪（主人确认设计第 2 节第 4 项之后派 Opus 写）
+## 还没有做的
 
-原则：不进资金、库存扣减、订单状态机的路径；选读路径和派生数据；每个要有像真的那样的触发条件。下面是主会话的初步分配，
-派任务之前要先读对应的代码确认接缝存在、确认它和写路径不共用会被拖垮的资源（或者共用是有意的）。
-
-| 开关 | 类别 | 服务 | 想法 | 要注意的 |
-|---|---|---|---|---|
-| f02 | 内存泄漏 | gateway | 一个按“用户加 SKU”做键、没有上限也不淘汰的本地缓存 | Zipf 分布下键的增长是长尾的，涨得慢才像真的；limit 512 Mi，算一下多久到 |
-| f03 | 锁竞争 | order 的读路径（查订单） | 一把全局的互斥锁罩住了一段带 I/O 的代码 | 读路径有自己的隔离舱（`OrderReadBulkheadRejecting`），确认拖不到下单；要 mutex、block 采样开着才诊断得了 |
-| f04 | CPU 飙高 | gateway | 每个请求里重新编译正则，或者大量小对象引发 GC 压力 | Go 的正则是 RE2，没有回溯，计划里的“正则回溯”在 Go 里造不出来，复盘时讲这一点 |
-| f05 | 死锁 | orderindex | 两条路径以相反的顺序拿两把锁，要并发到一定程度才撞上 | 撞上之后消费者停住，派生数据落后，重启恢复；别放在会拖住全部 goroutine 的地方（探针也会挂，变成反复重启，那是另一个场景） |
-| f06 | 连接泄漏 | orderindex 的查询 | 某个出错的分支没有关 `rows` | 它的连接池和 inventory、payment 不共用，但连的是同一个 `mysql-main`：算清楚池的上限，不能把主库的 `max_connections` 吃满 |
-| f07 | panic 反复重启 | payment 之外的任一个，倾向 orderindex | 某种少见的输入下空指针，没有 recover | 要 `FAULT_FILE` 加 Secret（重启后开关要还在）；消费者里的 panic 会让同一条消息反复触发，像真的“毒消息” |
-| f08 | 数据竞争 | orderindex（派生数据） | 并发写一个没有保护的 map 或者计数 | 只在 `oppenheimer-e2e` 里做；不能进 `-race` 的测试，测试单独处理 |
-
-gateway 已经有 f01，再放两个偏多：写之前看看 f02、f04 能不能有一个挪到 order 的读路径上。
+- `f08` 数据竞争（只在 e2e 里做，测试要绕开 `-race`）。打算放 orderindex 的派生数据上，没有派出去。
+- `FAULT_FILE`：`pkg/fault` 启动时会读，但挂它的 Secret 和 chart 的改动没有做。s014 靠它。
+- 带故障代码的镜像要重新构建、滚动一次，新的六个开关才在集群上（现在集群上是 `afc5341-p4`，只有 `f01`）。
+- 第二档新加的六个都要带负载试一次再标 `blind: yes`。
+- 顺带发现、不属于故障实验的：`pkg/mysqlx` 的连接池指标只带库名，订单库的主库池和从库池标签完全一样，分不出是哪个池满了（f06 的子 Agent 读 SDK 代码得出的，没有在集群上核对）。

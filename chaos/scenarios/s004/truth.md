@@ -25,8 +25,9 @@ kubelet 随后在**同一个 Pod** 里把容器重新拉起来。
 
 ## 备注
 
-原来计划的写法是 `pod-kill` 加 `gracePeriod: 0`。2026-11-24 查集群上的 CRD：`gracePeriod` 的默认值就是 0，
-所以 s002 已经是这种写法，再写一个没有区别。要模拟“进程突然没了”（崩溃、OOM、掉电），`container-kill` 更贴近：进程直接收到 KILL。
+原来计划的写法是 `pod-kill` 加 `gracePeriod: 0`。查集群上的 CRD：`gracePeriod` 的默认值就是 0，那种写法是“Pod 立刻从 API 里消失”，端点也立刻撤掉。
+要模拟“进程突然没了”（崩溃、OOM、掉电），`container-kill` 更贴近：进程直接收到 KILL，Pod 和端点都还在。
 
-上面的证据是按设计推的，**没有量过**；`container-kill` 在这个集群上没有冒烟过（4a 的冒烟只试了 `pod-kill`）。
-先在 `oppenheimer-e2e` 里试一次再用，核对：退出码是不是 137、事件里写什么、边车留不留、消费的分区停多久。
+B1（2026-11-24，`oppenheimer-e2e`，没有负载）试过：业务容器 `restartCount` 0 → 1，上一次退出 `reason: Error`、`exitCode: 137`（不是 OOMKilled）；Pod 名不变，另一个副本和边车没有动；
+事件里只有重新拉起的 `Pulled`、`Created`、`Started`，**没有 `Killing`**；清单不用写 `duration`（一次性的）。约 1 秒后容器就重新起来了。
+没有量的（要有负载）：在途请求断了多少、边车摘不摘、消费的分区停多久。

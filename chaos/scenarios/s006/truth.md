@@ -24,9 +24,7 @@ gateway 自己的进程没有内存泄漏。
 
 ## 备注
 
-没有核实的几件事，第一次用之前在 `oppenheimer-e2e` 里试：
-
-- 超过 limit 时被杀的是整个容器还是只有那个占内存的进程。按设计推是整个容器（cgroup v2 下 Kubernetes 默认把一个容器当成一组一起杀），
-  如果只杀了那个 worker，业务进程不受影响，这个场景就不成立，要换写法。
-- 容器重启之后 Chaos Mesh 会不会对新的容器再注入一次（会的话 5 分钟里会反复 OOM，`restartCount` 加好几次，进入 CrashLoopBackOff 的退避）。
-- 冒烟只在探测 Pod 上试过 96 MB、没有超过 limit 的情形。
+B1（2026-11-24，`oppenheimer-e2e`，没有负载）试过：注入后 10 秒内被选中的副本的业务容器 `OOMKilled`、`restartCount` 0 → 1，整个容器被杀（不是只杀占内存的那个进程）。
+**容器重启之后 Chaos Mesh 没有再注入**：之后的 50 秒里它一直正常运行，所以这个场景是“OOM 一次”，不是反复 OOM。
+没有量的（要有负载）：入口的 5xx 有多少，`ContainerOOMKilled` 多久响。
+长期运行的那一套里 gateway 平时的内存水位比 e2e 高，640 MB 仍然超过 limit，结论不变。

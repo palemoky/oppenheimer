@@ -509,7 +509,7 @@ check_warmup() { # skip
   fi
   if [[ "$skip" == 1 ]]; then
     WARMUP_SKIPPED=1
-    echo "warmup check skipped (--skip-warmup): steady load has run ${STEADY_AGE:-unknown}s (the default minimum is ${STEADY_MIN_AGE}s)"
+    echo "warmup check skipped (--skip-warmup): steady load has run ${STEADY_AGE:-an unknown number of }s (the default minimum is ${STEADY_MIN_AGE}s)"
     return 0
   fi
   if [[ -z "$STEADY_AGE" ]]; then
