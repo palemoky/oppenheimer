@@ -4,6 +4,9 @@
 
 ## 当前状态
 
+- **现在（2026-11-24 07:10 UTC，这一条最新）**：**主人定了两件事，都动工了；全部没有提交，没有动集群。** ①“DeepSeek 的调用放在低谷价格处理”：Agent 的费用按时段算了，高峰里告警触发的诊断留到高峰结束再跑、手动提问要 `-force`（[设计 3d 第 10 节](design/3d-diagnosis-agent.md)）。②“4a 的设计待定项都按建议”：十项都定了，4a 第 2 步（`pkg/fault`、构建标签、检查、第一个故障点）做完了（[设计 4a 第 6 节](design/4a-chaos-prep.md)、[ADR-0041](adr/0041-two-fault-injection-paths.md)）。见下面“4a 动工”。**等主人的**：4a 第 1 步（装 Chaos Mesh、冒烟）的具体做法登记在计划文件里，要一句同意；提交也要主人说。
+- **现在（2026-11-24 06:40 UTC，这一条最新）**：**用 DeepSeek（`deepseek-flash`）在本机把 Agent 对着真的集群跑通了三次**（主人要求；只读，没有部署）。结果在[设计 3d 第 9.5 节](design/3d-diagnosis-agent.md)。试跑查出一个问题并改了（模型写的工具参数不是合法 JSON 时的处理）。全部改动仍然没有提交。下一条里“没有对真的 API 跑过”对 DeepSeek 作废，对 OpenAI 和 Claude 仍然成立。
+- **现在（2026-11-24 06:00 UTC，这一条最新）**：**诊断 Agent 的模型后端可换了（主人要求），代码、测试、文档都写了，没有提交，没有动集群，没有对真的 API 跑过。** 见下面“Agent 的模型后端可换”。主人说稍后用 DeepSeek 试跑：这同时解开了 3d“等 API 密钥”的阻塞（原来等的是 Claude 的密钥）。4a 的状态没有变：设计第 2 节的第 1 到 9 项仍然等主人确认。分支仍是 `phase-4a`。
 - **现在（2026-11-24 04:00 UTC，这一条最新）**：**主人同意后重启了 `mysql-main`，带上了 `MALLOC_ARENA_MAX=4`（03:58 UTC）。** 见下面“mysql-main 的内存”。改动没有提交（chart 的模板和 values、`mysql-main.yaml`、文档）。**验证只做了一半**：环境变量到了进程里；它管不管用要有一次连接数的高峰才知道。**主人定了：不单独跑压测，等阶段 4 第一次发压时一起看**（登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”）。主人要求后提交并推送了（分支 `phase-4a`，`git log` 看；没有开 PR，CI 只在 PR 上跑，所以没有 CI 结果）。4a 的十项里第 10 项（主库内存）到这里算处理了，**另外九项仍然等主人确认**（下一条）。
 - **现在（2026-11-24 03:20 UTC，这一条最新）**：**开始阶段 4 的 4a，只写了设计，没有动工、没有动集群。** 分支 `phase-4a`（从合并了 PR #20 的 `main` 开的，没有推送）。设计 [design/4a-chaos-prep.md](design/4a-chaos-prep.md)，**第 2 节的十项等主人确认**。（已随上一条提交。）另外有一条在响的告警要主人定怎么处理（`mysql-main-0` 内存只涨不降，到了 limit 的 90%，见下面“4a 设计写完”）。阶段 3 剩的两项没有变：3d 等 API 密钥（`.env` 里还没有），3c 的“放几天看误报”要等几天。**下一步**：见下面“4a 设计写完”。
 - **现在（2026-11-24 03:30 UTC，这一条最新）**：**3e 做完了。PR #19 已合并进 `main`（`f555db1`，主人要求；合并前最后一次推送只有文档）。** 第 7 步的阶段笔记 [notes/3e-reconciliation.md](notes/3e-reconciliation.md) 和计划文件里“3e 对账按场景拆补的”面试考点写了，主人要求后提交、推送，从 `phase-3e` 另开了一个 PR 合并进 `main`（`gh pr list --state merged --head phase-3e` 看号码，`git log --merges -1 origin/main` 看合并提交；这次推送只有文档，合并前没有等它的 CI）。下一条里“没有提交”“只剩第 7 步”到这里作废。**下一步**：阶段 3 剩 3d 的试跑（等 API 密钥，见下面 3d 的“下一步”）和 3c 的“上线后放几天看误报”；之后是阶段 4（`docs/plan/phase-4-chaos.md`，“4a 准备”里登记了 3e 留下的三件）。集群上各组件的镜像 tag 见下一条。
@@ -18,6 +21,48 @@
 - **当前分支**：`phase-2d`（2026-11-15 从合并了 2c 的 `main` 开出），已推送。PR #12 已合并；合并之后在同一个分支上追加了 2026-11-17 的两个提交（宿主机硬件、`vm.sh resize`、`AGENTS.md`），另开了 **PR #13** 等主人看，`40063bd` 的 CI 27 项全部通过（`test (./services/order)` 4 分 16 秒、e2e 3 分 57 秒，和上次相比没有明显变化）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。PR #12 的 CI：第一次推送失败 1 项（和 2d 无关的偶发失败，见“2d 做到哪”的下一步）；`cb0d456` 的 27 项全部通过（最长的是 `test (./services/order)` 4 分 09 秒、e2e 3 分 50 秒）。那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。**PR #13 已由主人合并**（2026-11-17，合并提交 `9012921`）。合并之后同一个分支上又追加了宿主机的地址和兜底通道、`hardware.md` 精简、修 `redis-gate-1` 的记录，已推送，另开了 **PR #14**（CI 只在 PR 和推到 `main` 时跑，所以要开 PR 才有结果）：`84f73d5` 的 CI 27 项全部通过（`test (./services/order)` 2 分 58 秒、e2e 4 分 32 秒，没有明显变化）。之后追加的文档提交 `eb671d4` 的 CI 也是 27 项全部通过，**PR #14 已合并**（合并提交 `0af2c2d`）。合并之后 `phase-2d` 上还有一次只改本文件的提交（记录删备份和这句话），不在 `main` 里：**阶段 3 的分支从 `phase-2d` 开，或者从 `main` 开之后把这个提交带过去。** 工作区是干净的。
 - **最后更新**：2026-11-23（第 16 项做完，第五个 SLO、SLO 的大盘、ADR-0037 做了，3c 的计划项全部勾了，都没有提交，见下面“3c 第 16 项做完”；以下括号里是更早写的）（主人对待定项给了决定，规则改了并下发，第 17、18 项做了，延迟消费者并发和按分区计数的队列上限写完了，都没有提交，见下面“3c 待定项的处理”；以下括号里是更早写的）（3c 的告警质量检查开始做了，见下面“3c 告警质量检查”；以下括号里是更早写的）（3c 的第 6、7 步：Alertmanager 的路由和抑制、webhook 接收端、runbook 做了，都没有提交，见下面“3c 的 Alertmanager 和 runbook”；以下括号里是更早写的）（3c 的设计写完，等主人确认十项，见下面“3c 设计写完”；当前分支 `phase-3c`；以下括号里是更早写的）（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
+
+### 4a 动工（2026-11-24 06:45 到 07:10 UTC；这一段最新，新会话先读这里）
+
+- **主人说的**：“1. 现在是 DeepSeek 的高峰价格，我想在相关的调用放在低谷价格处理 2. 4a 的设计待定项都按建议”。
+- **第 1 件（Agent 躲开高峰价）**，细节在设计 3d 第 10 节：
+  - `llm.Price` 可以带高峰时段，`CostOf` 按发请求的时刻算；DeepSeek 的高峰是 UTC 周一到周五 01:00 到 04:00、06:00 到 10:00，其余半价。
+  - `agent serve -peak=defer`（默认）：高峰里告警触发的诊断留着、高峰结束再跑；`/ask` 回 409，`agent ask -force` 才跑。`-peak=run` 关掉。只对分时段计价的模型起作用。
+  - **主会话自己定的、主人没有逐条确认过的**：告警的诊断最晚推迟 4 小时（那时 Pod 的状态和事件可能已经没了）；手动提问不是排队而是拒绝加 `-force`。主人要的是“放在低谷处理”，这两条是主会话对它的理解，不合适就改。
+  - **之后主会话自己对真的 API 的试跑也排在低谷里**（北京时间工作日 12:00 到 14:00、18:00 以后，周末全天）。
+- **第 2 件（4a）**：
+  - 设计、计划的状态改成了“已确认”。ADR-0041 写了。
+  - 第 2 步做完了（不动集群）：`pkg/fault`、五个服务挂 `fault.Register`、Dockerfile 和 `images.sh` 的 `GO_TAGS`、Makefile 的 `lint-faults`、`test-faults`、`check-faults`、CI 的两处、第一个故障点 `f01` 和它的场景目录 `chaos/scenarios/s001/`（**主人不读**）。
+  - 验证：`pkg`、`services/gateway` 带标签和不带标签的 lint 都是 0 issues；`services/gateway` 的 `make test` 通过；带标签的 vet 和测试在不连依赖的情况下通过；`make check-faults` 通过；`order`、`inventory`、`payment`、`orderindex` 两种构建都编得过、`cmd` 的 lint 0 issues；`services/agent` 的 lint 和测试通过。**整个仓库的 `make lint test` 没有跑**：本机 compose 的 Redis 连不上（`pkg/cache` 的用例失败，和这次的改动无关，没有查原因），而且改动涉及的模块都单独跑过了。提交之前要把 compose 起好重跑一次。
+- **没有做的 / 下一步**（按设计 4a 第 4 节的顺序）：
+  1. **第 1 步，等主人同意**：装 Chaos Mesh 和六类冒烟。具体做法登记在 `docs/plan/phase-4-chaos.md` 的“安装 Chaos Mesh”下面。values 和脚本还没有写（可以先写，不动集群）。
+  2. 第 3 步（`pprof_capture`，Opus）、第 4 步（`chaos/` 的格式、`chaos-run.sh`、`chaos-steady.sh`，Sonnet）可以并行，**但要先提交**：worktree 是从已提交的分支建的，现在工作区里有二十多个没提交的文件（Agent 的后端、高峰价、`pkg/fault`），子 Agent 看不到。第 3 步还会改 `services/agent/cmd/agent/serve.go`，和没提交的改动是同一个文件。
+  3. 提交之前：`make up` 之后整个仓库 `make lint test`，再 `make lint-faults test-faults check-faults`。
+  4. 第 5、6 步要动集群（部署带标签的镜像、Agent 屏蔽 `chaos-mesh`、走通一遍），到时再登记。走通时用的压测和对真的 DeepSeek 的调用排在低谷时段。
+- **提醒**：`go build` 在模块目录里直接跑会改 `go.work.sum`（和这些改动无关的增删），主会话每次都 `git checkout go.work.sum` 还原了；提交前看一眼它不在改动里。
+
+### Agent 的模型后端可换（2026-11-24 05:20 到 06:00 UTC；这一段最新）
+
+- **主人说的**：“现在的 agent 只支持 Claude，是否可以做成组件式，支持 DeepSeek、OpenAI 等”；看了方案后：“修改吧，我稍后用 DeepSeek 尝试”。
+- **做了的**（细节：[设计 3d 第 9 节](design/3d-diagnosis-agent.md)，决定：[ADR-0040](adr/0040-llm-providers-behind-one-interface.md)）：
+  - `services/agent/internal/llm/openai.go`（OpenAI 兼容协议的适配器，手写，没有新依赖）、`provider.go`（四个后端的预设：`anthropic`、`deepseek`、`openai`、`openai-compatible`）、`price.go`（加 DeepSeek 的价和 `ParsePrice`）。
+  - `agent serve` 加了 `-provider`、`-model`、`-base-url`、`-price`（也能用环境变量 `AGENT_PROVIDER` 等给）。不带参数时和原来一样（Claude、`claude-opus-5-5`）。
+  - 部署：Secret 改名 `agent-llm`（键名就是环境变量名），`monitoring.sh agent` 从 `.env` 读 `AGENT_PROVIDER`、`AGENT_MODEL`、`AGENT_BASE_URL`、`AGENT_PRICE` 和几个密钥。**脚本只过了 `bash -n`，没有运行过；清单没有 apply 过**（和 3d 第 4 步一样）。
+  - 循环、工具、报告、触发没有改。
+- **验证了的**：`make lint MODULES=$PWD/services/agent` 0 issues；`make test MODULES=$PWD/services/agent` 全过（新加的用例对着 `httptest`：请求的形状、第二轮的请求体逐字节以第一轮为前缀、`reasoning_content` 和不认识的字段原样带回、用量的换算、各种结束原因、重试和不重试、失败不留历史）。本机起了一次二进制：写错的后端名、没有价的模型都在启动时失败，`AGENT_PROVIDER=deepseek` 能起来并打出“没有密钥”的 warn。**整个仓库的 `make lint test` 没有重跑**（只动了 `services/agent` 这一个模块和文档、脚本、清单）。
+- **没有验证的**：对真的 DeepSeek、OpenAI 的 API 一次都没有跑过。DeepSeek 的事实是 2026-11-24 从它的文档查的；OpenAI 的一部分是子 Agent 的摘要，没有逐条核对到原文。
+- **计划变更**：3d 的计划里加了一项“模型的后端可换”（已勾）；“试跑”那一项不再只等 Claude 的密钥，哪一家的密钥到了都能做。
+- **下一步**：
+  1. 主人在 `.env` 里放 `DEEPSEEK_API_KEY`（集群里跑再加 `AGENT_PROVIDER=deepseek`）。本机试跑的命令和第一次要看的五件事在设计第 9.3 节。
+  2. 试跑的结果写回设计第 9 节；有 400、缓存不命中、报告被反复打回这类问题就地改适配器。
+  3. 主人说提交之后提交（`git status` 里的全部改动都是这一件事的）。
+  4. 回到 4a。
+- **试跑之后（06:40 UTC）补**：
+  - 主人把 DeepSeek 的默认模型改成了 `deepseek-flash`（`provider.go`），`.env` 里放了 `DEEPSEEK_API_KEY` 和 `AGENT_PROVIDER=deepseek`。
+  - 本机跑了三次（做法和数见设计 9.5）：没有 400，缓存命中约 93%，一次约 0.03 到 0.05 美元、两分钟上下。第二次因为主会话把端口转发带掉了，不算数。
+  - 改了的：`llm.ToolCall.Malformed`，循环对“参数不是合法 JSON”的调用不执行、不占报告的打回名额。`make lint`、`make test`（只 `services/agent`）通过。
+  - **还没有做的**：集群里部署（`make agent`，要动集群，先登记、先拿同意）；经 Alertmanager 的 webhook 触发；Pod 到 `api.deepseek.com` 通不通。所以计划里“触发方式”“试跑”两项仍然不勾。
+  - 试跑时 Agent 对 3c 留下的“`PrometheusErrorSendingAlertsTo...` 只到 pending”给了一个解释（设计 9.5 最后），没有另外核实。
 
 ### mysql-main 的内存（2026-11-24 03:10 到 04:05 UTC；这一段最新，新会话先读这里）
 
@@ -1166,6 +1211,8 @@
 ## 阻塞项与待确认
 
 - **`TestLandConcurrentRedeliveredShuffled` 在 CI 上偶发失败过一次**（2026-11-22，`0db0499`，重跑通过）：主人定了暂时不改，再出现时再说，见“3b 收尾”一段。
+
+- **`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在本机带 `-race` 时偶发失败**（2026-11-24 发现，`loaded 2 times, want 1`，单独跑 30 次失败 3 次，带不带 `faults` 标签都一样，和当天的改动无关，`pkg/cache` 没有动过）。原因没有查实。推测（没有验证）：`Get` 先读 Redis、没命中再进 singleflight，这两步之间没有再看一次缓存；100 个并发里有的读得慢（或者超过了读的短时限被当成 Redis 不可用），等它走到 singleflight 时第一趟回源已经结束，于是自己又回源一次。如果是这样，它是缓存本身的一个小缺口（多回源一次，不会读到错的值），不只是用例的问题。还没有决定改不改，等主人定。
 
 - （已定）1 亿数据量：主人 2026-11-22 定了不做，理由在 `docs/notes/3b-capacity.md` 第 8 节。
 

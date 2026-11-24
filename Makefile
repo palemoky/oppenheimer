@@ -104,6 +104,22 @@ lint: ## 对所有模块运行 golangci-lint
 test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
 
+# 有带 faults 标签的文件的模块（阶段 4 的故障代码，见 pkg/fault 的包注释）。这些文件平时不参加编译，
+# 下面三个目标保证它们一直编得过、测得过，并且确实没有进平时的二进制。
+FAULT_MODULES = $(shell grep -rlE '^//go:build faults' --include='*.go' pkg services 2>/dev/null | awk -F/ '{ if ($$1 == "pkg") print "pkg"; else print $$1 "/" $$2 }' | sort -u)
+
+.PHONY: lint-faults
+lint-faults: ## 带 faults 标签对有故障代码的模块再跑一遍 golangci-lint
+	@for m in $(FAULT_MODULES); do echo "==> lint -tags faults $$m"; (cd $$m && golangci-lint run --build-tags faults ./...) || exit 1; done
+
+.PHONY: test-faults
+test-faults: ## 带 faults 标签对有故障代码的模块跑 vet 和测试（带竞态检测；对着 MySQL 等的用例和 make test 一样要先 make up，否则被跳过）
+	@for m in $(FAULT_MODULES); do echo "==> test -tags faults $$m"; (cd $$m && go vet -tags faults ./... && go test -race -tags faults ./...) || exit 1; done
+
+.PHONY: check-faults
+check-faults: ## 核对平时的构建里没有故障代码（go tool nm 对比带标签和不带标签的二进制）
+	scripts/check-faults.sh
+
 .PHONY: test-unit
 test-unit: ## 只运行不依赖 MySQL、Redis、Kafka 的测试
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR= OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
@@ -314,7 +330,7 @@ monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometh
 	scripts/cluster/monitoring.sh up
 
 .PHONY: agent
-agent: ## 部署诊断 Agent 到命名空间 monitoring（只读 RBAC、存记录的卷、Secret agent-anthropic 来自 .env 的 ANTHROPIC_API_KEY；不在 monitoring-up 里；Alertmanager 的 webhook 另用 AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager 打开）
+agent: ## 部署诊断 Agent 到命名空间 monitoring（只读 RBAC、存记录的卷、模型的后端由 .env 的 AGENT_PROVIDER 选，Secret agent-llm 来自 .env 里对应的密钥如 DEEPSEEK_API_KEY；不在 monitoring-up 里；Alertmanager 的 webhook 另用 AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager 打开）
 	scripts/cluster/monitoring.sh agent
 
 .PHONY: monitoring-status

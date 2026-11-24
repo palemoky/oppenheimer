@@ -20,6 +20,7 @@ import (
 	"github.com/palemoky/oppenheimer/api/eventx"
 	orderindexv1 "github.com/palemoky/oppenheimer/api/gen/oppenheimer/orderindex/v1"
 	"github.com/palemoky/oppenheimer/pkg/app"
+	"github.com/palemoky/oppenheimer/pkg/fault"
 	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
 	"github.com/palemoky/oppenheimer/pkg/logx"
@@ -227,7 +228,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, app.AdminMux(serviceName, readiness))
+	admin := app.AdminMux(serviceName, readiness)
+	fault.Register(admin)
+	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, admin)
 	if err != nil {
 		return err
 	}

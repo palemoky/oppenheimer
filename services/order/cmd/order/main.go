@@ -24,6 +24,7 @@ import (
 	"github.com/palemoky/oppenheimer/pkg/app"
 	"github.com/palemoky/oppenheimer/pkg/cache"
 	"github.com/palemoky/oppenheimer/pkg/degrade"
+	"github.com/palemoky/oppenheimer/pkg/fault"
 	"github.com/palemoky/oppenheimer/pkg/grpcx"
 	"github.com/palemoky/oppenheimer/pkg/idgen"
 	"github.com/palemoky/oppenheimer/pkg/kafkax"
@@ -884,6 +885,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	readiness := &app.Readiness{}
 	admin := app.AdminMux(serviceName, readiness)
 	switches.Register(admin)
+	fault.Register(admin)
 	httpServer, err := app.ListenHTTP(ctx, "http", cfg.httpAddr, admin)
 	if err != nil {
 		return err

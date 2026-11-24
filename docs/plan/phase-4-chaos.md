@@ -20,10 +20,16 @@
 
 ## 4a 准备
 
-设计：[4a-chaos-prep.md](../design/4a-chaos-prep.md)（2026-11-24 写，第 2 节的十项等主人确认，没有动工）。
+设计：[4a-chaos-prep.md](../design/4a-chaos-prep.md)（2026-11-24 写；同一天主人确认第 2 节的十项都按建议）。进度见 `PROGRESS.md`。
 
 - [ ] 安装 Chaos Mesh
-- [ ] 代码缺陷类故障的注入机制（`pkg/fault`）：这类故障无法从外部注入，需要在服务里预埋故障开关
+  - **登记（2026-11-24，等主人对下面的具体做法说同意再动）**：按[设计 3.2](../design/4a-chaos-prep.md)。
+    1. 装：Helm chart `chaos-mesh` 2.8.8 到命名空间 `chaos-mesh`，`chaosDaemon.runtime=containerd`、`socketPath=/run/k3s/containerd/containerd.sock`、`enableFilterNamespace=true`、不装 dashboard。会多出一个特权的 DaemonSet（三个节点各一个 `chaos-daemon`）、controller-manager、`chaos-dns-server`，内存预算 0.5 GB。
+    2. 冒烟：只在 `oppenheimer-e2e` 里（先 `make cluster-e2e E2E_KEEP=1` 起一套），给它加注入的注解，六类各一个最小的对象、各 30 秒：PodChaos（杀一个 Pod）、NetworkChaos（延迟、分区）、StressChaos（CPU、内存）、IOChaos、TimeChaos、DNSChaos。长期运行的 `oppenheimer`、`mysql`、`redis`、`kafka`、`monitoring` 不加注解，不会被注入。
+    3. 做完删掉 e2e 那一套和注解；Chaos Mesh 留着。
+    4. 不发压。影响：e2e 命名空间里的 Pod 会被杀、被限速；三个节点上各多一个特权 Pod。
+- [x] 代码缺陷类故障的注入机制（`pkg/fault`）：这类故障无法从外部注入，需要在服务里预埋故障开关
+  - 2026-11-24：`pkg/fault`、构建标签 `faults`、三道检查、第一个故障点 `f01` 写了（[设计第 6 节](../design/4a-chaos-prep.md)、[ADR-0041](../adr/0041-two-fault-injection-paths.md)）。**带标签的镜像没有构建和部署过，开关没有在集群上打开过**；其余的故障点在 4b 里一个个加
   - 通过管理接口或配置在运行时触发，默认关闭
   - 故障代码要写得像真实的 bug（例如忘记关闭的 goroutine、无上限的缓存、不一致的加锁顺序），而不是一眼能看出来的 `sleep`
   - 用构建标签隔离，正常构建的二进制里不包含故障代码
@@ -119,5 +125,7 @@
 - 形成一份故障速查手册：现象 → 可能原因 → 验证方法。
 
 ## 面试考点
+
+4a 故障开关补的（[设计 4a](../design/4a-chaos-prep.md) 第 3.3 节和第 6 节、[ADR-0041](../adr/0041-two-fault-injection-paths.md)）：哪些故障从外面造不出来、只能预埋；Go 的构建标签怎么用（`//go:build` 写错了会被当成普通注释，文件就进了平时的构建）、怎么证明一段代码没有进二进制（`go tool nm`，以及这种检查为什么要“反过来确认一次”防止空转）；为什么不靠“常量为 false 的分支会被编译器删掉”；故障开关为什么必须自己会关（ttl）；带缓冲和不带缓冲的 channel 在“先返回、后台还在跑”这种写法里差在哪；shell 里 `pipefail` 加 `grep -q` 的 SIGPIPE 陷阱。
 
 混沌工程的原则；Go 的 goroutine 泄漏、内存泄漏、死锁的成因与 pprof 排查方法；GMP 调度与 GC 原理；MySQL 慢查询优化、索引失效场景、InnoDB 锁（行锁、间隙锁、临键锁）与死锁分析；Redis 大 key 与热 key 的发现和治理；MySQL 主从切换的数据安全（半同步、GTID）；Redis 故障转移期间的数据丢失窗口与脑裂；Kafka 的 ISR、acks、不丢消息的完整条件；CAP 在这些实验里的具体表现；线上故障排查的思路与真实案例（这一阶段的复盘就是案例）。

@@ -39,13 +39,15 @@ compute_tag() {
     echo "$IMAGE_TAG"
     return
   fi
-  local sha status
+  local sha status suffix=""
+  # GO_TAGS=faults 构建的是带故障代码的镜像（阶段 4），tag 带后缀，不会和平时的镜像混。
+  [[ " ${GO_TAGS:-} " == *" faults "* ]] && suffix="-faults"
   sha="$(git -C "$ROOT" rev-parse --short HEAD)"
   status="$(git -C "$ROOT" status --porcelain)"
   if [[ -n "$status" ]]; then
-    echo "${sha}-dirty-$(date -u +%Y%m%d%H%M%S)"
+    echo "${sha}-dirty-$(date -u +%Y%m%d%H%M%S)${suffix}"
   else
-    echo "$sha"
+    echo "${sha}${suffix}"
   fi
 }
 
@@ -81,6 +83,7 @@ do_build() { # tag 服务...
     docker buildx build --platform "$PLATFORM" --load \
       -f "$dockerfile" \
       --build-arg "SERVICE=$s" \
+      --build-arg "GO_TAGS=${GO_TAGS:-}" \
       -t "$(image_name "$s" "$tag")" \
       "$ROOT"
   done

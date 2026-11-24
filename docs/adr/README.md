@@ -66,3 +66,5 @@
 | [0037](0037-slo-and-burn-rate-alerts.md) | SLO 用 7 天窗口和三档多窗口燃烧率告警，规则手写；429 不算坏；平时的流量由常驻探针提供；Alertmanager 的配置不用 `AlertmanagerConfig`；支付可用性是后加的第五个 SLO | 已采纳 |
 | [0038](0038-diagnosis-agent-own-loop.md) | 诊断 Agent 自己写循环（Messages API，历史收在接口后面只能追加）；上限是软的，撞到之后用已有证据交报告；报告经 `submit_report` 交，证据由程序按步骤号从运行记录里渲染 | 已采纳 |
 | [0039](0039-reconciliation-by-scenario.md) | 对账按数据的性质拆三类，各用一个不靠时间容差的判据：钱用支付单的状态，库存用一个一致性快照（总量守恒交给 CHECK），派生数据用行的版本号跟着 CDC 的变更核对；逐行的树留作下钻和独立的一路 | 已采纳 |
+| [0040](0040-llm-providers-behind-one-interface.md) | 诊断 Agent 的模型后端按配置选（Claude、DeepSeek、OpenAI、任何 OpenAI 兼容的服务）；Claude 之外只有一个手写的薄适配器，各家是它的预设；历史按原始 JSON 存、回复原样放回；用量换成一个口径；表里没有价的模型必须显式给价 | 已采纳 |
+| [0041](0041-two-fault-injection-paths.md) | 故障注入分两条路：外面能造的用 Chaos Mesh，代码缺陷用预埋的开关（`pkg/fault`）；有缺陷的实现放在业务包里、用构建标签 `faults` 隔离、不露痕迹；开关必须带 ttl；三道检查保证它不烂也不漏进平时的构建 | 已采纳 |

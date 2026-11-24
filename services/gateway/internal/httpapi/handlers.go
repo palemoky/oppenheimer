@@ -237,7 +237,7 @@ func (s *server) GetStock(c *gin.Context, rawSKUID oas.SkuId) {
 	if !ok {
 		return
 	}
-	resp, err := s.deps.Inventory.GetStock(c.Request.Context(), &inventoryv1.GetStockRequest{SkuId: skuID})
+	resp, err := s.stock(c.Request.Context(), &inventoryv1.GetStockRequest{SkuId: skuID})
 	if err != nil {
 		s.writeGRPCError(c, err)
 		return

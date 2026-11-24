@@ -44,6 +44,13 @@ jobs:
         with:
           version: v2.15
           working-directory: ${{ matrix.module }}
+      # 再带 faults 标签跑一遍：阶段 4 的故障代码（pkg/fault 的包注释）平时不参加编译，不单独 lint 就没人看它。
+      # 没有带标签文件的模块这一遍和上一遍看的是同样的代码，有缓存，很快。
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          working-directory: ${{ matrix.module }}
+          args: --build-tags faults
 
   test:
     needs: detect
@@ -160,6 +167,21 @@ jobs:
             echo "::error::api/gen 与 proto 定义不一致，请运行 make proto 并提交"
             exit 1
           fi
+
+  # 阶段 4 的故障代码（带 faults 构建标签，pkg/fault 的包注释）：带标签编译、vet、跑测试，
+  # 再核对不带标签的二进制里没有这些代码。不起 MySQL 等依赖：对着库的用例在上面的 test 里跑过了，这里它们被跳过。
+  faults:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: '**/go.sum'
+      - name: Vet and test with the faults tag
+        run: make test-faults
+      - name: Check the default build contains no fault code
+        run: make check-faults
 
   # 确认入库的生成代码与 OpenAPI 规范一致。
   openapi:
