@@ -7,7 +7,7 @@ target:
   workload: gateway
 duration: 30m
 requires:
-  - 镜像是带 -faults 后缀的构建
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
   - 稳态的压测在跑（没有读流量时这个场景几乎没有表现）
 recover:
   restart: [gateway]

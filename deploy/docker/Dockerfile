@@ -21,7 +21,7 @@ ARG TARGETARCH
 # order 下有 order 和 archiver 两个，共用一个镜像，靠容器的 command 选择。
 ARG SERVICE
 # 构建标签。平时是空的；阶段 4 做故障实验用的镜像传 faults，把预埋的故障代码编进去（pkg/fault 的包注释）。
-# 由 scripts/cluster/images.sh 的 GO_TAGS 传进来，那时镜像的 tag 带 -faults 后缀。
+# 由 scripts/cluster/images.sh 的 GO_TAGS 传进来，那时镜像的 tag 带 -p4 后缀（不写 faults，理由在 images.sh）。
 ARG GO_TAGS=""
 
 WORKDIR /src

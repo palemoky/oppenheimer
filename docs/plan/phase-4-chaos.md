@@ -62,6 +62,9 @@
     7. **顺带量的**（都是只读）：`mysql-main` 的 `MALLOC_ARENA_MAX=4` 在这次发压下的内存（570 请求/秒到不了 200 个连接，大概只能看到“没有变差”，真正的验证要等更大的一轮）。
     8. **不做的**：mutex、block 采样先不开（要用 3b 的压测量开销，另外登记）；第三档的场景；盲测。
     9. **出了岔子**：`make chaos-recover ALL=1 RESTART=1` 是总闸（删所有 Chaos Mesh 对象、关所有开关、去注解、重启五个服务）；`make chaos-steady ARGS=stop` 停压测。影响范围：`inventory` 少一个副本几十秒；`gateway` 在 `s001` 期间有预期的症状、之后重启一次；发压期间探针和 SLO 可能有抖动，告警可能发到 Telegram。
+- [ ] 换上改过名字的带故障代码的镜像（2026-11-24 加）
+  - **登记（2026-11-24，等主人同意）**：`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `9dda461-faults` 滚动成 `<提交号>-p4`（tag 不再写 faults，gateway 的故障文件改了名）。和上一次一样是滚动更新，不注入、不发压。要先提交（tag 是提交号）。之后核对：五个服务的 `/fault` 列得出开关、都是关的
+- [x] 阶段笔记（设计第 4 节第 7 步）：[notes/4a-chaos-prep.md](../notes/4a-chaos-prep.md)（2026-11-24）；ADR-0041 之前已写，这次补了两处改动
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
   - 2026-11-24：`scripts/cluster/chaos-run.sh`（`make chaos-blind|chaos-inject|chaos-recover|chaos-reveal`）写了，主会话评审过。**连集群的路径一条都没有真的跑过**（只用假的 `kubectl` 走过逻辑），第 6 步走通一遍之后再勾
   - 2026-11-24 走通之后：`inject`、`recover`、`reveal`、总闸都真的跑过了。**`blind`（随机抽、终端不打印内容）没有跑过**，所以仍然不勾；第一次盲测时勾

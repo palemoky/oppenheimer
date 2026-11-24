@@ -23,6 +23,8 @@
 #                        （monitoring、kube-system、istio-system、chaos-mesh 永远拒绝，别的也一律拒绝）
 #   CHAOS_STEADY_SKIP    传给 chaos-steady.sh check 的跳过项（见它的头部）
 #   CHAOS_RECOVER_WAIT   恢复后等回到稳态最多多少秒，默认 900
+#   CHAOS_RECOVER_SETTLE 恢复动作做完之后先等多少秒再开始查稳态，默认 180（稳态看的是 3 到 5 分钟窗口的比例，
+#                        刚撤掉注入、刚滚动重启时它还没有反应，马上查会 1 秒就过）
 #   CHAOS_RECON_WAIT     等 recon-check 核对到结束时刻最多多少秒，默认 1800
 #
 # 一次只有一个进行中的运行。注入的步骤：检查稳态 -> 选 -> 密封 -> 加注解 -> 记开始时刻 -> 按方式注入。
@@ -46,6 +48,7 @@ RUN_LABEL=oppenheimer.chaos/run
 SCEN_DIR="$ROOT/chaos/scenarios"
 RUNS_DIR="$ROOT/chaos/runs"
 RECOVER_WAIT="${CHAOS_RECOVER_WAIT:-900}"
+RECOVER_SETTLE="${CHAOS_RECOVER_SETTLE:-180}"
 RECON_WAIT="${CHAOS_RECON_WAIT:-1800}"
 # 能注入的命名空间只有这两个。别的（尤其下面四个）永远拒绝。
 ALLOWED_NS="oppenheimer oppenheimer-e2e"
@@ -764,7 +767,7 @@ cmd_recover() {
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for the active run (${run:-the only active one}):"
     echo "  - undo the injection (delete its objects / switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
-    echo "  - record the end time; wait up to ${RECOVER_WAIT}s for chaos-steady.sh check to pass"
+    echo "  - record the end time; wait ${RECOVER_SETTLE}s, then up to ${RECOVER_WAIT}s for chaos-steady.sh check to pass"
     echo "  - recon-check --from <start> --to <end> (retry while it says 'not covered yet', up to ${RECON_WAIT}s) -> chaos/runs/<run>/recon.txt"
     return 0
   fi
@@ -789,7 +792,8 @@ cmd_recover() {
   # 等回到稳态
   local t0 waited=0
   t0="$(date +%s)"
-  echo "==> waiting for the steady state (up to ${RECOVER_WAIT}s)"
+  echo "==> waiting for the steady state (${RECOVER_SETTLE}s to settle, then up to ${RECOVER_WAIT}s)"
+  sleep "$RECOVER_SETTLE"
   while true; do
     if "$HERE/chaos-steady.sh" check >>"$PRIVLOG" 2>&1; then
       state_set steady_again_at "$(now)"

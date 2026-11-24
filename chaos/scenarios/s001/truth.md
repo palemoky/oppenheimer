@@ -7,7 +7,7 @@ gateway 查库存的接口给下游调用套了一个 10 毫秒的时限：另�
 那个 goroutine 之后往 channel 里发结果时没有人收，永远阻塞。每一次超过 10 毫秒的库存查询泄漏一个 goroutine，
 同时这次请求返回 504。
 
-代码：`services/gateway/internal/httpapi/stock_variant.go` 的 `stockWithin`，开关 `f01`。
+代码：`services/gateway/internal/httpapi/stock_deadline.go` 的 `stockWithin`，开关 `f01`。
 
 ## 定位必需的关键证据
 

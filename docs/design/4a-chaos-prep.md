@@ -288,7 +288,8 @@ chaos/
   - **对的**：自己决定抓了 gateway 的 goroutine 剖析，找到了停在 `stockWithin`（`stock_variant.go:39`）的 `chan send`；排除了 inventory 变慢、CPU、重启、网格；指出 504 只在这一个接口上。建议里写了“select 上 `ctx.Done()`、不要阻塞地发”。
   - **不对的**：把原因说成“10:53 起流量涨了 100 倍，请求在进程里排队”（那是稳态的压测；阻塞的发送被理解成了排队的信号量，不是泄漏）；说“Prometheus 里只有 istio 的指标”（不对，有应用自己的 HTTP 指标）；没有抓第二次带 `base` 的剖析来证明“只涨不降”（它自己列在了“下一步”里）。
   - Agent 的内存峰值 27 MiB（上限 256 Mi），第 3 步担心的“剖析放大后吃紧”对 goroutine 剖析不成立；heap 剖析还没有量。
-- **发现的问题（都没有改，等主人定）**：
+- **之后改了的（2026-11-24 11:45 UTC，主人说“继续”之后按建议改的；不动集群，带新 tag 的镜像还没有部署）**：问题 1：tag 的后缀换成 `-p4`（不去掉：同一个提交号的两种构建不能共用一个 tag）。问题 2：`stock_variant.go` 改名 `stock_deadline.go`，`pkg/fault` 的包注释和 ADR-0041 里“统一用 `_variant`”的规则改成“按代码在做什么起名”。问题 5：`chaos-run.sh recover` 在恢复动作之后先等 `CHAOS_RECOVER_SETTLE`（默认 180 秒）再查稳态。`s002` 的 `truth.md` 补了实测的一句。验证：`make lint`（gateway、pkg）、`make test`（gateway）、`make lint-faults`、`make test-faults`、`make check-faults`、`chaos-run.sh lint` 都过；**新加的等待没有真的跑过**（只看了 `--dry-run` 的输出）。
+- **发现的问题（当时都没有改）**：
   1. **镜像 tag 的 `-faults` 后缀是泄漏**：它出现在 Pod 的事件和 describe 里，Agent 读到了，并且在报告里写了“要查 `-faults` 这个构建是不是改了 `stock_variant` 的行为”。人看 `kubectl get pods -o wide` 也看得到。建议：阶段 4 期间带标签的镜像不加后缀（改成从 tag 上看不出来的写法，比如只在镜像的 label 里记），或者平时的镜像也一直用带标签的构建。
   2. **文件名 `stock_variant.go` 出现在调用栈里**，`_variant` 这个后缀对每个故障点都一样，做过一次的人和读过一次的模型下次一眼认得出。建议故障文件不用统一的后缀。
   3. **`recon-check` 的 Job、`recon-hourly` 在事件里很显眼**，Agent 花了几步去看它们；不是泄漏，是噪声。
