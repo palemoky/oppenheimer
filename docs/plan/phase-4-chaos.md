@@ -39,9 +39,12 @@
   - 按症状选类型：CPU 高抓 CPU profile（默认 10 秒）；goroutine 数涨抓 goroutine（瞬时的，不用等）；内存涨抓 heap；延迟高而 CPU 不高抓 mutex 和 block
   - 喂给模型的是摘要，不是原始文件：top N 的函数和占比，goroutine 按调用栈聚合后的前几组和各自的数量
   - CPU profile 对被诊断的进程有开销，不算纯只读：每个 Pod 的抓取频率和时长设上限，pprof 只开在内部端口上，每次抓取都留痕
-- [ ] 实验清单目录 `chaos/`，每个场景一个可重复执行的清单
+- [x] 实验清单目录 `chaos/`，每个场景一个可重复执行的清单
+  - 2026-11-24：格式定了（`chaos/README.md`，`scripts/cluster/chaos-run.sh lint` 检查），三个场景 `s001` 到 `s003`。**主人在实验之前不读 `chaos/scenarios/`**
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
+  - 2026-11-24：`scripts/cluster/chaos-run.sh`（`make chaos-blind|chaos-inject|chaos-recover|chaos-reveal`）写了，主会话评审过。**连集群的路径一条都没有真的跑过**（只用假的 `kubectl` 走过逻辑），第 6 步走通一遍之后再勾
 - [ ] 实验期间的稳态压测脚本与数据一致性检查脚本
+  - 2026-11-24：`scripts/cluster/chaos-steady.sh start|stop|check` 写了。`check` 对着真的集群跑过（只读：告警、探针、五个 SLO 都读得到；没有发压所以“负载”一项不过，符合预期）。`start`、`stop`（k6）没有跑过。数据检查用已有的 `make recon-check`，由 `chaos-run.sh recover` 调
 - [ ] `mysql-main` 的 `MALLOC_ARENA_MAX=4` 管不管用（2026-11-24 加的，主人定了第一次发压时一起看）：连接涨到 200 以上时常驻内存涨多少、之后回不回落（没有它时 +300 MiB、不回落），p99 和吞吐有没有变差。背景和对照的数在 `PROGRESS.md` 的“mysql-main 的内存”
 - [ ] 3c 留下的告警验证（[设计 3c](../design/3c-slo-alerting.md) 第 8 节“第 16 项”），做对应的实验时顺带完成：
   - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
