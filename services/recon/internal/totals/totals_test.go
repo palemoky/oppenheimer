@@ -13,6 +13,27 @@ import (
 
 // ---------- compare：两条规则 ----------
 
+// 只有“成功”一组有数的写法，大部分用例用它。
+func okPay(s Sum, open int64) payBucket {
+	return payBucket{Sums: [NumGroups]Sum{GroupSucceeded: s}, Open: open}
+}
+
+func okOrd(s Sum) [NumGroups]Sum { return [NumGroups]Sum{GroupSucceeded: s} }
+
+func refundPay(s Sum, open int64) payBucket {
+	return payBucket{Sums: [NumGroups]Sum{GroupRefunded: s}, Open: open}
+}
+
+func refundOrd(s Sum) [NumGroups]Sum { return [NumGroups]Sum{GroupRefunded: s} }
+
+func okGroup(g GroupResult) [NumGroups]GroupResult {
+	return [NumGroups]GroupResult{GroupSucceeded: g}
+}
+
+func refundGroup(g GroupResult) [NumGroups]GroupResult {
+	return [NumGroups]GroupResult{GroupRefunded: g}
+}
+
 func TestCompare(t *testing.T) {
 	t.Parallel()
 	// 段号随便取，只要互不相同、升序有意义。
@@ -22,14 +43,14 @@ func TestCompare(t *testing.T) {
 	tests := []struct {
 		name string
 		pay  map[int64]payBucket
-		ord  map[int64]Sum
+		ord  map[int64][NumGroups]Sum
 		want Result
 	}{
 		{
 			name: "封口的段两边相等",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{3, 300}}, b1: {Accepted: Sum{2, 500}}},
-			ord:  map[int64]Sum{b0: {3, 300}, b1: {2, 500}},
-			want: Result{ClosedPayment: Sum{5, 800}, ClosedOrder: Sum{5, 800}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{3, 300}, 0), b1: okPay(Sum{2, 500}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{3, 300}), b1: okOrd(Sum{2, 500})},
+			want: Result{Groups: okGroup(GroupResult{ClosedPayment: Sum{5, 800}, ClosedOrder: Sum{5, 800}})},
 		},
 		{
 			name: "两边都没有数据",
@@ -38,65 +59,61 @@ func TestCompare(t *testing.T) {
 		{
 			// 支付服务认为订单接受了，订单库里没有这一笔：钱收了，订单没有记。
 			name: "封口的段支付一侧多一笔",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{3, 300}}},
-			ord:  map[int64]Sum{b0: {2, 200}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{3, 300}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{2, 200})},
 			want: Result{
-				ClosedPayment: Sum{3, 300}, ClosedOrder: Sum{2, 200},
-				MismatchCount: 1, MismatchAmount: 100,
+				Groups:     okGroup(GroupResult{ClosedPayment: Sum{3, 300}, ClosedOrder: Sum{2, 200}, Mismatch: Sum{1, 100}}),
 				Violations: []Violation{{Start: start(b0), Closed: true, Payment: Sum{3, 300}, Order: Sum{2, 200}}},
 			},
 		},
 		{
-			// 订单记了“已接受”，支付一侧这笔却不是“成功且已答复”（例如那边已经退款了）。封口之后才算差异。
+			// 订单记了“已接受”，支付一侧这笔却不是“成功且已答复”。封口之后才算差异。
 			name: "封口的段订单一侧多一笔",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{2, 200}}},
-			ord:  map[int64]Sum{b0: {3, 300}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{2, 200}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{3, 300})},
 			want: Result{
-				ClosedPayment: Sum{2, 200}, ClosedOrder: Sum{3, 300},
-				MismatchCount: 1, MismatchAmount: 100,
+				Groups:     okGroup(GroupResult{ClosedPayment: Sum{2, 200}, ClosedOrder: Sum{3, 300}, Mismatch: Sum{1, 100}}),
 				Violations: []Violation{{Start: start(b0), Closed: true, Payment: Sum{2, 200}, Order: Sum{3, 300}}},
 			},
 		},
 		{
 			// 笔数相等、金额不等：同一笔支付两边记的金额不一样。两个数分开报。
 			name: "封口的段只有金额不等",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{2, 200}}},
-			ord:  map[int64]Sum{b0: {2, 250}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{2, 200}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{2, 250})},
 			want: Result{
-				ClosedPayment: Sum{2, 200}, ClosedOrder: Sum{2, 250},
-				MismatchAmount: 50,
-				Violations:     []Violation{{Start: start(b0), Closed: true, Payment: Sum{2, 200}, Order: Sum{2, 250}}},
+				Groups:     okGroup(GroupResult{ClosedPayment: Sum{2, 200}, ClosedOrder: Sum{2, 250}, Mismatch: Sum{0, 50}}),
+				Violations: []Violation{{Start: start(b0), Closed: true, Payment: Sum{2, 200}, Order: Sum{2, 250}}},
 			},
 		},
 		{
 			// 订单已经接受、答复还没到支付服务：没封口，订单一侧多，是正常的在途，不是差异，也不进封口的合计。
 			name: "没封口的段订单一侧多是在途",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{1, 100}}, b1: {Accepted: Sum{1, 100}, Open: 2}},
-			ord:  map[int64]Sum{b0: {1, 100}, b1: {3, 300}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{1, 100}, 0), b1: okPay(Sum{1, 100}, 2)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{1, 100}), b1: okOrd(Sum{3, 300})},
 			want: Result{
-				ClosedPayment: Sum{1, 100}, ClosedOrder: Sum{1, 100},
-				InFlight: 2, OpenBuckets: 1, OldestOpen: start(b1),
+				Groups:      okGroup(GroupResult{ClosedPayment: Sum{1, 100}, ClosedOrder: Sum{1, 100}, InFlight: 2}),
+				OpenBuckets: 1, OldestOpen: start(b1),
 			},
 		},
 		{
 			// 没封口也不允许支付一侧多：“成功且已答复”的每一笔，订单一侧一定先记下了。
 			name: "没封口的段支付一侧多",
-			pay:  map[int64]payBucket{b1: {Accepted: Sum{3, 300}, Open: 1}},
-			ord:  map[int64]Sum{b1: {2, 200}},
+			pay:  map[int64]payBucket{b1: okPay(Sum{3, 300}, 1)},
+			ord:  map[int64][NumGroups]Sum{b1: okOrd(Sum{2, 200})},
 			want: Result{
+				Groups:      okGroup(GroupResult{Mismatch: Sum{1, 100}}),
 				OpenBuckets: 1, OldestOpen: start(b1),
-				MismatchCount: 1, MismatchAmount: 100,
 				Violations: []Violation{{Start: start(b1), Payment: Sum{3, 300}, Order: Sum{2, 200}}},
 			},
 		},
 		{
 			// 支付库里这一段一笔都没有，订单库里却有“已接受”的：订单接受了一笔支付服务没有的支付。
 			name: "只有订单一侧有的段按封口处理",
-			pay:  map[int64]payBucket{b0: {Accepted: Sum{1, 100}}},
-			ord:  map[int64]Sum{b0: {1, 100}, b2: {1, 999}},
+			pay:  map[int64]payBucket{b0: okPay(Sum{1, 100}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{1, 100}), b2: okOrd(Sum{1, 999})},
 			want: Result{
-				ClosedPayment: Sum{1, 100}, ClosedOrder: Sum{2, 1099},
-				MismatchCount: 1, MismatchAmount: 999,
+				Groups:     okGroup(GroupResult{ClosedPayment: Sum{1, 100}, ClosedOrder: Sum{2, 1099}, Mismatch: Sum{1, 999}}),
 				Violations: []Violation{{Start: start(b2), Closed: true, Payment: Sum{}, Order: Sum{1, 999}}},
 			},
 		},
@@ -105,6 +122,63 @@ func TestCompare(t *testing.T) {
 			name: "只有待出结果的支付单",
 			pay:  map[int64]payBucket{b2: {Open: 4}, b1: {Open: 1}},
 			want: Result{OpenBuckets: 2, OldestOpen: start(b1)},
+		},
+
+		// ----- 退款一组：同样的两条规则 -----
+		{
+			name: "退款：封口的段两边相等",
+			pay:  map[int64]payBucket{b0: refundPay(Sum{2, 700}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: refundOrd(Sum{2, 700})},
+			want: Result{Groups: refundGroup(GroupResult{ClosedPayment: Sum{2, 700}, ClosedOrder: Sum{2, 700}})},
+		},
+		{
+			// 订单已经写下“要求退款”、答复还没到，支付单还是“成功、没答复”：在途。
+			name: "退款：没封口的段订单一侧多是在途",
+			pay:  map[int64]payBucket{b0: {Open: 1}},
+			ord:  map[int64][NumGroups]Sum{b0: refundOrd(Sum{1, 700})},
+			want: Result{
+				Groups:      refundGroup(GroupResult{InFlight: 1}),
+				OpenBuckets: 1, OldestOpen: start(b0),
+			},
+		},
+		{
+			// 钱退了，订单一侧却没有“要求退款”的记录：没有人要求过的退款，不用等封口。
+			name: "退款：没封口的段支付一侧多",
+			pay:  map[int64]payBucket{b0: refundPay(Sum{1, 700}, 3)},
+			want: Result{
+				Groups:      refundGroup(GroupResult{Mismatch: Sum{1, 700}}),
+				OpenBuckets: 1, OldestOpen: start(b0),
+				Violations: []Violation{{Start: start(b0), Group: GroupRefunded, Payment: Sum{1, 700}}},
+			},
+		},
+		{
+			// 订单要求退款，这一段封口了支付一侧却没有退：该退的钱没退。
+			name: "退款：封口的段订单一侧多一笔",
+			pay:  map[int64]payBucket{b0: okPay(Sum{1, 100}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: {GroupSucceeded: Sum{1, 100}, GroupRefunded: Sum{1, 700}}},
+			want: Result{
+				Groups: [NumGroups]GroupResult{
+					GroupSucceeded: {ClosedPayment: Sum{1, 100}, ClosedOrder: Sum{1, 100}},
+					GroupRefunded:  {ClosedOrder: Sum{1, 700}, Mismatch: Sum{1, 700}},
+				},
+				Violations: []Violation{{Start: start(b0), Group: GroupRefunded, Closed: true, Order: Sum{1, 700}}},
+			},
+		},
+		{
+			// 订单记的是接受，支付一侧却退款了：两组各差一笔，同一段报两条。
+			name: "一边接受一边退款，两组都报",
+			pay:  map[int64]payBucket{b0: refundPay(Sum{1, 400}, 0)},
+			ord:  map[int64][NumGroups]Sum{b0: okOrd(Sum{1, 400})},
+			want: Result{
+				Groups: [NumGroups]GroupResult{
+					GroupSucceeded: {ClosedOrder: Sum{1, 400}, Mismatch: Sum{1, 400}},
+					GroupRefunded:  {ClosedPayment: Sum{1, 400}, Mismatch: Sum{1, 400}},
+				},
+				Violations: []Violation{
+					{Start: start(b0), Group: GroupSucceeded, Closed: true, Order: Sum{1, 400}},
+					{Start: start(b0), Group: GroupRefunded, Closed: true, Payment: Sum{1, 400}},
+				},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -122,15 +196,13 @@ func TestCompare(t *testing.T) {
 }
 
 func equalResult(a, b Result) bool {
-	if a.ClosedPayment != b.ClosedPayment || a.ClosedOrder != b.ClosedOrder || a.InFlight != b.InFlight ||
-		a.OpenBuckets != b.OpenBuckets || !a.OldestOpen.Equal(b.OldestOpen) ||
-		a.MismatchCount != b.MismatchCount || a.MismatchAmount != b.MismatchAmount ||
+	if a.Groups != b.Groups || a.OpenBuckets != b.OpenBuckets || !a.OldestOpen.Equal(b.OldestOpen) ||
 		len(a.Violations) != len(b.Violations) {
 		return false
 	}
 	for i := range a.Violations {
 		x, y := a.Violations[i], b.Violations[i]
-		if !x.Start.Equal(y.Start) || x.Closed != y.Closed || x.Payment != y.Payment || x.Order != y.Order {
+		if !x.Start.Equal(y.Start) || x.Group != y.Group || x.Closed != y.Closed || x.Payment != y.Payment || x.Order != y.Order {
 			return false
 		}
 	}
@@ -256,7 +328,7 @@ func TestCollectConsistent(t *testing.T) {
 	for i := range 20 {
 		e.add(0, 100+int64(i), payAcceptedRow, orderAccepted)
 	}
-	e.add(0, 7000, payRefundedRow, orderRefund)      // 订单要求退款：两边都不算
+	e.add(0, 7000, payRefundedRow, orderRefund)      // 订单要求退款、已退：进退款一组
 	e.add(0, 8000, payFailedAcked, orderFailedKnown) // 支付失败：两边都不算
 	// 第 1 分钟：在途的。订单接受了、答复没到（在途 2 笔）；成功了、订单还没处理；还没出结果。
 	e.add(1, 500, payAcceptedRow, orderAccepted)
@@ -264,6 +336,7 @@ func TestCollectConsistent(t *testing.T) {
 	e.add(1, 700, payUnacked, orderAccepted)
 	e.add(1, 800, payUnacked, orderNone)
 	e.add(1, 900, payPendingRow, orderNone)
+	e.add(1, 950, payUnacked, orderRefund) // 订单要求退款、答复没到：退款一组的在途
 	// 第 5 分钟：窗口之外，再怎么不一致也不该被看到。
 	e.add(5, 123456, payAcceptedRow, orderNone)
 
@@ -273,12 +346,16 @@ func TestCollectConsistent(t *testing.T) {
 	if !r.OK() {
 		t.Fatalf("violations on consistent data: %+v", r.Violations)
 	}
-	if r.ClosedPayment != wantClosed || r.ClosedOrder != wantClosed {
-		t.Errorf("closed totals: payment %+v, order %+v, want both %+v", r.ClosedPayment, r.ClosedOrder, wantClosed)
+	ok, refunded := r.Groups[GroupSucceeded], r.Groups[GroupRefunded]
+	if ok.ClosedPayment != wantClosed || ok.ClosedOrder != wantClosed {
+		t.Errorf("closed totals: payment %+v, order %+v, want both %+v", ok.ClosedPayment, ok.ClosedOrder, wantClosed)
 	}
-	if r.InFlight != 2 || r.OpenBuckets != 1 || !r.OldestOpen.Equal(e.base.Add(time.Minute)) {
+	if want := (GroupResult{ClosedPayment: Sum{1, 7000}, ClosedOrder: Sum{1, 7000}, InFlight: 1}); refunded != want {
+		t.Errorf("refunded group %+v, want %+v", refunded, want)
+	}
+	if ok.InFlight != 2 || r.OpenBuckets != 1 || !r.OldestOpen.Equal(e.base.Add(time.Minute)) {
 		t.Errorf("in flight %d, open buckets %d, oldest open %s; want 2, 1, %s",
-			r.InFlight, r.OpenBuckets, r.OldestOpen, e.base.Add(time.Minute))
+			ok.InFlight, r.OpenBuckets, r.OldestOpen, e.base.Add(time.Minute))
 	}
 	if !r.From.Equal(e.base) || !r.To.Equal(e.base.Add(3*time.Minute)) {
 		t.Errorf("window [%s, %s)", r.From, r.To)
@@ -293,11 +370,11 @@ func TestCollectFindsMissingOrderRecord(t *testing.T) {
 	e.add(0, 250, payAcceptedRow, orderNone)
 
 	r := e.collect(0, 2)
-	if r.OK() || r.MismatchCount != 1 || r.MismatchAmount != 250 {
-		t.Fatalf("mismatch count %d amount %d, violations %+v; want 1, 250", r.MismatchCount, r.MismatchAmount, r.Violations)
+	if r.OK() || r.Mismatch() != (Sum{1, 250}) {
+		t.Fatalf("mismatch %+v, violations %+v; want 1, 250", r.Mismatch(), r.Violations)
 	}
 	v := r.Violations[0]
-	if !v.Closed || !v.Start.Equal(e.base) || v.Payment != (Sum{2, 350}) || v.Order != (Sum{1, 100}) {
+	if v.Group != GroupSucceeded || !v.Closed || !v.Start.Equal(e.base) || v.Payment != (Sum{2, 350}) || v.Order != (Sum{1, 100}) {
 		t.Errorf("violation %+v", v)
 	}
 }
@@ -312,8 +389,29 @@ func TestCollectFindsAcceptedButRefunded(t *testing.T) {
 	e.add(1, 900, -1, orderAccepted)
 
 	r := e.collect(0, 2)
-	if len(r.Violations) != 2 || r.MismatchCount != 2 || r.MismatchAmount != 1300 {
-		t.Fatalf("mismatch count %d amount %d, violations %+v; want 2 violations, 2, 1300", r.MismatchCount, r.MismatchAmount, r.Violations)
+	// 第 0 分钟两组各差一笔 400（订单一侧多一笔接受，支付一侧多一笔退款），第 1 分钟“成功”一组差一笔 900。
+	if len(r.Violations) != 3 || r.Groups[GroupSucceeded].Mismatch != (Sum{2, 1300}) || r.Groups[GroupRefunded].Mismatch != (Sum{1, 400}) {
+		t.Fatalf("groups %+v, violations %+v; want 3 violations, succeeded {2 1300}, refunded {1 400}", r.Groups, r.Violations)
+	}
+}
+
+func TestCollectFindsRefundProblems(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.add(0, 100, payRefundedRow, orderRefund)
+	// 钱退了，订单库里没有“要求退款”的记录。同一段里还有没出结果的支付单（没封口）：不用等。
+	e.add(0, 300, payRefundedRow, orderNone)
+	e.add(0, 50, payPendingRow, orderNone)
+	// 订单要求退款，支付一侧却标成了“成功且已答复”：该退的钱没退。这一段封口了。
+	e.add(1, 700, payAcceptedRow, orderRefund)
+
+	r := e.collect(0, 2)
+	// 第 0 分钟退款一组支付一侧多 300；第 1 分钟“成功”一组支付一侧多 700，退款一组订单一侧多 700。
+	if len(r.Violations) != 3 || r.Groups[GroupRefunded].Mismatch != (Sum{2, 1000}) || r.Groups[GroupSucceeded].Mismatch != (Sum{1, 700}) {
+		t.Fatalf("groups %+v, violations %+v; want 3 violations, refunded {2 1000}, succeeded {1 700}", r.Groups, r.Violations)
+	}
+	if v := r.Violations[0]; v.Group != GroupRefunded || v.Closed || !v.Start.Equal(e.base) {
+		t.Errorf("first violation %+v, want the refunded group of the open bucket at minute 0", v)
 	}
 }
 
@@ -325,8 +423,8 @@ func TestCollectFindsAmountDifference(t *testing.T) {
 	testdb.MustExec(t, e.src.Payment, "UPDATE payments SET amount = 130 WHERE payment_id = ?", id)
 
 	r := e.collect(0, 1)
-	if r.OK() || r.MismatchCount != 0 || r.MismatchAmount != 30 {
-		t.Fatalf("mismatch count %d amount %d; want 0, 30", r.MismatchCount, r.MismatchAmount)
+	if r.OK() || r.Mismatch() != (Sum{0, 30}) {
+		t.Fatalf("mismatch %+v; want 0, 30", r.Mismatch())
 	}
 }
 
@@ -338,8 +436,8 @@ func TestCollectPaymentAheadInOpenBucket(t *testing.T) {
 	e.add(0, 300, payAcceptedRow, orderNone)
 
 	r := e.collect(0, 1)
-	if r.OK() || r.MismatchCount != 1 || r.MismatchAmount != 300 || r.Violations[0].Closed {
-		t.Fatalf("mismatch count %d amount %d, violations %+v; want 1, 300, not closed", r.MismatchCount, r.MismatchAmount, r.Violations)
+	if r.OK() || r.Mismatch() != (Sum{1, 300}) || r.Violations[0].Closed {
+		t.Fatalf("mismatch %+v, violations %+v; want 1, 300, not closed", r.Mismatch(), r.Violations)
 	}
 }
 
@@ -361,7 +459,7 @@ func TestCollectEmpty(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	r := e.collect(0, 30)
-	if !r.OK() || r.ClosedPayment != (Sum{}) || r.OpenBuckets != 0 {
+	if !r.OK() || r.Groups != ([NumGroups]GroupResult{}) || r.OpenBuckets != 0 {
 		t.Errorf("result on empty databases: %+v", r)
 	}
 }

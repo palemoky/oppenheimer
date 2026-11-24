@@ -97,8 +97,11 @@ func TestWatcherReportsMetrics(t *testing.T) { //nolint:paralleltest // 用到�
 		attrs map[string]string
 		want  int64
 	}{
-		{"recon.totals.mismatch", map[string]string{"kind": "count"}, 1},
-		{"recon.totals.mismatch", map[string]string{"kind": "amount"}, 250},
+		{"recon.totals.mismatch", map[string]string{"kind": "count", "group": "succeeded"}, 1},
+		{"recon.totals.mismatch", map[string]string{"kind": "amount", "group": "succeeded"}, 250},
+		// 没有差异的那一组也报，值是 0：有序列才分得清“没有差异”和“没在核对”。
+		{"recon.totals.mismatch", map[string]string{"kind": "count", "group": "refunded"}, 0},
+		{"recon.totals.mismatch", map[string]string{"kind": "amount", "group": "refunded"}, 0},
 		{"recon.totals.count", map[string]string{"side": "payment"}, 2},
 		{"recon.totals.count", map[string]string{"side": "order"}, 1},
 		{"recon.totals.amount", map[string]string{"side": "payment"}, 350},
