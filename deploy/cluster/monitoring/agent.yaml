@@ -64,6 +64,48 @@ subjects:
     name: agent
     namespace: monitoring
 ---
+# pprof_capture 工具（设计 4a 的 3.4）：经端口转发连到服务 Pod 回环上的调试端口（pkg/app 的 DEBUG_ADDR）取剖析。
+# 只在 oppenheimer 命名空间（Role，不是 ClusterRole）：mysql、redis、kafka 等命名空间里的端口不能让它连。
+#
+# 权限比用到的大，这一点要清楚：pods/portforward 不能限定端口，给了之后这个身份能连 oppenheimer 里
+# 任何 Pod 的任何端口（包括没有认证的降级开关）。能连哪个端口、发什么请求只靠工具的代码拦（固定端口、
+# 固定路径的 GET）。resourceNames 也帮不上：Pod 名带随机后缀。
+# create 是 SPDY 的端口转发（POST）要的动词；工具不用 WebSocket 那一路，所以不给 pods/portforward 的 get。
+# pods 的 get 用来在转发前确认 Pod 存在、在跑（ClusterRole 里已经有，这里写明是为了这个 Role 自己说得清楚）。
+# services/agent/deploy_test.go 核对这些规则。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oppenheimer-agent-pprof
+  namespace: oppenheimer
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+rules:
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oppenheimer-agent-pprof
+  namespace: oppenheimer
+  labels:
+    app.kubernetes.io/name: agent
+    app.kubernetes.io/part-of: oppenheimer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oppenheimer-agent-pprof
+subjects:
+  - kind: ServiceAccount
+    name: agent
+    namespace: monitoring
+---
 # 诊断记录（每次诊断一个文件）放在这里，Pod 重建后还在。local-path：卷在 Pod 所在的节点上，
 # 所以 Deployment 用 Recreate，Pod 也不能随意换节点（换了就看不到旧记录；记录丢了不影响 Agent 工作）。
 apiVersion: v1
@@ -111,7 +153,8 @@ spec:
       # 停止时正在跑的诊断会被取消，并把已有的过程写成一条记录落盘；这要比 alertsink 的 30 秒多留一些时间。
       terminationGracePeriodSeconds: 60
       serviceAccountName: agent
-      # 要读 Kubernetes 的 API，令牌要挂（alertsink 不挂）。权限只有上面那个只读的 ClusterRole。
+      # 要读 Kubernetes 的 API，令牌要挂（alertsink 不挂）。权限是上面那个只读的 ClusterRole，
+      # 加上 oppenheimer 命名空间里取 pprof 用的端口转发（Role oppenheimer-agent-pprof）。
       automountServiceAccountToken: true
       affinity:
         nodeAffinity:
@@ -145,20 +188,29 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # 模型 API 的密钥：Secret agent-llm 由 monitoring.sh agent 从 .env 建，键名就是环境变量名
+          # （ANTHROPIC_API_KEY、DEEPSEEK_API_KEY 等，.env 里有哪个放哪个）。optional：Secret 不存在也能起来，
+          # 只是每次诊断都以 api_error 结束。密钥不入库、不写在这里。
+          envFrom:
+            - secretRef:
+                name: agent-llm
+                optional: true
           env:
             # 查询工具的后端，都是只读的。
             - name: PROMETHEUS_URL
               value: http://kps-prometheus.monitoring:9090
             - name: LOKI_URL
               value: http://loki.monitoring:3100
-            # Claude API 的密钥：Secret agent-anthropic 由 monitoring.sh agent 从 .env 建。optional：Secret 不存在也能起来，
-            # 只是每次诊断都以 api_error 结束。密钥不入库、不写在这里。
-            - name: ANTHROPIC_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: agent-anthropic
-                  key: api-key
-                  optional: true
+            # 模型的后端（anthropic、deepseek、openai、openai-compatible，见设计 3d 第 9 节、ADR-0040）。这四个值由
+            # monitoring.sh agent 从 .env 的同名变量填进来；空着的用程序里的默认值（后端是 anthropic，模型是那个后端的默认模型）。
+            - name: AGENT_PROVIDER
+              value: "__AGENT_PROVIDER__"
+            - name: AGENT_MODEL
+              value: "__AGENT_MODEL__"
+            - name: AGENT_BASE_URL
+              value: "__AGENT_BASE_URL__"
+            - name: AGENT_PRICE
+              value: "__AGENT_PRICE__"
             # OTLP 接收端：monitoring 命名空间的 Collector（Service otel-gateway，gRPC 4317），和六个服务一样。
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-gateway.monitoring:4317

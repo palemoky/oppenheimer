@@ -99,13 +99,13 @@ func (m *memRecorder) Event(kind string, _ any) {
 	m.kinds = append(m.kinds, kind)
 }
 
-func (m *memRecorder) Raw(step string, raw []byte) {
+func (m *memRecorder) Raw(file string, raw []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.raw == nil {
 		m.raw = make(map[string][]byte)
 	}
-	m.raw[step] = raw
+	m.raw[file] = raw
 }
 
 func (m *memRecorder) count(kind string) int {
@@ -166,8 +166,8 @@ func TestRunReportsWithParallelCalls(t *testing.T) {
 	if res.Calls["a"][CallOK] != 1 || res.Calls["b"][CallOK] != 1 {
 		t.Errorf("calls = %v", res.Calls)
 	}
-	if string(rec.raw["s1"]) != `{"raw":true}` {
-		t.Errorf("raw s1 = %q", rec.raw["s1"])
+	if string(rec.raw["s1.json"]) != `{"raw":true}` {
+		t.Errorf("raw s1 = %q", rec.raw["s1.json"])
 	}
 	wantCost := 2 * (1000*4 + 100*20) * 1e-6
 	if diff := res.CostUSD - wantCost; diff > 1e-12 || diff < -1e-12 {
@@ -431,5 +431,99 @@ func TestRunWrapUpKeepsLastParseableReport(t *testing.T) {
 	res := r.Run(t.Context(), "q", &memRecorder{})
 	if res.Outcome != OutcomeReportedTruncated || !res.Unverified {
 		t.Fatalf("outcome = %s, unverified = %v", res.Outcome, res.Unverified)
+	}
+}
+
+// 参数不是合法 JSON 的调用（OpenAI 兼容的后端、没开严格模式时会有）不执行，错误还给模型；
+// 报告这样坏掉一次不占“打回”的名额：之后内容上不合格的报告仍然能被打回一次。
+func TestRunMalformedArgumentsGoBackToModel(t *testing.T) {
+	bad := func(id, name string) llm.ToolCall {
+		return llm.ToolCall{ID: id, Name: name, Input: jsontext.Value(`"{\"a\": \"x\"y\"}"`), Malformed: "invalid character 'y'"}
+	}
+	q := &fakeTool{name: "q"}
+	model := &scripted{t: t, replies: []func(llm.Turn) (*llm.Reply, error){
+		calls(bad("1", "q"), call("2", "q", `{}`)),
+		calls(bad("3", report.ToolName)),
+		calls(call("4", report.ToolName, reportInput("s9"))),
+		calls(call("5", report.ToolName, reportInput("s1"))),
+	}}
+	res := newRunner(t, model, q).Run(t.Context(), "why", &memRecorder{})
+
+	if res.Outcome != OutcomeReported || res.Unverified {
+		t.Fatalf("outcome = %s, unverified = %v, err = %v", res.Outcome, res.Unverified, res.Err)
+	}
+	if q.n.Load() != 1 {
+		t.Errorf("tool ran %d times, want 1 (the malformed call must not run)", q.n.Load())
+	}
+	first := model.turns[1].Results
+	if len(first) != 2 || !first[0].IsError || !strings.Contains(first[0].Content, "not valid JSON") ||
+		first[1].IsError || !strings.HasPrefix(first[1].Content, "[s1]") {
+		t.Errorf("results after turn 1 = %+v", first)
+	}
+	if r := model.turns[2].Results; len(r) != 1 || !r[0].IsError || !strings.Contains(r[0].Content, "not valid JSON") {
+		t.Errorf("malformed report result = %+v", r)
+	}
+	// 第三轮的报告引用了不存在的步骤：被打回（名额还在），第四轮才收下。
+	if r := model.turns[3].Results; len(r) != 1 || !r[0].IsError || strings.Contains(r[0].Content, "not valid JSON") {
+		t.Errorf("rejected report result = %+v", r)
+	}
+}
+
+// slowTool 声明了比默认更长的时限。
+type slowTool struct{ fakeTool }
+
+func (s *slowTool) Timeout() time.Duration { return time.Hour }
+
+// 工具拿到的 ctx 里有这次运行共享的 Scope 和自己的步骤号；同一次运行里各步看到的是同一个 Scope，
+// 不同的运行是不同的。RawExt 决定原始结果的文件名；声明了 Timeouter 的工具拿到的时限更长。
+func TestRunGivesToolsScopeStepAndTimeout(t *testing.T) {
+	type seen struct {
+		scope    *tool.Scope
+		step     string
+		deadline time.Duration
+	}
+	var mu sync.Mutex
+	var got []seen
+	record := func(ctx context.Context, _ jsontext.Value) (tool.Result, error) {
+		scope, step := tool.CallFrom(ctx)
+		dl, _ := ctx.Deadline()
+		mu.Lock()
+		got = append(got, seen{scope, step, time.Until(dl)})
+		mu.Unlock()
+		return tool.Result{Text: "ok", Raw: []byte("bin"), RawExt: ".pb.gz"}, nil
+	}
+	a := &slowTool{fakeTool{name: "a", fn: record}}
+	run := func() *memRecorder {
+		s := &scripted{replies: []func(llm.Turn) (*llm.Reply, error){
+			calls(call("t1", "a", `{}`), call("t2", "a", `{}`)),
+			calls(call("t3", report.ToolName, reportInput("s1", "s2"))),
+		}}
+		rec := &memRecorder{}
+		if res := newRunner(t, s, a).Run(t.Context(), "q", rec); res.Outcome != OutcomeReported {
+			t.Fatalf("outcome = %s", res.Outcome)
+		}
+		return rec
+	}
+	rec := run()
+	run()
+
+	if len(got) != 4 {
+		t.Fatalf("tool called %d times, want 4", len(got))
+	}
+	steps := map[string]bool{got[0].step: true, got[1].step: true}
+	if !steps["s1"] || !steps["s2"] {
+		t.Errorf("steps in the first run = %q, %q; want s1 and s2", got[0].step, got[1].step)
+	}
+	if got[0].scope == nil || got[0].scope != got[1].scope {
+		t.Error("calls in one run do not share a scope")
+	}
+	if got[2].scope == got[0].scope {
+		t.Error("two runs share a scope")
+	}
+	if got[0].deadline < time.Hour-time.Minute {
+		t.Errorf("deadline = %v, want the tool's own 1h timeout", got[0].deadline)
+	}
+	if string(rec.raw["s1.pb.gz"]) != "bin" {
+		t.Errorf("raw files = %v, want s1.pb.gz", rec.raw)
 	}
 }

@@ -4,6 +4,22 @@
 
 ## 当前状态
 
+- **现在（2026-11-24 12:30 UTC，这一条最新；新会话从这里开始）**：**4a 收尾了，PR #21 合并进 `main`（主人要求：“把 4a 处理完，提交并合并，然后我在新对话继续”）。** 合并提交用 `git log --merges -1 origin/main` 看；合并前最后一次推送只有文档，没有等它的 CI（上一次代码的推送 `afc5341` 是 33 项全过）。
+  - **“处理完”是主会话的理解**：4a 里还没有勾的四项（第一次盲测、mutex 和 block 采样、`MALLOC_ARENA_MAX` 的验证、3c 和 3e 留下的告警验证）都要发压或者要主人亲自排查，没有在这次做，挪到了 4b 里，写在 `docs/plan/phase-4-chaos.md` 的“4b 实验清单”开头。主人要的如果是把它们也做掉，在新会话里说。
+  - **下一步（新会话）**：从最新的 `main` 开分支 `phase-4b`。先读计划文件“4b 实验清单”开头的两段：四项 4a 留下的、三件开始之前要主人定的。然后先补场景（现在只有 `s001` 到 `s003`，主人不读 `chaos/scenarios/`），写 4b 的设计给主人确认。任何注入和发压先登记、先拿主人对具体做法的同意。
+  - **集群现在的状态**（12:00 UTC 前后）：五个服务 `afc5341-p4`（带故障代码，开关全关；阶段 4 结束后换回平时的）；cdc `07c0dcc`；Agent `9dda461`（11 个工具，看不到 `chaos-mesh`，Alertmanager 发给它的第二个地址开着，真的告警会触发诊断、花 DeepSeek 的钱）；Chaos Mesh 装着，没有实验对象，没有命名空间能被注入；压测停着；SKU 12001 到 12020 是走通时建的。`make recon-cron` 要显式给 `RECON_IMAGE_TAG`（默认取 order 的 tag，现在是 `afc5341-p4`，没有这个 tag 的 recon 镜像）。本机 compose 是起着的。
+  - **没有查的**：CI 的 e2e 连续两次约 5 分半（平时约 4 分钟）。
+- **现在（2026-11-24 12:05 UTC，这一条最新）**：**主人两件都同意了，都做了**：整个仓库 `make lint test`、`make lint-faults test-faults check-faults` 通过后提交、推送（`afc5341`）；五个服务滚动成 `afc5341-p4`（11:57 UTC），十个副本的 `/fault` 都读过（只有 gateway 有 `f01`，关着）。滚动时 `KubePodNotReady`、`KubeContainerWaiting` 对一个新的 gateway Pod 进过 pending（Pod 随后就绪，没有等着看它消掉）。下一条里“没有提交”“没有动集群”“等主人的两件”到这里作废。**这之后只改了计划文件和本文件，没有提交。** `afc5341` 的 CI 33 项全过（子 Agent 报的，主会话用 `gh pr checks 21` 核对了没有不通过的项；耗时是它报的：e2e 5 分 27 秒，上一次 5 分 46 秒，平时约 4 分钟，连续两次偏长，没有查原因；`test (./services/agent)` 5 分 21 秒，上一次 3 分 38 秒）。集群：五个服务 `afc5341-p4`，cdc `07c0dcc`，Agent `9dda461`；本机 compose 是起着的。
+- **现在（2026-11-24 12:00 UTC，这一条最新）**：**主人说“提交并推送，然后继续”：文档和复盘草稿提交、推送了（`b889931`）；走通时发现的问题按建议改了三处（tag 后缀 `-p4`、故障文件改名、恢复后先等 180 秒）；第 7 步的笔记写了（[notes/4a-chaos-prep.md](notes/4a-chaos-prep.md)）。这些改动没有提交，没有动集群。** 等主人的两件：提交；把集群上五个服务换成新 tag 的镜像（登记在计划文件“4a 准备”）。见下面“4a 收尾”。下一条里“等主人定”的六条：1、2、3 改了，4、5、6 留给 4b。`b889931` 的 CI 没有看（只有文档）。
+- **现在（2026-11-24 11:30 UTC，这一条最新）**：**4a 的第 5、6 步做完了（主人同意后）：Agent 看不到注入工具，部署并核对了；长期运行的那一套第一次走通了两个场景（`s002` 杀 Pod、`s001` 故障开关），对账差异都是 0。** 见下面“4a 第 5、6 步”。第 5 步的代码已提交并推送（`9dda461`，PR #21 的 CI 33 项全过）；**之后的文档和两份复盘草稿没有提交**。集群：五个服务现在是 `9dda461-faults`（带故障代码，开关全关）。4a 只剩：第 7 步的阶段笔记；走通时发现的七个问题等主人定改哪些；mutex、block 采样；第一次盲测。
+- **现在（2026-11-24 10:05 UTC，这一条最新）**：**集群里的 Agent 经告警触发跑通了一次**：高峰里留着的那条试跑告警在 10:00:00 UTC 自己开始诊断，70 秒、0.011 美元、结论正确（[设计 3d 第 9.6 节](design/3d-diagnosis-agent.md)）。3d 的“触发方式”勾了，“用 3c 的场景试跑几次”仍然不勾。PR #21 在 `c3250bd` 上 CI 全过（46 项）；这之后只有文档的提交。下面两条里“要到那时才知道”“还在等”到这里作废。**下一步不变**：4a 第 5、6 步，要动集群，先登记、先拿主人同意。
+- **现在（2026-11-24 09:30 UTC，这一条最新）**：**4a 的第 3、4 步（pprof 工具、场景格式和注入脚本）由子 Agent 写完，主会话评审后合进了 `phase-4a` 并推送**；`pkg/cache` 的偶发用例按主人的决定改了（没有清零，见“阻塞项与待确认”）；开了 draft PR #21。细节在[设计 4a 第 6 节](design/4a-chaos-prep.md)“第 3 步”“第 4 步”。**会改集群的路径都没有跑过**：下一步是第 5 步（Agent 屏蔽 `chaos-mesh` 和 `Pod*Chaos` 事件；重新部署带 pprof 工具的 Agent、apply Role）和第 6 步（走通一遍），都要先登记、先拿主人同意。CI：第二轮只挂了 `pkg/kafkax` 的 `TestEachAttemptGetsItsOwnSpan`（这个包没有动过，像是偶发，没有查），之后的推送看 `gh pr checks 21`。主人答复了：高峰的处理方式不改。还在等：10:00 UTC 之后集群里那条留着的试跑告警（见下一条）。
+- **现在（2026-11-24 08:55 UTC，这一条最新）**：**主人同意了三件事，都做了：提交并推送；装 Chaos Mesh 并冒烟（4a 第 1 步）；Agent 部署到集群验证。** 见下面“4a 第 1 步和 Agent 上集群”。下一条里“全部没有提交，没有动集群”“等主人的”到这里作废。分支 `phase-4a` 已推送，**没有开 PR，所以 CI 没有跑过**（CI 只在 PR 上跑；新加的 `faults` 那个 job 从来没有在 CI 上跑过）。集群上现在多了：命名空间 `chaos-mesh`（5 个 Pod，没有命名空间能被注入）、`monitoring` 里的 Deployment `agent`（DeepSeek）、Alertmanager 多发一份告警给 Agent。
+- **现在（2026-11-24 07:10 UTC，这一条最新）**：**主人定了两件事，都动工了；全部没有提交，没有动集群。** ①“DeepSeek 的调用放在低谷价格处理”：Agent 的费用按时段算了，高峰里告警触发的诊断留到高峰结束再跑、手动提问要 `-force`（[设计 3d 第 10 节](design/3d-diagnosis-agent.md)）。②“4a 的设计待定项都按建议”：十项都定了，4a 第 2 步（`pkg/fault`、构建标签、检查、第一个故障点）做完了（[设计 4a 第 6 节](design/4a-chaos-prep.md)、[ADR-0041](adr/0041-two-fault-injection-paths.md)）。见下面“4a 动工”。**等主人的**：4a 第 1 步（装 Chaos Mesh、冒烟）的具体做法登记在计划文件里，要一句同意；提交也要主人说。
+- **现在（2026-11-24 06:40 UTC，这一条最新）**：**用 DeepSeek（`deepseek-flash`）在本机把 Agent 对着真的集群跑通了三次**（主人要求；只读，没有部署）。结果在[设计 3d 第 9.5 节](design/3d-diagnosis-agent.md)。试跑查出一个问题并改了（模型写的工具参数不是合法 JSON 时的处理）。全部改动仍然没有提交。下一条里“没有对真的 API 跑过”对 DeepSeek 作废，对 OpenAI 和 Claude 仍然成立。
+- **现在（2026-11-24 06:00 UTC，这一条最新）**：**诊断 Agent 的模型后端可换了（主人要求），代码、测试、文档都写了，没有提交，没有动集群，没有对真的 API 跑过。** 见下面“Agent 的模型后端可换”。主人说稍后用 DeepSeek 试跑：这同时解开了 3d“等 API 密钥”的阻塞（原来等的是 Claude 的密钥）。4a 的状态没有变：设计第 2 节的第 1 到 9 项仍然等主人确认。分支仍是 `phase-4a`。
+- **现在（2026-11-24 04:00 UTC，这一条最新）**：**主人同意后重启了 `mysql-main`，带上了 `MALLOC_ARENA_MAX=4`（03:58 UTC）。** 见下面“mysql-main 的内存”。改动没有提交（chart 的模板和 values、`mysql-main.yaml`、文档）。**验证只做了一半**：环境变量到了进程里；它管不管用要有一次连接数的高峰才知道。**主人定了：不单独跑压测，等阶段 4 第一次发压时一起看**（登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”）。主人要求后提交并推送了（分支 `phase-4a`，`git log` 看；没有开 PR，CI 只在 PR 上跑，所以没有 CI 结果）。4a 的十项里第 10 项（主库内存）到这里算处理了，**另外九项仍然等主人确认**（下一条）。
+- **现在（2026-11-24 03:20 UTC，这一条最新）**：**开始阶段 4 的 4a，只写了设计，没有动工、没有动集群。** 分支 `phase-4a`（从合并了 PR #20 的 `main` 开的，没有推送）。设计 [design/4a-chaos-prep.md](design/4a-chaos-prep.md)，**第 2 节的十项等主人确认**。（已随上一条提交。）另外有一条在响的告警要主人定怎么处理（`mysql-main-0` 内存只涨不降，到了 limit 的 90%，见下面“4a 设计写完”）。阶段 3 剩的两项没有变：3d 等 API 密钥（`.env` 里还没有），3c 的“放几天看误报”要等几天。**下一步**：见下面“4a 设计写完”。
 - **现在（2026-11-24 03:30 UTC，这一条最新）**：**3e 做完了。PR #19 已合并进 `main`（`f555db1`，主人要求；合并前最后一次推送只有文档）。** 第 7 步的阶段笔记 [notes/3e-reconciliation.md](notes/3e-reconciliation.md) 和计划文件里“3e 对账按场景拆补的”面试考点写了，主人要求后提交、推送，从 `phase-3e` 另开了一个 PR 合并进 `main`（`gh pr list --state merged --head phase-3e` 看号码，`git log --merges -1 origin/main` 看合并提交；这次推送只有文档，合并前没有等它的 CI）。下一条里“没有提交”“只剩第 7 步”到这里作废。**下一步**：阶段 3 剩 3d 的试跑（等 API 密钥，见下面 3d 的“下一步”）和 3c 的“上线后放几天看误报”；之后是阶段 4（`docs/plan/phase-4-chaos.md`，“4a 准备”里登记了 3e 留下的三件）。集群上各组件的镜像 tag 见下一条。
 - **现在（2026-11-24 03:00 UTC）**：**3e 的第 6 步做完了，计划里 3e 的四项都勾了，只剩第 7 步（阶段笔记、面试考点）。** 造差异验证在 `oppenheimer-e2e` 里做完并清理了（e2e 整套、临时规则都删了；Alertmanager 里还有一条匹配 `env=e2e` 的静默，到 06:20 UTC 前后自己过期，匹配不到任何正式的告警）。九条告警里八条真实触发过，`DerivedDataCheckStalled` 没有（登记在 `docs/plan/phase-4-chaos.md` 的“4a 准备”）。结果在设计 3e 第 9 节“第 6 步：造差异验证”和三篇 runbook 的最后一节。集群 e2e 这次也跑了，通过。已提交并推送到 `6b115e4`（PR #19 的 CI 全过）；**之后写的文档（runbook、设计、两个计划文件、本文件）没有提交**，主人还没有说。长期运行的那一套：inventory 是 `4cf911d-dirty-20261124014241`（代码就是 `4cf911d`），另外五个服务 `07c0dcc`，`recon-totals` 和两个 CronJob 是 `recon:4cf911d`，`recon-stock`、`recon-changes` 是 `recon:6b115e4`。**下一步**：主人说提交之后提交、推送；第 7 步；PR #19 从 draft 转正、合并由主人定；3d 等 API 密钥。
 - **现在（2026-11-24 02:00 UTC）**：**PR #18（3d）已合并进 `main`（`1ec99b9`，主人要求）；PR #19（3e，draft）的 CI 全过；3e 第 6 步的部署和只读核对做完了，剩“造差异验证告警”，它的具体做法还要给主人看过再动。** 见下面“3e 第 6 步：部署”。工作区有没提交的改动（`watch_changes.go` 和 `changes.yaml` 加调试端口、`recon-check.sh` 修窗口、三个文档），主人还没有说提交。
@@ -17,7 +33,151 @@
 - **最后更新**：2026-11-23（第 16 项做完，第五个 SLO、SLO 的大盘、ADR-0037 做了，3c 的计划项全部勾了，都没有提交，见下面“3c 第 16 项做完”；以下括号里是更早写的）（主人对待定项给了决定，规则改了并下发，第 17、18 项做了，延迟消费者并发和按分区计数的队列上限写完了，都没有提交，见下面“3c 待定项的处理”；以下括号里是更早写的）（3c 的告警质量检查开始做了，见下面“3c 告警质量检查”；以下括号里是更早写的）（3c 的第 6、7 步：Alertmanager 的路由和抑制、webhook 接收端、runbook 做了，都没有提交，见下面“3c 的 Alertmanager 和 runbook”；以下括号里是更早写的）（3c 的设计写完，等主人确认十项，见下面“3c 设计写完”；当前分支 `phase-3c`；以下括号里是更早写的）（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
-### 3e 第 6 步：部署（2026-11-24 02:00 UTC；这一段最新，新会话先读这里）
+### 4a 收尾（2026-11-24 11:40 到 12:00 UTC；这一段最新，新会话先读这里）
+
+- **主人说的**：“提交并推送，然后继续”。主会话的理解：提交当时工作区里的文档；“继续”是按上一轮给的建议往下做不依赖别的决定的部分。**主人没有逐条说过改哪几条**，改的是主会话建议改的三条，不合适就退。
+- **改了的**（细节在设计 4a 第 6 节“第 6 步”的“之后改了的”）：
+  - `scripts/cluster/images.sh`：带故障代码的镜像 tag 后缀从 `-faults` 换成 `-p4`。没有去掉后缀：同一个提交号的两种构建共用一个 tag 的话后推的会盖掉先推的。
+  - `services/gateway/internal/httpapi/stock_variant.go`（和它的测试）改名 `stock_deadline.go`；`pkg/fault/doc.go`、ADR-0041、`s001` 的场景和答案跟着改。
+  - `scripts/cluster/chaos-run.sh`：`CHAOS_RECOVER_SETTLE`（默认 180 秒）。
+  - `chaos/scenarios/s002/truth.md` 补了实测的一句（没有失败）。
+  - 新文件 `docs/notes/4a-chaos-prep.md`；计划文件加了两项（换镜像的登记、阶段笔记）。
+- **验证了的**：`make lint`（gateway、pkg）0 issues；`make test`（gateway）、`make lint-faults`、`make test-faults`、`make check-faults`、`chaos-run.sh lint` 都过。**整个仓库的 `make lint test` 没有重跑**（提交前要跑）。**新加的 180 秒等待没有真的跑过。**
+- **没有做的**：提交；部署（集群上仍然是 `9dda461-faults`，文件名也是旧的）；上一段“没有做的”里除了第 7 步之外的各条。
+- **下一步**：
+  1. 主人说提交之后：`make up`、整个仓库 `make lint test`、`make lint-faults test-faults check-faults`，提交、推送，派 `ci-watcher` 看 PR #21。
+  2. 主人同意换镜像之后按计划文件里的登记做。
+  3. 4a 到这里只剩 mutex、block 采样和第一次盲测；PR #21 转正、合并由主人定。之后是 4b：先补场景（现在三个），`s002` 要不要改成不给宽限期的杀法、给 Agent 的问题里说不说有压测在跑，在那里定。
+
+### 4a 第 5、6 步（2026-11-24 10:30 到 11:30 UTC；这一段最新，新会话先读这里）
+
+- **主人说的**：“根据 PROGRESS.md 的进度继续”；主会话把第 5 步不动集群的部分写完、把要动集群的做法登记进计划文件后问了三件事，主人三件都同意：提交并推送、部署 Agent 和 Collector、走通一遍（注入加发压）。
+- **第 5 步**（[设计 4a 第 6 节“第 5 步”](design/4a-chaos-prep.md)）：`tool.Hidden`（kube、prom、loki 三组工具把 `chaos-mesh` 当成不存在，事件按 API 组筛）；Collector 的 `filter/hidden_namespaces`。整个仓库 `make lint test` 通过后提交、推送（`9dda461`）；CI 33 项全过（子 Agent 报的：e2e 5 分 46 秒，比平时的约 4 分钟长，别的正常；主会话没有另外核对耗时）。部署后用 Agent 自己的身份核对过。
+  - **和设计 3.5 不一样、主人没有逐条确认过的**：不是“拒绝”而是“当它不存在”；RBAC 没有收；Prometheus 的工具也筛。
+- **第 6 步**（[设计 4a 第 6 节“第 6 步”](design/4a-chaos-prep.md)，时间线、量到的数、Agent 的表现都在那里）：两个场景都注入、恢复、对账差异 0、生成了复盘草稿（`docs/postmortems/2026-11-24-r20261124-*.md`，只有脚本填的部分，其余是空模板）。脚本没有改就通过了。Agent 在 `s001` 里用 pprof 找到了泄漏点，但把原因说偏了。
+- **等主人定的（走通时发现的，都没有改）**，细节在设计“第 6 步”的“发现的问题”：
+  1. 镜像 tag 的 `-faults` 后缀是泄漏（Agent 读到并写进了报告）。建议去掉后缀。
+  2. 故障文件统一的 `_variant.go` 后缀出现在调用栈里。建议不用统一的后缀。
+  3. 恢复后“等回到稳态”1 秒就过，应当先等一段固定的时间。建议改。
+  4. `s002` 的 `truth.md` 里“会有一小簇失败”不成立（正常的 TERM 没有造成失败）。要不要改成 `kill -9` 式的，4b 定。
+  5. 稳态的 mixed 有三成是设计好的 429，Agent 把压测当成了异常流量。给 Agent 的问题里要不要说明有压测在跑，是评测设计的事。
+  6. 逐行对账在有负载时慢（8 分钟的窗口 160 秒）。先记着。
+- **没有做的**：
+  - 这之后的文档改动和两份复盘草稿没有提交（主人同意的那次提交是第 5 步的代码）。
+  - 第 7 步（阶段笔记 `docs/notes/`；ADR-0041 已有）。
+  - mutex、block 采样没有打开（要用 3b 的压测量开销，先登记）。
+  - `blind`、`recover --all --restart`、`s003`、`istio` 和 `script` 两种注入方式没有真的跑过。
+  - `mysql-main` 的 `MALLOC_ARENA_MAX=4` 仍然没有验证（这一轮连接最多 97 个）。
+  - 关于 `chaos-mesh` 自己的告警发给 Agent 时没有筛。
+- **集群现在的状态**（11:26 UTC）：五个服务 `9dda461-faults`、开关全关（总闸跑过一次）；cdc `07c0dcc`；Agent `9dda461`（11 个工具，Alertmanager 的第二个地址开着）；`otel-agent` 不收 `chaos-mesh` 的日志；压测停了；没有 Chaos Mesh 的对象和注入的注解；SKU 12001 到 12020 是这次建的。**`recon-cron` 默认取 order 的 tag，现在是 `9dda461-faults`，仓库里没有这个 tag 的 recon 镜像：下次要跑 `make recon-cron` 时显式给 `RECON_IMAGE_TAG`。** 本机 compose 是停的。
+- **下一步**：
+  1. 主人定上面六条改哪些；说提交之后提交文档和复盘草稿。
+  2. 改完（第 1、2 条要重新构建、部署带故障代码的镜像）之后做第 7 步的笔记，4a 收尾，PR #21 转正与否由主人定。
+  3. 然后是 4b：先补场景（现在只有三个），第一次盲测前把 `blind` 用 `DRY_RUN=1` 和 e2e 那一套走一遍。
+
+### 4a 第 1 步和 Agent 上集群（2026-11-24 08:20 到 08:55 UTC；这一段最新，新会话先读这里）
+
+- **主人说的**：“1. agent 的修改可以在集群部署验证 2. 可以安装 Chaos Mesh 并冒烟 3. 提交并推送”。
+- **提交和推送**：提交前 `make up`，整个仓库 `make lint`、`make test`、`make lint-faults`、`make check-faults` 都过；`make test-faults` 第一遍挂了一个和改动无关的偶发用例（`pkg/cache`，登记在“阻塞项与待确认”），重跑通过。两个提交（Agent 的后端和高峰价；故障开关）推到了 `origin/phase-4a`。之后的改动（Chaos Mesh 的脚本、冒烟、文档）是另一个提交，`git log` 看。**没有开 PR**（主人只说了提交和推送）。
+- **Chaos Mesh**：装了、冒烟过了，六类都能用。细节和发现在[设计 4a 第 6 节“第 1 步”](design/4a-chaos-prep.md)。要记住的一条：**NetworkChaos、IOChaos 会在目标命名空间里留下 `PodNetworkChaos` / `PodIOChaos` 对象和事件**，对盲测和 Agent 的评测都是泄漏，怎么处理没有定（第 4、5 步里定）。
+  - 新文件：`deploy/cluster/chaos-mesh/values.yaml`、`scripts/cluster/chaos-mesh.sh`（`install|status|uninstall`）、`scripts/cluster/chaos-smoke.sh`；`make chaos-mesh`、`make chaos-smoke`；`cluster.env` 的 `CHAOS_MESH_VERSION`。
+  - `chaos-mesh.sh uninstall` 没有运行过。
+  - e2e 那一套（`oppenheimer-e2e`）用完删了。长期运行的 `oppenheimer` 没有被注入过。
+- **Agent 上集群**（`make agent`，镜像 tag 是当时的提交 `355f2ea`）：
+  - 起来了：日志里 `provider=deepseek model=deepseek-flash peak=defer peak_pricing=true tools=10`。Secret `agent-llm` 由脚本从 `.env` 建的（只有 `DEEPSEEK_API_KEY`）。`monitoring.sh agent` 这是第一次真的运行，没有改就通过了。
+  - 高峰里手动提问被拒绝（`kubectl -n monitoring exec deploy/agent -- /app/agent ask -addr http://127.0.0.1:8080 "..."` 回 409，写明高峰到 10:00 UTC）。
+  - **打开了 Alertmanager 发给 Agent 的第二个地址**（`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager`）。这是主会话对“在集群部署验证”的理解：不打开就验不了“告警触发”这一段。**从此真的告警会触发诊断、花模型的钱**（有冷却、队列上限、每天的预算；高峰里的留到低谷）。要关：不带 `AGENT_WEBHOOK` 再跑一次 `scripts/cluster/monitoring.sh alertmanager`。
+  - 打开时发现并改了一个缺陷：`scripts/alertmanager-test.sh` 的检查里“不发给 Agent”的两份渲染会继承调用方的 `AGENT_WEBHOOK=1`，于是带着这个变量下发时检查必然失败（这条路以前没有走过）。
+  - 用 `amtool alert add` 加了一条试跑的告警（`alertname=AgentWebhookTrial severity=warning namespace=oppenheimer service=gateway`，10 分钟后自己恢复，不发 Telegram）。Agent 收到了（`queued=true`），因为在高峰里，留到 10:00 UTC（日志 `alert diagnosis held until peak pricing hours end`）。**10:00 UTC 之后它会不会按时跑、对 DeepSeek 调不调得通（Pod 里到 `api.deepseek.com` 的连通性）、集群里的工具好不好用，要到那时才知道**：结果看 `kubectl -n monitoring logs deploy/agent` 和 `/var/lib/agent/runs` 里的记录，补到[设计 3d 第 9.5 节](design/3d-diagnosis-agent.md)和 3d 的计划项里。
+- **下一步**（4a，按设计第 4 节）：
+  1. 第 3 步（`pprof_capture`，Opus）和第 4 步（`chaos/` 的格式、`chaos-run.sh`、`chaos-steady.sh`，Sonnet）现在可以并行派出去了（都已提交；worktree 从 `main` 建，任务说明里写明先快进到 `phase-4a`）。第 4 步要把上面“痕迹”那条考虑进去。
+  2. 第 5 步（Agent 屏蔽 `chaos-mesh` 命名空间和 `Pod*Chaos` 的事件）、第 6 步（走通一遍）要动集群，先登记、先拿同意。
+  3. 主人还没有答复的：高峰时段的两条理解（告警最晚推迟 4 小时、手动提问拒绝加 `-force`，见下一段）；要不要开 PR 让 CI 跑；`pkg/cache` 那个偶发用例改不改。
+
+### 4a 动工（2026-11-24 06:45 到 07:10 UTC）
+
+- **主人说的**：“1. 现在是 DeepSeek 的高峰价格，我想在相关的调用放在低谷价格处理 2. 4a 的设计待定项都按建议”。
+- **第 1 件（Agent 躲开高峰价）**，细节在设计 3d 第 10 节：
+  - `llm.Price` 可以带高峰时段，`CostOf` 按发请求的时刻算；DeepSeek 的高峰是 UTC 周一到周五 01:00 到 04:00、06:00 到 10:00，其余半价。
+  - `agent serve -peak=defer`（默认）：高峰里告警触发的诊断留着、高峰结束再跑；`/ask` 回 409，`agent ask -force` 才跑。`-peak=run` 关掉。只对分时段计价的模型起作用。
+  - **主会话自己定的、主人没有逐条确认过的**：告警的诊断最晚推迟 4 小时（那时 Pod 的状态和事件可能已经没了）；手动提问不是排队而是拒绝加 `-force`。主人要的是“放在低谷处理”，这两条是主会话对它的理解，不合适就改。
+  - **之后主会话自己对真的 API 的试跑也排在低谷里**（北京时间工作日 12:00 到 14:00、18:00 以后，周末全天）。
+- **第 2 件（4a）**：
+  - 设计、计划的状态改成了“已确认”。ADR-0041 写了。
+  - 第 2 步做完了（不动集群）：`pkg/fault`、五个服务挂 `fault.Register`、Dockerfile 和 `images.sh` 的 `GO_TAGS`、Makefile 的 `lint-faults`、`test-faults`、`check-faults`、CI 的两处、第一个故障点 `f01` 和它的场景目录 `chaos/scenarios/s001/`（**主人不读**）。
+  - 验证：`pkg`、`services/gateway` 带标签和不带标签的 lint 都是 0 issues；`services/gateway` 的 `make test` 通过；带标签的 vet 和测试在不连依赖的情况下通过；`make check-faults` 通过；`order`、`inventory`、`payment`、`orderindex` 两种构建都编得过、`cmd` 的 lint 0 issues；`services/agent` 的 lint 和测试通过。**整个仓库的 `make lint test` 没有跑**：本机 compose 的 Redis 连不上（`pkg/cache` 的用例失败，和这次的改动无关，没有查原因），而且改动涉及的模块都单独跑过了。提交之前要把 compose 起好重跑一次。
+- **没有做的 / 下一步**（按设计 4a 第 4 节的顺序）：
+  1. **第 1 步，等主人同意**：装 Chaos Mesh 和六类冒烟。具体做法登记在 `docs/plan/phase-4-chaos.md` 的“安装 Chaos Mesh”下面。values 和脚本还没有写（可以先写，不动集群）。
+  2. 第 3 步（`pprof_capture`，Opus）、第 4 步（`chaos/` 的格式、`chaos-run.sh`、`chaos-steady.sh`，Sonnet）可以并行，**但要先提交**：worktree 是从已提交的分支建的，现在工作区里有二十多个没提交的文件（Agent 的后端、高峰价、`pkg/fault`），子 Agent 看不到。第 3 步还会改 `services/agent/cmd/agent/serve.go`，和没提交的改动是同一个文件。
+  3. 提交之前：`make up` 之后整个仓库 `make lint test`，再 `make lint-faults test-faults check-faults`。
+  4. 第 5、6 步要动集群（部署带标签的镜像、Agent 屏蔽 `chaos-mesh`、走通一遍），到时再登记。走通时用的压测和对真的 DeepSeek 的调用排在低谷时段。
+- **提醒**：`go build` 在模块目录里直接跑会改 `go.work.sum`（和这些改动无关的增删），主会话每次都 `git checkout go.work.sum` 还原了；提交前看一眼它不在改动里。
+
+### Agent 的模型后端可换（2026-11-24 05:20 到 06:00 UTC；这一段最新）
+
+- **主人说的**：“现在的 agent 只支持 Claude，是否可以做成组件式，支持 DeepSeek、OpenAI 等”；看了方案后：“修改吧，我稍后用 DeepSeek 尝试”。
+- **做了的**（细节：[设计 3d 第 9 节](design/3d-diagnosis-agent.md)，决定：[ADR-0040](adr/0040-llm-providers-behind-one-interface.md)）：
+  - `services/agent/internal/llm/openai.go`（OpenAI 兼容协议的适配器，手写，没有新依赖）、`provider.go`（四个后端的预设：`anthropic`、`deepseek`、`openai`、`openai-compatible`）、`price.go`（加 DeepSeek 的价和 `ParsePrice`）。
+  - `agent serve` 加了 `-provider`、`-model`、`-base-url`、`-price`（也能用环境变量 `AGENT_PROVIDER` 等给）。不带参数时和原来一样（Claude、`claude-opus-5-5`）。
+  - 部署：Secret 改名 `agent-llm`（键名就是环境变量名），`monitoring.sh agent` 从 `.env` 读 `AGENT_PROVIDER`、`AGENT_MODEL`、`AGENT_BASE_URL`、`AGENT_PRICE` 和几个密钥。**脚本只过了 `bash -n`，没有运行过；清单没有 apply 过**（和 3d 第 4 步一样）。
+  - 循环、工具、报告、触发没有改。
+- **验证了的**：`make lint MODULES=$PWD/services/agent` 0 issues；`make test MODULES=$PWD/services/agent` 全过（新加的用例对着 `httptest`：请求的形状、第二轮的请求体逐字节以第一轮为前缀、`reasoning_content` 和不认识的字段原样带回、用量的换算、各种结束原因、重试和不重试、失败不留历史）。本机起了一次二进制：写错的后端名、没有价的模型都在启动时失败，`AGENT_PROVIDER=deepseek` 能起来并打出“没有密钥”的 warn。**整个仓库的 `make lint test` 没有重跑**（只动了 `services/agent` 这一个模块和文档、脚本、清单）。
+- **没有验证的**：对真的 DeepSeek、OpenAI 的 API 一次都没有跑过。DeepSeek 的事实是 2026-11-24 从它的文档查的；OpenAI 的一部分是子 Agent 的摘要，没有逐条核对到原文。
+- **计划变更**：3d 的计划里加了一项“模型的后端可换”（已勾）；“试跑”那一项不再只等 Claude 的密钥，哪一家的密钥到了都能做。
+- **下一步**：
+  1. 主人在 `.env` 里放 `DEEPSEEK_API_KEY`（集群里跑再加 `AGENT_PROVIDER=deepseek`）。本机试跑的命令和第一次要看的五件事在设计第 9.3 节。
+  2. 试跑的结果写回设计第 9 节；有 400、缓存不命中、报告被反复打回这类问题就地改适配器。
+  3. 主人说提交之后提交（`git status` 里的全部改动都是这一件事的）。
+  4. 回到 4a。
+- **试跑之后（06:40 UTC）补**：
+  - 主人把 DeepSeek 的默认模型改成了 `deepseek-flash`（`provider.go`），`.env` 里放了 `DEEPSEEK_API_KEY` 和 `AGENT_PROVIDER=deepseek`。
+  - 本机跑了三次（做法和数见设计 9.5）：没有 400，缓存命中约 93%，一次约 0.03 到 0.05 美元、两分钟上下。第二次因为主会话把端口转发带掉了，不算数。
+  - 改了的：`llm.ToolCall.Malformed`，循环对“参数不是合法 JSON”的调用不执行、不占报告的打回名额。`make lint`、`make test`（只 `services/agent`）通过。
+  - **还没有做的**：集群里部署（`make agent`，要动集群，先登记、先拿同意）；经 Alertmanager 的 webhook 触发；Pod 到 `api.deepseek.com` 通不通。所以计划里“触发方式”“试跑”两项仍然不勾。
+  - 试跑时 Agent 对 3c 留下的“`PrometheusErrorSendingAlertsTo...` 只到 pending”给了一个解释（设计 9.5 最后），没有另外核实。
+
+### mysql-main 的内存（2026-11-24 03:10 到 04:05 UTC；这一段最新，新会话先读这里）
+
+原因的分析（不是泄漏，malloc 的堆里约 700 MiB 是释放了没还的）在下一段“4a 设计写完”的“集群上只读看到的”里。
+
+- **主人说的**：“查一下 mysql-main-0 内存为什么涨”，看了结论后“同意，按建议重启主库”。
+- **改了的**：`deploy/charts/mysql` 加了一个值 `mysqld.mallocArenaMax`（空着就不设环境变量），只在 `deploy/cluster/mysql/mysql-main.yaml` 里设成 4。渲染结果和线上的 release 对比过：两个订单库没有差别，`mysql-main` 只多了这一个环境变量。
+- **做了的**：03:58:13 UTC 只对 `mysql-main` 这一个 release 跑了 `helm upgrade`（和 `middleware.sh mysql` 里同样的参数，没有跑整个脚本，免得碰两个订单库），接着 `durability.sh apply`（主库 1/1，没有变）。**没有用 `make middleware-up`。** Pod 约 15 秒后就绪，在 `k3s-agent-2` 上；`/proc/1/environ` 里有 `MALLOC_ARENA_MAX=4`。重启后常驻内存约 790 MiB（缓冲池还没填满）。
+- **重启的影响**（04:04 UTC 核对的）：`mysql_up` 有两个 15 秒的点是 0（约 30 秒）。探针 10 分钟里 582 轮全部成功，没有失败、没有不完整的；gateway 没有 5xx；业务 Pod 没有重启；`Aborted_connects` 是 0。告警：`MySQLDown`、`OrderLandingBreakerOpen` 只到 `pending`；**`MeshEndpointEjected` 响了**（warning，order 到 inventory 的端点 10 分钟里被摘除约 3 次），按规则的 10 分钟窗口约 04:09 自己恢复，**没有等着看**。重启后 6 分钟常驻内存 1564 MiB（缓冲池在回填），连接 16 个。旧的 `ContainerMemoryNearLimit` 随着重启消失了。
+- **顺带看到、没有查的**：主库不在的 30 秒里 inventory 的端点被边车摘除，说明它对上游返回的是会被算成“这个服务坏了”的错误（或者超时），而规范要求“自己是好的、依赖坏了”返回 `errx.Degraded`。是超时还是返回码没有看。阶段 4“MySQL 主库宕机”的实验会再遇到，记在这里。
+- **顺带核对的连接池**（读代码，没有改）：连 `mysql-main` 的有 inventory、payment（都用 `pkg/mysqlx` 的默认值 50，各 2 个副本，合计最多 200）、orderindex（2 个副本 × 2 个库，池的大小来自它自己的配置，**没有查是多少**）、order 连冷库（2 × 10）、三个常驻核对（2、2、8）、对账的 Job、exporter、备份。`max_connections` 是 400，历史最高 226。order 的 values 里有一条“(副本上限 + 1) × 连接池 ≤ max_connections − 40”的预算，**inventory、payment、orderindex 没有写过这样的预算**，滚动更新或扩副本时合计可能超过 400。
+- **没有做的**：
+  1. **验证**（主人定了等阶段 4 第一次发压时一起看）：比两件事：连接涨到 200 以上时常驻内存涨多少（上次 15 到 225 个连接 +300 MiB，之后不回落）；p99 和吞吐有没有变差（4 个 arena 的锁）。对照的数在下一段。
+  2. inventory、payment、orderindex 的连接池预算。
+- **下一步**：回到 4a（下一段），等主人确认设计第 2 节的第 1 到 9 项。第一次发压之后把内存的结果写进这里和 `mysql-main.yaml` 的注释（管用就留着，不管用就去掉这个值、把 limit 提到 3 Gi）。
+
+### 4a 设计写完（2026-11-24 03:20 UTC）
+
+- **做了的**：
+  - 核对了 3e 的收尾：PR #19、#20 都已合并，`main` 在 `260269b`，工作区干净。
+  - 写了 4a 的设计 `docs/design/4a-chaos-prep.md`：注入分两条路（Chaos Mesh 管外部的，`pkg/fault` 管代码缺陷），加 Istio 的故障注入和脚本；故障代码用构建标签 `faults` 隔离、放在业务包里、不露痕迹；Agent 的 `pprof_capture` 经端口转发连调试端口；场景目录 `chaos/` 和注入脚本（密封答案、到时恢复、总闸、结束后 `recon-check`）；稳态用 k6，要证明“不丢”的用带账本的发压工具。
+  - 查了 Chaos Mesh：最新正式版 v2.8.8；k3s 的两个安装参数；**它支不支持 Kubernetes 1.37 没有查到**，装上后要逐类冒烟。还没有登记到 `versions.md`（安装时登记）。
+- **集群上只读看到的**（kubeconfig 要先 `source scripts/cluster/cluster.env` 再 `export KUBECONFIG=$KUBECONFIG_OUT`）：
+  - 三个节点 Ready，内存已用 52% 到 68%。
+  - **`ContainerMemoryNearLimit` 在响**：`mysql-main-0` 常驻内存是 limit（2560 Mi）的 90.4%，从 11 月 23 日 22:44 UTC 起；过去 7 天这条告警只有它响过；四个订单库在 70% 到 75%。**没有动，只读查了原因（主人要求，2026-11-24 04:00 UTC 前后）**：
+    - **结论：不是泄漏，是“涨到过的高点不还给系统”。** 匿名内存 2316 MiB 分三块（`/proc/1/smaps` 按映射分的）：缓冲池约 1000；`performance_schema` 约 350（两块大映射，启动时按 `max_connections=400` 分好的）；malloc 的堆约 970。`performance_schema` 记到的活着的分配一共约 1616 MB，扣掉缓冲池和它自己，malloc 的堆里活着的只有约 220。**堆里约 700 MiB 是 MySQL 已经释放、glibc 没有还给系统的。** `mysqld` 用 glibc 的 malloc；堆里有 80 多个 10 到 60 MiB 的映射（每个线程各用各的 arena）。
+    - **每次上涨对着什么**（Prometheus，5 分钟一个点）：
+      - 11 月 22 日 12:10 UTC，+790：缓冲池一次填满（`bp_data` 242 → 992 MiB）。正常，只有一次。
+      - 11 月 23 日 02:30 到 03:05，**+300**：连接从 15 涨到 225，同时在跑的线程最多 206，每秒 6600 条语句（3c 的过载压测）。压测停了之后一点没有回落。
+      - 之后两次同样的高峰（08:30、10:40 前后，都是 225 个连接）只涨了 +60、+45。**同样的高峰第二次涨得少得多，这是“高点不还”的特征，泄漏会每次涨一样多。**
+      - 空闲时（15 个连接、每秒 1000 条）还有几次 +30 到 +45 的小台阶（22 日 23:35、23 日 22:10、22:45）。22:10 那次对着一次每秒 5.9 万行的扫描，另外两次没有对上是什么，**没有查清**。
+    - **没有证实的一步**：没有进进程看 malloc 自己的统计（要 gdb 或 `malloc_info`），“堆里那 700 MiB 是空闲块”是从两边的账相减得出的。
+    - **更正**：上一版这里写的“连接 226 个”读错了，那是 `Max_used_connections`（历史最高，11 月 23 日 08:40），现在是 16 个。“再来一两次高峰就 OOM”也说重了：同样大小的高峰只会再涨几十 MiB。真正的风险是**比 225 个连接更大的高峰**：按 +300 MiB 对 210 个新连接估，一个连接约 1.4 MiB，`max_connections` 是 400，连满要再多约 250 MiB，而现在离 limit 只剩约 240 MiB。阶段 4 的故障（重试、连接池重建）正好会造出这种高峰。
+    - **另一件事**：不重启的话这条告警会一直响（内存不会自己降下来），等于废掉了。
+    - **处理的选项（都要重启主库，要主人同意）**：A. 加环境变量 `MALLOC_ARENA_MAX=4`，重启后重跑一次 3c 的过载压测，看那 +300 变成多少（可能的代价是 200 个线程抢 4 个 arena 的锁，要看 p99）；B. 换 jemalloc（要改镜像）；C. limit 提到 3 Gi（不解决“不还”，只是按 400 个连接把余量留够）；D. 把 `max_connections` 和各服务连接池的总和降到实际需要的数。建议 A 加 D 里“核对连接池总和”这一步，A 没有效果再做 C。
+  - 3c 的“放几天看误报”：过去 48 小时里的告警大多是 3c、3e 故意触发的，现在分不出误报，过几天安静的日子再看。`PrometheusErrorSendingAlertsTo...` 两条仍然只到 `pending`。
+- **没有做的**：十项没有确认，所以代码、清单、脚本都没有写；ADR 没有写（确认后写）；没有提交。
+- **下一步**：
+  1. 主人确认设计第 2 节的十项（或改）。
+  2. 主人定 `mysql-main-0` 的内存怎么处理（上面的选项；要重启主库）。
+  3. 按设计第 4 节的顺序做。第 1 步（装 Chaos Mesh、冒烟）要动集群，先登记到计划文件、先拿同意。第 2 步（`pkg/fault`）不动集群，可以先做。
+
+### 3e 第 6 步：部署（2026-11-24 02:00 UTC）
 
 主人说“同意第6步的操作”。登记在计划文件 3e 一节末尾。细节和数：设计第 9 节“第 6 步”。
 
@@ -1124,6 +1284,8 @@
 
 - **`TestLandConcurrentRedeliveredShuffled` 在 CI 上偶发失败过一次**（2026-11-22，`0db0499`，重跑通过）：主人定了暂时不改，再出现时再说，见“3b 收尾”一段。
 
+- **`pkg/cache` 的 `TestConcurrentColdKeyLoadsOnceInProcess` 在本机带 `-race` 时偶发失败**（2026-11-24 发现，`loaded 2 times, want 1`，和当天的改动无关）。**直接原因查到了（2026-11-24 09:10 UTC，用一份带日志的临时用例，已删）**：每次失败都恰好有一个 `Get` 开头那次读 Redis 超过了 200 毫秒的短时限（`readTimeout`，日志 `cache read failed, loading from source ... context deadline exceeded`）。它被当成“Redis 不可用”，不再碰 Redis、直接回源；这时第一趟回源（100 毫秒）已经结束，singleflight 里没有可搭的，于是多回源一次。**这是代码按设计在走**（1d 的 6.18：Redis 挂住时不让请求等），不会读到错的值；用例断言的“恰好 1 次”默认了没有一次读会超过 200 毫秒。失败率：机器空闲时 30 次里 3 次，有别的编译在跑时 40 次里 6 次；先用 100 个并发的 `PING` 把连接池预热之后降到 100 次里 2 次、150 次里 2 次（仍然是同一条日志）。**没有查到的**：预热之后为什么还会有读超过 200 毫秒（连接池 32 个连接、100 个并发，带 `-race`；失败的那几轮里同时有 5 到 10 个 `Get` 慢到 190 毫秒以上，像是一批连接一起卡了一下，没有再往下查）；不带 `-race` 会不会出现没有试。**主人定了按建议改（2026-11-24）**：`Config.ReadTimeout`（默认仍是 200 毫秒）加了，这个用例把它设成 5 秒，并且先用并发的 `PING` 把连接池建满（`warmPool`）。**改完失败率从约一成降到 300 次里 2 次，没有清零**：剩下的失败每次都卡整整 1 秒，日志是 go-redis 自己的读超时（`i/o timeout`）。继续查到的：新建的 go-redis 客户端上 100 个并发的首次 `GET`，约 9% 超过 150 毫秒，集中在 1 秒，最长 4 秒（像 TCP 握手重传的间隔）；8 个并发时一次都没有；不经过 go-redis、直接 TCP 连 8 个并发也没有。**推断（没有证实）**：一下子建几十条连接时，本机经容器端口转发（OrbStack）偶尔有连接卡住，是本机环境的事，不是缓存的逻辑；连续跑几百遍时前一遍留下的大量建连断连 让它更容易出现。CI（Linux）上这个用例有没有失败过没有专门查。再出现时先看是不是卡 1 秒。
+
 - （已定）1 亿数据量：主人 2026-11-22 定了不做，理由在 `docs/notes/3b-capacity.md` 第 8 节。
 
 - 内存测试已做完：memtest86+ 完整跑了两轮没有错误（2026-11-17，主人在开机菜单里跑的），之后已卸载。
@@ -1210,6 +1372,7 @@
 | 2026-11-22 | 加 3e“对账方式按场景拆”（钱对笔数和金额、库存对守恒式、派生数据按 CDC 的变更核对），放在 3d 之后、阶段 4 的故障实验之前；其中“钱的笔数和金额做成指标”提前到 3c | 主人提出对账该按场景用合适的方式；现在的 `recon` 一律逐行摘要。全量对账量过（1473.7 万单 1 分 55 秒），不急，所以整体放在 3d 之后；阶段 4 的每次实验要用对账当裁判，所以在它之前。笔数和金额能做成指标，让钱的差异几分钟内报警，属于 3c 的业务告警。主人 2026-11-22 定 |
 | 2026-11-22 | `recon-daily` 从比最近 26 小时改成全量（不带 `-since`，加 `ARCHIVE_DSN`） | 主人定的。全量量过只要 1 分 55 秒，每天一次的代价可以不计；全量能发现订单创建很久之后才出现的差异，窗口式的看不到。耗时随总量线性增长，告警里盯它的耗时 |
 | 2026-11-23 | 3c 告警质量检查的登记表：第 9 项从“1.3 倍、1.15 倍”改成“用量除以 0.75、除以 0.82，只改主库”；第 5 项要 27 分钟而不是 15 分钟；第 3、4 项挪到其余几项之后做 | 1.15 倍是 87%，越过 order 停止受理的 85%，探针在跑会真的拒单；`ConsumerNotConsuming` 实际约 21 分钟才响；第 3、4 项会烧 SLO 的预算，中、慢档在恢复后还要响半小时到两小时，放在前面会和后面几项的告警混在一起 |
+| 2026-11-24 | 4a 加两个 checkbox：“Agent 看不到注入工具”“走通一遍”（原来只在设计第 4 节的第 5、6 步里）；前者的做法和设计 3.5 有三处不同（不存在而不是拒绝、RBAC 不收、Prometheus 也筛） | 要动集群的步骤得有地方登记和勾；RBAC 没有拒绝规则，见设计 4a 第 6 节“第 5 步” |
 
 ## 会话日志
 

@@ -4,7 +4,7 @@
 //
 //	<运行号>/meta.json      开始时写：触发方式、问题原文、模型、上限、版本
 //	<运行号>/events.jsonl   只追加，一行一个事件，写完一行就落盘
-//	<运行号>/raw/<步骤>.json 工具调用的原始结果
+//	<运行号>/raw/<步骤>.json 工具调用的原始结果（pprof 的剖析是 <步骤>.pb.gz）
 //	<运行号>/report.json、report.md
 //	<运行号>/summary.json   结束时写；没有它说明这次运行没有正常结束
 //
@@ -43,16 +43,18 @@ const OutcomeIncomplete = "incomplete"
 
 // Meta 是一次运行开始时就知道的事。
 type Meta struct {
-	ID        string         `json:"id"`
-	Trigger   string         `json:"trigger"`
-	Question  string         `json:"question"`
-	Alert     jsontext.Value `json:"alert,omitzero"`
-	Model     string         `json:"model"`
-	Effort    string         `json:"effort"`
-	Limits    any            `json:"limits"`
-	Version   string         `json:"version"`
-	Prompt    string         `json:"prompt_sha256"`
-	StartedAt time.Time      `json:"started_at"`
+	ID       string         `json:"id"`
+	Trigger  string         `json:"trigger"`
+	Question string         `json:"question"`
+	Alert    jsontext.Value `json:"alert,omitzero"`
+	// Provider 是模型的后端（anthropic、deepseek 等）。加这个字段之前的记录里没有它。
+	Provider  string    `json:"provider,omitzero"`
+	Model     string    `json:"model"`
+	Effort    string    `json:"effort"`
+	Limits    any       `json:"limits"`
+	Version   string    `json:"version"`
+	Prompt    string    `json:"prompt_sha256"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 // Summary 是一次运行结束时的统计。
@@ -287,13 +289,13 @@ func (r *Run) Event(kind string, data any) {
 	}
 }
 
-// Raw 保存一步工具调用的原始结果。
-func (r *Run) Raw(step string, raw []byte) {
+// Raw 保存一步工具调用的原始结果。file 是 raw/ 下的文件名（s1.json、s3.pb.gz）。
+func (r *Run) Raw(file string, raw []byte) {
 	if len(raw) == 0 {
 		return
 	}
-	if err := r.root.WriteFile(rawDir+"/"+step+".json", raw, 0o640); err != nil {
-		r.logger.Error("write raw tool result failed", "step", step, "error", err)
+	if err := r.root.WriteFile(rawDir+"/"+file, raw, 0o640); err != nil {
+		r.logger.Error("write raw tool result failed", "file", file, "error", err)
 	}
 }
 

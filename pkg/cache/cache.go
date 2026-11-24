@@ -43,8 +43,8 @@ const (
 	tagValue byte = 1
 )
 
-// readTimeout 是 Get 进来时读一次缓存的时限。正常的往返在 1 毫秒以内，200 毫秒容得下一次 TCP 重传。
-const readTimeout = 200 * time.Millisecond
+// defaultReadTimeout 是 Get 进来时读一次缓存的时限的默认值。正常的往返在 1 毫秒以内，200 毫秒容得下一次 TCP 重传。
+const defaultReadTimeout = 200 * time.Millisecond
 
 // redisWarnEvery 是 Redis 持续出错期间重复告警的最小间隔。
 const redisWarnEvery = 10 * time.Second
@@ -90,6 +90,10 @@ type Config struct {
 	// WaitMax 是等别人重建的上限，默认 200 毫秒。超过后自己回源，但不写缓存。
 	// 有上限是为了不让“持锁的实例卡住”变成“所有实例一起卡住”。
 	WaitMax time.Duration
+	// ReadTimeout 是 Get 进来时读一次缓存的时限，默认 200 毫秒。超过就当 Redis 不可用，这一次直接回源：
+	// 那时正在进行的回源它还能搭上，已经结束的就搭不上了，会自己再回源一次（值不会错，只是多查一次）。
+	// 线上不要调长：Redis 挂住时每个请求都要先等满它。可配主要是给测试用的。
+	ReadTimeout time.Duration
 	// Logger 为空时用 slog.Default()。
 	Logger *slog.Logger
 	// Breaker 是保护这个 Redis 的熔断器（设计文档 1d 的 6.6）。为 nil 时用默认参数建一个。
@@ -123,6 +127,7 @@ type Cache[T any] struct {
 	lockTTL     time.Duration
 	waitStep    time.Duration
 	waitMax     time.Duration
+	readTimeout time.Duration
 
 	breaker *breaker.Breaker
 	off     *degrade.Switch
@@ -155,6 +160,7 @@ func New[T any](cfg Config, codec Codec[T]) (*Cache[T], error) {
 		lockTTL:     orDefault(cfg.LockTTL, 3*time.Second),
 		waitStep:    orDefault(cfg.WaitStep, 20*time.Millisecond),
 		waitMax:     orDefault(cfg.WaitMax, 200*time.Millisecond),
+		readTimeout: orDefault(cfg.ReadTimeout, defaultReadTimeout),
 		breaker:     cfg.Breaker,
 		off:         cfg.Switch,
 	}
@@ -222,7 +228,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string, load func(context.Contex
 		// 这一次读有自己的短时限：缓存是为了快，Redis 挂住时不能让每个请求先等满客户端的读超时（1 秒）
 		// 才回源。熔断器要数到连续几次失败才打开，没有这个时限的话打开之前的每个请求都多等 1 秒
 		// （故障注入实测，设计文档 1d 的 6.18）。
-		rctx, cancel := context.WithTimeout(ctx, readTimeout)
+		rctx, cancel := context.WithTimeout(ctx, c.readTimeout)
 		e, hit, rerr := c.read(rctx, key)
 		cancel()
 		switch {

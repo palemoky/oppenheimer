@@ -5,6 +5,7 @@ import (
 
 	"github.com/palemoky/oppenheimer/pkg/app"
 	"github.com/palemoky/oppenheimer/pkg/degrade"
+	"github.com/palemoky/oppenheimer/pkg/fault"
 )
 
 // defaultAdminAddr 是内部管理端口的默认地址。只在本机回环上监听：上面的 /degrade 没有鉴权，
@@ -27,8 +28,10 @@ func publicMux(api http.Handler, readiness *app.Readiness) *http.ServeMux {
 }
 
 // adminMux 是内部管理端口的路由：两个探测和降级开关（设计文档 1d 的 6.9）。
+// fault.Register 在平时的构建里什么都不挂（pkg/fault 的包注释）。
 func adminMux(readiness *app.Readiness, switches *degrade.Set) *http.ServeMux {
 	mux := app.AdminMux(serviceName, readiness)
 	switches.Register(mux)
+	fault.Register(mux)
 	return mux
 }

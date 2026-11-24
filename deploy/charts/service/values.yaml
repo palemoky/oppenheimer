@@ -65,6 +65,11 @@ config:
   #   kubectl -n oppenheimer port-forward deploy/order 6060:6060
   #   go tool pprof http://127.0.0.1:6060/debug/pprof/heap
   DEBUG_ADDR: "127.0.0.1:6060"
+  # mutex、block 剖析的采样（pkg/app 的 ListenDebug，设计 4a 的 3.4）。默认不设，即不采样，取到的剖析是空的。
+  # 只在 DEBUG_ADDR 设了时生效；改了会重启 Pod。要打开时在服务自己的 values（deploy/cluster/services/<服务>.yaml）
+  # 的 config 里写，起步值见设计；开销用 3b 的压测量过再定。诊断 Agent 不会、也不能替你打开它们。
+  #   DEBUG_MUTEX_FRACTION: "100"   # 平均每 100 次锁争用记 1 次
+  #   DEBUG_BLOCK_RATE: "1ms"       # 平均每阻塞 1 毫秒记 1 次；是 Go 的时长，要带单位
 
 # 密码：从 Secret 取。secretName 是本命名空间里的 Secret（services.sh 从 mysql 命名空间复制）。
 # 这些变量排在 env 列表的最前面，expandEnv 里的 $(变量名) 才能引用它们（被引用的必须在前面）。

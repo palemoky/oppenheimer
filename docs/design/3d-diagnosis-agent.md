@@ -55,6 +55,7 @@
    k3s-server 的盘紧张过（3c 的 `ServerDiskLow`）；一次运行估计几百 KB，量小。
 10. **API 密钥要你提供。** 放在仓库根目录的 `.env`（`ANTHROPIC_API_KEY`，不入库，和 Telegram 的 token 同一个办法），脚本把它做成 Secret。建议在 Console 里单建一个工作区、给它设月度的花费上限，密钥只属于这个工作区。
     顺带要你知道的：诊断时查到的日志、指标、Pod 的状态会发给 Anthropic 的 API。这个项目里没有真实用户的数据。
+    （2026-11-24 补：后端可以换了，见第 9 节。数据发给所选的那一家，密钥是那一家的环境变量。）
 
 ## 3. 设计
 
@@ -319,4 +320,125 @@ Sonnet 子 Agent 写的，主会话读了 RBAC 的规则和 `cmd_agent`，重跑
 - `scripts/cluster/monitoring.sh agent`（`make agent`）：镜像没有就构建，`.env` 里有 `ANTHROPIC_API_KEY` 就做成 Secret `agent-anthropic`（没有也能起来，只是每次诊断都以 `api_error` 结束），下发，等就绪。不在 `monitoring.sh up` 里。
 - **Alertmanager 的第二个地址是带开关的**：配置里两个接收端各加了一段 `# agent-begin` 到 `# agent-end`，渲染时默认删掉，`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager` 才带上。原因：Agent 没有部署时带着这个地址，Alertmanager 每次通知都会失败并触发它自己的失败告警。`make alertmanager-test` 现在检查四种渲染（有没有 Telegram × 有没有 Agent）。给 Agent 的那一条 `send_resolved: false`（它不处理恢复通知）。
 - 留下的风险：`local-path` 的卷把 Pod 钉在一个节点上，那个节点没了 Pod 会一直 Pending，要删 PVC 才能换节点（运行记录也就没了）；`/ask` 没有鉴权，集群里任何 Pod 都能让它花钱（有每天的预算兜底）；`/healthz` 不检查 Claude、Prometheus、Loki，依赖坏了 Pod 不会被重启，要靠指标发现。
+
+## 9. 模型的后端可换（2026-11-24 加，主人要求；决定见 [ADR-0040](../adr/0040-llm-providers-behind-one-interface.md)）
+
+主人问“现在只支持 Claude，能不能做成组件式，支持 DeepSeek、OpenAI 等”，看了方案后说“修改吧，我稍后用 DeepSeek 尝试”。
+
+### 9.1 查到的事实（2026-11-24，DeepSeek 和 OpenAI 的官方文档，由子 Agent 读网页后报回）
+
+DeepSeek（`api-docs.deepseek.com`）：
+
+| 事实 | 对实现的影响 |
+|---|---|
+| 地址 `https://api.deepseek.com`，端点 `POST /chat/completions`；beta 地址是 `/beta` | 预设里写前一个 |
+| 现在的模型是 `deepseek-flash` 和 `deepseek-v4-pro`，上下文都是 100 万 token，都支持工具调用 | 默认用 `deepseek-flash`（主人在试跑前从 `deepseek-v4-pro` 改的） |
+| 价格（每百万 token，高峰时段）：flash 输入 0.3、命中缓存 0.006、输出 1.2 美元；v4-pro 输入 1.32、命中缓存 0.044、输出 3.96。平时是一半；高峰是 UTC 周一到周五 01:00 到 04:00、06:00 到 10:00 | 价格表填高峰的；平时会高估一倍 |
+| 思考默认是开的，深度用 `reasoning_effort`（`none`、`low`、`high`、`max`；`medium`、`xhigh` 会被当成 `high`） | `-effort` 原样发成 `reasoning_effort` |
+| 思考内容在 `message.reasoning_content` 里。**带 `tools` 的请求，之后的每一轮都要把它原样带回去，否则回 400** | 回复里的消息按原始 JSON 存进历史 |
+| 思考模式下 `tool_choice` 的 `required` 和指定工具回 400 | 和 Claude 一样，不强制，靠提示和循环里的检查 |
+| 严格模式（`strict`）只在 beta 地址上有，支持的 Schema 比标准的窄（没有 `minLength`、`maxLength`、`minItems`、`maxItems`） | 不开；报告由循环自己核对 |
+| `usage`：`prompt_tokens` 等于 `prompt_cache_hit_tokens` 加 `prompt_cache_miss_tokens`；`prompt_tokens_details.cached_tokens` 和前者相同 | 命中的从输入里减出来 |
+| `finish_reason`：`stop`、`length`、`tool_calls`、`content_filter`、`insufficient_system_resource`、`aborted` | 后两个是“回复不完整”，当成可以重试的错误 |
+| 输出上限的字段是 `max_tokens`（文档里没有 `max_completion_tokens`） | 预设里选字段名 |
+| 缓存是自动的、按前缀匹配，没有固定的有效期（“几小时到几天”），不保证命中 | 不用设断点；“前缀一个字节都不能变”照旧 |
+| 错误码：400、401、402（余额不足）、422、429（限流或并发超限）、500、503 | 只重试 429 和 5xx |
+| 非流式的请求在排队和生成期间会先发空行保活；10 分钟还没开始推理就断开 | 读完整个响应体再解析 |
+| 它另有一个 Anthropic 兼容的地址，但忽略 `anthropic-beta`、`cache_control`、`is_error` | 没走这条路，见 ADR-0040 |
+
+**文档里没有写的**：`reasoning_tokens` 是不是已经算在 `completion_tokens` 里；一次回复最多几个工具调用；工具的个数上限。
+
+OpenAI（`developers.openai.com` 的 Chat Completions 参考，有一部分是子 Agent 的摘要而不是原文）：`max_tokens` 已经废弃、推理模型不接受，用 `max_completion_tokens`；`finish_reason` 是 `stop`、`length`、`tool_calls`、`content_filter`；缓存命中在 `prompt_tokens_details.cached_tokens`；回复里**没有思考内容**；严格模式要求每个对象 `additionalProperties: false`、字段全部 `required`；系统提示推荐用 `developer` 角色，`system` 仍然接受。**没有查证的**：`cached_tokens` 是否含在 `prompt_tokens` 里（按含在里面实现的，和 DeepSeek 一样）；新模型的缓存写另有价（输入价的 1.25 倍），适配器没有算。
+
+### 9.2 改了什么
+
+- `internal/llm/openai.go`：OpenAI 兼容协议的适配器。历史是 `[]jsontext.Value`，assistant 的消息原样放回；每个工具结果是单独的一条 `tool` 消息，出错的在内容开头加 `ERROR: `；工具定义只编码一次（`json.Deterministic`），每轮发同样的字节；参数不是合法 JSON 时包成一个 JSON 字符串交给工具去报错；重试用 `pkg/retry`（最多发 3 次，只对 429、5xx、连接错误、被服务端中断的回复）。
+- `internal/llm/provider.go`：四个后端的预设和 `New`。密钥的环境变量：`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`LLM_API_KEY`（`openai-compatible`）。
+- `internal/llm/price.go`：加了 DeepSeek 的两个模型和 `ParsePrice`。
+- `cmd/agent/serve.go`：`-provider`、`-model`、`-base-url`、`-price`，各自能从环境变量给（`AGENT_PROVIDER`、`AGENT_MODEL`、`AGENT_BASE_URL`、`AGENT_PRICE`）。`-model` 的默认值从 `claude-opus-5-5` 变成“所选后端的默认模型”，不带参数时行为和原来一样。没有密钥时启动日志里有一条 warn。
+- 运行记录的 `meta.json` 多了 `provider`。
+- 部署：Secret 从 `agent-anthropic`（一个键）改成 `agent-llm`（键名就是环境变量名，`.env` 里有哪个放哪个），清单用 `envFrom`；`.env` 的 `AGENT_PROVIDER` 等四个值由 `monitoring.sh agent` 填进清单。旧的 Secret 从来没有建过（Agent 没有部署过），不用迁移。
+
+循环、工具、报告、触发都没有改。
+
+### 9.3 用 DeepSeek 试跑怎么做
+
+本机（不动集群，不带 Kubernetes 工具时去掉 `-kubeconfig`）：
+
+```
+export DEEPSEEK_API_KEY=...
+cd services/agent
+go run ./cmd/agent serve -provider=deepseek -listen=127.0.0.1:8080 -runs-dir=../../tmp/agent-runs \
+  -prometheus-url=http://127.0.0.1:9090 -loki-url=http://127.0.0.1:3100 -kubeconfig=$KUBECONFIG
+go run ./cmd/agent ask ...      # 另开一个终端，参数见 agent ask -h
+```
+
+集群里：`.env` 加 `DEEPSEEK_API_KEY=...` 和 `AGENT_PROVIDER=deepseek`，然后 `make agent`（要动集群，先登记、先拿同意，见第 5 节）。
+
+第一次试跑要看的（都是只有真的 API 才能回答的）：
+
+1. 第二轮起有没有 400（`reasoning_content` 带回去了没有）。
+2. `events.jsonl` 里每一轮的 `cache_read` 是不是从第二轮起大于 0。
+3. 不开严格模式时 `submit_report` 的参数合不合 Schema，被打回了几次。
+4. 一轮模型调用要多久（循环给的时限是 3 分钟），有没有被 `length` 截断（输出上限 16000，思考算不算在里面文档没有写）。
+5. Pod 到 `api.deepseek.com` 通不通（集群里跑的时候）。
+
+### 9.4 没有做、没有验证的
+
+- **OpenAI 和 Claude 没有对真的 API 跑过**（DeepSeek 跑过，见 9.5）。OpenAI 的预设连文档都没有逐条核对到原文。
+- 429 的 `Retry-After` 没有读，按自己的退避等。
+- DeepSeek 平时的半价没有算；OpenAI 的缓存写没有算。
+- 没有流式。
+
+
+### 9.5 用 DeepSeek 试跑的结果（2026-11-24 06:25 到 06:34 UTC，主人要求）
+
+在本机跑的 `agent serve -provider=deepseek`（模型 `deepseek-flash`，effort `high`），Prometheus 和 Loki 经 `kubectl port-forward`，Kubernetes 工具用本机的 kubeconfig；`agent ask` 提问。**只读，没有往集群里部署任何东西，没有经过 Alertmanager 的 webhook。** 运行记录在 `tmp/agent-runs/`（不入库）。
+
+| 运行 | 问题 | 结束原因 | 轮数 | 工具调用 | 输入 / 缓存读 / 输出 token | 估的费用 | 用时 |
+|---|---|---|---|---|---|---|---|
+| `20261124T062500Z-cd5p` | 现在集群里有没有不正常的地方 | `reported_truncated`（轮数） | 27 | 59 | 4.5 万 / 82.6 万 / 2.3 万 | 0.046 美元 | 143 秒 |
+| `20261124T062904Z-rvzp` | 某条告警为什么反复 pending | `reported` | 13 | 24 | 3.8 万 / 34.2 万 / 2.5 万 | 0.043 美元 | 151 秒 |
+| `20261124T063201Z-dwlw` | 同上 | `reported` | 15 | 35 | 2.7 万 / 31.6 万 / 1.8 万 | 0.032 美元 | 112 秒 |
+
+**第二次不算数**：主会话重启 Agent 时把端口转发一起带掉了，那一次 Prometheus 和 Loki 的工具全部是“连不上”，它只靠 Kubernetes 的工具交了报告。它验证的只有“工具全错时循环照样走得完”。
+
+9.3 列的五件事：
+
+1. **没有 400。** 三次运行 55 轮模型调用全部成功，`reasoning_content` 原样带回是对的。运行记录里每一轮都有思考内容（是原文，不是摘要）。
+2. **缓存从第二轮起命中**，而且几乎全中：每一轮的 `cache_read` 约等于上一轮的全部输入。三次合计输入里约 93% 是缓存读。请求体逐字节稳定这一条起作用了。
+3. **不开严格模式的代价出现了一次**：第一次运行交报告时，一个字符串里的双引号没有转义，参数不是合法的 JSON。当时的处理是包成字符串交给报告的解析，错误信息是“cannot unmarshal JSON string into Go report.Report”，模型看了重发、第二次对了，但占掉了唯一的一次“打回”名额。**已改**：`llm.ToolCall` 加了 `Malformed`，循环看到它就不执行这次调用，把“参数不是合法的 JSON、常见原因是引号没转义”还给模型，不占打回的名额（`TestRunMalformedArgumentsGoBackToModel`）。改完之后的两次运行里没有再出现，所以**这条路径只有单元测试走过**。
+4. **一轮 1 到 22 秒**，离 3 分钟的时限很远；没有被 `length` 截断，单轮输出最多约 3800 token。
+5. Pod 到 `api.deepseek.com` 通不通**没有验证**（是在本机跑的）。
+
+另外看到的：
+
+- 第一次撞了 25 轮的上限：问题问得宽，flash 每轮查得细。上限起了作用，收尾两轮交出了报告。要不要给 flash 调大轮数、或者在系统提示里让它收得早一点，等阶段 4 有了真的告警再看。
+- 报告的溯源是好的：结论都引用了步骤号，没有被“引用了不存在的步骤”打回过。
+- 第三次的结论（没有另外核实）：`PrometheusErrorSendingAlertsToSomeAlertmanagers` 反复进 pending，是因为通知量很小（5 分钟约 3 次），一次失败的 POST 就让错误率远超阈值，持续约 5 分钟后自己退掉，到不了 `for: 15m`；失败本身是连接层的（EOF、reset），Alertmanager 一侧只有 200。这正是 3c 留下的“这两条只到 pending”那件事，可以当作排查的起点。
+- 费用是按高峰价估的。
+
+### 9.6 在集群里经告警触发的一次（2026-11-24，主人同意部署后）
+
+- **怎么触发的**：`make agent` 部署（DeepSeek、`deepseek-flash`、`-peak=defer`），`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager` 打开第二个地址，08:46 UTC 用 `amtool alert add` 加了一条试跑的告警（`AgentWebhookTrial`，warning，说明里写“核对 gateway 过去一小时是否健康”）。当时在高峰里。
+- **走通了的**：Alertmanager 30 秒后把它发到了 Agent（`queued=true`）；Agent 把它留着（`held until 2026-11-24T10:00:00Z`）；**10:00:00 UTC 整自己开始跑**，运行号 `20261124T100000Z-igur`，70 秒，14 轮，38 次工具调用，结果 `reported`，按低谷价算 0.011 美元，缓存读 23 万 token。Pod 里到 `api.deepseek.com` 是通的，集群里的三组工具都能用。问题里带上了“这次诊断是推迟的、现在几点、先看告警还在不在”那段话，模型第一步确实先查了告警的现状。
+- **结论对不对**：对。它报告的是“这条告警背后没有真的故障，是直接塞进 Alertmanager 的试跑通知（Prometheus 里没有对应的规则和 `ALERTS` 序列），已经恢复；gateway 这一小时一直健康”，置信度高，证据是零个非 2xx、延迟平、Pod 没有重启、探针每分钟 `failed=0`。它还注意到 08:37 前后 `oppenheimer-e2e` 里有过一个 `chaos-smoke` 的 Pod（当时在做 Chaos Mesh 的冒烟），并说明它没有影响 gateway。
+- **看到的两个现象**：
+  1. 第一次交报告被程序退回了一次（引用了一个出错的步骤当证据），模型改了之后第二次通过。退回的机制在起作用。
+  2. 一次 PromQL 写错了（`vector cannot contain metrics with the same labelset`），模型自己换了写法。
+- **一处没有弄清的**：问题里那条告警的 `firing since` 是 08:56:28，比通知到达的时刻（08:46:58）还晚，正好等于 `amtool alert add --end` 给的结束时刻。是 `amtool` 只给 `--end` 时的行为、Alertmanager 的行为，还是 Agent 解析的问题，没有查。由 Prometheus 规则产生的真告警有没有这个现象也没有看过。
+- **仍然没有验的**：由真的告警规则触发（这次是手工加的告警）；一组里有多条告警；冷却、队列满、每天预算这几条在集群里的表现；高峰里攒了多条之后依次跑；带 pprof 工具的新镜像（这次部署的是 `355f2ea`，没有 pprof）。
+
+## 10. 躲开高峰价（2026-11-24 加，主人要求：“现在是 DeepSeek 的高峰价格，我想在相关的调用放在低谷价格处理”）
+
+DeepSeek 的高峰是 UTC 周一到周五 01:00 到 04:00、06:00 到 10:00（北京时间工作日 09:00 到 12:00、14:00 到 18:00），其余时间半价。
+
+- **费用按时段算**：价格表里的模型可以带一份高峰时段（`llm.PeakSchedule`），表里填高峰价，其余时间乘系数（DeepSeek 是 0.5）。`llm.CostOf` 多了一个时刻的参数，循环用发请求的时刻。9.5 里那三次都在高峰里，费用没有估高。
+- **高峰里不调模型**（`-peak=defer`，默认；环境变量 `AGENT_PEAK`；`-peak=run` 关掉）。只对分时段计价的模型起作用，Claude 不受影响：
+  - **告警触发的诊断留着**，高峰结束时按收到的顺序跑。留着的不占队列，最多留 `-queue` 个（默认 5），再多的丢掉并记指标（跳过原因 `peak_hold_full`）。跑的时候在问题末尾写明“这次诊断是推迟的、现在几点、告警可能已经恢复”。
+  - **手动提问回 409**，说明高峰到几点；`agent ask -force`（请求体里 `"force": true`）按高峰价马上跑。提问的人在等，不能替他留几个小时。
+- **放弃了什么**：高峰里响的告警最晚要等 4 小时才诊断。指标和日志都还在（Prometheus、Loki 的保留期远比这长），但 Pod 的状态、事件（k3s 默认留 1 小时）可能已经没了，`kube_*` 工具看到的是事后的样子。一次诊断在高峰里也只要几美分，所以这是“按主人的要求省钱”，不是不这样就不行。阶段 4 的实验由人定时间，排在低谷里做（北京时间中午 12:00 到 14:00、18:00 以后、周末），就不会碰到推迟。
+- **不知道的**：节假日（DeepSeek 说法定节假日不算高峰，程序不知道哪天是，会把节假日的工作日当成高峰：多等、费用估高）；一次调用跨过时段边界时按哪一头计价；一次运行在低谷的最后几分钟开始、跑进高峰时不会中途停。
+- 留着的诊断只在内存里，进程重启就没了（和去重的状态一样）。
+- 测试：`TestPeakSchedule`（时段的边界、时区、周末、两个时段的价）、`TestPeakHoursDeferAlertsAndGateAsk`（告警留着、提问被拒、`force` 能跑、高峰结束后留着的那个跑了）。
 

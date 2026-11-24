@@ -44,6 +44,11 @@ mysqld:
   # CDC 的全量读也要在这个时间内读完。从库断开超过这个时间要重新 CLONE（切换手册本来就是一律重建）。
   # 备份是 mysqldump 的逻辑备份，恢复不依赖 binlog。
   binlogExpireLogsSeconds: 86400
+  # glibc malloc 的 arena 个数上限（环境变量 MALLOC_ARENA_MAX）。空着就不设，用 glibc 的默认值（核数的 8 倍）。
+  # mysqld 每个连接一个线程，线程多的时候各用各的 arena；高峰过后 MySQL 释放的内存留在各个 arena 里还不回系统，
+  # 常驻内存停在涨到过的高点上。调小它换来的是少留碎片，代价是线程多时抢 arena 的锁。
+  # 只在量到这个问题的实例上设（mysql-main.yaml）。
+  mallocArenaMax: ""
 
 resources:
   memory: 1Gi

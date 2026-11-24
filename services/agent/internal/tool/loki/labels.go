@@ -89,7 +89,11 @@ func (t *labelsTool) Call(ctx context.Context, input jsontext.Value) (tool.Resul
 	if resp.Status != "success" {
 		return tool.Result{}, fmt.Errorf("the Loki server answered with status %q", resp.Status)
 	}
-	return tool.Result{Text: formatLabels(args.Label, resp.Data, fmtRange(start, end)), Raw: body}, nil
+	values := resp.Data
+	if tool.IsNamespaceLabel(args.Label) {
+		values = slices.DeleteFunc(values, t.c.hidden.Namespace)
+	}
+	return tool.Result{Text: formatLabels(args.Label, values, fmtRange(start, end)), Raw: body}, nil
 }
 
 func formatLabels(label string, values []string, span string) string {

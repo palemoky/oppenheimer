@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -83,9 +84,9 @@ func (k *kube) get(ctx context.Context, input jsontext.Value) (tool.Result, erro
 	var items []object
 	more, remaining := false, (*int64)(nil)
 	if args.Name != "" && (ns != "" || !s.namespaced) && args.Selector == "" {
-		o, err := s.get(ctx, k.client, ns, args.Name)
+		o, err := k.getOne(ctx, s, ns, args.Name)
 		if err != nil {
-			return tool.Result{}, apiError(err, where(s.kind, ns, args.Name))
+			return tool.Result{}, err
 		}
 		items = []object{o}
 	} else {
@@ -118,6 +119,10 @@ func (k *kube) get(ctx context.Context, input jsontext.Value) (tool.Result, erro
 
 // list 列一页对象，按名字再筛一遍（fake clientset 不认字段选择器）。
 func (k *kube) list(ctx context.Context, s *spec, ns, name, selector string) (items []object, more bool, remaining *int64, err error) {
+	if k.hidden.Namespace(ns) {
+		// 和一个不存在的命名空间一样：apiserver 对它返回空列表。
+		return nil, false, nil, nil
+	}
 	opts := metav1.ListOptions{LabelSelector: selector, Limit: listPageLimit}
 	if name != "" {
 		opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", name).String()
@@ -126,10 +131,35 @@ func (k *kube) list(ctx context.Context, s *spec, ns, name, selector string) (it
 	if err != nil {
 		return nil, false, nil, apiError(err, where(s.kind, ns, ""))
 	}
-	if name != "" {
-		p.items = slices.DeleteFunc(p.items, func(o object) bool { return o.GetName() != name })
-	}
+	p.items = slices.DeleteFunc(p.items, func(o object) bool {
+		return (name != "" && o.GetName() != name) || k.isHidden(o)
+	})
 	return p.items, p.more, p.remaining, nil
+}
+
+// getOne 按名字取一个对象。隐藏的（hidden.go）和不存在的回答一样。
+func (k *kube) getOne(ctx context.Context, s *spec, ns, name string) (object, error) {
+	what := where(s.kind, ns, name)
+	if k.hidden.Namespace(ns) {
+		return nil, notFound(what)
+	}
+	o, err := s.get(ctx, k.client, ns, name)
+	if err != nil {
+		return nil, apiError(err, what)
+	}
+	if k.isHidden(o) {
+		return nil, notFound(what)
+	}
+	return o, nil
+}
+
+// isHidden 报告一个对象是不是对模型隐藏的：在隐藏的命名空间里，或者是关于隐藏对象的事件。
+func (k *kube) isHidden(o object) bool {
+	if k.hidden.Namespace(o.GetNamespace()) {
+		return true
+	}
+	e, ok := o.(*corev1.Event)
+	return ok && k.hiddenEvent(e)
 }
 
 func writeListHeader(b *strings.Builder, s *spec, ns string, args getArgs, total int, more bool, remaining *int64) {
@@ -247,11 +277,7 @@ func (k *kube) describe(ctx context.Context, input jsontext.Value) (tool.Result,
 // 只找到一个就用它，找到多个让模型指定。
 func (k *kube) resolve(ctx context.Context, s *spec, ns, name string) (object, error) {
 	if ns != "" || !s.namespaced {
-		o, err := s.get(ctx, k.client, ns, name)
-		if err != nil {
-			return nil, apiError(err, where(s.kind, ns, name))
-		}
-		return o, nil
+		return k.getOne(ctx, s, ns, name)
 	}
 	items, _, _, err := k.list(ctx, s, "", name, "")
 	if err != nil {

@@ -104,6 +104,22 @@ lint: ## 对所有模块运行 golangci-lint
 test: ## 运行全部测试（带竞态检测）。集成测试需要先 make up
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && go test -race ./...) || exit 1; done
 
+# 有带 faults 标签的文件的模块（阶段 4 的故障代码，见 pkg/fault 的包注释）。这些文件平时不参加编译，
+# 下面三个目标保证它们一直编得过、测得过，并且确实没有进平时的二进制。
+FAULT_MODULES = $(shell grep -rlE '^//go:build faults' --include='*.go' pkg services 2>/dev/null | awk -F/ '{ if ($$1 == "pkg") print "pkg"; else print $$1 "/" $$2 }' | sort -u)
+
+.PHONY: lint-faults
+lint-faults: ## 带 faults 标签对有故障代码的模块再跑一遍 golangci-lint
+	@for m in $(FAULT_MODULES); do echo "==> lint -tags faults $$m"; (cd $$m && golangci-lint run --build-tags faults ./...) || exit 1; done
+
+.PHONY: test-faults
+test-faults: ## 带 faults 标签对有故障代码的模块跑 vet 和测试（带竞态检测；对着 MySQL 等的用例和 make test 一样要先 make up，否则被跳过）
+	@for m in $(FAULT_MODULES); do echo "==> test -tags faults $$m"; (cd $$m && go vet -tags faults ./... && go test -race -tags faults ./...) || exit 1; done
+
+.PHONY: check-faults
+check-faults: ## 核对平时的构建里没有故障代码（go tool nm 对比带标签和不带标签的二进制）
+	scripts/check-faults.sh
+
 .PHONY: test-unit
 test-unit: ## 只运行不依赖 MySQL、Redis、Kafka 的测试
 	@for m in $(MODULES); do echo "==> test $${m#$(ROOT)/}"; (cd $$m && OPPENHEIMER_TEST_MYSQL_DSN= OPPENHEIMER_TEST_REDIS_ADDR= OPPENHEIMER_TEST_REDIS_SENTINEL_ADDR= OPPENHEIMER_TEST_REDIS_CLUSTER_ADDR= OPPENHEIMER_TEST_KAFKA_BROKERS= go test -race ./...) || exit 1; done
@@ -314,7 +330,7 @@ monitoring-up: ## 装可观测的后端到命名空间 monitoring（kube-prometh
 	scripts/cluster/monitoring.sh up
 
 .PHONY: agent
-agent: ## 部署诊断 Agent 到命名空间 monitoring（只读 RBAC、存记录的卷、Secret agent-anthropic 来自 .env 的 ANTHROPIC_API_KEY；不在 monitoring-up 里；Alertmanager 的 webhook 另用 AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager 打开）
+agent: ## 部署诊断 Agent 到命名空间 monitoring（只读 RBAC、存记录的卷、模型的后端由 .env 的 AGENT_PROVIDER 选，Secret agent-llm 来自 .env 里对应的密钥如 DEEPSEEK_API_KEY；不在 monitoring-up 里；Alertmanager 的 webhook 另用 AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager 打开）
 	scripts/cluster/monitoring.sh agent
 
 .PHONY: monitoring-status
@@ -362,6 +378,36 @@ cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 
 .PHONY: cluster-chaos
 cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
 	scripts/cluster/chaos.sh
+
+.PHONY: chaos-mesh
+chaos-mesh: ## 装 Chaos Mesh 到命名空间 chaos-mesh（不装界面；装上之后没有命名空间能被注入，注解由注入脚本在实验时加）；卸载和查看用 scripts/cluster/chaos-mesh.sh uninstall|status
+	scripts/cluster/chaos-mesh.sh install
+
+.PHONY: chaos-smoke
+chaos-smoke: ## Chaos Mesh 的冒烟：在 oppenheimer-e2e 里六类故障各造一个最小的对象，核对生效、到时恢复、留下的痕迹；要先 make chaos-mesh 和 E2E_KEEP=1 make cluster-e2e；CHAOS_SMOKE_ONLY="delay time" 只跑几类
+	scripts/cluster/chaos-smoke.sh
+
+# 故障实验（阶段 4，设计 docs/design/4a-chaos-prep.md 的 3.5、3.6，场景的格式见 chaos/README.md）。命令前加 @：盲测时终端不回显参数。
+# 命名空间默认 oppenheimer，CHAOS_NS=oppenheimer-e2e 改成 e2e 那一套。
+.PHONY: chaos-steady
+chaos-steady: ## 故障实验的稳态压测：make chaos-steady ARGS=start|stop|check（start 要 SKUS=...；k6 mixed 固定 570 请求/秒，取 3b 容量拐点 1907 的三成）；只看不动用 ARGS="check --dry-run"
+	@scripts/cluster/chaos-steady.sh $(ARGS)
+
+.PHONY: chaos-blind
+chaos-blind: ## 盲测：make chaos-blind POOL=1（第一档）或 POOL=1,2:pod,network（风险档:类别）；先检查稳态，抽一个场景，密封，注入；终端只打印运行号和 sealed.json 的 SHA-256（记下来）；DRY_RUN=1 不连集群
+	@scripts/cluster/chaos-run.sh blind --pool "$(POOL)" $(if $(DRY_RUN),--dry-run)
+
+.PHONY: chaos-inject
+chaos-inject: ## 不盲的注入：make chaos-inject SCENARIO=s002；第三档要加 CONFIRM_RISK3=<同一个编号>；DRY_RUN=1 只打印将要做什么
+	@scripts/cluster/chaos-run.sh inject --scenario "$(SCENARIO)" $(if $(CONFIRM_RISK3),--confirm-risk3 "$(CONFIRM_RISK3)") $(if $(DRY_RUN),--dry-run)
+
+.PHONY: chaos-recover
+chaos-recover: ## 恢复当前的实验：撤掉注入、等回到稳态、等静止后跑 recon-check，结果写进 chaos/runs/<运行号>/；ALL=1 是总闸（所有 Chaos Mesh 对象、故障开关、脚本建的 VirtualService 全撤，RESTART=1 再重启五个服务）；NO_RECON=1 不跑对账；DRY_RUN=1 只打印
+	@scripts/cluster/chaos-run.sh recover $(if $(ALL),--all) $(if $(RESTART),--restart) $(if $(NO_RECON),--no-recon) $(if $(RUN),--run "$(RUN)") $(if $(DRY_RUN),--dry-run)
+
+.PHONY: chaos-reveal
+chaos-reveal: ## 复盘时打开答案：核对 sealed.json 的摘要（SHA=<记下的摘要>），在 docs/postmortems/ 生成复盘草稿，把 truth.md 填进“评测用标注”；运行还没恢复时拒绝（FORCE=1 例外）
+	@scripts/cluster/chaos-run.sh reveal $(if $(RUN),--run "$(RUN)") $(if $(SHA),--sha "$(SHA)") $(if $(FORCE),--force)
 
 .PHONY: cluster-fault
 cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、并发上限、超时和不重试；和 cluster-e2e 共用 oppenheimer-e2e；FAULT_SCENARIOS、E2E_KEEP 见脚本

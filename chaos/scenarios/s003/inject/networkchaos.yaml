@@ -1,0 +1,19 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: payment
+  delay:
+    latency: 100ms
+    jitter: 20ms
+  duration: 10m

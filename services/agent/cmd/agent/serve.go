@@ -17,11 +17,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go/v2"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -35,6 +36,7 @@ import (
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/kube"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/loki"
+	"github.com/palemoky/oppenheimer/services/agent/internal/tool/pprof"
 	"github.com/palemoky/oppenheimer/services/agent/internal/tool/prom"
 	"github.com/palemoky/oppenheimer/services/agent/internal/trigger"
 )
@@ -45,6 +47,14 @@ const serviceName = "agent"
 //
 //go:embed system.md
 var systemPrompt string
+
+// 高峰时段的处理方式（-peak）。
+const (
+	// peakDefer：告警触发的诊断留到高峰结束再跑，手动提问要带 force 才跑。
+	peakDefer = "defer"
+	// peakRun：不管时段，来了就跑。
+	peakRun = "run"
+)
 
 const (
 	// maxBodyBytes 是一次请求体的上限。
@@ -58,9 +68,13 @@ const (
 type serveConfig struct {
 	listen      string
 	runsDir     string
+	provider    string
+	baseURL     string
 	model       string
 	effort      string
 	fallback    bool
+	price       string
+	peak        string
 	dailyBudget float64
 	cooldown    time.Duration
 	queueSize   int
@@ -72,6 +86,12 @@ type serveConfig struct {
 	lokiURL       string
 	kubeconfig    string
 	inCluster     bool
+	// pprofNamespace、pprofPort 是 pprof_capture 能连的命名空间和 Pod 回环上的调试端口。
+	pprofNamespace string
+	pprofPort      int
+	// hiddenNamespaces、hiddenAPIGroups 是对模型不存在的命名空间和 API 组（逗号分隔），见 tool.Hidden。
+	hiddenNamespaces string
+	hiddenAPIGroups  string
 }
 
 func serveCmd(args []string, stderr io.Writer) int {
@@ -81,9 +101,17 @@ func serveCmd(args []string, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.StringVar(&cfg.listen, "listen", ":8080", "address to listen on")
 	fs.StringVar(&cfg.runsDir, "runs-dir", "runs", "directory for run records")
-	fs.StringVar(&cfg.model, "model", "claude-opus-5-5", "Claude model id")
-	fs.StringVar(&cfg.effort, "effort", "high", "output_config.effort: low, medium, high, xhigh, max")
-	fs.BoolVar(&cfg.fallback, "fallback", true, "enable server-side refusal fallback (beta)")
+	fs.StringVar(&cfg.provider, "provider", envOr("AGENT_PROVIDER", llm.ProviderAnthropic),
+		"model backend (default $AGENT_PROVIDER, else anthropic): "+strings.Join(llm.Providers(), ", "))
+	fs.StringVar(&cfg.model, "model", os.Getenv("AGENT_MODEL"), "model id (default $AGENT_MODEL, else the provider's default)")
+	fs.StringVar(&cfg.baseURL, "base-url", os.Getenv("AGENT_BASE_URL"),
+		"API base URL (default $AGENT_BASE_URL, else the provider's own); required for openai-compatible")
+	fs.StringVar(&cfg.effort, "effort", "high", "thinking effort (output_config.effort or reasoning_effort); accepted values differ by provider, empty omits it")
+	fs.BoolVar(&cfg.fallback, "fallback", true, "enable server-side refusal fallback (beta; anthropic only)")
+	fs.StringVar(&cfg.price, "price", os.Getenv("AGENT_PRICE"),
+		"USD per million tokens as input,output[,cache_write[,cache_read]] for a model that is not in the built-in table (default $AGENT_PRICE)")
+	fs.StringVar(&cfg.peak, "peak", envOr("AGENT_PEAK", peakDefer),
+		"what to do during the model's peak pricing hours (default $AGENT_PEAK, else defer): defer holds alert diagnoses until the peak ends and makes /ask require force; run ignores the hours. No effect for models without peak pricing")
 	fs.Float64Var(&cfg.dailyBudget, "daily-budget-usd", 20, "stop starting runs once this much was spent in one UTC day")
 	fs.DurationVar(&cfg.cooldown, "cooldown", time.Hour, "minimum time between two diagnoses of the same alert group")
 	fs.IntVar(&cfg.queueSize, "queue", 5, "how many diagnoses may wait behind the running one")
@@ -123,8 +151,22 @@ func serveCmd(args []string, stderr io.Writer) int {
 }
 
 func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
-	// 名字写错的模型在这里就失败：没有价格就卡不了费用的上限。
-	price, err := llm.PriceOf(cfg.model)
+	// 凭据从后端自己的环境变量里取（ANTHROPIC_API_KEY、DEEPSEEK_API_KEY 等）。没有凭据不挡启动：
+	// webhook 照收、照记，诊断会以 api_error 结束并留下记录。
+	if cfg.peak != peakDefer && cfg.peak != peakRun {
+		return fmt.Errorf("config: -peak must be %s or %s, got %q", peakDefer, peakRun, cfg.peak)
+	}
+	opts := llm.Options{Provider: cfg.provider, Model: cfg.model, Effort: cfg.effort, Fallback: cfg.fallback, BaseURL: cfg.baseURL}
+	if err := opts.Resolve(os.Getenv); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	cfg.model = opts.Model
+	// 名字写错的模型在这里就失败：没有价格就卡不了费用的上限。表里没有的模型要用 -price 显式给，不猜。
+	price, err := modelPrice(cfg)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	client, err := llm.New(opts)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -134,13 +176,10 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	tools, err := buildTools(cfg)
+	tools, err := buildTools(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("tools: %w", err)
 	}
-	// 凭据由 SDK 自己从环境里取（ANTHROPIC_API_KEY 等）。没有凭据不挡启动：
-	// webhook 照收、照记，诊断会以 api_error 结束并留下记录。
-	client := anthropic.NewClient()
 	budget := trigger.NewDailyBudget(cfg.dailyBudget, spentToday(store, time.Now(), logger), nil)
 	a := &app{
 		cfg:    cfg,
@@ -148,7 +187,7 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 		store:  store,
 		budget: budget,
 		runner: &loop.Runner{
-			LLM:    llm.NewAnthropic(client, llm.AnthropicConfig{Model: cfg.model, Effort: cfg.effort, Fallback: cfg.fallback}),
+			LLM:    client,
 			Tools:  tools,
 			System: systemPrompt,
 			Limits: cfg.limits,
@@ -172,8 +211,11 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	wg.Go(func() { a.pruneLoop(ctx) })
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
-	logger.InfoContext(ctx, "agent started", "listen", ln.Addr().String(), "model", cfg.model,
-		"effort", cfg.effort, "fallback", cfg.fallback, "tools", len(tools.Defs()), "runs_dir", cfg.runsDir)
+	if opts.APIKey == "" && cfg.provider != llm.ProviderCompatible {
+		logger.WarnContext(ctx, "no API key: every diagnosis will end in api_error", "provider", cfg.provider, "env", llm.KeyEnv(cfg.provider))
+	}
+	logger.InfoContext(ctx, "agent started", "listen", ln.Addr().String(), "provider", cfg.provider, "model", cfg.model,
+		"effort", cfg.effort, "fallback", cfg.fallback && cfg.provider == llm.ProviderAnthropic, "peak", cfg.peak, "peak_pricing", price.Peak != nil, "tools", len(tools.Defs()), "runs_dir", cfg.runsDir)
 
 	select {
 	case err := <-serveErr:
@@ -191,17 +233,42 @@ func serve(ctx context.Context, cfg serveConfig, logger *slog.Logger) error {
 	return nil
 }
 
+// modelPrice 返回配置的模型的单价：表里有的用表里的，没有的用 -price 给的。
+// 表里有的模型不接受 -price：两个数不一样时不知道该信哪个。
+func modelPrice(cfg serveConfig) (llm.Price, error) {
+	price, err := llm.PriceOf(cfg.model)
+	switch {
+	case cfg.price == "":
+		if err != nil {
+			return llm.Price{}, fmt.Errorf("%w; give it with -price", err)
+		}
+		return price, nil
+	case err == nil:
+		return llm.Price{}, fmt.Errorf("model %q has a built-in price, -price is only for models without one", cfg.model)
+	}
+	return llm.ParsePrice(cfg.price)
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // buildTools 登记只读工具。没有给地址（或者没有给 Kubernetes 的连接方式）的那一组不登记；
 // 一组都没有时 Agent 只有循环自己加的 submit_report，仍然能启动。
-func buildTools(cfg serveConfig) (*tool.Registry, error) {
+// pprof_capture 跟着 kube_* 一起登记：它经 apiserver 的端口转发连 Pod。
+func buildTools(cfg serveConfig, logger *slog.Logger) (*tool.Registry, error) {
 	// 工具自己不设超时：每次调用的时限由循环经 ctx 给（loop.Limits.ToolTimeout）。
 	client := &http.Client{}
+	hidden := tool.NewHidden(cfg.hiddenNamespaces, cfg.hiddenAPIGroups)
 	var tools []tool.Tool
 	if cfg.prometheusURL != "" {
-		tools = append(tools, prom.New(prom.Config{BaseURL: cfg.prometheusURL, HTTP: client})...)
+		tools = append(tools, prom.New(prom.Config{BaseURL: cfg.prometheusURL, HTTP: client, Hidden: hidden})...)
 	}
 	if cfg.lokiURL != "" {
-		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client})...)
+		tools = append(tools, loki.New(loki.Config{BaseURL: cfg.lokiURL, HTTP: client, Hidden: hidden})...)
 	}
 	kubeCfg, err := kubeConfig(cfg)
 	if err != nil {
@@ -212,7 +279,14 @@ func buildTools(cfg serveConfig) (*tool.Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("kubernetes client: %w", err)
 		}
-		tools = append(tools, kube.New(kube.Config{Client: cs})...)
+		tools = append(tools, kube.New(kube.Config{Client: cs, Hidden: hidden})...)
+		tools = append(tools, pprof.New(pprof.Config{
+			Pods:      cs,
+			Forwarder: pprof.NewKubeForwarder(kubeCfg, cs),
+			Namespace: cfg.pprofNamespace,
+			Port:      cfg.pprofPort,
+			Logger:    logger,
+		}))
 	}
 	return tool.NewRegistry(tools...)
 }
@@ -255,6 +329,10 @@ func spentToday(store *runlog.Store, now time.Time, logger *slog.Logger) float64
 }
 
 type app struct {
+	// now、after 为 nil 时用 time.Now、time.After；测试里换掉。
+	now   func() time.Time
+	after func(time.Duration) <-chan time.Time
+
 	cfg        serveConfig
 	logger     *slog.Logger
 	store      *runlog.Store
@@ -301,9 +379,18 @@ func (a *app) handleAlerts(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleAsk(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Question string `json:"question"`
+		// Force 为真时在高峰时段也马上跑（按高峰价）。
+		Force bool `json:"force"`
 	}
 	if err := json.UnmarshalRead(http.MaxBytesReader(w, r.Body, maxBodyBytes), &req); err != nil || req.Question == "" {
-		http.Error(w, `body must be {"question": "..."}`, http.StatusBadRequest)
+		http.Error(w, `body must be {"question": "...", "force": false}`, http.StatusBadRequest)
+		return
+	}
+	// 提问的人在等，不能替他留到几个小时以后：说明高峰到什么时候，让他自己决定等还是加 force。
+	if until, peak := a.peakUntil(); peak && !req.Force {
+		w.Header().Set("Retry-After", strconv.Itoa(int(until.Sub(a.clock()).Seconds())+1))
+		http.Error(w, fmt.Sprintf("peak pricing hours for %s until %s; ask again after that, or set force to run now at the peak price",
+			a.cfg.model, until.Format(time.RFC3339)), http.StatusConflict)
 		return
 	}
 	reply, err := a.dispatcher.Ask(r.Context(), req.Question)
@@ -346,13 +433,67 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // work 是唯一的工作协程：同一时刻只跑一次诊断。
+func (a *app) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
+// peakUntil 回答现在是不是该躲开的高峰时段（配置成 defer，而且这个模型分时段计价），是的话返回高峰结束的时刻。
+func (a *app) peakUntil() (time.Time, bool) {
+	if a.cfg.peak != peakDefer {
+		return time.Time{}, false
+	}
+	return a.runner.Price.PeakUntil(a.clock())
+}
+
+// work 是唯一的工作协程：同一时刻只跑一次诊断。
+//
+// 高峰时段里收到的告警诊断不跑，留在 held 里，高峰结束时按收到的顺序跑。留着的不占队列：
+// 带 force 的手动提问照样能马上跑。held 只在内存里，进程重启就没了（和去重的状态一样）。
+// 代价是诊断晚了几个小时：指标和日志还在，但 Pod、事件这些当时的状态可能已经没了，见设计 3d 第 10 节。
 func (a *app) work(ctx context.Context) {
+	after := a.after
+	if after == nil {
+		after = time.After
+	}
+	var held []trigger.Job
+	var wake <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-wake:
+			wake = nil
+			jobs := held
+			held = nil
+			for _, job := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				job.Question += fmt.Sprintf("\n\nNote: this diagnosis was held back during peak pricing hours. "+
+					"The time above is when the alert notification arrived; the current time is now %s. "+
+					"The alert may have resolved since: check its current state first, and query the time range around when it fired.",
+					a.clock().UTC().Format(time.RFC3339))
+				a.runJob(ctx, job)
+			}
 		case job := <-a.dispatcher.Jobs():
-			a.runJob(ctx, job)
+			until, peak := a.peakUntil()
+			if !peak || job.Kind != trigger.KindAlert {
+				a.runJob(ctx, job)
+				continue
+			}
+			if len(held) >= a.cfg.queueSize {
+				recordSkip(ctx, trigger.SkipPeakFull)
+				a.logger.WarnContext(ctx, "alert diagnosis dropped: too many already held for off-peak hours", "held", len(held))
+				continue
+			}
+			held = append(held, job)
+			a.logger.InfoContext(ctx, "alert diagnosis held until peak pricing hours end", "until", until, "held", len(held))
+			if wake == nil {
+				wake = after(until.Sub(a.clock()))
+			}
 		}
 	}
 }
@@ -377,7 +518,7 @@ func (a *app) runJob(ctx context.Context, job trigger.Job) {
 	id := runlog.NewID(started)
 	run, err := a.store.Create(runlog.Meta{
 		ID: id, Trigger: job.Kind, Question: job.Question, Alert: job.Alert,
-		Model: a.cfg.model, Effort: a.cfg.effort, Limits: a.cfg.limits.Record(),
+		Provider: a.cfg.provider, Model: a.cfg.model, Effort: a.cfg.effort, Limits: a.cfg.limits.Record(),
 		Version: version(), Prompt: promptHash(), StartedAt: started.UTC(),
 	})
 	var rec loop.Recorder = noRecord{}

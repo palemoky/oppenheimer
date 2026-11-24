@@ -39,13 +39,17 @@ compute_tag() {
     echo "$IMAGE_TAG"
     return
   fi
-  local sha status
+  local sha status suffix=""
+  # GO_TAGS=faults 构建的是带故障代码的镜像（阶段 4），tag 带后缀，不会和平时的镜像混（同一个提交号的两种构建
+  # 不能共用一个 tag：后推的会盖掉先推的，也看不出集群上跑的是哪一种）。后缀故意不写 faults：tag 出现在 Pod 的
+  # 事件和 describe 里，第一次走通时诊断 Agent 读到 -faults 就写进了报告（设计 4a 第 6 节“第 6 步”）。p4 是阶段 4。
+  [[ " ${GO_TAGS:-} " == *" faults "* ]] && suffix="-p4"
   sha="$(git -C "$ROOT" rev-parse --short HEAD)"
   status="$(git -C "$ROOT" status --porcelain)"
   if [[ -n "$status" ]]; then
-    echo "${sha}-dirty-$(date -u +%Y%m%d%H%M%S)"
+    echo "${sha}-dirty-$(date -u +%Y%m%d%H%M%S)${suffix}"
   else
-    echo "$sha"
+    echo "${sha}${suffix}"
   fi
 }
 
@@ -81,6 +85,7 @@ do_build() { # tag 服务...
     docker buildx build --platform "$PLATFORM" --load \
       -f "$dockerfile" \
       --build-arg "SERVICE=$s" \
+      --build-arg "GO_TAGS=${GO_TAGS:-}" \
       -t "$(image_name "$s" "$tag")" \
       "$ROOT"
   done

@@ -89,6 +89,9 @@ func (k *kube) events(ctx context.Context, input jsontext.Value) (tool.Result, e
 // fetchEvents 取一页事件。按对象过滤用字段选择器交给 apiserver，回来之后再按同样的条件筛一遍
 // （fake clientset 不认字段选择器，真的 apiserver 认，再筛一遍对真的没有坏处）。
 func (k *kube) fetchEvents(ctx context.Context, ns, kind, name string) (evs []corev1.Event, more bool, err error) {
+	if k.hidden.Namespace(ns) {
+		return nil, false, nil
+	}
 	set := fields.Set{}
 	if kind != "" {
 		set["involvedObject.kind"] = kind
@@ -105,9 +108,27 @@ func (k *kube) fetchEvents(ctx context.Context, ns, kind, name string) (evs []co
 		return nil, false, apiError(err, where("Event", ns, ""))
 	}
 	evs = slices.DeleteFunc(list.Items, func(e corev1.Event) bool {
-		return (kind != "" && !strings.EqualFold(e.InvolvedObject.Kind, kind)) || (name != "" && e.InvolvedObject.Name != name)
+		return (kind != "" && !strings.EqualFold(e.InvolvedObject.Kind, kind)) || (name != "" && e.InvolvedObject.Name != name) ||
+			k.hiddenEvent(&e)
 	})
 	return evs, list.Continue != "", nil
+}
+
+// hiddenEvent 报告一条事件是不是对模型隐藏的（hidden.go）：事件自己或它说的对象在隐藏的命名空间里，
+// 或者它说的对象属于隐藏的 API 组。后一种是故障注入工具在**目标**命名空间里留下的痕迹：Chaos Mesh 的
+// NetworkChaos、IOChaos 会在目标 Pod 旁边建同名的 PodNetworkChaos、PodIOChaos，每次更新都有一条事件
+// （设计 4a 第 6 节“第 1 步”）。按 API 组认而不是按 kind 的名字：以后多出别的 kind 不用改这里。
+func (k *kube) hiddenEvent(e *corev1.Event) bool {
+	refs := []*corev1.ObjectReference{&e.InvolvedObject}
+	if e.Related != nil {
+		refs = append(refs, e.Related)
+	}
+	for _, r := range refs {
+		if k.hidden.Namespace(r.Namespace) || k.hidden.APIVersion(r.APIVersion) {
+			return true
+		}
+	}
+	return k.hidden.Namespace(e.Namespace)
 }
 
 // eventTime 是事件最后一次出现的时间。新旧两种 API 写的字段不一样，取能找到的最晚的那个。

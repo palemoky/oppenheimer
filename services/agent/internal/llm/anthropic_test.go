@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
@@ -214,10 +215,10 @@ func TestPrice(t *testing.T) {
 		t.Error("unknown model must be an error")
 	}
 	// 回退到表里没有的模型：按配置的模型的价算。
-	if got := CostOf("some-other-model", p, Usage{Input: 1_000_000}); got != 4 {
+	if got := CostOf("some-other-model", p, Usage{Input: 1_000_000}, time.Now()); got != 4 {
 		t.Errorf("fallback cost = %v, want 4", got)
 	}
-	if got := CostOf("claude-sonnet-5-5", p, Usage{Input: 1_000_000}); got != 2 {
+	if got := CostOf("claude-sonnet-5-5", p, Usage{Input: 1_000_000}, time.Now()); got != 2 {
 		t.Errorf("served-by cost = %v, want 2", got)
 	}
 }

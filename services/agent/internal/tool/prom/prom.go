@@ -32,11 +32,13 @@ type Config struct {
 	HTTP *http.Client
 	// Now 为 nil 时用 time.Now。测试里固定它，相对时间才能断言。
 	Now func() time.Time
+	// Hidden 是对模型不存在的命名空间（故障注入工具），nil 时什么都不隐藏。见 tool.Hidden。
+	Hidden *tool.Hidden
 }
 
 // New 返回四个工具：prom_query、prom_query_range、prom_alerts、prom_rule。
 func New(cfg Config) []tool.Tool {
-	c := &client{base: strings.TrimRight(cfg.BaseURL, "/"), http: cfg.HTTP, now: cfg.Now}
+	c := &client{base: strings.TrimRight(cfg.BaseURL, "/"), http: cfg.HTTP, now: cfg.Now, hidden: cfg.Hidden}
 	if c.http == nil {
 		c.http = http.DefaultClient
 	}
@@ -53,9 +55,10 @@ func New(cfg Config) []tool.Tool {
 
 // client 建好之后只读，所以工具可以并发调用。
 type client struct {
-	base string
-	http *http.Client
-	now  func() time.Time
+	base   string
+	http   *http.Client
+	now    func() time.Time
+	hidden *tool.Hidden
 }
 
 // envelope 是 Prometheus API 响应的外层。

@@ -63,8 +63,9 @@ localize() { # <目录>
 }
 
 # 四种渲染：带不带 Telegram，带不带 Agent 的 webhook。前两种（Agent 没开）是默认的下发内容。
-render "$tmp/with" 1
-render "$tmp/without"
+# 这两份是“不发给 Agent”的：调用方带着 AGENT_WEBHOOK=1 来时（monitoring.sh alertmanager 下发前的检查）不能跟着变。
+AGENT_WEBHOOK=0 render "$tmp/with" 1
+AGENT_WEBHOOK=0 render "$tmp/without"
 AGENT_WEBHOOK=1 render "$tmp/with-agent" 1
 AGENT_WEBHOOK=1 render "$tmp/without-agent"
 variants="with without with-agent without-agent"

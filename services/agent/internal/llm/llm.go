@@ -37,6 +37,9 @@ type ToolCall struct {
 	ID    string
 	Name  string
 	Input jsontext.Value
+	// Malformed 不为空表示模型写的参数不是合法的 JSON，这里是解析的错误；Input 那时是把原文包起来的一个 JSON 字符串。
+	// 只有参数以字符串形式传的协议（OpenAI 兼容的）而且没开严格模式时才会出现。循环不执行这样的调用，把错误还给模型。
+	Malformed string `json:",omitzero"`
 }
 
 // ToolResult 是一次工具调用的结果，CallID 对应 ToolCall.ID。

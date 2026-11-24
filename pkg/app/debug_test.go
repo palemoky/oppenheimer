@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	rpprof "runtime/pprof"
 	"strings"
 	"testing"
 	"time"
@@ -161,5 +163,79 @@ func TestWithDebug(t *testing.T) {
 	d := &HTTPServer{name: "debug"}
 	if got := WithDebug(d, a, b); len(got) != 3 || got[0] != d || got[1] != a || got[2] != b {
 		t.Errorf("WithDebug(d, a, b) = %v, want [d a b]", got)
+	}
+}
+
+func TestDebugSamplingOffByDefault(t *testing.T) {
+	t.Setenv(DebugAddrEnv, "127.0.0.1:0")
+	t.Setenv(DebugMutexFractionEnv, "")
+	t.Setenv(DebugBlockRateEnv, "")
+	before := runtime.SetMutexProfileFraction(-1)
+	s, err := ListenDebug(t.Context(), discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	if got := runtime.SetMutexProfileFraction(-1); got != before {
+		t.Errorf("mutex profile fraction = %d without %s, want it unchanged (%d)", got, DebugMutexFractionEnv, before)
+	}
+}
+
+func TestDebugSamplingFromEnv(t *testing.T) {
+	t.Setenv(DebugAddrEnv, "127.0.0.1:0")
+	t.Setenv(DebugMutexFractionEnv, "100")
+	t.Setenv(DebugBlockRateEnv, "1ns") // 每次阻塞都记，下面一次短阻塞就能看到
+	t.Cleanup(func() {
+		runtime.SetMutexProfileFraction(0)
+		runtime.SetBlockProfileRate(0)
+	})
+	s, err := ListenDebug(t.Context(), discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	if got := runtime.SetMutexProfileFraction(-1); got != 100 {
+		t.Errorf("mutex profile fraction = %d, want 100", got)
+	}
+	ch := make(chan struct{})
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		close(ch)
+	}()
+	<-ch
+	if n := rpprof.Lookup("block").Count(); n == 0 {
+		t.Error("block profile is empty after a blocking receive, want block sampling on")
+	}
+}
+
+func TestDebugSamplingNeedsDebugPort(t *testing.T) {
+	t.Setenv(DebugAddrEnv, "")
+	t.Setenv(DebugMutexFractionEnv, "7")
+	before := runtime.SetMutexProfileFraction(-1)
+	if s, err := ListenDebug(t.Context(), discard); s != nil || err != nil {
+		t.Fatalf("ListenDebug = %v, %v; want nil, nil", s, err)
+	}
+	if got := runtime.SetMutexProfileFraction(-1); got != before {
+		t.Errorf("mutex profile fraction = %d with the debug port off, want it unchanged (%d)", got, before)
+	}
+}
+
+func TestDebugSamplingBadValues(t *testing.T) {
+	for _, tt := range []struct{ env, value string }{
+		{DebugMutexFractionEnv, "abc"},
+		{DebugMutexFractionEnv, "-1"},
+		{DebugBlockRateEnv, "1"}, // 没有单位：不猜是纳秒还是毫秒
+		{DebugBlockRateEnv, "-1ms"},
+	} {
+		t.Run(tt.env+"="+tt.value, func(t *testing.T) {
+			t.Setenv(DebugAddrEnv, "127.0.0.1:0")
+			t.Setenv(DebugMutexFractionEnv, "")
+			t.Setenv(DebugBlockRateEnv, "")
+			t.Setenv(tt.env, tt.value)
+			if s, err := ListenDebug(t.Context(), discard); err == nil {
+				_ = s.Stop(context.Background())
+				t.Fatal("ListenDebug succeeded, want an error for the bad value")
+			}
+		})
 	}
 }

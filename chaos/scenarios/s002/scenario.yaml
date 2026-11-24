@@ -1,0 +1,16 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s002
+method: chaos-mesh
+risk: 1
+category: pod
+target:
+  workload: inventory
+duration: 5m
+requires:
+  - 目标工作负载至少 2 个副本（否则杀掉那一个就是整个服务不可用，不是这个场景要练的）
+  - 稳态的压测在跑
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：Deployment 自己补上被杀的 Pod
+expected_alerts: []

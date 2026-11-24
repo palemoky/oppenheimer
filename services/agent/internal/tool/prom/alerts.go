@@ -78,10 +78,9 @@ func (t *alertsTool) Call(ctx context.Context, input jsontext.Value) (tool.Resul
 	if err := json.Unmarshal(resp.data, &data); err != nil {
 		return tool.Result{}, fmt.Errorf("cannot parse the Prometheus alerts: %w", err)
 	}
-	alerts := data.Alerts
-	if a.State != "" {
-		alerts = slices.DeleteFunc(alerts, func(al alert) bool { return al.State != a.State })
-	}
+	alerts := slices.DeleteFunc(data.Alerts, func(al alert) bool {
+		return (a.State != "" && al.State != a.State) || t.c.hidden.Labels(al.Labels)
+	})
 	slices.SortStableFunc(alerts, func(x, y alert) int {
 		// firing 在前，同一状态里先激活的在前：最早出问题的地方往往离根因最近。
 		if c := cmp.Compare(rank(x.State), rank(y.State)); c != 0 {
@@ -225,6 +224,7 @@ func (t *ruleTool) Call(ctx context.Context, input jsontext.Value) (tool.Result,
 				continue
 			}
 			if r.Name == name {
+				r.Alerts = slices.DeleteFunc(r.Alerts, func(al alert) bool { return t.c.hidden.Labels(al.Labels) })
 				found = append(found, match{g, r})
 				continue
 			}

@@ -41,6 +41,8 @@ type Config struct {
 	Client kubernetes.Interface
 	// Now 返回现在的时间，nil 时用 time.Now。相对时间参数和“多久以前”都按它算。
 	Now func() time.Time
+	// Hidden 是对模型不存在的命名空间和 API 组（故障注入工具），nil 时什么都不隐藏。见 hidden.go。
+	Hidden *tool.Hidden
 }
 
 // New 返回四个只读工具。cfg.Client 在调用期间只读，工具可以并发调用。
@@ -48,7 +50,7 @@ func New(cfg Config) []tool.Tool {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	k := &kube{client: cfg.Client, now: cfg.Now}
+	k := &kube{client: cfg.Client, now: cfg.Now, hidden: cfg.Hidden}
 	return []tool.Tool{
 		&fn{def: getDef(), call: k.get},
 		&fn{def: describeDef(), call: k.describe},
@@ -60,6 +62,7 @@ func New(cfg Config) []tool.Tool {
 type kube struct {
 	client kubernetes.Interface
 	now    func() time.Time
+	hidden *tool.Hidden
 }
 
 // fn 把一个函数包成 tool.Tool。
@@ -97,11 +100,16 @@ func str(desc string) map[string]any {
 func apiError(err error, what string) error {
 	switch {
 	case apierrors.IsNotFound(err):
-		return fmt.Errorf("%s not found; use kube_get to list what exists", what)
+		return notFound(what)
 	case apierrors.IsForbidden(err):
 		return fmt.Errorf("the agent is not permitted to read %s", what)
 	}
 	return fmt.Errorf("reading %s: %w", what, err)
+}
+
+// notFound 是“找不到”的回答。隐藏的对象（hidden.go）也用它，两者要一字不差。
+func notFound(what string) error {
+	return fmt.Errorf("%s not found; use kube_get to list what exists", what)
 }
 
 // where 描述对象的位置，用在错误信息里。

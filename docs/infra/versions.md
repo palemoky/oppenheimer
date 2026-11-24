@@ -24,6 +24,7 @@
 | golangci-lint | v2.15 | 稳定版 | 2026-11-11 | CI 与本地保持一致 |
 | k8s.io/client-go | v0.37.2 | 稳定版 | 2026-11-24 | 连同 `k8s.io/api`、`k8s.io/apimachinery` 同版本，对应集群的 Kubernetes 1.37。诊断 Agent 的 `kube_*` 工具用（只读，设计文档 3d 的 3.3）。版本是从 Go 模块代理查的。只有 `services/agent` 依赖它 |
 | anthropic-sdk-go | v2.13.0 | 稳定版 | 2026-11-24 | `github.com/anthropics/anthropic-sdk-go/v2`，诊断 Agent 调 Claude API（设计文档 3d、ADR-0038）。版本是从 Go 模块代理查的（v2 的最新版；v1 仍在发，最新 v1.84.0），没有 LTS。走 beta 命名空间（`client.Beta.Messages`），因为服务端的拒绝回退只在那里有。模型的价格表写在 `services/agent/internal/llm/price.go`，查证日期同 |
+| DeepSeek API | 模型 `deepseek-v4-pro`、`deepseek-flash` | 托管服务 | 2026-11-24 | 诊断 Agent 的另一个模型后端（设计文档 3d 第 9 节、ADR-0040）。没有用 SDK：OpenAI 兼容协议的客户端是手写的（`services/agent/internal/llm/openai.go`），没有新增依赖。模型名、价格、协议上的细节是从 `api-docs.deepseek.com` 查的；价格表在 `services/agent/internal/llm/price.go`（填的是高峰时段的价）。OpenAI 的预设没有固定模型，要用 `-model` 和 `-price` 给 |
 | promtool | 3.13.5 | LTS | 2026-11-22 | 随 Prometheus 的发布包（`prometheus-3.13.5.<os>-<arch>.tar.gz`，来源 github.com/prometheus/prometheus/releases，只取 `promtool`），版本跟集群上的 Prometheus（`cluster.env` 的 `PROMETHEUS_VERSION`，3.13 是 LTS）。`make promtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；SLO 规则的单元测试和下发前的检查用，版本写在 `Makefile` 里，升级时和 `cluster.env` 一起改 |
 | amtool | 0.35.0 | 稳定版 | 2026-11-23 | 随 Alertmanager 的发布包（`alertmanager-0.35.0.<os>-<arch>.tar.gz`，来源 github.com/prometheus/alertmanager/releases，只取 `amtool`），版本跟集群上的 Alertmanager（kube-prometheus-stack 的 chart 带的，`kubectl -n monitoring get alertmanager` 看得到 v0.35.0）。`make amtool` 装进 `./bin` 并校验发布页 `sha256sums.txt`；检查 Alertmanager 的配置和核对路由用（`make alertmanager-test`），版本写在 `Makefile` 里，chart 升级时一起看；Alertmanager 没有 LTS |
 | yq | v4.54.3 | 稳定版 | 2026-11-22 | mikefarah/yq，来源 github.com/mikefarah/yq/releases（`yq_<os>_<arch>`，校验发布页 `checksums` 里的 SHA-256）。从 `PrometheusRule` 清单里抽 `.spec.groups` 给 promtool；`make yq` 装进 `./bin`。ubuntu-latest 预装了同版本，但本机没有，两边统一用 `./bin` 里的；没有 LTS |
@@ -64,6 +65,7 @@
 | mysqld_exporter | v0.21.0 | 稳定版 | 2026-11-17 | MySQL 的指标（设计文档 3a、ADR-0030 第 8 项），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-10-22），没有 LTS；镜像 `quay.io/prometheus/mysqld-exporter:v0.21.0`。在 MySQL 9.7.4 上实测：`SHOW REPLICA STATUS` 能用（它依次试 `SHOW ALL SLAVES STATUS`、`SHOW SLAVE STATUS`、`SHOW REPLICA STATUS`），指标名仍带 `slave_status`，但 9.x 的字段名是新的（`seconds_behind_source`、`replica_io_running`） |
 | redis_exporter | v1.97.0 | 稳定版 | 2026-11-17 | Redis 的指标（同上），命名空间 `monitoring`，多目标模式。GitHub releases 的最新正式版（2026-11-04），没有 LTS；镜像 `oliver006/redis_exporter:v1.97.0-alpine`（Docker Hub 的 tag 带 `v`） |
 | KEDA | 2.21.1 | 稳定版 | 2026-11-17 | 按 Prometheus 里的请求速率伸缩 gateway、order（设计文档 3a 的 3.8、ADR-0030 第 10 项），命名空间 `keda`，release 名 `keda`。GitHub releases 的最新正式版（2026-11-15），没有 LTS；chart `kedacore/keda` 2.21.1（仓库 `https://kedacore.github.io/charts`），chart 和应用同一个版本号，镜像在 `ghcr.io/kedacore/`。官方测试的 Kubernetes 是 1.34 到 1.36；在我们的 1.37.2 上实测：三个组件就绪，`external.metrics.k8s.io` 可用，`prometheus` 和 `cpu` 两种触发器扩缩正常 |
+| Chaos Mesh | 2.8.8 | 稳定版 | 2026-11-24 | 故障注入（设计文档 4a 的 3.2、ADR-0041），命名空间 `chaos-mesh`，release 名 `chaos-mesh`。chart 仓库 `https://charts.chaos-mesh.org` 的最新版（2026-11-24 查），没有 LTS；chart 和应用同一个版本号。不装 dashboard，controller-manager 1 个副本，`chaosDaemon.runtime=containerd`、套接字 `/run/k3s/containerd/containerd.sock`。在 k3s v1.37.2、containerd 2.3.7、内核 7.0.0 上实测：PodChaos、NetworkChaos、StressChaos、IOChaos、TimeChaos、DNSChaos 六类都生效并到时恢复（`make chaos-smoke`） |
 | Kafka（集群上） | 4.3.2 | 稳定版 | 2026-11-15 | **偏离规则**：最新的是 4.4.0（本机 compose 在用），Strimzi 还不支持。Strimzi 支持后升级 |
 | distribution（registry） | 3.1.2 | 稳定版 | 2026-11-15 | 集群里的镜像仓库，镜像 `registry:3.1.2`，数据在 NAS |
 | podinfo | 6.9.0 | 稳定版 | 2026-11-15 | 只在 `make cluster-smoke` 里临时部署，回显请求头 |
@@ -144,7 +146,6 @@ CDC 的 MySQL 账号 `cdc` 由复制脚本在两个主库上创建（从库只�
 | Strimzi、MySQL Operator | 2 | 无 |
 | OpenTelemetry Collector 与 Go SDK | 1d / 3 | 无 |
 | Grafana、Loki、Alertmanager | 3 | 无 |
-| Chaos Mesh | 4 | 无 |
 | Rust | 8 | 无，选最新 stable |
 
 「是否有 LTS」一栏是初步判断，引入时一并核实。
