@@ -379,6 +379,14 @@ cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 
 cluster-chaos: ## 在集群上做删 Pod 对账测试：和 cluster-e2e 共用 oppenheimer-e2e，压测期间随机删业务 Pod，恢复、静止后 verify 和 recon；CHAOS_* 见脚本，E2E_KEEP=1 保留现场
 	scripts/cluster/chaos.sh
 
+.PHONY: chaos-mesh
+chaos-mesh: ## 装 Chaos Mesh 到命名空间 chaos-mesh（不装界面；装上之后没有命名空间能被注入，注解由注入脚本在实验时加）；卸载和查看用 scripts/cluster/chaos-mesh.sh uninstall|status
+	scripts/cluster/chaos-mesh.sh install
+
+.PHONY: chaos-smoke
+chaos-smoke: ## Chaos Mesh 的冒烟：在 oppenheimer-e2e 里六类故障各造一个最小的对象，核对生效、到时恢复、留下的痕迹；要先 make chaos-mesh 和 E2E_KEEP=1 make cluster-e2e；CHAOS_SMOKE_ONLY="delay time" 只跑几类
+	scripts/cluster/chaos-smoke.sh
+
 .PHONY: cluster-fault
 cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、并发上限、超时和不重试；和 cluster-e2e 共用 oppenheimer-e2e；FAULT_SCENARIOS、E2E_KEEP 见脚本
 	scripts/cluster/fault.sh

@@ -22,8 +22,9 @@
 
 设计：[4a-chaos-prep.md](../design/4a-chaos-prep.md)（2026-11-24 写；同一天主人确认第 2 节的十项都按建议）。进度见 `PROGRESS.md`。
 
-- [ ] 安装 Chaos Mesh
-  - **登记（2026-11-24，等主人对下面的具体做法说同意再动）**：按[设计 3.2](../design/4a-chaos-prep.md)。
+- [x] 安装 Chaos Mesh
+  - **做完了（2026-11-24，主人同意后）**：`make chaos-mesh` 装、`make chaos-smoke` 冒烟，六类都生效并且到时恢复；目标命名空间里会留下 `PodNetworkChaos` / `PodIOChaos` 对象和事件（对盲测是泄漏，怎么处理在第 4、5 步里定）。结果在[设计第 6 节“第 1 步”](../design/4a-chaos-prep.md)。e2e 那一套删了，Chaos Mesh 留着，现在没有命名空间能被注入
+  - 登记（2026-11-24，当时等主人对下面的具体做法说同意）：按[设计 3.2](../design/4a-chaos-prep.md)。
     1. 装：Helm chart `chaos-mesh` 2.8.8 到命名空间 `chaos-mesh`，`chaosDaemon.runtime=containerd`、`socketPath=/run/k3s/containerd/containerd.sock`、`enableFilterNamespace=true`、不装 dashboard。会多出一个特权的 DaemonSet（三个节点各一个 `chaos-daemon`）、controller-manager、`chaos-dns-server`，内存预算 0.5 GB。
     2. 冒烟：只在 `oppenheimer-e2e` 里（先 `make cluster-e2e E2E_KEEP=1` 起一套），给它加注入的注解，六类各一个最小的对象、各 30 秒：PodChaos（杀一个 Pod）、NetworkChaos（延迟、分区）、StressChaos（CPU、内存）、IOChaos、TimeChaos、DNSChaos。长期运行的 `oppenheimer`、`mysql`、`redis`、`kafka`、`monitoring` 不加注解，不会被注入。
     3. 做完删掉 e2e 那一套和注解；Chaos Mesh 留着。
@@ -125,6 +126,8 @@
 - 形成一份故障速查手册：现象 → 可能原因 → 验证方法。
 
 ## 面试考点
+
+4a 装 Chaos Mesh 补的（[设计 4a](../design/4a-chaos-prep.md) 第 6 节“第 1 步”）：Chaos Mesh 的几类故障各自在哪一层动手（NetworkChaos 是目标 Pod 网络命名空间里的 tc/netem 和 iptables，所以延迟加在出方向、一来一回是两倍；StressChaos 是往目标容器的 cgroup 里放 stress-ng；IOChaos 是把卷换成一层 FUSE；TimeChaos 是 ptrace 进去改 vDSO 里取时间的函数，所以只对注入时已经在跑的进程、经过 vDSO 取时间的进程有效；DNSChaos 是把 Pod 的 DNS 指到它自己的 DNS 服务）；`chaos-daemon` 为什么要特权、生产里这意味着什么（它能进任何 Pod 的命名空间，装它等于多了一个能动所有业务的入口，要配命名空间过滤、RBAC、审计）；为什么默认谁都不能被注入（`enableFilterNamespace` 加注解）；冒烟为什么要先验“没开的时候不生效”；验证一类故障要量“生效、到时恢复、留下什么痕迹”三件事。
 
 4a 故障开关补的（[设计 4a](../design/4a-chaos-prep.md) 第 3.3 节和第 6 节、[ADR-0041](../adr/0041-two-fault-injection-paths.md)）：哪些故障从外面造不出来、只能预埋；Go 的构建标签怎么用（`//go:build` 写错了会被当成普通注释，文件就进了平时的构建）、怎么证明一段代码没有进二进制（`go tool nm`，以及这种检查为什么要“反过来确认一次”防止空转）；为什么不靠“常量为 false 的分支会被编译器删掉”；故障开关为什么必须自己会关（ttl）；带缓冲和不带缓冲的 channel 在“先返回、后台还在跑”这种写法里差在哪；shell 里 `pipefail` 加 `grep -q` 的 SIGPIPE 陷阱。
 

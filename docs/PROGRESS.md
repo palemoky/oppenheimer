@@ -4,6 +4,7 @@
 
 ## 当前状态
 
+- **现在（2026-11-24 08:55 UTC，这一条最新）**：**主人同意了三件事，都做了：提交并推送；装 Chaos Mesh 并冒烟（4a 第 1 步）；Agent 部署到集群验证。** 见下面“4a 第 1 步和 Agent 上集群”。下一条里“全部没有提交，没有动集群”“等主人的”到这里作废。分支 `phase-4a` 已推送，**没有开 PR，所以 CI 没有跑过**（CI 只在 PR 上跑；新加的 `faults` 那个 job 从来没有在 CI 上跑过）。集群上现在多了：命名空间 `chaos-mesh`（5 个 Pod，没有命名空间能被注入）、`monitoring` 里的 Deployment `agent`（DeepSeek）、Alertmanager 多发一份告警给 Agent。
 - **现在（2026-11-24 07:10 UTC，这一条最新）**：**主人定了两件事，都动工了；全部没有提交，没有动集群。** ①“DeepSeek 的调用放在低谷价格处理”：Agent 的费用按时段算了，高峰里告警触发的诊断留到高峰结束再跑、手动提问要 `-force`（[设计 3d 第 10 节](design/3d-diagnosis-agent.md)）。②“4a 的设计待定项都按建议”：十项都定了，4a 第 2 步（`pkg/fault`、构建标签、检查、第一个故障点）做完了（[设计 4a 第 6 节](design/4a-chaos-prep.md)、[ADR-0041](adr/0041-two-fault-injection-paths.md)）。见下面“4a 动工”。**等主人的**：4a 第 1 步（装 Chaos Mesh、冒烟）的具体做法登记在计划文件里，要一句同意；提交也要主人说。
 - **现在（2026-11-24 06:40 UTC，这一条最新）**：**用 DeepSeek（`deepseek-flash`）在本机把 Agent 对着真的集群跑通了三次**（主人要求；只读，没有部署）。结果在[设计 3d 第 9.5 节](design/3d-diagnosis-agent.md)。试跑查出一个问题并改了（模型写的工具参数不是合法 JSON 时的处理）。全部改动仍然没有提交。下一条里“没有对真的 API 跑过”对 DeepSeek 作废，对 OpenAI 和 Claude 仍然成立。
 - **现在（2026-11-24 06:00 UTC，这一条最新）**：**诊断 Agent 的模型后端可换了（主人要求），代码、测试、文档都写了，没有提交，没有动集群，没有对真的 API 跑过。** 见下面“Agent 的模型后端可换”。主人说稍后用 DeepSeek 试跑：这同时解开了 3d“等 API 密钥”的阻塞（原来等的是 Claude 的密钥）。4a 的状态没有变：设计第 2 节的第 1 到 9 项仍然等主人确认。分支仍是 `phase-4a`。
@@ -22,7 +23,26 @@
 - **最后更新**：2026-11-23（第 16 项做完，第五个 SLO、SLO 的大盘、ADR-0037 做了，3c 的计划项全部勾了，都没有提交，见下面“3c 第 16 项做完”；以下括号里是更早写的）（主人对待定项给了决定，规则改了并下发，第 17、18 项做了，延迟消费者并发和按分区计数的队列上限写完了，都没有提交，见下面“3c 待定项的处理”；以下括号里是更早写的）（3c 的告警质量检查开始做了，见下面“3c 告警质量检查”；以下括号里是更早写的）（3c 的第 6、7 步：Alertmanager 的路由和抑制、webhook 接收端、runbook 做了，都没有提交，见下面“3c 的 Alertmanager 和 runbook”；以下括号里是更早写的）（3c 的设计写完，等主人确认十项，见下面“3c 设计写完”；当前分支 `phase-3c`；以下括号里是更早写的）（3b 收尾：集群已恢复成平时的配置，下一步是 3c，见下面“3b 收尾”；以下括号里是更早写的）（容量结论写完，`GOALS.md` 已修正，没有提交，有一件事等主人定；见下面“3b 容量结论”；以下括号里是更早写的）（长稳跑完并对账通过，binlog 和 Kafka 的保留期已改并生效，已提交未推送，下一步是容量结论；见下面“3b 定 requests 和弹性测试”开头“主人定了 B 之后”的最后一条；以下括号里是更早写的）（中间件的 requests 也调了并验证，已提交；以下括号里是更早写的）（CPU requests、HPA 阈值、弹性测试做完并对账通过，有一件事等主人定，见下面“3b 定 requests 和弹性测试”；以下括号里是更早写的）（主人定的三件事做完并验证，读从库的模式对比做完，已提交并推送，见下面“3b 三件事和读模式对比”；以下括号里是更早写的）（扩容系数做完并对账通过，有三件事等主人定，见下面“3b 扩容系数”；以下括号里是更早写的）（空表对照做完并对账通过，PR #15 已合并，下一步是扩容系数，见下面“3b 空表对照”；以下括号里是更早写的）（混合读写和秒杀的阶梯做完并对账通过，下一步是空表对照，在新会话里做，见下面“3b 混合读写和秒杀的阶梯”；以下括号里是更早写的）（`Reserve` 的 3 秒路由做完并对账通过，下一步是秒杀和混合读写的阶梯，见下面“3b 第 3 轮”的“下一步”第 3 项；以下括号里是更早写的）（3b 第 3 轮进行中，见下面“3b 第 3 轮”；以下括号里是更早写的）（宿主机上验证了盘变慢的原因、幂等键只留 1 小时，见下面“3b 第 2 轮之后”；以下括号里是更早写的）（3b 第 1 轮优化做完，见下面“3b 第 1 轮”；以下括号里是 2026-11-18 写的）（3b 第 1 步的改动已提交到新分支 `phase-3b`（从 `phase-3a` 开出）并推送，见下面“3b 做到哪”；以下是 2026-11-17 深夜写的）（3b 的设计已确认并开工；3a 的状态没有变：只剩“空转一天后再量一次”就收尾。按请求速率的 HPA、验证 5、6、7、从空集群重建、笔记都做完了，全部已提交并推送，工作区干净。**PR #15（draft）**：`18d6c41` 的 CI 27 项全部通过（`test (./services/order)` 4 分 30 秒、e2e 4 分 13 秒，都在以往的范围内）；那之后只有记录这个结果的一次文档提交，它的 CI 没有再看。当前分支 `phase-3a`）
 - **开始阶段 3 之前**：`redis-gate-1` 已修好（见会话日志 2026-11-17 最后），Redis 主从现在的主库是 `redis-gate-0`；Mac mini 已开机（`ssh mini` 能登录，macOS 27.2，还没有装 k6）；集群里没有不正常的 Pod。
 
-### 4a 动工（2026-11-24 06:45 到 07:10 UTC；这一段最新，新会话先读这里）
+### 4a 第 1 步和 Agent 上集群（2026-11-24 08:20 到 08:55 UTC；这一段最新，新会话先读这里）
+
+- **主人说的**：“1. agent 的修改可以在集群部署验证 2. 可以安装 Chaos Mesh 并冒烟 3. 提交并推送”。
+- **提交和推送**：提交前 `make up`，整个仓库 `make lint`、`make test`、`make lint-faults`、`make check-faults` 都过；`make test-faults` 第一遍挂了一个和改动无关的偶发用例（`pkg/cache`，登记在“阻塞项与待确认”），重跑通过。两个提交（Agent 的后端和高峰价；故障开关）推到了 `origin/phase-4a`。之后的改动（Chaos Mesh 的脚本、冒烟、文档）是另一个提交，`git log` 看。**没有开 PR**（主人只说了提交和推送）。
+- **Chaos Mesh**：装了、冒烟过了，六类都能用。细节和发现在[设计 4a 第 6 节“第 1 步”](design/4a-chaos-prep.md)。要记住的一条：**NetworkChaos、IOChaos 会在目标命名空间里留下 `PodNetworkChaos` / `PodIOChaos` 对象和事件**，对盲测和 Agent 的评测都是泄漏，怎么处理没有定（第 4、5 步里定）。
+  - 新文件：`deploy/cluster/chaos-mesh/values.yaml`、`scripts/cluster/chaos-mesh.sh`（`install|status|uninstall`）、`scripts/cluster/chaos-smoke.sh`；`make chaos-mesh`、`make chaos-smoke`；`cluster.env` 的 `CHAOS_MESH_VERSION`。
+  - `chaos-mesh.sh uninstall` 没有运行过。
+  - e2e 那一套（`oppenheimer-e2e`）用完删了。长期运行的 `oppenheimer` 没有被注入过。
+- **Agent 上集群**（`make agent`，镜像 tag 是当时的提交 `355f2ea`）：
+  - 起来了：日志里 `provider=deepseek model=deepseek-flash peak=defer peak_pricing=true tools=10`。Secret `agent-llm` 由脚本从 `.env` 建的（只有 `DEEPSEEK_API_KEY`）。`monitoring.sh agent` 这是第一次真的运行，没有改就通过了。
+  - 高峰里手动提问被拒绝（`kubectl -n monitoring exec deploy/agent -- /app/agent ask -addr http://127.0.0.1:8080 "..."` 回 409，写明高峰到 10:00 UTC）。
+  - **打开了 Alertmanager 发给 Agent 的第二个地址**（`AGENT_WEBHOOK=1 scripts/cluster/monitoring.sh alertmanager`）。这是主会话对“在集群部署验证”的理解：不打开就验不了“告警触发”这一段。**从此真的告警会触发诊断、花模型的钱**（有冷却、队列上限、每天的预算；高峰里的留到低谷）。要关：不带 `AGENT_WEBHOOK` 再跑一次 `scripts/cluster/monitoring.sh alertmanager`。
+  - 打开时发现并改了一个缺陷：`scripts/alertmanager-test.sh` 的检查里“不发给 Agent”的两份渲染会继承调用方的 `AGENT_WEBHOOK=1`，于是带着这个变量下发时检查必然失败（这条路以前没有走过）。
+  - 用 `amtool alert add` 加了一条试跑的告警（`alertname=AgentWebhookTrial severity=warning namespace=oppenheimer service=gateway`，10 分钟后自己恢复，不发 Telegram）。Agent 收到了（`queued=true`），因为在高峰里，留到 10:00 UTC（日志 `alert diagnosis held until peak pricing hours end`）。**10:00 UTC 之后它会不会按时跑、对 DeepSeek 调不调得通（Pod 里到 `api.deepseek.com` 的连通性）、集群里的工具好不好用，要到那时才知道**：结果看 `kubectl -n monitoring logs deploy/agent` 和 `/var/lib/agent/runs` 里的记录，补到[设计 3d 第 9.5 节](design/3d-diagnosis-agent.md)和 3d 的计划项里。
+- **下一步**（4a，按设计第 4 节）：
+  1. 第 3 步（`pprof_capture`，Opus）和第 4 步（`chaos/` 的格式、`chaos-run.sh`、`chaos-steady.sh`，Sonnet）现在可以并行派出去了（都已提交；worktree 从 `main` 建，任务说明里写明先快进到 `phase-4a`）。第 4 步要把上面“痕迹”那条考虑进去。
+  2. 第 5 步（Agent 屏蔽 `chaos-mesh` 命名空间和 `Pod*Chaos` 的事件）、第 6 步（走通一遍）要动集群，先登记、先拿同意。
+  3. 主人还没有答复的：高峰时段的两条理解（告警最晚推迟 4 小时、手动提问拒绝加 `-force`，见下一段）；要不要开 PR 让 CI 跑；`pkg/cache` 那个偶发用例改不改。
+
+### 4a 动工（2026-11-24 06:45 到 07:10 UTC）
 
 - **主人说的**：“1. 现在是 DeepSeek 的高峰价格，我想在相关的调用放在低谷价格处理 2. 4a 的设计待定项都按建议”。
 - **第 1 件（Agent 躲开高峰价）**，细节在设计 3d 第 10 节：

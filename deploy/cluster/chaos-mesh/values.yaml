@@ -1,0 +1,43 @@
+# Chaos Mesh 的 Helm values（scripts/cluster/chaos-mesh.sh install）。版本在 scripts/cluster/cluster.env。
+# 设计：docs/design/4a-chaos-prep.md 的 3.2。
+
+controllerManager:
+  # chart 默认 3 个副本加选主。练习集群只要 1 个：它挂了只是这段时间不能建、不能收回实验，
+  # 已经注入的故障由各节点的 chaos-daemon 维持，到期的收回要等它回来。
+  replicaCount: 1
+  leaderElection:
+    enabled: false
+  # 只有带注解 chaos-mesh.org/inject=enabled 的命名空间能被注入。注解由注入脚本在实验开始时加、结束时去掉，
+  # 平时没有任何命名空间能被注入：误 apply 一份清单不会生效。
+  enableFilterNamespace: true
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+chaosDaemon:
+  # k3s 自带的 containerd，套接字不在默认的位置。
+  runtime: containerd
+  socketPath: /run/k3s/containerd/containerd.sock
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# 不装界面：省内存；盲测时它上面直接写着答案；所有实验都从入库的清单来。
+dashboard:
+  create: false
+
+# DNSChaos 要它。
+dnsServer:
+  create: true
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi

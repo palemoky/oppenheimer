@@ -212,6 +212,39 @@ chaos/
 
 ## 6. 实现中的发现和量到的数
 
+### 第 1 步：装 Chaos Mesh、六类冒烟（2026-11-24 08:30 到 08:45 UTC；主人同意后做的）
+
+- **装了什么**：chart `chaos-mesh` 2.8.8 到命名空间 `chaos-mesh`（`make chaos-mesh`，values 在 `deploy/cluster/chaos-mesh/values.yaml`）。五个 Pod：controller-manager 1 个（chart 默认 3 个加选主，改成了 1 个）、`chaos-daemon` 每个节点 1 个（特权）、`chaos-dns-server` 1 个。没有装界面。空闲时实际占用的内存合计约 120 MiB（67 + 13 + 16 + 13 + 12，`kubectl top`），预算是 0.5 GB。
+- **冒烟**（`scripts/cluster/chaos-smoke.sh`，`make chaos-smoke`；只动 `oppenheimer-e2e`，做完那一套删了，Chaos Mesh 留着）。集群是 k3s v1.37.2、containerd 2.3.7、内核 7.0.0：
+
+  | 项 | 怎么验的 | 生效 | 到时恢复 | 量到的 |
+  |---|---|---|---|---|
+  | 命名空间过滤 | 没有注解时建一个延迟对象 | 不生效（对） | | `Selected=False`，延迟没有变 |
+  | PodChaos 杀 Pod | gateway 两个副本里杀一个 | 是 | 是（Deployment 补上） | |
+  | NetworkChaos 延迟 | gateway 的 Pod 上加 300 毫秒，从探测 Pod 访问 `/healthz` | 是 | 是 | 10 → 600 → 10 毫秒（一来一回各 300） |
+  | NetworkChaos 分区 | gateway 和探测 Pod 之间，双向 | 是 | 是 | 期间超时，之后正常 |
+  | StressChaos CPU | 探测 Pod（limit 500m）里 1 个 worker | 是 | 是 | 5 秒里用掉的 CPU：0.01 → 2.5 → 0.01 秒 |
+  | StressChaos 内存 | 探测 Pod 里 96 MB | 是 | 是 | cgroup 内存 2 → 95 → 2 MiB |
+  | IOChaos | 探测 Pod 的 `emptyDir` 上加 500 毫秒 | 是 | 是 | 读一个小文件 0 → 3010 → 0 毫秒（一次 `cat` 是好几次文件操作，每次都被延迟） |
+  | TimeChaos | gateway 的 Go 进程往回拨 1 小时，看响应的 `Date` 头 | 是 | 是 | 慢 0 → 3600 → 0 秒 |
+  | DNSChaos | 探测 Pod 里让 `gateway.*` 解析失败 | 是 | 是 | 模式之外的名字（`order`）期间照常能解析 |
+
+  六类在这个版本组合上都能用，4b 不需要因为“某一类用不了”改用脚本。
+
+- **设计里要在冒烟时核对的两点**：
+  1. **NetworkChaos 和 Istio 边车不冲突**：gateway 的 Pod 带边车，延迟、分区都按预期生效，恢复之后 Pod 仍然是 2/2、`/healthz` 正常。**只验了不经过边车的 HTTP 端口**（8080 不过边车）；经边车的 gRPC 那条路上延迟是什么样，没有量。
+  2. **目标命名空间里有痕迹**（设计 3.2 以为把对象建在 `chaos-mesh` 里就没有了，不对）：
+     - NetworkChaos 和 IOChaos 会在**目标 Pod 所在的命名空间**里给每个目标 Pod 建一个同名的 `PodNetworkChaos` / `PodIOChaos` 对象，实验结束之后也留着（至少留到 Pod 没了；冒烟结束 7 分钟后还在）。`kubectl -n <目标> get podnetworkchaos -o yaml` 能直接读出注入的是什么。
+     - 这些对象每次更新都会在目标命名空间里产生一条事件（`PodNetworkChaos <Pod 名> Updated`），`kubectl get events` 看得到。
+     - Pod 上没有多出注解。PodChaos、StressChaos、TimeChaos、DNSChaos 在目标命名空间里没有留下对象和事件（杀 Pod 当然有 Pod 自己的 `Killing` 事件，和正常删除一样）。
+     - **这对盲测和 Agent 的评测都是泄漏**：主人排查时看事件是正常动作；Agent 的 `kubectl` 类工具读事件时也会看到。**怎么处理没有定**，在第 4、5 步里定：主人这一侧只能靠约定（不看 `*.chaos-mesh.org` 的资源、事件里的这几行不算数）；Agent 这一侧可以在工具里把 `involvedObject.kind` 是 `Pod*Chaos` 的事件滤掉（第 5 步本来就要屏蔽 `chaos-mesh` 命名空间，一起做）。
+- **冒烟里碰到的三件事**（都是验法的问题，不是 Chaos Mesh 的）：
+  1. 第一遍把 TimeChaos 打在探测 Pod（busybox）上，它的主进程看到的时间没有变；换成 gateway 的 Go 进程就生效。**busybox 那边为什么不生效没有查**（猜测是这个静态链接的进程不经过 vDSO 取时间，而 TimeChaos 改的是 vDSO；没有验证）。4b 的时钟偏移场景打的是 Go 服务，不受影响；要对别的进程用时先单独验。
+  2. TimeChaos 期间 gateway 每 15 秒一条的“指标上报失败”日志停了，恢复之后又有。说明时钟回拨对进程里和时间有关的逻辑确实有影响（那条日志本身是 e2e 那一套连不上 Collector，和这次无关）。没有深究停的原因。
+  3. 这个集群的上游 DNS 在代理后面，**不存在的域名也会解析出一个假地址**（198.18.0.0/15）。所以 DNSChaos 用“让能解析的名字失败”来验，不能用“让不存在的名字解析出来”。以后设计 DNS 类的场景、写“解析失败”的告警时也要记得这一点：外部域名在这里永远不会 NXDOMAIN。
+- **没有验的**：HTTPChaos（设计里就不用）；节点级的故障（关虚拟机不经过 Chaos Mesh）；同时有两个实验对象；controller-manager 挂掉时已注入的故障怎么收回；长期运行的那一套（`oppenheimer`）上一次都没有注入过。
+- **顺带**：e2e 这一套（`E2E_KEEP=1 make cluster-e2e`）这次也跑了，通过。删命名空间时那些 `PodNetworkChaos` 对象没有挡住删除。
+
 ### 第 2 步：`pkg/fault`、构建标签、检查、第一个故障点（2026-11-24；没有动集群）
 
 决定记在 [ADR-0041](../adr/0041-two-fault-injection-paths.md)。
