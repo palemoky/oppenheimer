@@ -36,19 +36,22 @@
   - 用构建标签隔离，正常构建的二进制里不包含故障代码
 - [ ] 给诊断 Agent 加 pprof 工具（从阶段 6 提前，2026-11-15），在做下面“Go 代码缺陷”那一批实验之前完成：goroutine 泄漏、内存泄漏、死锁没有 pprof 基本诊断不了
   - 2026-11-24：工具写了（`pprof_capture`，[设计第 6 节“第 3 步”](../design/4a-chaos-prep.md)），有测试，主会话用本机的 `agent tool` 对着真的 `order` Pod 抓过一次 goroutine。**Role 没有 apply，集群里的 Agent 还是没有这个工具的镜像，五个服务的 mutex、block 采样没有打开**，所以不勾
+  - 2026-11-24 走通之后：Role apply 了，集群里的 Agent 带着这个工具，并且在 `s001` 里自己决定抓了 goroutine 剖析、找到了泄漏点（设计“第 6 步”）。**只剩 mutex、block 采样没有打开**（要用 3b 的压测量开销，另外登记），打开并量过之后勾
   - 抓不抓、抓哪一种由 Agent 看了运行时指标之后决定，不做成“指标一超阈值就自动抓”：什么时候该抓 profile 本身是要评测的能力
   - 按症状选类型：CPU 高抓 CPU profile（默认 10 秒）；goroutine 数涨抓 goroutine（瞬时的，不用等）；内存涨抓 heap；延迟高而 CPU 不高抓 mutex 和 block
   - 喂给模型的是摘要，不是原始文件：top N 的函数和占比，goroutine 按调用栈聚合后的前几组和各自的数量
   - CPU profile 对被诊断的进程有开销，不算纯只读：每个 Pod 的抓取频率和时长设上限，pprof 只开在内部端口上，每次抓取都留痕
 - [x] 实验清单目录 `chaos/`，每个场景一个可重复执行的清单
   - 2026-11-24：格式定了（`chaos/README.md`，`scripts/cluster/chaos-run.sh lint` 检查），三个场景 `s001` 到 `s003`。**主人在实验之前不读 `chaos/scenarios/`**
-- [ ] Agent 看不到注入工具（设计 3.5 的最后一段；2026-11-24 加的一项，原来只写在设计里）
+- [x] Agent 看不到注入工具（设计 3.5 的最后一段；2026-11-24 加的一项，原来只写在设计里）
+  - **做完了（2026-11-24）**：部署了，用 Agent 自己的身份核对过，Loki 里 `chaos-mesh` 没有新日志。挡不住的六种情形和走通时又发现的两处泄漏（镜像 tag 的 `-faults`、文件名的 `_variant`）在设计第 6 节“第 5 步”“第 6 步”
   - 2026-11-24：代码和配置写了（`tool.Hidden`，十个工具里有关的都接上；Collector 不收 `chaos-mesh` 的日志；[设计第 6 节“第 5 步”](../design/4a-chaos-prep.md)），对着真的集群只读核对过。**没有部署**，部署后用 Agent 自己的身份核对过再勾
   - **登记（2026-11-24；主人同一天同意了）**：
     1. `make agent`：重建 Agent 的镜像并重新部署（Recreate，几秒钟收不到 webhook）；同一份清单里的 Role `oppenheimer-agent-pprof`（`oppenheimer` 里 `pods/portforward` 的 create）第一次 apply。
     2. `scripts/cluster/monitoring.sh collector`：`helm upgrade` 日志采集的 DaemonSet（三个节点上的 `otel-agent` 逐个重启；读到哪里有检查点，重启期间的日志不丢）。
     3. 核对：`kubectl -n monitoring exec deploy/agent -- /app/agent tool ...` 查不到 `chaos-mesh`、能对 `order` 的一个 Pod 抓 goroutine 剖析（验 Role）；Loki 里 `chaos-mesh` 没有新日志。只读。
-- [ ] 走通一遍（设计第 4 节第 6 步）：一个不盲的第一档场景和第一个故障点，从检查稳态到生成复盘草稿
+- [x] 走通一遍（设计第 4 节第 6 步）：一个不盲的第一档场景和第一个故障点，从检查稳态到生成复盘草稿
+  - **做完了（2026-11-24 10:52 到 11:26 UTC）**：`s002`、`s001` 都注入、恢复、对账差异 0、生成了复盘草稿；脚本没有改就通过了。量到的数、Agent 的表现、发现的七个问题在[设计第 6 节“第 6 步”](../design/4a-chaos-prep.md)。五个服务现在是带故障代码的镜像（开关全关）
   - **登记（2026-11-24；主人同一天同意了）**。都在长期运行的 `oppenheimer` 上，这是它第一次被注入。
     1. **换成带故障代码的镜像**：`GO_TAGS=faults make deploy`，五个服务（gateway、order、inventory、payment、orderindex）滚动更新成 `-faults` 后缀的镜像。故障代码进了集群，开关默认全关。阶段 4 期间一直用这套镜像；结束后换回平时的。
     2. **发压**（从本机经 Mac mini 上的 k6；期间本机不跑测试、lint、构建）：先 `loadtest.sh skus` 备 20 个新 SKU、每个 2.5 万库存（写 `inventory` 的表，只增不改已有的），再 `make chaos-steady ARGS=start`：mixed，570 请求/秒（3b 拐点的三成，其中下单约 46 单/秒），最长 2 小时，两个场景做完就停。
@@ -61,9 +64,12 @@
     9. **出了岔子**：`make chaos-recover ALL=1 RESTART=1` 是总闸（删所有 Chaos Mesh 对象、关所有开关、去注解、重启五个服务）；`make chaos-steady ARGS=stop` 停压测。影响范围：`inventory` 少一个副本几十秒；`gateway` 在 `s001` 期间有预期的症状、之后重启一次；发压期间探针和 SLO 可能有抖动，告警可能发到 Telegram。
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
   - 2026-11-24：`scripts/cluster/chaos-run.sh`（`make chaos-blind|chaos-inject|chaos-recover|chaos-reveal`）写了，主会话评审过。**连集群的路径一条都没有真的跑过**（只用假的 `kubectl` 走过逻辑），第 6 步走通一遍之后再勾
-- [ ] 实验期间的稳态压测脚本与数据一致性检查脚本
+  - 2026-11-24 走通之后：`inject`、`recover`、`reveal`、总闸都真的跑过了。**`blind`（随机抽、终端不打印内容）没有跑过**，所以仍然不勾；第一次盲测时勾
+- [x] 实验期间的稳态压测脚本与数据一致性检查脚本
+  - 2026-11-24 走通时 `start`、`stop`、`check` 和 `recon-check` 都真的跑了。留下两个要改的：恢复后“等回到稳态”1 秒就过（设计“第 6 步”的问题 5）；mixed 有三成是设计好的 429，说明里没有写（问题 4）
   - 2026-11-24：`scripts/cluster/chaos-steady.sh start|stop|check` 写了。`check` 对着真的集群跑过（只读：告警、探针、五个 SLO 都读得到；没有发压所以“负载”一项不过，符合预期）。`start`、`stop`（k6）没有跑过。数据检查用已有的 `make recon-check`，由 `chaos-run.sh recover` 调
 - [ ] `mysql-main` 的 `MALLOC_ARENA_MAX=4` 管不管用（2026-11-24 加的，主人定了第一次发压时一起看）：连接涨到 200 以上时常驻内存涨多少、之后回不回落（没有它时 +300 MiB、不回落），p99 和吞吐有没有变差。背景和对照的数在 `PROGRESS.md` 的“mysql-main 的内存”
+  - 2026-11-24 走通时（570 请求/秒）连接最多 97 个，常驻内存 +59 MiB，到不了 200 个连接，验证不了；等更大的一轮
 - [ ] 3c 留下的告警验证（[设计 3c](../design/3c-slo-alerting.md) 第 8 节“第 16 项”），做对应的实验时顺带完成：
   - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
   - `OtelCollectorExportQueueFull` 单独响的情形：gateway 在而 agent 发不过去（比如挡住 agent 到 gateway 的 4317）

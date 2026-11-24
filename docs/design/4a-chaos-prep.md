@@ -266,7 +266,38 @@ chaos/
   4. **关于 `chaos-mesh` 自己的告警**会经 Alertmanager 发给 Agent（比如 `chaos-daemon` 的内存到了 limit），问题里就带着这个命名空间。触发那一层没有筛。现在这样的告警没有响过。
   5. `loki_labels` 问别的标签（`k8s_pod_name`、`service_name`）的值时，一小时内有过日志的 `chaos-mesh` 的 Pod 名还在；日志停收一小时后自己没有。
   6. 主人这一侧仍然只靠约定：Grafana 里不再搜得到它的日志了（顺带的好处），但 `kubectl` 什么都看得到。
-- **没有做的**：部署（Agent 的镜像、Collector 的 `helm upgrade`）要动集群，登记在计划文件“4a 准备”里，等主人同意。部署后要核对的：Agent 用**自己的身份**在集群里查不到 `chaos-mesh`；Loki 里 `chaos-mesh` 不再有新的日志。
+- **部署和核对（2026-11-24 10:49 UTC，主人同意后）**：`make agent`（镜像 `9dda461`，工具从 10 个变成 11 个，Role `oppenheimer-agent-pprof` 第一次 apply）、`monitoring.sh collector`（三个 `otel-agent` 几乎同时重启，不是逐个；都起来了，日志里没有配置错误）。用 Agent **自己的身份**（`kubectl -n monitoring exec deploy/agent -- /app/agent tool -in-cluster ...`）：全命名空间的 Pod 列表 54 行里没有 `chaos`；指名列 `chaos-mesh` 是 0 个；`count by (namespace) (kube_pod_info)` 11 个命名空间里没有它；`loki_labels` 的 12 个命名空间里没有它；对 `order` 的一个 Pod 抓 goroutine 剖析成功（Role 管用）。Loki：`s002` 注入前后的 10 分钟里 `chaos-controller-manager` 自己写了 99 行日志，Loki 里这个命名空间是 0 行。
+
+### 第 6 步：走通一遍（2026-11-24 10:52 到 11:26 UTC；主人同意后做的；长期运行的 `oppenheimer` 第一次被注入）
+
+- **做了什么**：
+  | 时刻（UTC） | 事 |
+  |---|---|
+  | 10:52 | `GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务滚动成 `9dda461-faults`（cdc 没有动，仍是 `07c0dcc`） |
+  | 10:53 | `make down`；`loadtest.sh skus 12001 20 25000`；`chaos-steady.sh start`（k6 mixed，570 请求/秒） |
+  | 10:56:13 | `make chaos-inject SCENARIO=s002`：杀了 `inventory` 的一个 Pod |
+  | 10:59:18 到 11:05:38 | `make chaos-recover`：对账差异 0；`make chaos-reveal` |
+  | 11:05:55 | `make chaos-inject SCENARIO=s001`：`gateway` 两个副本的开关 `f01` 打开 |
+  | 11:10:15 到 11:13:20 | 手动问了集群里的 Agent 一次 |
+  | 11:13:33 到 11:25:08 | `make chaos-recover`（关开关、滚动重启 gateway）：对账差异 0；`make chaos-reveal` |
+  | 11:25 | `chaos-steady.sh stop`；`make chaos-recover ALL=1`（总闸，试了一次，10 秒，没有东西可撤） |
+- **脚本**：注入、恢复、对账、揭晓、总闸、压测的启停，会改集群的路径这次都真的走了一遍，**没有改一行就通过了**。没有走到的：`blind`（随机抽、终端不打印内容）；`recover --all --restart`；`istio`、`script` 两种注入方式；`s003`；注入中途失败的撤销（trap）；到 ttl 自己关。
+- **`s002`（杀 Pod）量到的**：新 Pod 3 秒后调度、约 30 秒内 2/2。gateway 的 5xx 是 0，告警没有响也没有进 pending，探针没有失败。`truth.md` 里“会有一小簇失败”按设计推的那句**不成立**（至少在这个负载下）：被杀的 Pod 是正常收到 TERM 退出的，边车和优雅停止把在途的请求做完了。要造出失败得用 `pod-failure` 或者 `kill -9`（`gracePeriod: 0`），4b 写场景时定。
+- **`s001`（故障开关）量到的**：gateway 每个副本的 goroutine 从 88 涨到 239（8 分钟，约每分钟 19 个）；查库存的 504 约每秒 0.3 到 0.8 次（这个接口每秒约 200 次成功，即约 0.3%）；gateway 的内存没有看得出的变化（8 分钟太短）；**没有任何告警**（没有针对 goroutine 数或者单个读接口错误率的规则，`expected_alerts` 是空的，符合）。k6 自己的阈值（失败率小于 0.1%）也没有破。关掉开关后 504 立刻没有了，泄漏的 goroutine 留到 Pod 重启。重启 gateway 期间没有 503。
+- **Agent（`deepseek-flash`，手动提问，只告诉它“查库存的接口从 11:06 起有少量 504”）**：3 分 05 秒，26 轮、57 次工具调用，0.0245 美元，结束状态 `reported_truncated`。运行号 `20261124T111015Z-eebw`（在 Agent 的卷里）。
+  - **对的**：自己决定抓了 gateway 的 goroutine 剖析，找到了停在 `stockWithin`（`stock_variant.go:39`）的 `chan send`；排除了 inventory 变慢、CPU、重启、网格；指出 504 只在这一个接口上。建议里写了“select 上 `ctx.Done()`、不要阻塞地发”。
+  - **不对的**：把原因说成“10:53 起流量涨了 100 倍，请求在进程里排队”（那是稳态的压测；阻塞的发送被理解成了排队的信号量，不是泄漏）；说“Prometheus 里只有 istio 的指标”（不对，有应用自己的 HTTP 指标）；没有抓第二次带 `base` 的剖析来证明“只涨不降”（它自己列在了“下一步”里）。
+  - Agent 的内存峰值 27 MiB（上限 256 Mi），第 3 步担心的“剖析放大后吃紧”对 goroutine 剖析不成立；heap 剖析还没有量。
+- **发现的问题（都没有改，等主人定）**：
+  1. **镜像 tag 的 `-faults` 后缀是泄漏**：它出现在 Pod 的事件和 describe 里，Agent 读到了，并且在报告里写了“要查 `-faults` 这个构建是不是改了 `stock_variant` 的行为”。人看 `kubectl get pods -o wide` 也看得到。建议：阶段 4 期间带标签的镜像不加后缀（改成从 tag 上看不出来的写法，比如只在镜像的 label 里记），或者平时的镜像也一直用带标签的构建。
+  2. **文件名 `stock_variant.go` 出现在调用栈里**，`_variant` 这个后缀对每个故障点都一样，做过一次的人和读过一次的模型下次一眼认得出。建议故障文件不用统一的后缀。
+  3. **`recon-check` 的 Job、`recon-hourly` 在事件里很显眼**，Agent 花了几步去看它们；不是泄漏，是噪声。
+  4. **稳态的 mixed 压测有约三成是 429**（363 个 200、43 个 202、170 个 429，每秒）：Zipf 分布造出来的热点用户和热点 SKU 被限流，是这个场景设计好的，但 `chaos-steady.sh` 的说明里没有写，“570 请求/秒”里真正进到后面的约 400。Agent 也被它带偏了（把压测当成了异常的流量）。以后给 Agent 的问题里要不要说明“有一条固定的压测在跑”，是评测设计要定的事。
+  5. **恢复后的“等回到稳态”1 秒就过了**：`s001` 恢复时 gateway 正在滚动重启，检查读的是 5 分钟窗口的比例，重启造成的抖动还没有进来。之后探针的失败比例到过 3.75%（阈值 10%）。应当在恢复动作之后先等一个固定的时间再查。
+  6. **逐行对账在有负载时慢**：商家索引那一对 8 分钟的窗口（1.6 万行）用了 160 秒（没有负载时整个 24 分钟的窗口约 15 秒）。恢复一次总共 6 到 12 分钟，大头是等常驻核对越过结束时刻和这一步。
+  7. `chaos-steady.sh start` 用 `seq -s,` 拼的 SKU 列表末尾多一个逗号（macOS 的 `seq`），k6 的配置会滤掉空项，没有影响；是主会话敲命令的问题，不是脚本的。
+- **`mysql-main` 的 `MALLOC_ARENA_MAX=4`**：这一轮连接数从 16 到最多 97，常驻内存 1652 → 1711 MiB（+59，其中有缓冲池还在回填的份）。没有到 200 个连接，**验证不了**“连接高峰时不再涨 300 MiB”，只能说这个负载下没有异常。计划里那一项不勾。
+- **集群现在的状态**：五个服务是 `9dda461-faults`（开关全关，阶段 4 期间留着）；压测停了；没有 Chaos Mesh 的对象，`oppenheimer` 没有注入的注解；SKU 12001 到 12020 留着（卖掉了一部分）；本机的 compose 是停的（`make up` 再起）。
 
 ### 第 3 步：`pprof_capture`（2026-11-24；Opus 写，主会话评审；Role 没有 apply，集群里的 Agent 还是旧镜像）
 
