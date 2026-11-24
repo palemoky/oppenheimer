@@ -2,6 +2,8 @@
 
 覆盖的告警：`ReconFoundDifferences`（critical）、`ReconRunFailed`（warning）、`ReconNotRunning`（warning）、`ReconDailySlow`（warning）
 
+常驻的三个核对各有自己的 runbook：钱 [payment-totals.md](payment-totals.md)，库存 [recon-stock.md](recon-stock.md)，派生数据的变更 [recon-changes.md](recon-changes.md)。
+
 规则：[business.yaml](../../deploy/cluster/monitoring/rules/business.yaml) 的 `business.recon` 组。设计：[3c-slo-alerting.md](../design/3c-slo-alerting.md) 第 3.7 节、第 8 节“`recon` 的 CronJob”“全量对账的耗时”。原理：[ADR-0022](../adr/0022-reconciliation-hash-tree.md)。
 
 ## 这条告警在说什么

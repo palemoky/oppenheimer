@@ -343,6 +343,18 @@ probe: ## 装或更新常驻探针（Deployment probe，命名空间 oppenheimer
 recon-totals: ## 装或更新钱的笔数和金额核对（Deployment recon-totals，命名空间 oppenheimer）：每 30 秒核对一次最近 30 分钟的支付，结果是指标 recon.totals.*；镜像 tag 按当前工作区算，没有就构建；可重复执行
 	scripts/cluster/services.sh recon-totals
 
+.PHONY: recon-stock
+recon-stock: ## 装或更新库存的计数对流水核对（Deployment recon-stock，命名空间 oppenheimer）：每分钟核对预占的计数，每小时再核对已售的计数并数出卡住的预占，结果是指标 recon.stock.*；镜像 tag 按当前工作区算，没有就构建；可重复执行
+	scripts/cluster/services.sh recon-stock
+
+.PHONY: recon-changes
+recon-changes: ## 装或更新跟着 CDC 变更核对派生数据（Deployment recon-changes，命名空间 oppenheimer）：每条订单变更稍后去商家索引、从库、冷库按主键核对，结果是指标 recon.changes.*，开关 changes_check 见 docs/runbooks/recon-changes.md；镜像 tag 按当前工作区算，没有就构建；可重复执行
+	scripts/cluster/services.sh recon-changes
+
+.PHONY: recon-check
+recon-check: ## 阶段 4 每次故障实验收尾用的“对账差异为 0”：FROM=<RFC3339> TO=<RFC3339>；先读三个常驻核对的指标（期间没有不一致、而且都核对到了 TO 之后），再对 [FROM, TO) 跑一次逐行对账；DRY_RUN=1 只打印不连集群
+	scripts/cluster/recon-check.sh $(if $(DRY_RUN),--dry-run) --from "$(FROM)" --to "$(TO)"
+
 .PHONY: cluster-e2e
 cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
 	scripts/cluster/e2e.sh $(E2E_ARGS)

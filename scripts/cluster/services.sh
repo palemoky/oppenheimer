@@ -14,6 +14,10 @@
 #   services.sh recon-cron-resume  恢复它们（压测之后）
 #   services.sh recon-totals       装或更新钱的笔数和金额核对（Deployment recon-totals，deploy/cluster/recon/totals.yaml），可重复执行；
 #                                  镜像的 tag 按当前工作区算（RECON_TOTALS_IMAGE_TAG 可覆盖），仓库里没有就构建并推送 recon 的镜像
+#   services.sh recon-stock        装或更新库存的计数对流水核对（Deployment recon-stock，deploy/cluster/recon/stock.yaml），可重复执行；
+#                                  镜像的 tag 按当前工作区算（RECON_STOCK_IMAGE_TAG 可覆盖），仓库里没有就构建并推送 recon 的镜像
+#   services.sh recon-changes      装或更新跟着 CDC 变更核对派生数据（Deployment recon-changes，deploy/cluster/recon/changes.yaml），可重复执行；
+#                                  镜像的 tag 按当前工作区算（RECON_CHANGES_IMAGE_TAG 可覆盖），其余同 recon-stock
 #   services.sh probe              装或更新常驻探针（Deployment probe，deploy/cluster/probe/），可重复执行；装之前核对 PROBE_SKUS 在库存里都存在
 #   services.sh probe-stop         把探针的副本数改成 0（正式压测之前）
 #   services.sh probe-start        改回 1（压测之后）
@@ -89,7 +93,7 @@ MYSQL_SECRET_KEYS=(app-password cdc-password)
 E2E_ROOT_SECRET_KEYS=(root-password)
 
 usage() {
-  sed -n '2,47p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,51p' "${BASH_SOURCE[0]}" >&2
   exit 2
 }
 
@@ -506,13 +510,13 @@ probe_scale() { # 副本数
   kubectl -n "$NS" get deployment probe
 }
 
-# ---------- 钱的笔数和金额核对（设计文档 3c 第 8 节） ----------
+# ---------- 常驻的核对：钱的笔数和金额（设计文档 3c 第 8 节）、库存的计数对流水、派生数据的变更（设计文档 3e） ----------
+# 三个都是 recon 镜像里的一个子命令，装法相同：按当前工作区算 tag，仓库里没有就构建推送，填占位符后 apply 并等就绪。
 
-RECON_TOTALS_MANIFEST="$ROOT/deploy/cluster/recon/totals.yaml"
-
-cmd_recon_totals() {
-  local tag="${RECON_TOTALS_IMAGE_TAG:-}" image
-  # 和 probe 一样按当前工作区算 tag：这个子命令在 recon 里是后加的，沿用现在部署的 tag 可能拿到没有它的旧镜像。
+# 装一个常驻的核对：<名字> <清单> <tag 的覆盖值>
+install_recon_watcher() {
+  local name="$1" manifest="$2" tag="$3" image
+  # 和 probe 一样按当前工作区算 tag：这些子命令在 recon 里是后加的，沿用现在部署的 tag 可能拿到没有它的旧镜像。
   [[ -n "$tag" ]] || tag="$("$HERE/images.sh" tag)"
   if curl -fsI -m 10 -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
     "http://$REGISTRY_ADDR/v2/oppenheimer/recon/manifests/$tag" >/dev/null 2>&1; then
@@ -526,10 +530,14 @@ cmd_recon_totals() {
     exit 1
   fi
   image="$REGISTRY_ADDR/oppenheimer/recon:$tag"
-  echo "==> recon-totals (image $image)"
-  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$RECON_TOTALS_MANIFEST" | kubectl -n "$NS" apply -f - >/dev/null
-  kubectl -n "$NS" rollout status deployment recon-totals --timeout=120s
+  echo "==> $name (image $image)"
+  sed -e "s|__IMAGE__|$image|g" -e "s|__IMAGE_TAG__|$tag|g" "$manifest" | kubectl -n "$NS" apply -f - >/dev/null
+  kubectl -n "$NS" rollout status deployment "$name" --timeout=120s
 }
+
+cmd_recon_totals() { install_recon_watcher recon-totals "$ROOT/deploy/cluster/recon/totals.yaml" "${RECON_TOTALS_IMAGE_TAG:-}"; }
+cmd_recon_stock() { install_recon_watcher recon-stock "$ROOT/deploy/cluster/recon/stock.yaml" "${RECON_STOCK_IMAGE_TAG:-}"; }
+cmd_recon_changes() { install_recon_watcher recon-changes "$ROOT/deploy/cluster/recon/changes.yaml" "${RECON_CHANGES_IMAGE_TAG:-}"; }
 
 cmd="${1:-}"
 [[ -n "$cmd" ]] || usage
@@ -558,6 +566,8 @@ recon-cron) cmd_recon_cron ;;
 recon-cron-suspend) recon_cron_suspend true ;;
 recon-cron-resume) recon_cron_suspend false ;;
 recon-totals) cmd_recon_totals ;;
+recon-stock) cmd_recon_stock ;;
+recon-changes) cmd_recon_changes ;;
 probe) cmd_probe ;;
 probe-stop) probe_scale 0 ;;
 probe-start) probe_scale 1 ;;
