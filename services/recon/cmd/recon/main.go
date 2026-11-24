@@ -9,8 +9,9 @@
 //	PAYMENT_DSN          payment 必填
 //	INVENTORY_DSN        stock 必填
 //
-// 另有两种常驻的用法，结果报成指标：recon watch-totals 按笔数和金额核对支付和订单两边（见 watch.go）；
-// recon watch-stock 核对库存的计数对不对得上流水（见 watch_stock.go）。
+// 另有三种常驻的用法，结果报成指标：recon watch-totals 按笔数和金额核对支付和订单两边（见 watch.go）；
+// recon watch-stock 核对库存的计数对不对得上流水（见 watch_stock.go）；
+// recon watch-changes 跟着 CDC 的变更核对派生数据（见 watch_changes.go）。
 //
 // 报告的文本打到标准输出，日志（JSON）打到标准错误。
 // 退出码：0 没有差异；1 有确认的差异（修复之后仍有的也算）；2 参数或运行错误。
@@ -78,6 +79,11 @@ func main() {
 	// watch-stock 也是常驻的（库存的计数对流水，见 watch_stock.go）。
 	if len(os.Args) > 1 && os.Args[1] == watchStockCommand {
 		os.Exit(watchStock(logger, os.Args[2:]))
+	}
+
+	// watch-changes 也是常驻的（跟着 CDC 的变更核对派生数据，见 watch_changes.go）。
+	if len(os.Args) > 1 && os.Args[1] == watchChangesCommand {
+		os.Exit(watchChanges(logger, os.Args[2:]))
 	}
 
 	opts, err := parseFlags(os.Args[1:])

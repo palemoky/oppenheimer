@@ -71,6 +71,9 @@ const (
 	GroupOrderSubmit          = "order.order-submit"
 	GroupOrderCloseDelay      = "order.order-close-delay"
 	GroupOrderIndexCDCOrders  = "orderindex.cdc-orders"
+	// GroupReconCDCOrders 是 recon watch-changes 的消费组：它跟着订单的行变更核对派生数据，
+	// 和 orderindex 各读各的，互不影响位点。
+	GroupReconCDCOrders = "recon.cdc-orders"
 )
 
 // OrderKey 返回以订单号为准的消息 key。
