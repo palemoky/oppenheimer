@@ -8,6 +8,8 @@ metadata:
     oppenheimer.chaos/run: __RUN_ID__
 spec:
   action: pod-kill
+  # 等于 Pod 的 terminationGracePeriodSeconds：正常下线（先 TERM，排空，到时才 KILL）。不写的话默认是 0，立刻删。
+  gracePeriod: 45
   mode: one
   selector:
     namespaces: [__TARGET_NS__]

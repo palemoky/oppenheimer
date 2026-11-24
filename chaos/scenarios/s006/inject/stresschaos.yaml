@@ -1,0 +1,19 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+# 业务容器的内存 limit 是 512Mi，这里要的比它多。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  mode: one
+  containerNames: [gateway]
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: gateway
+  stressors:
+    memory: {workers: 1, size: 640MB}
+  duration: 5m

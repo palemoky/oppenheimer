@@ -1,0 +1,16 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s007
+method: chaos-mesh
+risk: 1
+category: network
+target:
+  workload: inventory
+duration: 10m
+requires:
+  - 稳态的压测在跑
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉
+    - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
+expected_alerts: [MeshEndpointEjected]

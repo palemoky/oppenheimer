@@ -1,0 +1,18 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: DNSChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  action: error
+  mode: all
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: orderindex
+  # 两条：带搜索域展开的各种写法，和不展开的原样（上游 DNS 对不存在的名字会给假地址，不能让它落到那里）。
+  patterns: ["mysql-main-primary.mysql.svc.*", "mysql-main-primary.mysql.svc"]
+  duration: 35m

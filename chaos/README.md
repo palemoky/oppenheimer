@@ -43,6 +43,7 @@ chaos/
 | `requires` | 是 | 前置条件，给人看的清单（可以是 `[]`）。脚本不检查它们，`inject` 时打印出来 |
 | `recover.restart` | 是 | 恢复时脚本要滚动重启的工作负载（可以是 `[]`）。泄漏类故障关了开关之后后果还在，要靠它 |
 | `recover.notes` | 是 | 恢复步骤的说明，给人看（可以是 `[]`） |
+| `blind` | 否 | `yes` 或 `no`，不写是 `no`。在集群上试过（注入生效、到时恢复、`truth.md` 的证据和实际对得上）才写 `yes`；`chaos-blind` 只从 `yes` 的里面抽 |
 | `expected_alerts` | 是 | 预期会响的告警名（可以是 `[]`）。盲测时不看，复盘时和实际对照 |
 
 **YAML 的子集**：脚本里没有 YAML 库，用自带的小解析器读。只支持：顶层 `键: 值`，一层嵌套（缩进 2 个空格），
@@ -74,13 +75,32 @@ chaos/
 ## 怎么用
 
 ```sh
-make chaos-steady ARGS=start     # 先起稳态的压测（见 chaos-steady.sh 的头部）
+make chaos-steady ARGS=start     # 先起稳态的压测（见 chaos-steady.sh 的头部）；启动时刻记在 tmp/chaos-steady/started_at
 make chaos-blind POOL=1          # 盲测：从第一档里抽一个，密封，注入；终端只打印运行号和密封的 SHA-256
 make chaos-inject SCENARIO=s002  # 不盲：指定场景
-make chaos-recover               # 恢复当前的运行，等静止，跑 recon-check，结果写进运行目录
+make chaos-recover               # 恢复当前的运行，等回到稳态；前台查三个常驻核对的指标，逐行对账放到后台
+make chaos-status                # 有没有进行中的运行；逐行对账是不是还在后台跑、有没有不通过又没确认的
+make chaos-recon-ack RUN=<运行号> # 看过不通过的对账结果之后确认，下一次注入才放行
 make chaos-recover ALL=1         # 总闸：所有 Chaos Mesh 对象、所有故障开关、脚本建的 VirtualService 全部撤掉
-make chaos-reveal                # 打开答案，生成 docs/postmortems/ 里的复盘草稿
+make chaos-reveal                # 打开答案，生成 docs/postmortems/ 里的复盘草稿（后台的逐行对账还在跑就等它）
 ```
+
+**注入前的两道闸**（`chaos-blind`、`chaos-inject`，dry-run 不查）：
+
+- **压测要先跑够 30 分钟**（`CHAOS_STEADY_MIN_AGE` 秒，默认 1800）。不够，或者 `started_at` 不存在（压测没起，或者是旧版脚本起的）就拒绝，并报出已经跑了多久、还差多久：
+  诊断的一方会把“流量刚上来”当成故障的原因（上一次走通时压测起了 13 分钟就注入）。`SKIP_WARMUP=1`（`--skip-warmup`）显式跳过，
+  跳过时终端打一行说明，运行的 `state.json` 记 `warmup_skipped: yes`；不跳过时记 `steady_age_s`（注入时压测跑了多少秒）。
+- **前面的运行有没看过的对账不通过就拒绝**：逐行对账是 `failed`（有差异）或 `error`（出错、或者后台进程没留下结果就没了），或者前台指标那一段的退出码不是 0，
+  而这个运行目录里没有 `recon-rows.acked`。看过 `chaos/runs/<运行号>/recon.txt`、`recon-metrics.txt` 之后用 `make chaos-recon-ack RUN=<运行号>` 确认。
+  逐行对账还在跑（`running`）不拦，只提示一行。老的运行目录（只有 `recon_rc`）不拦。
+
+**恢复后的对账分两段**：
+
+1. 前台：`recon-check --metrics-only`。三个常驻核对（钱、库存、变更）越过结束时刻并且没有不一致，就算这次实验的数据检查过了，可以开始下一个。
+   输出在 `recon-metrics.txt`，退出码在 `state.json` 的 `recon_metrics_rc`。
+2. 后台：`recon-check --rows-only`（逐行对账，有负载时要几分钟）。`nohup` 起，脱离终端和 make。输出在 `recon.txt`，退出码写进 `recon-rows.rc`，pid 在 `recon-rows.pid`
+   （后台进程不写 `state.json`，避免和前台互相盖掉）。指标那一段不是 0、场景是第三档、或者 `WAIT_RECON=1` 时，逐行对账不放后台，前台等它跑完。
+   `NO_RECON=1` 两段都不做。
 
 `chaos-blind`、`chaos-inject`、`chaos-recover` 加 `DRY_RUN=1` 只打印将要做什么，不连集群（`chaos-steady` 用 `ARGS="check --dry-run"`）。命名空间默认 `oppenheimer`，`CHAOS_NS=oppenheimer-e2e` 改成 e2e 那一套；
 别的命名空间一律拒绝（尤其 `monitoring`、`kube-system`、`istio-system`、`chaos-mesh`）。

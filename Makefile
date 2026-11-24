@@ -368,8 +368,8 @@ recon-changes: ## 装或更新跟着 CDC 变更核对派生数据（Deployment r
 	scripts/cluster/services.sh recon-changes
 
 .PHONY: recon-check
-recon-check: ## 阶段 4 每次故障实验收尾用的“对账差异为 0”：FROM=<RFC3339> TO=<RFC3339>；先读三个常驻核对的指标（期间没有不一致、而且都核对到了 TO 之后），再对 [FROM, TO) 跑一次逐行对账；DRY_RUN=1 只打印不连集群
-	scripts/cluster/recon-check.sh $(if $(DRY_RUN),--dry-run) --from "$(FROM)" --to "$(TO)"
+recon-check: ## 阶段 4 每次故障实验收尾用的“对账差异为 0”：FROM=<RFC3339> TO=<RFC3339>；先读三个常驻核对的指标（期间没有不一致、而且都核对到了 TO 之后），再对 [FROM, TO) 跑一次逐行对账；METRICS_ONLY=1 只查指标，ROWS_ONLY=1 只跑逐行对账；DRY_RUN=1 只打印不连集群
+	scripts/cluster/recon-check.sh $(if $(DRY_RUN),--dry-run) $(if $(METRICS_ONLY),--metrics-only) $(if $(ROWS_ONLY),--rows-only) --from "$(FROM)" --to "$(TO)"
 
 .PHONY: cluster-e2e
 cluster-e2e: ## 在集群上跑端到端测试：构建推送镜像、建 e2e_* 库、在 oppenheimer-e2e 部署一套、以 Job 运行测试，跑完删掉；E2E_ARGS="-run TestX" 传测试参数，E2E_KEEP=1 保留现场
@@ -390,24 +390,32 @@ chaos-smoke: ## Chaos Mesh 的冒烟：在 oppenheimer-e2e 里六类故障各造
 # 故障实验（阶段 4，设计 docs/design/4a-chaos-prep.md 的 3.5、3.6，场景的格式见 chaos/README.md）。命令前加 @：盲测时终端不回显参数。
 # 命名空间默认 oppenheimer，CHAOS_NS=oppenheimer-e2e 改成 e2e 那一套。
 .PHONY: chaos-steady
-chaos-steady: ## 故障实验的稳态压测：make chaos-steady ARGS=start|stop|check（start 要 SKUS=...；k6 mixed 固定 570 请求/秒，取 3b 容量拐点 1907 的三成）；只看不动用 ARGS="check --dry-run"
+chaos-steady: ## 故障实验的稳态压测：make chaos-steady ARGS=start|stop|check（start 要 SKUS=...；k6 mixed 固定 570 请求/秒，取 3b 容量拐点 1907 的三成；start 记下启动时刻，注入要压测先跑够 30 分钟）；只看不动用 ARGS="check --dry-run"
 	@scripts/cluster/chaos-steady.sh $(ARGS)
 
 .PHONY: chaos-blind
-chaos-blind: ## 盲测：make chaos-blind POOL=1（第一档）或 POOL=1,2:pod,network（风险档:类别）；先检查稳态，抽一个场景，密封，注入；终端只打印运行号和 sealed.json 的 SHA-256（记下来）；DRY_RUN=1 不连集群
-	@scripts/cluster/chaos-run.sh blind --pool "$(POOL)" $(if $(DRY_RUN),--dry-run)
+chaos-blind: ## 盲测：make chaos-blind POOL=1（第一档）或 POOL=1,2:pod,network（风险档:类别）；先检查压测跑够 30 分钟（SKIP_WARMUP=1 跳过）、前面的运行没有没确认的对账不通过、稳态，再抽一个场景，密封，注入；终端只打印运行号和 sealed.json 的 SHA-256（记下来）；DRY_RUN=1 不连集群
+	@scripts/cluster/chaos-run.sh blind --pool "$(POOL)" $(if $(SKIP_WARMUP),--skip-warmup) $(if $(DRY_RUN),--dry-run)
 
 .PHONY: chaos-inject
-chaos-inject: ## 不盲的注入：make chaos-inject SCENARIO=s002；第三档要加 CONFIRM_RISK3=<同一个编号>；DRY_RUN=1 只打印将要做什么
-	@scripts/cluster/chaos-run.sh inject --scenario "$(SCENARIO)" $(if $(CONFIRM_RISK3),--confirm-risk3 "$(CONFIRM_RISK3)") $(if $(DRY_RUN),--dry-run)
+chaos-inject: ## 不盲的注入：make chaos-inject SCENARIO=s002；第三档要加 CONFIRM_RISK3=<同一个编号>；压测没跑够 30 分钟拒绝，SKIP_WARMUP=1 跳过；前面的运行有没确认的对账不通过也拒绝（make chaos-recon-ack）；DRY_RUN=1 只打印将要做什么
+	@scripts/cluster/chaos-run.sh inject --scenario "$(SCENARIO)" $(if $(CONFIRM_RISK3),--confirm-risk3 "$(CONFIRM_RISK3)") $(if $(SKIP_WARMUP),--skip-warmup) $(if $(DRY_RUN),--dry-run)
 
 .PHONY: chaos-recover
-chaos-recover: ## 恢复当前的实验：撤掉注入、等回到稳态、等静止后跑 recon-check，结果写进 chaos/runs/<运行号>/；ALL=1 是总闸（所有 Chaos Mesh 对象、故障开关、脚本建的 VirtualService 全撤，RESTART=1 再重启五个服务）；NO_RECON=1 不跑对账；DRY_RUN=1 只打印
-	@scripts/cluster/chaos-run.sh recover $(if $(ALL),--all) $(if $(RESTART),--restart) $(if $(NO_RECON),--no-recon) $(if $(RUN),--run "$(RUN)") $(if $(DRY_RUN),--dry-run)
+chaos-recover: ## 恢复当前的实验：撤掉注入、等回到稳态，前台查三个常驻核对的指标（过了就可以开始下一个实验），逐行对账放后台（结果看 make chaos-status，不通过会拒绝下一次注入直到 chaos-recon-ack）；WAIT_RECON=1 逐行对账也在前台等（第三档本来就等）；结果写进 chaos/runs/<运行号>/；ALL=1 是总闸（所有 Chaos Mesh 对象、故障开关、脚本建的 VirtualService 全撤，RESTART=1 再重启五个服务）；NO_RECON=1 不跑对账；DRY_RUN=1 只打印
+	@scripts/cluster/chaos-run.sh recover $(if $(ALL),--all) $(if $(RESTART),--restart) $(if $(NO_RECON),--no-recon) $(if $(WAIT_RECON),--wait-recon) $(if $(RUN),--run "$(RUN)") $(if $(DRY_RUN),--dry-run)
 
 .PHONY: chaos-reveal
-chaos-reveal: ## 复盘时打开答案：核对 sealed.json 的摘要（SHA=<记下的摘要>），在 docs/postmortems/ 生成复盘草稿，把 truth.md 填进“评测用标注”；运行还没恢复时拒绝（FORCE=1 例外）
+chaos-reveal: ## 复盘时打开答案：核对 sealed.json 的摘要（SHA=<记下的摘要>），在 docs/postmortems/ 生成复盘草稿，把 truth.md 填进“评测用标注”；后台的逐行对账还在跑就等它（FORCE=1 不等）；运行还没恢复时拒绝（FORCE=1 例外）
 	@scripts/cluster/chaos-run.sh reveal $(if $(RUN),--run "$(RUN)") $(if $(SHA),--sha "$(SHA)") $(if $(FORCE),--force)
+
+.PHONY: chaos-status
+chaos-status: ## 当前有没有进行中的实验，和逐行对账还在后台跑、或者不通过又没确认的运行（只打印运行号和状态）
+	@scripts/cluster/chaos-run.sh status
+
+.PHONY: chaos-recon-ack
+chaos-recon-ack: ## 确认看过一个运行的对账结果：make chaos-recon-ack RUN=<运行号>；不确认的话下一次注入被拒绝；逐行对账还在跑时不能确认
+	@scripts/cluster/chaos-run.sh recon-ack --run "$(RUN)"
 
 .PHONY: cluster-fault
 cluster-fault: ## 在集群上做故障注入，验证 Istio 边车的熔断、并发上限、超时和不重试；和 cluster-e2e 共用 oppenheimer-e2e；FAULT_SCENARIOS、E2E_KEEP 见脚本

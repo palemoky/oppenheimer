@@ -1,0 +1,17 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+# container-kill：chaos-daemon 直接对容器里的进程发 KILL，没有 TERM、没有排空。只杀业务容器，边车留着。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  action: container-kill
+  mode: one
+  containerNames: [order]
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: order

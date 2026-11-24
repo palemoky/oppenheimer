@@ -1,0 +1,16 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s004
+method: chaos-mesh
+risk: 1
+category: pod
+target:
+  workload: order
+duration: 5m
+requires:
+  - 目标工作负载至少 2 个副本
+  - 稳态的压测在跑（没有在途的请求就没有东西会断）
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：kubelet 在原地把容器重新拉起来（Pod 不换）
+expected_alerts: []
