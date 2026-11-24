@@ -245,6 +245,20 @@ chaos/
 - **没有验的**：HTTPChaos（设计里就不用）；节点级的故障（关虚拟机不经过 Chaos Mesh）；同时有两个实验对象；controller-manager 挂掉时已注入的故障怎么收回；长期运行的那一套（`oppenheimer`）上一次都没有注入过。
 - **顺带**：e2e 这一套（`E2E_KEEP=1 make cluster-e2e`）这次也跑了，通过。删命名空间时那些 `PodNetworkChaos` 对象没有挡住删除。
 
+### 第 3 步：`pprof_capture`（2026-11-24；Opus 写，主会话评审；Role 没有 apply，集群里的 Agent 还是旧镜像）
+
+- **做了的**：`services/agent/internal/tool/pprof`（工具、SPDY 端口转发、摘要）；`tool.Scope`（一次运行里各工具共享的状态，“最多 8 次”和 `base` 要它）和 `tool.Timeouter`（工具自己声明时限：原来每次工具调用固定 15 秒，装不下 30 秒的 CPU 剖析）；原始文件按 `raw/<步骤>.pb.gz` 落盘；`agent serve` 的 `-pprof-namespace`、`-pprof-port`；`pkg/app/debug.go` 读 `DEBUG_MUTEX_FRACTION`、`DEBUG_BLOCK_RATE`（只在调试端口开着时生效）；`oppenheimer` 命名空间里的 Role `oppenheimer-agent-pprof`（`pods/portforward` 的 create、`pods` 的 get）。
+- **对着真的 Pod 跑过一次**（主会话，用本机的 `agent tool` 和管理员的 kubeconfig，不是 Agent 自己的身份）：`order` 的一个 Pod 的 goroutine 剖析，186 个 goroutine、46 种调用栈，摘要可读（第一组是 72 个停在 `kafkax.(*worker).runLane` 的 select）。**没有验的**：Agent 自己的身份加这个 Role 能不能转发（Role 没有 apply）；`cpu`、`heap`、`mutex`、`block` 对着真的 Pod；`base` 的差值；模型会不会用、用得对不对。
+- **和 3.4 不一样的地方**：
+  1. goroutine 的“等待的状态”是从最里面的运行时帧推断的，没有“等了多久”。原因：带状态和时长的文本格式（`debug=2`）在输出期间会停住整个进程，goroutine 多的时候对被诊断的进程影响明显；用的是二进制格式。代价是模型看不到“已经等了 20 分钟”这个泄漏的强信号，只能靠隔一会儿再抓一次带 `base` 看数量涨没涨。
+  2. 调试端口是配置给的（默认 6060），不是从 Pod 上发现的：`DEBUG_ADDR` 在 ConfigMap 里，Agent 没有读 ConfigMap 的权限。同样的原因，工具没法事先知道某个服务开没开 mutex、block 采样，只能抓回来是空的再说明“为空不等于没有争用”。
+  3. 多了参数 `heap_sample`（默认在用的字节数）；`base` 允许是另一个 Pod 的抓取，结果里会写明“这是两个进程的差别，不是随时间的增长”。
+- **设计的问题（子 Agent 提的，主会话认为成立）**：
+  1. CPU 剖析的间隔是按 Pod 算的：一个服务有 N 个副本就可以同时剖 N 个。名额和间隔只在 Agent 进程的内存里，重启清零。
+  2. Agent 的内存上限 256 Mi：单份剖析最多 16 MiB，解析会放大几倍，一次运行里成功的几份还要留着给 `base` 用。大的 heap 剖析可能吃紧，**没有量过**。
+  3. mutex、block 和 heap 的 `alloc_*` 是从进程启动累计的，不是“最近”；结果里写了，模型仍然可能读错。这是阶段 6 评测要看的。
+  4. 只给了 `pods/portforward` 的 create（SPDY）。以后有人把转发换成 WebSocket 那一路会 403，要另给 get。
+
 ### 第 4 步：场景格式、`chaos-run.sh`、`chaos-steady.sh`（2026-11-24；Sonnet 写，主会话评审；没有注入过）
 
 - **和 3.5、3.6 不一样的地方**（都接受了）：

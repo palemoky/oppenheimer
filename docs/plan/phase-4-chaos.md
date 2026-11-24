@@ -35,6 +35,7 @@
   - 故障代码要写得像真实的 bug（例如忘记关闭的 goroutine、无上限的缓存、不一致的加锁顺序），而不是一眼能看出来的 `sleep`
   - 用构建标签隔离，正常构建的二进制里不包含故障代码
 - [ ] 给诊断 Agent 加 pprof 工具（从阶段 6 提前，2026-11-15），在做下面“Go 代码缺陷”那一批实验之前完成：goroutine 泄漏、内存泄漏、死锁没有 pprof 基本诊断不了
+  - 2026-11-24：工具写了（`pprof_capture`，[设计第 6 节“第 3 步”](../design/4a-chaos-prep.md)），有测试，主会话用本机的 `agent tool` 对着真的 `order` Pod 抓过一次 goroutine。**Role 没有 apply，集群里的 Agent 还是没有这个工具的镜像，五个服务的 mutex、block 采样没有打开**，所以不勾
   - 抓不抓、抓哪一种由 Agent 看了运行时指标之后决定，不做成“指标一超阈值就自动抓”：什么时候该抓 profile 本身是要评测的能力
   - 按症状选类型：CPU 高抓 CPU profile（默认 10 秒）；goroutine 数涨抓 goroutine（瞬时的，不用等）；内存涨抓 heap；延迟高而 CPU 不高抓 mutex 和 block
   - 喂给模型的是摘要，不是原始文件：top N 的函数和占比，goroutine 按调用栈聚合后的前几组和各自的数量
