@@ -40,10 +40,10 @@
 环境是 `make cluster-chaos`（e2e 里自带发压的 Job 和 recon）：`GO_TAGS=faults E2E_KEEP=1 CHAOS_DELETE=0`，另加 `CHAOS_EXTRA_OVERLAY` 把 gateway、payment 降到 1 个副本（集群的 CPU requests 用到了 97%，不降的话第二个 gateway 排不上）。基线（开关全关）一轮压测加对账、verify 全过。留下的现场里再发压、再对账用的是照 `chaos.sh` 写的一个临时脚本（没有入库）：给新的 SKU 灌库存、`load warmup`、`load run`、`recon -pairs index`。
 
 - **s014（`persist`）**：一段 8 分钟的压测跑着（e2e 里 `PAYMENT_TIMEOUT` 是 5 秒，CLOSED 的变更很多）。注入：写 Secret、等 120 秒、开开关。开关打开后 20 秒内两个副本都崩了并且重启后接着崩（一分半钟里重启 3 次，`CrashLoopBackOff`，退出码 2），`--previous` 的日志里是答案文件写的那个 panic 和调用栈（`rowDirect` ← `decodeChanges` 起的 goroutine）。**重启后还在崩就说明文件同步进去了、启动时读到了**；没有另外去读重启后的 `/fault`。恢复：Secret 被删、滚动重启出两个新副本、正常。压测跑完后对商家索引：20889 行两边一致，差异 0（位点没有提交过的那些变更重放了）。期间没有告警响（e2e 里规则不对着它）。
-  - 试出一个误报并改了：崩溃循环里的 Pod 关不了开关，脚本把它算成“恢复失败”、退出码 1、提示跑总闸。现在 `persist` 的场景里关不掉只记一笔。**改了之后没有再对着集群跑过。**
+  - 试出一个误报并改了：崩溃循环里的 Pod 关不了开关，脚本把它算成“恢复失败”、退出码 1、提示跑总闸。现在 `persist` 的场景里关不掉只记一笔。第二轮（同一天）重做了一遍 s014 的注入和恢复：没有再误报，运行的状态是 `undo_ok: yes`，Secret 清了、新副本正常。
 - **s015**：开 `f08`，把 e2e 的 cdc 缩到 0，发 90 秒压（约 3400 单），cdc 恢复到 1。一分钟后对商家索引：**875 处差异**，缺行 176、同一个订单版本低 699、多出来的行 0、重复 0，复查（隔 30 秒）一条都没有自己好。看到的例子和答案一致：订单库 `status=5 version=2`，索引 `status=2 version=1`。约四分之一的订单坏了，比答案里估的“几十到几百”多：这次所有订单的两次变更都压在同一段积压里。关开关后 `recon -repair`：875 条全部修好；再对一次，24289 行两边一致。orderindex 全程没有重启。
   - 用的是“缩到 0 再恢复”而不是答案里写的“滚动重启 cdc”：滚动重启的停顿只有几秒，攒不出多少积压。`scenario.yaml` 的 requires 还是原来的写法，没有改。
-  - 变更核对（recon-changes）报不报 `lagging` 没有验：e2e 里没有装它。
+  - **变更核对（recon-changes）第二轮验了（2026-11-26 14:40 到 15:00 UTC，主人说“可以安装后在 e2e 验证一下”）**：把 `deploy/cluster/recon/changes.yaml` 的库名换成 `e2e_` 前缀、加上 `KAFKA_PREFIX=e2e-<运行号>.`，装进 `oppenheimer-e2e`（镜像 `recon:6b115e4`；长期运行的那一个没有动；清单是临时改的，没有入库）。重做一遍 s015：`recon_changes_checked_total{target="index",result="lagging"}` 是 **945**，`mismatch` 是 0，日志里每条是 `derived version 1 < change version 2`；同一时刻逐行对账的差异也是 **945**（缺行 173、版本低 772）。两边一条不差，和答案写的一致。`-repair` 修好 945 条，再对差异 0。注入之前（包括 s014 崩溃循环的那一分多钟）`lagging` 是 0：索引落后不到 2 分钟不报。
 
 ## 还没有做的（2026-11-26 更新）
 

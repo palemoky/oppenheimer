@@ -10,7 +10,7 @@ requires:
   - 只在 oppenheimer-e2e 里做（CHAOS_NS=oppenheimer-e2e）：这个场景会写坏商家索引（派生数据），不在 oppenheimer 里做
   - 镜像是带故障代码的构建（GO_TAGS=faults）
   - 稳态的压测在 oppenheimer-e2e 上跑着，有下单和付款（同一个订单几秒之内有好几次变更）
-  - 要有积压才会触发：消费者跟得上时一批只有一两条，开关开着也没有任何表现。开关打开之后滚动重启一次 cdc（不是 orderindex），cdc 追赶的那段时间里 orderindex 一批几百条
+  - 要有积压才会触发：消费者跟得上时一批只有一两条，开关开着也没有任何表现。开关打开之后把 cdc 缩到 0、等一分钟以上再恢复（不是重启 orderindex；滚动重启 cdc 的停顿太短），cdc 追赶的那段时间里 orderindex 一批几百条
 recover:
   restart: []
   notes:
