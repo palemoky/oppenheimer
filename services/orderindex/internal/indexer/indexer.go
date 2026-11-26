@@ -225,18 +225,13 @@ func (ix *Indexer) Apply(ctx context.Context, changes []*cdcv1.RowChange) (Count
 // Store 的语句模板在构造时渲染好、只读，连接由 database/sql 的池分配；Stats 有锁。
 func (ix *Indexer) Handler(timeout time.Duration) kafkax.BatchHandler {
 	return func(ctx context.Context, msgs []kafkax.Message) error {
-		changes := make([]*cdcv1.RowChange, len(msgs))
-		for i, msg := range msgs {
-			ch := &cdcv1.RowChange{}
-			if err := proto.Unmarshal(msg.Value, ch); err != nil {
-				return kafkax.Permanent(fmt.Errorf("indexer: unmarshal row change (partition %d offset %d): %w",
-					msg.Partition, msg.Offset, err))
-			}
-			changes[i] = ch
+		changes, err := unmarshalChanges(msgs)
+		if err != nil {
+			return err
 		}
 		wctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		_, err := ix.Apply(wctx, changes)
+		_, err = ix.Apply(wctx, changes)
 		// 多条的批出错时 kafkax 会记一条告警再逐条回退，这里只在逐条（会原地重试、停住分区）时报错，
 		// 避免同一个问题在日志里报两遍，也只有这时才知道是哪一条。
 		if errors.Is(err, ErrSchema) && len(msgs) == 1 {
@@ -246,6 +241,29 @@ func (ix *Indexer) Handler(timeout time.Duration) kafkax.BatchHandler {
 		}
 		return err
 	}
+}
+
+// unmarshalInOrder 按顺序逐条反序列化一批消息，返回和 msgs 一一对应的变更；遇到第一条反序列化不了的就返回它的错误。
+func unmarshalInOrder(msgs []kafkax.Message) ([]*cdcv1.RowChange, error) {
+	changes := make([]*cdcv1.RowChange, len(msgs))
+	for i, msg := range msgs {
+		ch, err := unmarshalOne(msg)
+		if err != nil {
+			return nil, err
+		}
+		changes[i] = ch
+	}
+	return changes, nil
+}
+
+// unmarshalOne 反序列化一条消息。消息不是 RowChange 时返回 kafkax.Permanent，理由见 Handler。
+func unmarshalOne(msg kafkax.Message) (*cdcv1.RowChange, error) {
+	ch := &cdcv1.RowChange{}
+	if err := proto.Unmarshal(msg.Value, ch); err != nil {
+		return nil, kafkax.Permanent(fmt.Errorf("indexer: unmarshal row change (partition %d offset %d): %w",
+			msg.Partition, msg.Offset, err))
+	}
+	return ch, nil
 }
 
 // Stats 累计一段时间内的应用结果和端到端延迟。并发安全。
