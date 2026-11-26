@@ -67,7 +67,8 @@
 - [x] 换上改过名字的带故障代码的镜像（2026-11-24 加）
   - **做完了（2026-11-24 11:57 UTC，主人同意后）**：五个服务是 `afc5341-p4`，十个副本的 `/fault` 都读过：gateway 两个副本列出 `f01`、关着，另外四个服务是空表
   - **登记（2026-11-24；主人同一天同意了）**：`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `9dda461-faults` 滚动成 `<提交号>-p4`（tag 不再写 faults，gateway 的故障文件改了名）。和上一次一样是滚动更新，不注入、不发压。要先提交（tag 是提交号）。之后核对：五个服务的 `/fault` 列得出开关、都是关的
-- [ ] 4b：让新写的六个故障点进集群（2026-11-24 加）
+- [x] 4b：让新写的六个故障点进集群（2026-11-24 加）
+  - **做完了（2026-11-24 15:24 UTC，主人同意后）**：五个服务是 `92d2426-p4`，十个副本的 `/fault` 都读过：开关各自列得出（gateway 2 个、order 2 个、inventory 1 个、orderindex 2 个、payment 空表），全部关着；滚动后两分钟只有 Watchdog 在响，没有重启
   - **登记（2026-11-24；主人同一天同意了“重新构建并滚动镜像”）**：`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `afc5341-p4` 滚动成 `<提交号>-p4`。和上一次一样是滚动更新，不注入、不发压、不开任何开关。要先提交（tag 是提交号）。之后核对：五个服务每个副本的 `/fault` 列得出各自的开关、都是关的；没有告警在响
 - [x] 阶段笔记（设计第 4 节第 7 步）：[notes/4a-chaos-prep.md](../notes/4a-chaos-prep.md)（2026-11-24）；ADR-0041 之前已写，这次补了两处改动
 - [ ] 盲测脚本：随机选场景注入，并把答案密封到文件
@@ -80,6 +81,7 @@
   - 2026-11-24 走通时（570 请求/秒）连接最多 97 个，常驻内存 +59 MiB，到不了 200 个连接，验证不了；等更大的一轮
 - [ ] 3c 留下的告警验证（[设计 3c](../design/3c-slo-alerting.md) 第 8 节“第 16 项”），做对应的实验时顺带完成：
   - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
+    - 2026-11-26 用历史数据核对了：推断成立（一小时前没有流量时右边是 0/0 的 NaN，比较不成立，`for` 被打断）。表和改法的建议在[设计 3c](../design/3c-slo-alerting.md) 第 8 节“`OrderAdmitRateDropped` 不改”之后。主人 2026-11-26 定了改：规则和单元测试 y1 到 y4 写了，**还没有下发到集群**
   - `OtelCollectorExportQueueFull` 单独响的情形：gateway 在而 agent 发不过去（比如挡住 agent 到 gateway 的 4317）
   - 3e 留下的（2026-11-24）：`DerivedDataCheckStalled` 没有真实触发过（要“核对停了”同时“订单库有写入”，e2e 里没有流量）；`recon-changes` 的从库目标没有造过不一致；有负载时三个常驻核对的开销、每天全量对账对线上的影响没有量
   - 只有单元测试的：超卖、闸门内存写满、Collector 导出失败、支付可用性的三档；`RateLimitFallingBack` 改成按比例之后没有真实触发过
@@ -100,7 +102,16 @@
   7. 出了岔子：`CHAOS_NS=oppenheimer-e2e make chaos-recover ALL=1`；最坏删掉整个 `oppenheimer-e2e` 命名空间。
 - [x] 结果写回各场景的 `truth.md` 和设计 4b；过了的场景标成能盲测（2026-11-24：第一档 5 个标了；丢包、DNS 两个先不进池，第一次带负载由主会话带着做）
 - [ ] Istio 故障注入的两条路重试（B4 开始之前；上次探测请求被 gateway 的鉴权挡在 401）
-- [ ] `pkg/mysqlx` 的连接池指标加一个区分主库池和从库池的标签（2026-11-24 写故障点时发现的，平时的可观测缺口；标签是有限的枚举，符合规范；没有在集群上核对过现在的指标长什么样）
+- [x] `pkg/mysqlx` 的连接池指标加一个区分主库池和从库池的标签（2026-11-24 写故障点时发现的，平时的可观测缺口；标签是有限的枚举，符合规范；没有在集群上核对过现在的指标长什么样）
+  - 2026-11-26 写了：`mysqlx.Config.Role`（`primary`、`replica`、`archive`，不写是 `primary`，别的值报错），作为 `db.role` 属性同时加在数据库的 span、耗时指标和连接池指标上；order 的从库池和冷库池各自标了；`service.json` 大盘的四个连接池面板按它分开。单元测试核对了同名的库三个池各报各的上限。**集群上要等下一次换镜像才有这个标签**，到时在 Prometheus 里看一眼 `db_sql_connection_max_open` 是不是分成了两条
+
+**B3 的准备（2026-11-26；仓库里写完了，上集群的两步是登记，等主人同意）**
+
+- [x] `f08` 数据竞争的故障点和场景 `s015`（Opus 写，主会话逐行读了故障代码和对 `indexer.go` 的改动；测试文件没有逐行读）
+- [x] 重启后还在的开关：chart 的 `startupOverrides`、`chaos-run.sh` 的 `persist`、`s014` 标上（Sonnet 写，主会话读了全部 diff；只用桩走过，**没有对着集群跑过**）。环境变量改名 `STARTUP_OVERRIDES_FILE`（理由同镜像 tag 不写 faults；主人 2026-11-26 认可）
+- [ ] **登记，等同意：重新构建、滚动带故障代码的镜像**。要先提交。`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`，五个服务从 `92d2426-p4` 滚动成 `<提交号>-p4`。和前两次不同的一点：**Deployment 的定义多了一个可选的 Secret 卷和一个环境变量**（Secret 不存在，Pod 照常起）。不注入、不发压、不开任何开关。之后核对：十个副本的 `/fault`（orderindex 应当列出 3 个）全关；没有告警；Prometheus 里 order 的 `db_sql_connection_max_open` 按 `db_role` 分成了几条；大盘 `service.json` 要 `monitoring.sh dashboards` 重新下发一次
+- [ ] **登记，等同意：在 `oppenheimer-e2e` 里试 `persist`（`s014`）和 `s015`**。`GO_TAGS=faults E2E_KEEP=1 make cluster-e2e` 起一套（本机构建镜像），只动 `oppenheimer-e2e`，做完删掉。`s014`：验 Secret 写进去、120 秒后开开关、orderindex 崩了重启之后开关还在、`recover` 清 Secret 并滚动重启后恢复。`s015`：要流量和积压（开关打开后重启 e2e 里的 cdc），之后逐行对账看得出差异、`-repair` 修得好；`recon-check` 要显式指到 e2e（脚本默认对着 `oppenheimer`）。e2e 里没有压测，流量怎么造到时先定再做。影响：e2e 的 orderindex 反复重启；长期运行的那一套不动
+- [ ] 六个新开关（`s009` 到 `s014`）带负载各试一次、mutex 和 block 采样的开销：要稳态压测和阶梯压测，B2 之后另行登记
 
 **4a 留下的四项，在这里做**（checkbox 仍在“4a 准备”里，做完回去勾）：
 
@@ -131,7 +142,7 @@
 
 **Go 代码缺陷（常见生产故障，通过故障开关注入）**
 
-2026-11-24：除“数据竞争”之外的七类，故障点和场景都写了（[设计 4b](../design/4b-experiments.md) 第 8 节）。**新写的六个还没有进集群**（要重新构建、滚动带故障代码的镜像，先登记），也没有带负载试过；下面的 checkbox 是“实验做了、复盘写了”才勾。panic 那一类还差 `FAULT_FILE` 的 Secret 和清单。
+2026-11-24：除“数据竞争”之外的七类，故障点和场景都写了（[设计 4b](../design/4b-experiments.md) 第 8 节）。新写的六个进了集群（`92d2426-p4`，开关全关），**还没有带负载试过**；下面的 checkbox 是“实验做了、复盘写了”才勾。panic 那一类要的 Secret 和清单 2026-11-26 写了，数据竞争那一类也写了（见上面“B3 的准备”），都还没有上集群。
 
 - [ ] goroutine 泄漏：阻塞在无人接收的 channel、未取消的 context、未关闭的 response body
 - [ ] 内存泄漏：无上限的 map 或缓存、切片引用大数组、未停止的 ticker、全局变量持有
