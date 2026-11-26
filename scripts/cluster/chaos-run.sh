@@ -44,6 +44,8 @@
 #                        刚撤掉注入、刚滚动重启时它还没有反应，马上查会 1 秒就过）
 #   CHAOS_RECON_WAIT     等 recon-check 核对到结束时刻最多多少秒，默认 1800（reveal 等后台的逐行对账也是这个上限）
 #   CHAOS_STEADY_MIN_AGE 注入时压测至少已经跑了多少秒，默认 1800
+#   CHAOS_FILE_SYNC_WAIT fault-switch 场景写了 persist: yes 时，写完 Secret 之后等多少秒再打开开关，默认 120
+#                        （kubelet 把 Secret 的变更同步进已经在跑的 Pod 的卷要一个同步周期；容器原地重启读的是卷里的文件）
 #
 # 一次只有一个进行中的运行。注入的步骤：检查稳态 -> 选 -> 密封 -> 加注解 -> 记开始时刻 -> 按方式注入。
 # 注入中途失败或者被 Ctrl-C：走一遍恢复（trap），运行标成 aborted。注入成功之后脚本就退出了，
@@ -69,6 +71,10 @@ RECOVER_WAIT="${CHAOS_RECOVER_WAIT:-900}"
 RECOVER_SETTLE="${CHAOS_RECOVER_SETTLE:-180}"
 RECON_WAIT="${CHAOS_RECON_WAIT:-1800}"
 STEADY_MIN_AGE="${CHAOS_STEADY_MIN_AGE:-1800}"
+FILE_SYNC_WAIT="${CHAOS_FILE_SYNC_WAIT:-120}"
+# 进程重启后还在的那一路：开关名写进目标命名空间的这个 Secret 的这个键（chart 把它挂到 Pod 里，见 deploy/charts/service）。
+OV_SECRET=startup-overrides
+OV_KEY=enabled
 STEADY_STARTED_AT="$ROOT/tmp/chaos-steady/started_at"
 # 能注入的命名空间只有这两个。别的（尤其下面四个）永远拒绝。
 ALLOWED_NS="oppenheimer oppenheimer-e2e"
@@ -259,6 +265,15 @@ lint_scenario() {
         [[ "$(jq -r '.switch // ""' <<<"$sw")" =~ ^f[0-9]{2}$ ]] || lint_err "$id" "switch.yaml: switch must be f01..f99"
         [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] || lint_err "$id" "switch.yaml: ttl is required (like 30m)"
         [[ "$(jq -r '.admin_port // ""' <<<"$sw")" =~ ^[0-9]+$ ]] || lint_err "$id" "switch.yaml: admin_port is required"
+        # persist：写了 yes 才走“进程重启后还在”那一路；不写是 no。yes 时恢复要靠滚动重启换掉 Pod，所以 recover.restart 要含目标。
+        case "$(jq -r '.persist // "no"' <<<"$sw")" in
+        yes)
+          [[ "$(jq -r --arg w "$(jq -r '.target.workload // ""' <<<"$sj")" '(.recover.restart // []) | index($w) // "" | tostring' <<<"$sj")" =~ ^[0-9]+$ ]] ||
+            lint_err "$id" "switch.yaml: persist: yes needs the target workload in recover.restart"
+          ;;
+        no) ;;
+        *) lint_err "$id" "switch.yaml: persist must be yes or no" ;;
+        esac
         if [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] && [[ "$(jq -r '.duration // ""' <<<"$sj")" =~ ^[0-9]+[smh]$ ]]; then
           [[ "$(dur_s "$(jq -r .ttl <<<"$sw")")" -le "$(dur_s "$(jq -r .duration <<<"$sj")")" ]] || lint_err "$id" "switch.yaml: ttl is longer than duration"
         fi
@@ -419,6 +434,43 @@ render() { # 文件
   sed -e "s|__TARGET_NS__|$TNS|g" -e "s|__RUN_ID__|$RUN|g" "$1"
 }
 
+# ---- “进程重启后还在”：开关名写进 Secret（细节只进私有日志） ----
+# 读 Secret 里现有的名字（逗号、空格、换行分隔），每行一个。Secret 不存在不算错。
+ov_read() {
+  local raw
+  raw="$(kubectl -n "$TNS" get secret "$OV_SECRET" --ignore-not-found -o "jsonpath={.data.$OV_KEY}" 2>>"$PRIVLOG")" || return 1
+  [[ -n "$raw" ]] || return 0
+  printf '%s' "$raw" | base64 -d | tr ',' ' ' | tr -s '[:space:]' '\n' | grep -v '^$' || true
+}
+# 把清单（标准输入，每行一个名字）写回：空就删掉 Secret，不空就建或更新。
+ov_write() {
+  local f rc=0
+  f="$(mktemp "${TMPDIR:-/tmp}/chaos-ov.XXXXXX")"
+  { grep -v '^$' || true; } | sort -u >"$f"
+  if [[ -s "$f" ]]; then
+    kubectl -n "$TNS" create secret generic "$OV_SECRET" "--from-file=$OV_KEY=$f" --dry-run=client -o yaml 2>>"$PRIVLOG" |
+      kubectl -n "$TNS" apply -f - >>"$PRIVLOG" 2>&1 || rc=1
+  else
+    kubectl -n "$TNS" delete secret "$OV_SECRET" --ignore-not-found >>"$PRIVLOG" 2>&1 || rc=1
+  fi
+  rm -f "$f"
+  return "$rc"
+}
+ov_add() { # 开关名
+  local cur
+  cur="$(ov_read)" || return 1
+  { printf '%s\n' "$cur"; printf '%s\n' "$1"; } | grep -v '^$' | ov_write
+}
+ov_remove() { # 开关名
+  local cur
+  cur="$(ov_read)" || return 1
+  { printf '%s\n' "$cur" | grep -vx -- "$1" || true; } | ov_write
+}
+# 目标的 Deployment 有没有挂这个卷（平时的镜像和部署没有：写了 Secret 也不会有任何效果，不如拒绝）。
+ov_mounted() { # 工作负载
+  [[ " $(kubectl -n "$TNS" get deploy "$1" -o 'jsonpath={.spec.template.spec.volumes[*].name}' 2>>"$PRIVLOG") " == *" $OV_SECRET "* ]]
+}
+
 # ---- 注入和撤销，按方式 ----
 inject_by_method() {
   local m sid w f
@@ -438,6 +490,14 @@ inject_by_method() {
     ttl="$(sealed .params.ttl)"
     port="$(sealed .params.admin_port)"
     [[ -n "$ttl" ]] || { plog "fault switch without ttl refused"; return 1; }
+    if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
+      # 顺序：写 Secret -> 等 kubelet 同步 -> 再经端口打开。容器原地重启读的是卷里的文件，没同步完就崩会读到旧的。
+      ov_mounted "$w" || { plog "persist: $w does not mount $OV_SECRET (deployed without the faults build?)"; return 1; }
+      plog "persist: add $sw to $OV_SECRET/$OV_KEY"
+      ov_add "$sw" || { plog "persist: writing the secret failed"; return 1; }
+      plog "persist: waiting ${FILE_SYNC_WAIT}s for the volume sync"
+      sleep "$FILE_SYNC_WAIT"
+    fi
     plog "switch $sw on, ttl $ttl, port $port, workload $w"
     fault_each "$w" "$port" "/fault/$sw?mode=on&ttl=$ttl" || return 1
     ;;
@@ -467,6 +527,12 @@ undo_run() {
     local sw port
     sw="$(sealed .params.switch)"
     port="$(sealed .params.admin_port)"
+    # persist：先从 Secret 里去掉，再关开关，最后（下面）滚动重启：新 Pod 启动时读的是当时的 Secret。
+    # 经端口关开关在 Pod 崩溃循环里会失败，只记一笔，不中止。
+    if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
+      plog "persist: remove $sw from $OV_SECRET/$OV_KEY"
+      ov_remove "$sw" || { bad=1; plog "persist: removing from the secret failed"; }
+    fi
     fault_each "$w" "$port" "/fault/$sw?mode=off" || { bad=1; plog "switch off failed on some replica; the ttl will turn it off"; }
     ;;
   script)
@@ -648,13 +714,17 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
       fault-switch)
         local sw
         sw="$(yaml_to_json "$SCEN_DIR/$sid/inject/switch.yaml")"
+        if [[ "$(jq -r '.persist // "no"' <<<"$sw")" == yes ]]; then
+          echo "  first: add the switch to Secret $OV_SECRET (key $OV_KEY) in $TNS (merge, no duplicates), check the Deployment mounts it,"
+          echo "         then wait ${FILE_SYNC_WAIT}s (CHAOS_FILE_SYNC_WAIT) for the volume sync, then:"
+        fi
         echo "  PUT /fault/$(jq -r .switch <<<"$sw")?mode=on&ttl=$(jq -r .ttl <<<"$sw") on port $(jq -r .admin_port <<<"$sw") of every running pod of $(jq -r '.target.workload' <<<"$sj") (via kubectl port-forward)"
         ;;
       script) echo "  inject/run.sh inject" ;;
       esac
       echo "  requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
     fi
-    echo "on failure or Ctrl-C: undo (delete objects / switch off / run.sh recover / remove the annotation) and mark the run aborted"
+    echo "on failure or Ctrl-C: undo (delete objects / remove the switch from the Secret if it was added, then switch off / run.sh recover / remove the annotation) and mark the run aborted"
     return 0
   fi
 
@@ -772,6 +842,7 @@ recover_all() { # restart dry
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for namespaces: $ALLOWED_NS"
     echo "  - delete every Chaos Mesh experiment object in all namespaces (every kind of the chaos-mesh.org CRDs except Pod*Chaos)"
+    echo "  - delete Secret $OV_SECRET in each of those namespaces (if present), before anything is restarted"
     echo "  - on every running pod of $SERVICES (name:admin port): GET /fault via kubectl port-forward, then switch off every switch listed"
     echo "  - delete VirtualService/DestinationRule/EnvoyFilter carrying the label $RUN_LABEL"
     echo "  - run recover for scripts of active runs, remove the annotation $ANNOT"
@@ -789,6 +860,8 @@ recover_all() { # restart dry
   for ns in $ALLOWED_NS; do
     kubectl get ns "$ns" >/dev/null 2>&1 || continue
     TNS="$ns"
+    # 重启之前无条件删掉：新 Pod 启动时读的是当时的 Secret。不存在不算错。
+    kubectl -n "$ns" delete secret "$OV_SECRET" --ignore-not-found >>"$PRIVLOG" 2>&1 || { bad=1; echo "  could not delete the startup list in $ns (see log)"; }
     for s in $SERVICES; do
       w="${s%%:*}"
       port="${s##*:}"
@@ -884,7 +957,7 @@ cmd_recover() {
   fi
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for the active run (${run:-the only active one}):"
-    echo "  - undo the injection (delete its objects / switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
+    echo "  - undo the injection (delete its objects / for a persisted switch: remove it from Secret $OV_SECRET first (delete the Secret when empty), then switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
     echo "  - record the end time; wait ${RECOVER_SETTLE}s, then up to ${RECOVER_WAIT}s for chaos-steady.sh check to pass"
     echo "  - foreground: recon-check --metrics-only --from <start> --to <end> (retry while it says 'not covered yet', up to ${RECON_WAIT}s) -> chaos/runs/<run>/recon-metrics.txt, exit code into state recon_metrics_rc"
     echo "  - then recon-check --rows-only (row-level reconciliation) -> chaos/runs/<run>/recon.txt, exit code in recon-rows.rc:"

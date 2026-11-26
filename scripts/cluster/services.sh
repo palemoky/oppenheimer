@@ -174,6 +174,11 @@ helm_args() { # 服务 tag
   # tag 用 --set-string：tag 是提交号的前 7 位，碰上全是数字的（7390796）时 --set 会把它当成整数，
   # 模板里的 printf "%s" 渲染出 %!s(int64=7390796)，Pod 报 InvalidImageName（2026-11-17 重建时遇到）。
   HELM_ARGS+=(--set "image.repository=$REGISTRY_ADDR/oppenheimer/$s" --set-string "image.tag=$tag")
+  # 部署带故障代码的镜像（GO_TAGS 里有 faults，同 images.sh 的判断）时，五个业务服务挂上启动时读的开关清单（阶段 4）。
+  # cdc 没有故障开关。平时的部署不打开，渲染结果和以前逐字节相同。
+  if [[ " ${GO_TAGS:-} " == *" faults "* && "$s" != cdc ]]; then
+    HELM_ARGS+=(--set startupOverrides.enabled=true)
+  fi
   # LOADTEST=1：长期运行的那一套叠压测用的一层（scripts/cluster/loadtest.sh 的 pin、preflight 配合使用）。
   if [[ $E2E_MODE -eq 0 && "${LOADTEST:-0}" == 1 && -f "$VALUES/loadtest/$s.yaml" ]]; then
     HELM_ARGS+=(-f "$VALUES/loadtest/$s.yaml")

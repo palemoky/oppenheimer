@@ -1,5 +1,6 @@
 switch: f07
 ttl: 30m
 # orderindex 的管理端口，注入要经端口转发，每个副本各开一次。
-# 只经这个端口打开的开关在进程内存里，进程崩了就复位：要持续的效果得同时走 FAULT_FILE（见 scenario.yaml 的 requires）。
+# 只经这个端口打开的开关在进程内存里，进程崩了就复位：要持续的效果得同时走启动时读的那份清单（STARTUP_OVERRIDES_FILE 指的 Secret，见 scenario.yaml 的 requires；persist: yes 时脚本负责写和清）。
 admin_port: 8084
+persist: yes

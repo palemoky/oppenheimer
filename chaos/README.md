@@ -59,6 +59,10 @@ chaos/
   - `duration` 写在清单里（到时 Chaos Mesh 自己撤掉）。
 - **`fault-switch`**：`switch.yaml`，字段 `switch`（`f01` 到 `f99`）、`ttl`（必须有，不超过 `duration`）、`admin_port`（目标服务管理端口，gateway 是 8089，order 8081，inventory 8082，payment 8083，orderindex 8084）。
   脚本对目标工作负载的**每个**副本经 `kubectl port-forward` 到管理端口，`PUT /fault/<开关>?mode=on&ttl=<ttl>`。
+  可选字段 `persist`（`yes` 或 `no`，不写是 `no`）：`yes` 时开关要在进程重启之后还开着。注入时脚本先把开关名写进目标命名空间里一个 Secret，
+  等 `CHAOS_FILE_SYNC_WAIT` 秒（默认 120，kubelet 把它同步进已经在跑的 Pod 要一个周期），再经管理端口打开；恢复时先从 Secret 里去掉，再关开关，
+  再做 `recover.restart` 的滚动重启（所以 `persist: yes` 要求 `recover.restart` 含目标工作负载，`lint` 检查）。`recover --all` 无条件删掉这个 Secret。
+  目标的 Deployment 要挂着它（chart 在部署带故障代码的镜像时自动挂；没挂的话 `persist: yes` 的注入会被拒绝）。
 - **`istio`**：一个或几个 `*.yaml`（VirtualService 等），`metadata.namespace: __TARGET_NS__`，名字和标签的规则同 `chaos-mesh`。脚本 `kubectl apply`，恢复时按标签删。
 - **`script`**：`run.sh`，接收一个参数 `inject` 或 `recover`，环境变量 `TARGET_NS`、`RUN_ID`、`RUN_DIR`、`KUBECONFIG`。恢复要能重复执行。
 

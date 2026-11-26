@@ -8,12 +8,12 @@ target:
 duration: 30m
 requires:
   - 镜像是带故障代码的构建（GO_TAGS=faults）
-  - 要走 FAULT_FILE 那条路（orderindex 挂的那个 Secret 里列出 f07）才能重启后还在；只经管理端口打开的话每个副本崩一次之后开关就复位，自己好了
+  - 要走启动时读的那份清单（STARTUP_OVERRIDES_FILE 指的那个 Secret 里列出 f07；switch.yaml 的 persist: yes，脚本写）才能重启后还在；只经管理端口打开的话每个副本崩一次之后开关就复位，自己好了
   - 稳态的压测跑了 15 分钟以上（要有到期关单产生的 CLOSED 订单变更；注入前的闸要求 30 分钟，满足）
 recover:
   restart: [orderindex]
   notes:
-    - 从 FAULT_FILE 指的那个 Secret 里去掉 f07（只经管理端口打开的不用这一步），脚本做
+    - 从 STARTUP_OVERRIDES_FILE 指的那个 Secret 里去掉 f07（只经管理端口打开的不用这一步），脚本做
     - 滚动重启 orderindex（CrashLoopBackOff 的退避最长 5 分钟，等它自己拉起来太慢），脚本做
     - 重启后消费者从已提交的位点接着消费，积压的变更追上之后派生数据一致，不需要重建索引
 expected_alerts: [ConsumerNotConsuming, DerivedDataLagging, IngressGateway5xxHigh]

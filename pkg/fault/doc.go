@@ -41,9 +41,13 @@
 // 打开时必须有 ttl，到了进程自己关：开发机断网、注入脚本死掉，故障也不会留在集群上。
 // 泄漏类的故障关了开关之后已经泄漏的不会回来，恢复要重启 Pod。
 //
-// 重启后还要在的故障（panic 导致反复重启）用环境变量 FAULT_FILE 指的文件：进程启动时读一次，
-// 里面列出的开关一登记就是开着的，没有 ttl。文件不存在不算错。
+// 重启后还要在的故障（panic 导致反复重启）用环境变量 FileEnv 指的文件：进程启动时读一次，
+// 里面列出的开关一登记就是开着的，没有 ttl。文件不存在不算错。集群上它来自一个可以不存在的 Secret，
+// 只有带故障代码的部署才挂（deploy/charts/service 的 startupOverrides），注入就是改 Secret 的内容。
 package fault
 
 // FileEnv 是放“启动时就打开哪些开关”的文件路径的环境变量。只有带 faults 标签的构建会读。
-const FileEnv = "FAULT_FILE"
+//
+// 名字故意不带 fault：环境变量的名字在 Pod 的规格里，诊断 Agent 读得到（值会被遮掉，名字不会），
+// 和镜像 tag 不写 faults 是同一个理由（设计 4a 第 6 节“第 6 步”）。设计文档里把这条路叫 FAULT_FILE。
+const FileEnv = "STARTUP_OVERRIDES_FILE"
