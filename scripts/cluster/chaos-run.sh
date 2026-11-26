@@ -532,8 +532,12 @@ undo_run() {
     if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
       plog "persist: remove $sw from $OV_SECRET/$OV_KEY"
       ov_remove "$sw" || { bad=1; plog "persist: removing from the secret failed"; }
+      # 这一类的 Pod 多半在崩溃循环里，端口转发连不上是常态；下面的滚动重启会把它们换掉（lint 保证 recover.restart 含目标），
+      # 新 Pod 读到的 Secret 里已经没有这个开关。所以关不掉不算恢复失败（第一次在 e2e 里试时因此误报过，2026-11-26）。
+      fault_each "$w" "$port" "/fault/$sw?mode=off" || plog "switch off failed on some replica (expected while crash-looping); the rollout replaces them"
+    else
+      fault_each "$w" "$port" "/fault/$sw?mode=off" || { bad=1; plog "switch off failed on some replica; the ttl will turn it off"; }
     fi
-    fault_each "$w" "$port" "/fault/$sw?mode=off" || { bad=1; plog "switch off failed on some replica; the ttl will turn it off"; }
     ;;
   script)
     TARGET_NS="$TNS" RUN_ID="$RUN" RUN_DIR="$RUNDIR" run_q "$SCEN_DIR/$sid/inject/run.sh" recover || bad=1
