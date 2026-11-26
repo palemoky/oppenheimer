@@ -7,6 +7,7 @@
 #   o-q  序列消失：CDC 的管道、服务的指标、消费者不消费
 #   x-    3e 的两个常驻核对：库存的计数对流水（x1-x4）、派生数据的变更（x5-x12）
 #   u-w  限流的退回按比例：过载时零星的超时不响、Redis 不在时探针的流量也响、流量太小时不响
+#   y1-y4 受理比例对比一小时前：一小时前没有流量（序列在但不涨、序列不存在）时退回绝对门槛，照样响；现在正常时不响
 # 断言都用 ALERTS：exp_alerts 要逐字对注解，注解改一个字就得改测试。
 rule_files:
   - ../business.yaml
@@ -867,3 +868,63 @@ tests:
       - expr: count(ALERTS{alertname="DerivedDataCheckStalled"})
         eval_time: 1500s
         exp_samples: []
+
+  # y1. 前 60 分钟序列在但不涨（探针停着）。之后每秒 1 个请求，受理只有两成。一小时前的比例是 0/0 的 NaN：
+  #     改之前这条不响；现在拿 1 当基线，0.2 < 0.5，过了 for 的 10 分钟就响。
+  - name: y1_admit_rate_low_with_no_traffic_an_hour_ago_fires
+    interval: 30s
+    input_series:
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}'
+        values: '0x120 0+6x80'
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="backpressure"}'
+        values: '0x120 0+24x80'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderAdmitRateDropped"})
+        eval_time: 59m
+        exp_samples: []
+      - expr: count(ALERTS{alertname="OrderAdmitRateDropped",alertstate="firing"})
+        eval_time: 80m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # y2. 原来就管用的情形不能改坏：一小时前全部受理，现在只有两成。
+  - name: y2_admit_rate_halved_against_an_hour_ago_fires
+    interval: 30s
+    input_series:
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}'
+        values: '0+30x120 3600+6x80'
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="backpressure"}'
+        values: '0x120 0+24x80'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderAdmitRateDropped",alertstate="firing"})
+        eval_time: 80m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # y3. 一小时前没有流量、现在全部受理：基线是 1，1 不小于 0.5，不响。
+  - name: y3_admit_rate_healthy_after_idle_hour_quiet
+    interval: 30s
+    input_series:
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}'
+        values: '0x120 0+30x80'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderAdmitRateDropped"})
+        eval_time: 80m
+        exp_samples: []
+
+  # y4. 一小时前连序列都没有（服务刚部署）：右边没有值，同样退回绝对门槛。
+  - name: y4_admit_rate_low_with_no_series_an_hour_ago_fires
+    interval: 30s
+    input_series:
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}'
+        values: '_x120 0+6x80'
+      - series: 'order_admissions_total{k8s_namespace_name="oppenheimer",outcome="backpressure"}'
+        values: '_x120 0+24x80'
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="OrderAdmitRateDropped",alertstate="firing"})
+        eval_time: 80m
+        exp_samples:
+          - labels: '{}'
+            value: 1
