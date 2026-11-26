@@ -35,6 +35,21 @@ const (
 	errNoSuchTable     = 1146
 )
 
+// Role 说明一个连接池连的是哪一种库。它是链路和指标上的 db.role 属性，只有下面几个值。
+//
+// 订单库的主库池和从库池连的是同名的库（db.namespace 一样）：没有这个属性时两个池的连接池指标是同一条序列，
+// 看不出满的是哪一个（阶段 4 写连接泄漏的故障点时发现的）。
+type Role string
+
+const (
+	// RolePrimary 是主库，Config.Role 不写时的默认值。
+	RolePrimary Role = "primary"
+	// RoleReplica 是只读的从库。
+	RoleReplica Role = "replica"
+	// RoleArchive 是冷库（归档库）。
+	RoleArchive Role = "archive"
+)
+
 // Config 是连接池配置。零值字段使用默认值。
 type Config struct {
 	// DSN 采用 go-sql-driver/mysql 的格式，例如 user:pass@tcp(127.0.0.1:3306)/dbname。
@@ -47,6 +62,8 @@ type Config struct {
 	ConnMaxLifetime time.Duration
 	// ConnMaxIdleTime 默认 5 分钟。
 	ConnMaxIdleTime time.Duration
+	// Role 默认 RolePrimary。同一个进程里对同名的库开了不止一个池时（主库加从库）必须区分开。
+	Role Role
 }
 
 // Open 打开连接池并验证连通性。
@@ -71,6 +88,15 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 // 给可选的依赖用（从库、冷库，设计文档 1d 的 6.10）：它们在运行中坏了都能降级，启动时坏着也不该让服务起不来。
 // 自己的主库仍然用 Open，连不上就启动失败。只有 DSN 本身写错才返回错误。
 func OpenLazy(cfg Config) (*sql.DB, error) {
+	role := cfg.Role
+	switch role {
+	case "":
+		role = RolePrimary
+	case RolePrimary, RoleReplica, RoleArchive:
+	default:
+		// 指标的标签只能是有限的枚举，不接受随手写的值。
+		return nil, fmt.Errorf("mysqlx: unknown role %q", role)
+	}
 	parsed, err := mysql.ParseDSN(cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("mysqlx: parse dsn: %w", err)
@@ -91,7 +117,11 @@ func OpenLazy(cfg Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("mysqlx: new connector: %w", err)
 	}
 	// 链路和指标（设计文档 1d 的 8.4）：每条语句、每次开事务和提交各一个 span，并记录调用耗时。
-	attrs := otelsql.WithAttributes(attribute.String("db.system.name", "mysql"), attribute.String("db.namespace", parsed.DBName))
+	attrs := otelsql.WithAttributes(
+		attribute.String("db.system.name", "mysql"),
+		attribute.String("db.namespace", parsed.DBName),
+		attribute.String("db.role", string(role)),
+	)
 	db := otelsql.OpenDB(connector, attrs,
 		otelsql.WithSpanNameFormatter(spanName),
 		// 同上，耗时指标里也不把 ErrSkip 记成 status=error。

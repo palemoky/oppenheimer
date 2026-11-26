@@ -3,6 +3,7 @@ package mysqlx_test
 import (
 	"context"
 	"crypto/rand"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -24,7 +27,11 @@ import (
 // 用例用语句里独有的标记（SQL 注释）区分自己的 span。
 var spans = tracetest.NewSpanRecorder()
 
+// 全局的 MeterProvider 同理：连接池的指标在 OpenLazy 里登记到当时的全局 provider 上。
+var metrics = sdkmetric.NewManualReader()
+
 func TestMain(m *testing.M) {
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)))
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 		sdktrace.WithSpanProcessor(spans),
@@ -203,6 +210,54 @@ func TestOpenLazyInstrumented(t *testing.T) {
 	parent.End()
 	if len(byName(spansOf(parent.SpanContext().TraceID()), "mysql SELECT")) != 1 {
 		t.Error("no `mysql SELECT` span from an OpenLazy pool")
+	}
+}
+
+// 主库池和从库池连的是同名的库：连接池的指标要靠 db.role 分成两条序列，各报各的上限。
+func TestPoolMetricsTellRolesApart(t *testing.T) {
+	// 不建连接：OpenLazy 不 ping，连接池的指标读的是 sql.DB 自己的统计。库名每次不同，不和别的用例的池混。
+	dbName := "pool_" + strings.ToLower(rand.Text())
+	dsn := "u:p@tcp(127.0.0.1:1)/" + dbName
+	for role, maxOpen := range map[mysqlx.Role]int{"": 7, mysqlx.RoleReplica: 11, mysqlx.RoleArchive: 3} {
+		db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: dsn, MaxOpenConns: maxOpen, Role: role})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := metrics.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "db.sql.connection.max_open" {
+				continue
+			}
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("%s is %T, want an int64 gauge", m.Name, m.Data)
+			}
+			for _, dp := range gauge.DataPoints {
+				if ns, _ := dp.Attributes.Value("db.namespace"); ns.AsString() != dbName {
+					continue
+				}
+				role, _ := dp.Attributes.Value("db.role")
+				got[role.AsString()] = dp.Value
+			}
+		}
+	}
+	want := map[string]int64{"primary": 7, "replica": 11, "archive": 3}
+	if !maps.Equal(got, want) {
+		t.Errorf("max_open by db.role = %v, want %v", got, want)
+	}
+}
+
+func TestOpenRejectsUnknownRole(t *testing.T) {
+	if _, err := mysqlx.OpenLazy(mysqlx.Config{DSN: "u:p@tcp(127.0.0.1:1)/x", Role: "standby"}); err == nil {
+		t.Error("an unknown role was accepted; metric labels must stay a closed set")
 	}
 }
 

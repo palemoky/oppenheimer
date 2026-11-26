@@ -1128,8 +1128,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "max by (k8s_pod_name, db_namespace) (db_sql_connection_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", status=\"inuse\"})",
-              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} 在用",
+              "expr": "max by (k8s_pod_name, db_namespace, db_role) (db_sql_connection_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\", status=\"inuse\"})",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} {{db_role}} 在用",
               "refId": "A",
               "range": true,
               "editorMode": "code"
@@ -1139,8 +1139,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "max by (k8s_pod_name, db_namespace) (db_sql_connection_max_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
-              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} 上限",
+              "expr": "max by (k8s_pod_name, db_namespace, db_role) (db_sql_connection_max_open{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"})",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} {{db_role}} 上限",
               "refId": "B",
               "range": true,
               "editorMode": "code"
@@ -1192,8 +1192,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
-              "legendFormat": "{{k8s_pod_name}} {{db_namespace}}",
+              "expr": "sum by (k8s_pod_name, db_namespace, db_role) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} {{db_role}}",
               "refId": "A",
               "range": true,
               "editorMode": "code"
@@ -1245,8 +1245,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_duration_milliseconds_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])) / sum by (k8s_pod_name, db_namespace) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
-              "legendFormat": "{{k8s_pod_name}} {{db_namespace}}",
+              "expr": "sum by (k8s_pod_name, db_namespace, db_role) (rate(db_sql_connection_wait_duration_milliseconds_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval])) / sum by (k8s_pod_name, db_namespace, db_role) (rate(db_sql_connection_wait_total{k8s_namespace_name=\"$namespace\", service_name=\"$service\", k8s_pod_name=~\"$pod\"}[$__rate_interval]))",
+              "legendFormat": "{{k8s_pod_name}} {{db_namespace}} {{db_role}}",
               "refId": "A",
               "range": true,
               "editorMode": "code"

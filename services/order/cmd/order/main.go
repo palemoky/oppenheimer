@@ -593,7 +593,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		for i, dsn := range cfg.mysqlReplicaDSNs {
 			// 从库连不上不阻止启动（设计文档 1d 的 6.7、6.10）：它们初始被标记为不健康，展示读和 sweeper 读主库，
 			// 探测（ReplicaProber）连续通过之后自动用上。所以不 ping，只有 DSN 写错才失败。
-			db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns})
+			db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: dsn, MaxOpenConns: cfg.mysqlMaxOpenConns, Role: mysqlx.RoleReplica})
 			if err != nil {
 				return fmt.Errorf("open order db %d replica: %w", i, err)
 			}
@@ -620,7 +620,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		coldMigrate func(context.Context) error
 	)
 	if cfg.archiveDSN != "" {
-		db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns})
+		db, err := mysqlx.OpenLazy(mysqlx.Config{DSN: cfg.archiveDSN, MaxOpenConns: archiveMaxOpenConns, Role: mysqlx.RoleArchive})
 		if err != nil {
 			return fmt.Errorf("open archive db: %w", err)
 		}
