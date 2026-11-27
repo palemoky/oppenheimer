@@ -75,4 +75,5 @@
   - `recover` 等稳态时会被“故障结束之后才响的告警”卡满 900 秒（s008 的 `ReconFoundDifferences`）。按 runbook 手工复跑 `recon-hourly` 成功后 critical 消了；失败的 Job 对象不删，`KubeJobFailed` 一直响，之后的注入和恢复用了 `CHAOS_STEADY_SKIP=alerts`，每次注入前手工看过只有它在响。主会话想删这个 Job，被权限检查拦了，没有删（`recon-hourly-29928607`，日志存在 `chaos/runs/r20261126-173553-0ef2/recon-hourly-29928607.log`）。
   - `loadtest.sh wait-quiet` 在探针开着时等不到安静（`order.order-close-delay` 常年约 900，主会话的推断：探针每秒一单、每单一条 15 分钟后到期的关单消息）。
   - `k3s-server` 的系统盘在稳态压测下约每小时少 1 GB（19.4 → 15.4 GB），`ServerDiskLow` 响了。第二次试跑因此没有接着做。
+- **2026-11-27**：s012 的故障代码改了（细节在它的 `truth.md`），还没有上集群，不进池。“orderindex 索引库连不上时不降级”核对后不算缺口（计划文件那一项下面写了理由）：主库连不上按设计就是 `INTERNAL`，s008 的答案不用改。
 - 没有做的：第二次（mutex、block 采样的阶梯对照，s010、s011、s009）；s013 的 PROCESSLIST 和剖析没有核对。

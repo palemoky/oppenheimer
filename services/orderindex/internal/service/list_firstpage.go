@@ -75,9 +75,8 @@ func newPageCache(ttl time.Duration, maxRows int, now func() time.Time) *pageCac
 func (c *pageCache) get(ctx context.Context, q store.ListQuery,
 	load func(context.Context, store.ListQuery) ([]store.Row, error),
 ) ([]store.Row, error) {
-	m := c.merchant(q.MerchantID)
 	// 同一个商家同一时刻只让一个请求去查库，同时到的请求等它查完直接用结果，不一起打到索引库上。
-	m.mu.Lock()
+	m := c.lockMerchant(q.MerchantID)
 	defer m.mu.Unlock()
 	key := pageKey{status: q.Status, limit: q.Limit}
 	now := c.now()
@@ -97,10 +96,6 @@ func (c *pageCache) keep(m *merchantPages, key pageKey, p cachedPage) {
 	old := len(m.pages[key].rows)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.merchants[m.id] != m {
-		// m 在等锁的时候被清理掉了：它已经不在表里，记进去也没人用得上，行数还会算错。
-		return
-	}
 	c.rows -= old
 	delete(m.pages, key)
 	if c.rows+len(p.rows) > c.maxRows {
@@ -110,9 +105,12 @@ func (c *pageCache) keep(m *merchantPages, key pageKey, p cachedPage) {
 	m.pages[key] = p
 }
 
-// merchant 返回商家 id 的缓存，没有就建一个。每隔一个 TTL 顺带清掉过期的页和空了的商家，
-// 不需要单独的清理 goroutine。
-func (c *pageCache) merchant(id int64) *merchantPages {
+// lockMerchant 返回商家 id 的缓存，没有就建一个，返回时已经拿着它的锁，调用方负责解开。
+// 每隔一个 TTL 顺带清掉过期的页和空了的商家，不需要单独的清理 goroutine。
+//
+// 商家的锁在 c.mu 里面拿：出了 c.mu 再拿的话，刚查到的 m 可能在拿到它的锁之前就被清理从表里去掉了，
+// 往一个不在表里的 m 上记页，没人用得上，行数合计还会算错。
+func (c *pageCache) lockMerchant(id int64) *merchantPages {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if now := c.now(); now.Sub(c.sweptAt) >= c.ttl {
@@ -124,6 +122,7 @@ func (c *pageCache) merchant(id int64) *merchantPages {
 		m = &merchantPages{id: id, pages: map[pageKey]cachedPage{}}
 		c.merchants[id] = m
 	}
+	m.mu.Lock()
 	return m
 }
 

@@ -7,7 +7,6 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -69,26 +68,15 @@ func TestFirstPageSwitch(t *testing.T) {
 	}
 }
 
-// 开着时，一个商家正在查库、同时另一个请求赶上了清理，两边互相等住，之后所有请求都挂住。
+// 开着时，一个商家正在查库、同一个商家的另一个请求进来等它，两边互相等住，之后所有请求都挂住。
 //
-// 用的是测试自己的 pageCache 和假时钟，不碰包级的 firstPages：卡住的 goroutine 留在这个缓存上
+// 用的是测试自己的 pageCache 和不动的时钟，不碰包级的 firstPages：卡住的 goroutine 留在这个缓存上
 // （sync.Mutex 等不到就永远等，没法从外面解开），测试结束时它们还在，但只有这几个，不影响别的测试。
 // 先后顺序靠 goroutine 的调用栈确认（某个 goroutine 停在某个函数里的 Mutex.Lock），不靠 sleep 赌时序。
 func TestFirstPageInterleaving(t *testing.T) {
-	var (
-		clockMu sync.Mutex
-		clock   = time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
-	)
-	now := func() time.Time {
-		clockMu.Lock()
-		defer clockMu.Unlock()
-		return clock
-	}
-	advance := func(d time.Duration) {
-		clockMu.Lock()
-		defer clockMu.Unlock()
-		clock = clock.Add(d)
-	}
+	// 时钟不动：这里的交错不靠过期。
+	at := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return at }
 	c := newPageCache(time.Second, 1000, now)
 
 	loading := make(chan struct{})
@@ -122,10 +110,9 @@ func TestFirstPageInterleaving(t *testing.T) {
 	// 1. 商家 1 的第一页正在查库（持有商家 1 的锁）。
 	a := get(1, slowLoad)
 	<-loading
-	// 2. 过了一个 TTL，商家 2 的请求进来，顺带清理，清到商家 1 时等它的锁（持有整个缓存的锁）。
-	advance(time.Second)
-	b := get(2, fastLoad)
-	waitForStack(t, "(*pageCache).sweep")
+	// 2. 商家 1 的另一个请求进来，等商家 1 的锁（持有整个缓存的锁）。
+	b := get(1, fastLoad)
+	waitForStack(t, "(*pageCache).lockMerchant")
 	// 3. 商家 1 查完了，要记进缓存，等整个缓存的锁。
 	close(release)
 	waitForStack(t, "(*pageCache).keep")
@@ -135,10 +122,10 @@ func TestFirstPageInterleaving(t *testing.T) {
 	case <-a:
 		t.Fatal("the loading request returned; want it stuck")
 	case <-b:
-		t.Fatal("the sweeping request returned; want it stuck")
+		t.Fatal("the waiting request returned; want it stuck")
 	case <-time.After(500 * time.Millisecond):
 	}
-	// 之后来的任何请求，哪个商家都一样，也挂住（停在 merchant 里等整个缓存的锁）。
+	// 之后来的任何请求，哪个商家都一样，也挂住（停在 lockMerchant 里等整个缓存的锁）。
 	select {
 	case <-get(3, fastLoad):
 		t.Fatal("a later request returned; want it stuck")
