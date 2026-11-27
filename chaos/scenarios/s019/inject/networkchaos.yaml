@@ -1,0 +1,30 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+# inventory 的所有副本发往它的两个调用方（gateway、order 的 Pod）的包慢 4 秒，超过路由上最长的 3 秒时限：
+# 对调用方来说 inventory 整个“在、但是等不到”。探针、去 MySQL、Redis、Kafka 的流量不受影响，副本一直 Ready。
+# 要看的是不雪崩：调用方的时限、并发上限、摘除、order 的落库熔断器是不是像 1d 设计的那样把影响圈住。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: inventory
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces: [__TARGET_NS__]
+      expressionSelectors:
+        - key: app.kubernetes.io/name
+          operator: In
+          values: [gateway, order]
+  delay:
+    latency: 4s
+  duration: 10m

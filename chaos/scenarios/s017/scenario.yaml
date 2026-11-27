@@ -1,0 +1,17 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s017
+method: istio
+risk: 2
+category: mesh
+target:
+  workload: gateway
+duration: 20m
+requires:
+  - 稳态的压测在跑（要有发起支付的流量，稳态下约每秒 11 次）
+recover:
+  restart: []
+  notes:
+    - 恢复就是按运行标签删掉 EnvoyFilter，配置下发要几秒，之后的一两个请求可能还是旧的行为
+    - 这个对象没有 duration，不跑 recover 它就一直在（第二档的原因）
+    - 注入期间没付成的订单到支付时限后正常关单、退回库存，不用处理
+expected_alerts: [SLOOrderPayAvailabilityBurnFast]

@@ -201,6 +201,8 @@ bad_lines() {
 }
 # __POD_IPS:<命名空间>:<标签选择器>__（render 和 lint 共用）。选择器里不能有下划线：结尾的 __ 靠它分界。
 POD_IPS_RE='__POD_IPS:[a-z0-9-]+:[A-Za-z0-9./=,!-]+__'
+# __SVC_IP:<命名空间>:<Service 名>__：一个 Service 的 ClusterIP。
+SVC_IP_RE='__SVC_IP:[a-z0-9-]+:[a-z0-9-]+__'
 lint_err() { echo "  $1: $2"; LINT_N=$((LINT_N + 1)); }
 
 # 一个 Chaos Mesh / Istio 清单的检查。method: chaos-mesh 的 inject/*.yaml 和 also: chaos-mesh 的 inject/mesh/*.yaml 共用这一份，
@@ -226,6 +228,9 @@ lint_manifest() { # 编号 文件 chaos-mesh|istio
   # 运行时才知道的 Pod 地址：写了 __POD_IPS 就必须是完整的 __POD_IPS:<命名空间>:<选择器>__，不然 render 不会替换，字面值会被 apply。
   if sed -E "s|$POD_IPS_RE||g" "$y" | grep -q '__POD_IPS'; then
     lint_err "$id" "$(basename "$y"): malformed __POD_IPS placeholder (want __POD_IPS:<namespace>:<label selector>__, no underscore in the selector)"
+  fi
+  if sed -E "s|$SVC_IP_RE||g" "$y" | grep -q '__SVC_IP'; then
+    lint_err "$id" "$(basename "$y"): malformed __SVC_IP placeholder (want __SVC_IP:<namespace>:<service name>__)"
   fi
 }
 
@@ -509,6 +514,19 @@ render() { # 文件
     [[ -n "$lst" ]] || { plog "render: no running pod with $sel in $ns"; return 1; }
     plog "render: $ph -> $lst"
     out="${out//"$ph"/$lst}"
+  done
+  # __SVC_IP:<命名空间>:<Service 名>__：换成这个 Service 的 ClusterIP（"10.43.7.21"）。目标是一个有 ClusterIP 的 Service 时用：
+  # 包离开 Pod 时目的地址还是 ClusterIP（DNAT 在节点上做），按 Pod 地址过滤匹配不上。headless 的（None）取不到地址，要用 __POD_IPS。
+  phs="$(grep -oE "$SVC_IP_RE" <<<"$out" | sort -u || true)"
+  for ph in $phs; do
+    spec="${ph#__SVC_IP:}"
+    spec="${spec%__}"
+    ns="${spec%%:*}"
+    sel="${spec#*:}"
+    ips="$(kubectl -n "$ns" get service "$sel" -o 'jsonpath={.spec.clusterIP}' 2>>"$PRIVLOG")" || { plog "render: reading service $ns/$sel failed"; return 1; }
+    [[ "$ips" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { plog "render: service $ns/$sel has no cluster ip (got '$ips'; headless?)"; return 1; }
+    plog "render: $ph -> $ips"
+    out="${out//"$ph"/\"$ips\"}"
   done
   printf '%s\n' "$out"
 }

@@ -72,6 +72,8 @@ chaos/
   清单里可以写运行时才知道的 Pod 地址：`__POD_IPS:<命名空间>:<标签选择器>__`，例如 `externalTargets: [__POD_IPS:redis:app.kubernetes.io/name=redis-cache__]`。
   注入时脚本取这个命名空间里符合选择器、状态是 `Running` 的所有 Pod 的 IP，换成 `"10.42.1.5", "10.42.2.7"` 这样的列表（外面的方括号自己写）；一个地址都取不到就注入失败并撤销。
   地址只写进运行目录的 `private.log`。选择器里不能有下划线（结尾的 `__` 靠它分界），`lint` 查写法；dry-run 不连集群，所以不渲染。
+  目标是一个有 ClusterIP 的 Service 时写 `__SVC_IP:<命名空间>:<Service 名>__`，换成它的 ClusterIP（一个带引号的地址）：包离开 Pod 时目的地址还是 ClusterIP，
+  按 Pod 地址过滤匹配不上。headless 的 Service 没有这个地址（注入失败并撤销），用 `__POD_IPS`。这两个占位符在 `method: chaos-mesh` 的清单里同样可以用。
 - **`istio`**：一个或几个 `*.yaml`（VirtualService 等），`metadata.namespace: __TARGET_NS__`，名字和标签的规则同 `chaos-mesh`。脚本 `kubectl apply`，恢复时按标签删。
 - **`script`**：`run.sh`，接收一个参数 `inject` 或 `recover`，环境变量 `TARGET_NS`、`RUN_ID`、`RUN_DIR`、`KUBECONFIG`。恢复要能重复执行。
 
