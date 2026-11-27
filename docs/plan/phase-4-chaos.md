@@ -169,6 +169,23 @@
   - **撤**：`make chaos-recover`；出了岔子 `make chaos-recover ALL=1`。
   - **做完**：答案文件按实测写，够格的标 `blind: yes`；原来单独的那个场景留着不进池。
 
+**B4：服务之间（登记，2026-11-27；仓库里的部分写了，上集群的三步等主人同意）**。场景的内容不写在这里，在 `chaos/scenarios/NOTES.md`“B4”一节。
+
+- [x] 场景文件（2026-11-27，没有连集群）：五个新场景 `s017` 到 `s021`，都不带 `blind`。一个是 `istio` 方式的样例（EnvoyFilter，第二档：这个对象没有时长，不恢复就一直在）；四个是 Chaos Mesh（第一档，到时自己撤）。对应清单里的“服务间调用注入延迟与错误”“下游变慢引发的级联故障”“网络分区：服务与数据库之间”。答案文件都是按代码和 1d 的设计推的，试过再改。`chaos-run.sh lint` 21 个过了
+  - 脚本加了一个占位符 `__SVC_IP:<命名空间>:<Service 名>__`（换成 Service 的 ClusterIP；`chaos/README.md` 写了）：订单库的 `-primary`、`-replica` 是有 ClusterIP 的 Service，原来的 `__POD_IPS` 只能取 Pod 地址。主会话直接写的（十几行），用 kubectl 的桩验了取到、headless、不存在三种情况
+  - 原来想做的“服务到从库的分区”没有写：集群上 order 的读模式是 `primary`，展示读不走从库，那个场景基本没有症状
+  - 写答案时读代码看到一处可能的设计问题（和其中一个场景有关，内容在 `NOTES.md`）：试跑时验，成立的话再登记到这里、回到主人那里定
+- [ ] **第一步，在 `oppenheimer-e2e` 里试（等主人同意）**：`E2E_KEEP=1 CHAOS_DELETE=0 make cluster-chaos` 起一套（不需要带故障代码的构建；要 `CHAOS_EXTRA_OVERLAY` 把 gateway、payment 降到 1 个副本才排得下，其中一个场景要两个 order 副本，e2e 里的副本数到时先看）。五个场景各注入、恢复一次（`CHAOS_NS=oppenheimer-e2e`，`NO_RECON=1`），只验三件事：注入生效、撤得干净、目标的 Pod 没有因为注入掉 Ready（四个 Chaos Mesh 的都是只对着特定地址的延迟或者丢包，探针不该受影响）。做完 `services.sh e2e-down` 删掉
+  - 影响：只动 `oppenheimer-e2e`；但订单库的实例是两套共用的，其中两个场景挡的是“e2e 的 order 到订单库主库”的包，只选中 e2e 命名空间里的 Pod，长期运行的那一套的 order 不受影响。不发压（e2e 自带的那一轮基线除外）
+  - 撤：`CHAOS_NS=oppenheimer-e2e make chaos-recover ALL=1`；最坏删掉整个 `oppenheimer-e2e`
+- [ ] **第二步，带负载各试一次（等主人同意；主会话带着做，不盲，主人不用在场）**：`make down`；备 SKU 13184 起 20 个、每个 4 万；`CHAOS_STEADY_DURATION=4h make chaos-steady ARGS=start`（570 请求/秒）；满 30 分钟后依次 `make chaos-inject SCENARIO=...`，每个 10 到 20 分钟，对照答案看证据、量症状，`make chaos-recover`（其中三个加 `WAIT_RECON=1`），对账过了再下一个。预计 3 到 3.5 小时
+  - **影响比前几批大**：五个里有三个会让下单在注入的那 10 分钟里大面积失败（压测的请求，不是真实用户；探针的下单也会失败），**critical 的告警会响**（入口 5xx、下单可用性、探针一类），发到 Telegram，触发集群里的 Agent 诊断（花 DeepSeek 的钱，高峰时段会留到高峰结束）。不杀进程、不动中间件本身、不写坏数据；有三个是对落库重试、回收和补偿的考验，所以恢复时等逐行对账
+  - 撤：每个场景 `make chaos-recover`；出了岔子 `make chaos-recover ALL=1`，再 `make chaos-steady ARGS=stop`
+  - 做完：答案文件按实测改，够格的标 `blind: yes`；结果写进 `NOTES.md`；顺带看闸门 Redis 的 `latency latest`（上面那一项）
+- [ ] **第三步，`OtelCollectorExportQueueFull` 单独响（等主人同意；可以排在第二步的压测里，也可以单独做）**：让 Collector 的 gateway 在、agent 发不过去约 12 分钟（规则是队列超过八成持续 5 分钟，warning）。做法：手工建一个 NetworkChaos，选中 `monitoring` 里 agent 的 Pod，丢掉它们到 `otel-gateway` 的 ClusterIP 的包，`duration: 12m`；`chaos-run.sh` 按设计拒绝 `monitoring` 命名空间，所以这一个不走脚本、不做成场景，清单放 `tmp/`。要先给 `monitoring` 命名空间加 `chaos-mesh.org/inject=enabled` 的注解，做完去掉
+  - 影响：这 12 分钟里所有 Pod 的日志到得晚（agent 配的是一直重试、队列满了堵住上游，按 3c 第 11 项的经验不丢），agent 的内存会涨；链路和指标不经过 agent（服务直接发给 `otel-gateway`，agent 只有日志一条管线），不受影响。期间 Loki 里查不到最新的日志，所以不和别的实验同时做。要看的：这条告警响、`OtelCollectorExportFailing` 和 `OtelGatewayDown` 不响、恢复后队列排空
+  - 撤：删掉那个对象（到时它自己也会撤）、去掉注解
+
 **4a 留下的四项，在这里做**（checkbox 仍在“4a 准备”里，做完回去勾）：
 
 1. **第一次盲测**（勾“盲测脚本”）：`blind` 这条路没有真的跑过。先 `make chaos-blind POOL=1 DRY_RUN=1`，再在 `oppenheimer-e2e` 里真的跑一次（主会话看得到内容也没关系，验的是“终端不打印内容”和抽取），然后才是主人的第一次盲测。场景要先补到一档里至少有五六个，三个里抽一个谈不上盲。
@@ -291,3 +308,5 @@
 叠加场景试出来的（2026-11-27，数在 `chaos/scenarios/s016/truth.md`，主人盲测之前不读那个文件）：临界区里包了一次网络往返时吞吐上限是多少（1 / 锁里一次的时间）、为什么平时看不出来而依赖慢几毫秒就放大十倍；排队来自到达的随机性而不是平均速率（同样的平均速率，等间隔到达不排队，随机到达排队：压测工具的到达模型会不会把问题藏起来）；“依赖慢了 5 毫秒”为什么解释不了 p99 慢了 90 毫秒，怎么用链路上“服务端 span 开始到第一个子 span 之间的空白”和 mutex 剖析的差值分清“依赖慢”和“等锁”；累计的剖析为什么要做差值。测试里记并发峰值为什么不能“读到比自己小再 Store”（丢更新，后到的小值盖掉大值），原子变量上求最大值要用 CAS 循环。
 
 Istio 故障注入试出来的（2026-11-27，[设计 4b 第 9 节](../design/4b-experiments.md)）：同一个 host 写两个 VirtualService 实测是先建的生效、后加的被忽略；Envoy 的 HTTP 过滤器链的顺序意味着什么（故障过滤器在 `router` 前面，所以注入的延迟不计入路由的超时，注入的中断不经过上游、不触发摘除）；所以“用 Istio 注入延迟来验超时和熔断”验到的是调用方进程自己的时限，不是网格的；改一个长期存在的对象再改回去和新建一个带标签的对象再删掉，哪种恢复更可靠。闸门 Redis 的 20 次超时查出来的：AOF 重写收尾时主线程会停几百毫秒（和 fork 的那一下是两回事）；客户端的时限和依赖的“正常的停顿”挨得太近时，表现是偶发的、成簇的、两个副本同时的超时；怎么从“两个调用方同时超时”推到“问题在被调用的一方”；指标 30 秒一个点看不到 400 毫秒的停顿，要靠日志的时间戳和 Redis 自己的延迟监控。
+
+写 B4 的场景时碰到的（2026-11-27，都还没有在集群上验）：按地址过滤的网络故障该写 Service 的 ClusterIP 还是 Pod 的地址（包离开 Pod 时目的地址还是 ClusterIP，DNAT 在节点上由 kube-proxy 做；headless 的 Service 没有 ClusterIP，客户端直接连 Pod）；主动的健康检查和被动的摘除各自看的是什么（探针来自节点；摘除看的是调用方实际拿到的结果）；连接被拒绝和包被丢弃对客户端是两回事（前者立刻失败，后者要等到时限，时限没设好的地方就是挂住）；摘除时间为什么随次数加长、全部端点都被摘除时返回什么（恐慌阈值）。

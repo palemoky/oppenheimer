@@ -4,7 +4,18 @@
 
 ## 当前状态
 
-- **现在（2026-11-27 约 13:05 UTC，这一条最新；新会话从这里开始）**：**主人回“提交并推送”和“（闸门 Redis 那一项）按照你的建议做”。**
+- **现在（2026-11-27 约 13:50 UTC，这一条最新；新会话从这里开始）**：**主人说“根据 PROGRESS.md 的进度继续”。主会话的理解：上一条的下一步里 ① 是看 CI，②④ 要等负载或者主人在场，所以做 ③（B4）里不动集群的部分；要上集群的登记了，等同意。没有连集群，没有提交。**
+  - **CI**：PR 22 在 `c0ac957` 上 33 项全过（`ci-watcher` 报的，主会话用 `gh pr checks 22` 核对了）；`faults` 7 分 37 秒、e2e 5 分 36 秒、gateway 3 分 17 秒、order 3 分 48 秒。
+  - **B4 的场景写了**（计划文件“B4：服务之间”第一项勾了）：`s017` 到 `s021` 五个，都不带 `blind`；一个 `istio` 方式的样例（EnvoyFilter，第二档），四个 Chaos Mesh（第一档）。内容在 `chaos/scenarios/NOTES.md` 的表和“B4”一节（主人不读）。答案文件是按代码和 1d 的设计推的。`chaos-run.sh lint` 21 个过了，`DRY_RUN=1` 的 `chaos-inject` 走了一个。
+  - **脚本**：`chaos-run.sh` 加了占位符 `__SVC_IP:<命名空间>:<Service 名>__`（`render`、`lint_manifest`，`chaos/README.md` 写了）。主会话直接写的；`bash -n`、`shellcheck` 过了，`render` 用 kubectl 的桩验了三种情况。**没有对着集群渲染过。**
+  - **查到、改变了做法的**：集群上 order 的读模式是 `primary`，所以“到从库的分区”没有写；稳态压测的客户端遇到 5xx 不重试；agent 那个 Collector 只有日志一条管线。事实是三个 Haiku 的检索子 Agent 查的（带行号），主会话只核对了其中和设计问题有关的那一处（order 的列表和错误映射）。
+  - **读代码看到一处可能的设计问题**（和其中一个场景有关，内容在 `NOTES.md`“B4”）：没有实测，试跑时验，成立的话登记到计划文件、回到主人那里定。
+  - **等主人同意的三步**（计划文件“B4：服务之间”，各自写了影响和怎么撤）：①在 `oppenheimer-e2e` 里五个各试一次注入和撤销；②带负载各试一次（约 3 到 3.5 小时，**有三个会让下单大面积失败 10 分钟、critical 的告警会响、会触发 Agent 诊断**）；③手工让 `OtelCollectorExportQueueFull` 单独响（要给 `monitoring` 加 Chaos Mesh 的注解，不走脚本）。
+  - **改了没有提交的**（`git status`）：`scripts/cluster/chaos-run.sh`、`chaos/README.md`、`chaos/scenarios/NOTES.md`、新目录 `chaos/scenarios/s017/` 到 `s021/`、计划文件（登记加一段面试考点）、本文件。没有动 Go 代码，没有跑 `make lint test`。
+  - 集群、SKU（下次从 13184 起）、helm 和仓库差一行的事：和上一条一样，这次没有碰。
+  - **下一步**：①主人说提交就提交这一批；②主人同意 B4 的第一步之后在 e2e 里试（先看 `target` 加 `direction: to` 的延迟有没有让探针失败、`__SVC_IP` 渲染对不对、`grpc_status` 的中断生不生效）；③同意第二步之后带负载试，顺序和每个要看什么在 `NOTES.md`“B4”，做完顺带看闸门 Redis 的 `latency latest`；④主人时间充足时做第一次盲测（第二档要 `CHAOS_STEADY_DURATION=4h`、20 个 SKU 每个 4 万）。
+
+- **现在（2026-11-27 约 13:05 UTC，上一条）**：**主人回“提交并推送”和“（闸门 Redis 那一项）按照你的建议做”。**
   - 上一条那一批提交并推送了（`7f2e63a`）；PR 22 在 `7f2e63a` 上 CI 33 项全过（`ci-watcher` 报的，主会话用 `gh pr checks 22` 核对了没有不通过的）；耗时：gateway 的测试 3 分 14 秒（前几次在 2 分 20 秒到 3 分 20 秒之间来回，这次只改了文档，当波动）、order 4 分 27 秒、e2e 4 分 12 秒。
   - **闸门 Redis 的延迟监控开了**（建议里的 a；细节和“怎么看”在计划文件“4b 实验清单”最后一项下面）：chart 加了 `redis.latencyMonitorThresholdMs: 100`；集群上两个节点 `CONFIG SET` 了，**没有 `helm upgrade`、没有重启**。**helm 的 release 和仓库差这一行**，下一次 `middleware.sh redis` 会带着它滚动重启闸门 Redis 和 Sentinel。b（调大 AOF 重写的最小体积）没有做，等有数据再定。
   - 这一批（`deploy/charts/redis-ha/` 的两个文件、计划文件、本文件）主人说提交并推送，做了（`git log` 看）；`helm lint` 过了。工作区干净。
