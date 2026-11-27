@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -223,6 +224,18 @@ func (r *runner) stop(t *testing.T, timeout time.Duration) error {
 		r.cancel()
 	})
 	return r.err
+}
+
+// raisePeak 把 peak 抬到至少 n。必须用 CAS：“读到比自己小再 Store”会丢更新，
+// 后到的小值盖掉先到的大值（两个 handler 同时在跑，一个存了 2，另一个随后存 1），
+// CI 上 TestDelayConsumerConcurrentAfterDue 因此报过 peak 1（2026-11-27）。
+func raisePeak(peak *atomic.Int32, n int32) {
+	for {
+		old := peak.Load()
+		if n <= old || peak.CompareAndSwap(old, n) {
+			return
+		}
+	}
 }
 
 // waitFor 轮询 cond 直到为真，超时则终止测试。

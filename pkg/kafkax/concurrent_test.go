@@ -75,9 +75,7 @@ func TestConcurrentConsumerKeepsPerKeyOrder(t *testing.T) {
 		}
 		busy[key] = true
 		mu.Unlock()
-		if n := inFlight.Add(1); n > peak.Load() {
-			peak.Store(n) // 只用来判断“有没有并行过”，不需要精确的最大值
-		}
+		raisePeak(&peak, inFlight.Add(1))
 
 		time.Sleep(2 * time.Millisecond)
 
