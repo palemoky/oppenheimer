@@ -104,10 +104,14 @@
 - [x] 结果写回各场景的 `truth.md` 和设计 4b；过了的场景标成能盲测（2026-11-24：第一档 5 个标了；丢包、DNS 两个先不进池，第一次带负载由主会话带着做）
 - [x] Istio 故障注入的两条路重试（B4 开始之前；上次探测请求被 gateway 的鉴权挡在 401）
   - 2026-11-27 做了（主人说“开始做”；只在 `oppenheimer-e2e`，做完删了）：另加一个同 host 的 VirtualService 不生效；改现有的 VirtualService 生效；EnvoyFilter 生效并且能只对一个下游。**定用 EnvoyFilter**（恢复就是按标签删对象，脚本现成支持）。还试出故障注入的延迟不受路由 `timeout` 的管、中断不算下游的失败。表和理由在[设计 4b 第 9 节](../design/4b-experiments.md)。`istio` 方式的样例场景没有写，B4 里写。
-- [ ] **等主人定**：闸门 Redis 的停顿和 order 的 300 毫秒时限挨得太近（2026-11-27 查 20 次 `STOCK_GATE_UNAVAILABLE` 查出来的）
+- [ ] 闸门 Redis 的停顿和 order 的 300 毫秒时限挨得太近（a 做了，b 等下一次有数据再定）：（2026-11-27 查 20 次 `STOCK_GATE_UNAVAILABLE` 查出来的）
   - **查到的**：那 20 次全是下单时 Hold 撞到 `gateTimeout`（300 毫秒），集中在两个时刻、两个 order 副本同时，和 mutex、block 采样没有关系。①07:38:03 UTC（3 次）：`redis-gate-0`（主库）的 AOF 重写收尾，日志里 “terminated with success” 到 “finished successfully” 之间 384 毫秒，主线程在这段时间不处理命令。同一轮压测里另外五次重写的这一段是 190 到 295 毫秒，没有超；下午那一轮四次是 110 到 230 毫秒，一次都没有超时。②08:05:17 到 08:05:18（17 次，同时还有查订单读闸门、消费者认领的超时）：主库的日志里那几秒没有任何记录（一分钟前的 RDB 保存 08:04:40 就结束了），没有慢命令，`aof_delayed_fsync` 没有涨；主库所在的 `k3s-agent-1` 那几分钟磁盘忙 71%、IO 压力约 20%，是常态不是尖峰。**原因没有定位**，猜是 AOF 的写被盘卡住了几百毫秒，指标的分辨率（30 秒）看不到。
   - **后果是对的**：20 个请求得到 503、带同一个幂等键可以重试，占用撤销或者留给回收任务，对账差异 0。占这一轮下单的约万分之一（20 / 22.6 万），在 SLO 的预算（千分之一）以内。
   - **可以做的**（主会话的建议是先做 a，再看要不要 b）：a. 给 `redis-gate` 开 `latency-monitor-threshold 100`（chart 的配置里加一行；下次再卡，`LATENCY LATEST` 直接说是 fork、AOF 写还是命令），只加观测、不改行为，但要滚动重启闸门 Redis 或者 `CONFIG SET` 再写回 values；b. 把 `auto-aof-rewrite-min-size` 从 64 MB 调大（现在稳态下约 18 分钟重写一次，调到 256 MB 约一个多小时一次），重写少了，撞上的机会按比例少，代价是重启时重放的 AOF 更长；c. 不动，接受万分之一。不建议把 300 毫秒调大：它是下单这一跳的预算，调大了闸门真坏的时候每个请求多等。
+  - **主人回“按照你的建议做”，a 做了（2026-11-27 约 13:00 UTC）**：`deploy/charts/redis-ha` 加了 `redis.latencyMonitorThresholdMs`（默认 100，写进 `redis.conf`）；集群上对 `redis-gate-0`、`redis-gate-1` 各执行了 `CONFIG SET latency-monitor-threshold 100`（原来是 0），**没有 `helm upgrade`**：这个 chart 的 ConfigMap 一变，Redis 和 Sentinel 两个 StatefulSet 都会滚动重启（模板里有 `checksum/config`），为一行观测配置让闸门切一次主不值得。
+    - **所以现在 helm 的 release 和仓库差这一行**：下一次有人跑 `scripts/cluster/middleware.sh redis` 时会带着它滚动重启闸门 Redis（那时本来也是要重启的）。在那之前某个 Pod 自己重启的话，它的配置回到 0，要重新 `CONFIG SET`。
+    - **怎么看**：`kubectl -n redis exec redis-gate-0 -c redis -- redis-cli latency latest`（每类事件最近一次和最大的一次，毫秒）；`latency history <事件名>` 看时间序列。再出现成簇的 Hold 超时时先看这个，然后才定要不要做 b。
+    - 这一项不勾：等下一次带负载的运行之后看一眼 `LATENCY LATEST` 里有什么，写回这里。
 - [x] `pkg/mysqlx` 的连接池指标加一个区分主库池和从库池的标签（2026-11-24 写故障点时发现的，平时的可观测缺口；标签是有限的枚举，符合规范；没有在集群上核对过现在的指标长什么样）
   - 2026-11-26 写了：`mysqlx.Config.Role`（`primary`、`replica`、`archive`，不写是 `primary`，别的值报错），作为 `db.role` 属性同时加在数据库的 span、耗时指标和连接池指标上；order 的从库池和冷库池各自标了；`service.json` 大盘的四个连接池面板按它分开。单元测试核对了同名的库三个池各报各的上限。**集群上要等下一次换镜像才有这个标签**，到时在 Prometheus 里看一眼 `db_sql_connection_max_open` 是不是分成了两条
 - [x] **（2026-11-27 核对后的结论：不改，这一条登记错了，见本项最后）** orderindex 的商家订单列表在索引库连不上时返回没有分类的错误（gRPC `INTERNAL`），没有熔断、没有降级（2026-11-26 带负载试跑时发现）：边车把它算成这个服务的失败，两个副本都被摘除，入口出 5xx，`IngressGateway5xxHigh`（critical）响。按 `AGENTS.md`“自己是好的、依赖坏了”应当用 `pkg/breaker` 熔断并返回 `errx.Degraded`，gateway 映射成 503 加原因码。还没有改；改之前先看 payment、inventory 对各自的库是不是同样的写法。改了之后对应场景的答案文件要跟着改

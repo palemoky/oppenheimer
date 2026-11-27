@@ -4,7 +4,14 @@
 
 ## 当前状态
 
-- **现在（2026-11-27 约 12:50 UTC，这一条最新；新会话从这里开始）**：**主人说两件：开始做 Istio 故障注入的重试；排查早上那 20 次 `STOCK_GATE_UNAVAILABLE`。都做了。**
+- **现在（2026-11-27 约 13:05 UTC，这一条最新；新会话从这里开始）**：**主人回“提交并推送”和“（闸门 Redis 那一项）按照你的建议做”。**
+  - 上一条那一批提交并推送了（`7f2e63a`）；PR 22 在 `7f2e63a` 上 CI 33 项全过（`ci-watcher` 报的，主会话用 `gh pr checks 22` 核对了没有不通过的）；耗时：gateway 的测试 3 分 14 秒（前几次在 2 分 20 秒到 3 分 20 秒之间来回，这次只改了文档，当波动）、order 4 分 27 秒、e2e 4 分 12 秒。
+  - **闸门 Redis 的延迟监控开了**（建议里的 a；细节和“怎么看”在计划文件“4b 实验清单”最后一项下面）：chart 加了 `redis.latencyMonitorThresholdMs: 100`；集群上两个节点 `CONFIG SET` 了，**没有 `helm upgrade`、没有重启**。**helm 的 release 和仓库差这一行**，下一次 `middleware.sh redis` 会带着它滚动重启闸门 Redis 和 Sentinel。b（调大 AOF 重写的最小体积）没有做，等有数据再定。
+  - 这一批（`deploy/charts/redis-ha/` 的两个文件、计划文件、本文件）主人说提交并推送，做了（`git log` 看）；`helm lint` 过了。工作区干净。
+  - **下一步**：①这次推送的 CI（派了 `ci-watcher`，结果没有写进来的话用 `gh pr checks 22` 看）；②下一次带负载的运行之后看 `redis-cli latency latest`，写回计划文件那一项；③B4（登记场景、拿同意；`istio` 方式用 EnvoyFilter 写样例场景）；④主人时间充足时做第一次盲测（第二档要 `CHAOS_STEADY_DURATION=4h`、20 个 SKU 每个 4 万）。
+  - 集群其余的状态和上一条一样。
+
+- **现在（2026-11-27 约 12:50 UTC，上一条）**：**主人说两件：开始做 Istio 故障注入的重试；排查早上那 20 次 `STOCK_GATE_UNAVAILABLE`。都做了。**
   - **Istio**（计划文件“B1”下面那一项勾了，表和理由在[设计 4b 第 9 节](design/4b-experiments.md)）：只在 `oppenheimer-e2e`（`E2E_KEEP=1 CHAOS_DELETE=0 E2E_SKIP_IMAGES=1 IMAGE_TAG=babd50a-p4 CHAOS_EXTRA_OVERLAY=tmp/p4-s016/overlay make cluster-chaos` 起的，做完 `e2e-down` 删了，没有带标签的对象留下）。另加同 host 的 VirtualService 不生效；改现有的生效；EnvoyFilter 生效。**定用 EnvoyFilter**。`istio` 方式的样例场景没有写，B4 里写（要先登记）。
   - **那 20 次**（计划文件“4b 实验清单”里新的一项，**等主人定**做不做 a、b）：全是下单的 Hold 撞到 300 毫秒时限，和采样没有关系。3 次是闸门 Redis 主库 AOF 重写收尾时主线程停了 384 毫秒（有日志的时间戳为证）；17 次那一簇主库日志里没有记录，原因没有定位。数据上没有后果。
   - **集群现在**：和上一条一样（`cf5b130-p4`、开关全关、没有实验对象、压测停着）；`oppenheimer-e2e` 不存在。本机 compose 起着。SKU 下次从 13184 起。
