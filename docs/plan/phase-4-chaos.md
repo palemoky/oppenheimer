@@ -84,6 +84,7 @@
   - `OrderAdmitRateDropped` 在“一小时前没有流量”时不起作用，这个原因是推断的：先用数据核对（探针停一段之后的一小时里看表达式两边各自有没有值），再决定改不改规则
     - 2026-11-26 用历史数据核对了：推断成立（一小时前没有流量时右边是 0/0 的 NaN，比较不成立，`for` 被打断）。表和改法的建议在[设计 3c](../design/3c-slo-alerting.md) 第 8 节“`OrderAdmitRateDropped` 不改”之后。主人 2026-11-26 定了改：规则和单元测试 y1 到 y4 写了，**还没有下发到集群**
   - `OtelCollectorExportQueueFull` 单独响的情形：gateway 在而 agent 发不过去（比如挡住 agent 到 gateway 的 4317）
+    - 2026-11-27 做了，单独响了（“4b 实验清单”B4 的第三步）
   - 3e 留下的（2026-11-24）：`DerivedDataCheckStalled` 没有真实触发过（要“核对停了”同时“订单库有写入”，e2e 里没有流量）；`recon-changes` 的从库目标没有造过不一致；有负载时三个常驻核对的开销、每天全量对账对线上的影响没有量
   - 只有单元测试的：超卖、闸门内存写满、Collector 导出失败、支付可用性的三档；`RateLimitFallingBack` 改成按比例之后没有真实触发过
 
@@ -112,6 +113,7 @@
     - **所以现在 helm 的 release 和仓库差这一行**：下一次有人跑 `scripts/cluster/middleware.sh redis` 时会带着它滚动重启闸门 Redis（那时本来也是要重启的）。在那之前某个 Pod 自己重启的话，它的配置回到 0，要重新 `CONFIG SET`。
     - **怎么看**：`kubectl -n redis exec redis-gate-0 -c redis -- redis-cli latency latest`（每类事件最近一次和最大的一次，毫秒）；`latency history <事件名>` 看时间序列。再出现成簇的 Hold 超时时先看这个，然后才定要不要做 b。
     - 这一项不勾：等下一次带负载的运行之后看一眼 `LATENCY LATEST` 里有什么，写回这里。
+    - **2026-11-27 B4 那一轮稳态（13:48 到 16:16 UTC）看了两次**：`redis-gate-0` 记到一类事件，`aof-write`（和 `aof-write-alone`）一次 161 毫秒，时间是 14:38:07 UTC（两个实验之间的基线里）。没有 fork 一类的事件。这和早上那 17 次的猜测对得上：是 AOF 的写被盘卡住，不是命令慢。只有一个样本，b（调大重写的最小体积）不解决“写被卡住”，先不做；要对症的话是看主库所在节点的盘（`k3s-agent-1`），等主人定
 - [x] `pkg/mysqlx` 的连接池指标加一个区分主库池和从库池的标签（2026-11-24 写故障点时发现的，平时的可观测缺口；标签是有限的枚举，符合规范；没有在集群上核对过现在的指标长什么样）
   - 2026-11-26 写了：`mysqlx.Config.Role`（`primary`、`replica`、`archive`，不写是 `primary`，别的值报错），作为 `db.role` 属性同时加在数据库的 span、耗时指标和连接池指标上；order 的从库池和冷库池各自标了；`service.json` 大盘的四个连接池面板按它分开。单元测试核对了同名的库三个池各报各的上限。**集群上要等下一次换镜像才有这个标签**，到时在 Prometheus 里看一眼 `db_sql_connection_max_open` 是不是分成了两条
 - [x] **（2026-11-27 核对后的结论：不改，这一条登记错了，见本项最后）** orderindex 的商家订单列表在索引库连不上时返回没有分类的错误（gRPC `INTERNAL`），没有熔断、没有降级（2026-11-26 带负载试跑时发现）：边车把它算成这个服务的失败，两个副本都被摘除，入口出 5xx，`IngressGateway5xxHigh`（critical）响。按 `AGENTS.md`“自己是好的、依赖坏了”应当用 `pkg/breaker` 熔断并返回 `errx.Degraded`，gateway 映射成 503 加原因码。还没有改；改之前先看 payment、inventory 对各自的库是不是同样的写法。改了之后对应场景的答案文件要跟着改
@@ -175,14 +177,22 @@
   - 脚本加了一个占位符 `__SVC_IP:<命名空间>:<Service 名>__`（换成 Service 的 ClusterIP；`chaos/README.md` 写了）：订单库的 `-primary`、`-replica` 是有 ClusterIP 的 Service，原来的 `__POD_IPS` 只能取 Pod 地址。主会话直接写的（十几行），用 kubectl 的桩验了取到、headless、不存在三种情况
   - 原来想做的“服务到从库的分区”没有写：集群上 order 的读模式是 `primary`，展示读不走从库，那个场景基本没有症状
   - 写答案时读代码看到一处可能的设计问题（和其中一个场景有关，内容在 `NOTES.md`）：试跑时验，成立的话再登记到这里、回到主人那里定
-- [ ] **第一步，在 `oppenheimer-e2e` 里试（等主人同意）**：`E2E_KEEP=1 CHAOS_DELETE=0 make cluster-chaos` 起一套（不需要带故障代码的构建；要 `CHAOS_EXTRA_OVERLAY` 把 gateway、payment 降到 1 个副本才排得下，其中一个场景要两个 order 副本，e2e 里的副本数到时先看）。五个场景各注入、恢复一次（`CHAOS_NS=oppenheimer-e2e`，`NO_RECON=1`），只验三件事：注入生效、撤得干净、目标的 Pod 没有因为注入掉 Ready（四个 Chaos Mesh 的都是只对着特定地址的延迟或者丢包，探针不该受影响）。做完 `services.sh e2e-down` 删掉
+- [x] **第一步做完了（2026-11-27 13:10 到 13:50 UTC，主人回“三步都同意”之后；只动了 `oppenheimer-e2e`，做完 `e2e-down` 删了）**：五个都注入生效、撤得干净，目标的 Pod 没有掉 Ready、没有重启；`__SVC_IP` 渲染出的地址是对的；长期运行的那一套没有受影响。用的是仓库里现成的 `babd50a-p4` 镜像，gateway、payment 降到 1 个副本。试出两处和答案不一样的，答案文件改了。走了一段弯路：探测脚本自己的毛病（`xargs -I{}` 把请求体里的 `{}` 换掉了），白查了几分钟“注入不生效”。原来的登记：**第一步，在 `oppenheimer-e2e` 里试**：`E2E_KEEP=1 CHAOS_DELETE=0 make cluster-chaos` 起一套（不需要带故障代码的构建；要 `CHAOS_EXTRA_OVERLAY` 把 gateway、payment 降到 1 个副本才排得下，其中一个场景要两个 order 副本，e2e 里的副本数到时先看）。五个场景各注入、恢复一次（`CHAOS_NS=oppenheimer-e2e`，`NO_RECON=1`），只验三件事：注入生效、撤得干净、目标的 Pod 没有因为注入掉 Ready（四个 Chaos Mesh 的都是只对着特定地址的延迟或者丢包，探针不该受影响）。做完 `services.sh e2e-down` 删掉
   - 影响：只动 `oppenheimer-e2e`；但订单库的实例是两套共用的，其中两个场景挡的是“e2e 的 order 到订单库主库”的包，只选中 e2e 命名空间里的 Pod，长期运行的那一套的 order 不受影响。不发压（e2e 自带的那一轮基线除外）
   - 撤：`CHAOS_NS=oppenheimer-e2e make chaos-recover ALL=1`；最坏删掉整个 `oppenheimer-e2e`
-- [ ] **第二步，带负载各试一次（等主人同意；主会话带着做，不盲，主人不用在场）**：`make down`；备 SKU 13184 起 20 个、每个 4 万；`CHAOS_STEADY_DURATION=4h make chaos-steady ARGS=start`（570 请求/秒）；满 30 分钟后依次 `make chaos-inject SCENARIO=...`，每个 10 到 20 分钟，对照答案看证据、量症状，`make chaos-recover`（其中三个加 `WAIT_RECON=1`），对账过了再下一个。预计 3 到 3.5 小时
+- [x] **第二步做完了（2026-11-27 13:48 到约 16:20 UTC；稳态 570 请求/秒，SKU 13184 到 13203）**：五个依次注入、恢复，每一个恢复后三个常驻核对和逐行对账差异都是 0，所有 Pod 全程 Ready、没有重启。五个都标了 `blind: yes`（**第一档的池现在 11 个，第二档 7 个**）。数在各自的 `truth.md` 最后一段和 `NOTES.md`“B4 带负载”。
+  - **“不雪崩”成立**：一个下游对所有调用方都等不到时，不依赖它的接口全程和基线一样，调用方的 goroutine 和内存没有涨。
+  - **试出三处设计上的问题，等主人定**（内容会剧透三个场景，所以这里只写到这个程度，细节在 `NOTES.md`“B4 试出来的三个问题”；主人可以先盲测再看，也可以现在看）。**主人 2026-11-27 回“其余都按建议”：这三处主会话只给了“先盲测再看还是现在看”的选择、没有给过做不做的建议，所以按不动的办：不改代码、不改网格配置，留着等主人看过再定**：
+    1. 边车的摘除在一种故障下圈不住坏的端点：约三成的请求一直失败到故障结束，摘除的时间没有像 `deploy/cluster/mesh/` 的注释写的那样一次比一次长。
+    2. 一处局部的依赖故障拖住了本来不该受影响的那一半下单（落库只剩不到一成）。
+    3. 同一种故障在流量很低时会让一个服务被调用方整个摘掉（带负载时不会）。
+  - 流程上的：每个实验留下的长窗口 SLO 告警（`...BurnMedium`，要响半小时上下）让 `recover` 等稳态超时、下一次注入被拒，第一个之后都用了 `CHAOS_STEADY_SKIP=alerts`（每次注入前看过在响的只有前面留下的）；因此白等过一轮 10 分钟。盲测时一天连着做几个会碰到同样的事，要定一个办法（建议：稳态检查里把 `burn="medium"`、`burn="slow"` 的 SLO 告警不算进“有告警在响”，只看快档）。**主人 2026-11-27 回“都按建议”，改了**：`chaos-steady.sh` 的告警查询加了 `burn!~"medium|slow"`（一行；用集群上现在在响的两条慢档告警核对过，检查通过）。
+  - 一次命令写错：主会话用了 `rm -f`，本机的 `rm` 是 `trash` 的别名、不认 `-f`，整条命令没有执行（没有碰集群），重来了一次。
+  - 原来的登记：**第二步，带负载各试一次（主会话带着做，不盲，主人不用在场）**：`make down`；备 SKU 13184 起 20 个、每个 4 万；`CHAOS_STEADY_DURATION=4h make chaos-steady ARGS=start`（570 请求/秒）；满 30 分钟后依次 `make chaos-inject SCENARIO=...`，每个 10 到 20 分钟，对照答案看证据、量症状，`make chaos-recover`（其中三个加 `WAIT_RECON=1`），对账过了再下一个。预计 3 到 3.5 小时
   - **影响比前几批大**：五个里有三个会让下单在注入的那 10 分钟里大面积失败（压测的请求，不是真实用户；探针的下单也会失败），**critical 的告警会响**（入口 5xx、下单可用性、探针一类），发到 Telegram，触发集群里的 Agent 诊断（花 DeepSeek 的钱，高峰时段会留到高峰结束）。不杀进程、不动中间件本身、不写坏数据；有三个是对落库重试、回收和补偿的考验，所以恢复时等逐行对账
   - 撤：每个场景 `make chaos-recover`；出了岔子 `make chaos-recover ALL=1`，再 `make chaos-steady ARGS=stop`
   - 做完：答案文件按实测改，够格的标 `blind: yes`；结果写进 `NOTES.md`；顺带看闸门 Redis 的 `latency latest`（上面那一项）
-- [ ] **第三步，`OtelCollectorExportQueueFull` 单独响（等主人同意；可以排在第二步的压测里，也可以单独做）**：让 Collector 的 gateway 在、agent 发不过去约 12 分钟（规则是队列超过八成持续 5 分钟，warning）。做法：手工建一个 NetworkChaos，选中 `monitoring` 里 agent 的 Pod，丢掉它们到 `otel-gateway` 的 ClusterIP 的包，`duration: 12m`；`chaos-run.sh` 按设计拒绝 `monitoring` 命名空间，所以这一个不走脚本、不做成场景，清单放 `tmp/`。要先给 `monitoring` 命名空间加 `chaos-mesh.org/inject=enabled` 的注解，做完去掉
+- [x] **第三步做完了（2026-11-27 15:57:14 到 16:09 UTC，稳态压测还在跑的时候；主人同意后）**：按下面登记的做法手工做的（清单在 `tmp/p4-b4/otel-queue.yaml`，不入库）。三个 agent 的导出队列一分半钟内占满（比值 1.0）；`OtelCollectorExportQueueFull` 先 pending，注入后 4 到 6 分钟之间响，**只有它响**（`OtelCollectorExportFailing`、`OtelGatewayDown` 都没有）；12 分钟到时对象自己撤掉，2 分钟内队列排空、告警消了。agent 的内存没有涨（三个 Pod 70 到 240 MiB，和之前一样）。做完删了对象、去掉了 `monitoring` 上的注解；`monitoring` 里留着三个 `PodNetworkChaos` 对象（Chaos Mesh 的痕迹，没有删）。日志丢没丢没有逐条核对。原来的登记：**第三步，`OtelCollectorExportQueueFull` 单独响**：让 Collector 的 gateway 在、agent 发不过去约 12 分钟（规则是队列超过八成持续 5 分钟，warning）。做法：手工建一个 NetworkChaos，选中 `monitoring` 里 agent 的 Pod，丢掉它们到 `otel-gateway` 的 ClusterIP 的包，`duration: 12m`；`chaos-run.sh` 按设计拒绝 `monitoring` 命名空间，所以这一个不走脚本、不做成场景，清单放 `tmp/`。要先给 `monitoring` 命名空间加 `chaos-mesh.org/inject=enabled` 的注解，做完去掉
   - 影响：这 12 分钟里所有 Pod 的日志到得晚（agent 配的是一直重试、队列满了堵住上游，按 3c 第 11 项的经验不丢），agent 的内存会涨；链路和指标不经过 agent（服务直接发给 `otel-gateway`，agent 只有日志一条管线），不受影响。期间 Loki 里查不到最新的日志，所以不和别的实验同时做。要看的：这条告警响、`OtelCollectorExportFailing` 和 `OtelGatewayDown` 不响、恢复后队列排空
   - 撤：删掉那个对象（到时它自己也会撤）、去掉注解
 
