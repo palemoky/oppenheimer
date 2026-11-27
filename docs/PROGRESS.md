@@ -10,8 +10,9 @@
   - 稳态压测 03:42:10 UTC 起（570 请求/秒，SKU 13061 到 13080 每个 2 万），04:13:10 注入 `s012`（运行 `r20261127-041310-f011`，不盲）：两个副本约 1 分钟、1 分半先后卡死，`MeshEndpointEjected`、`IngressGateway5xxHigh` 响了，goroutine 剖析和答案一致。04:18 恢复，181 秒回稳态，对账差异 0。结果在 `chaos/scenarios/s012/truth.md` 最后。`s012` 标了 `blind: yes`。**盲测的池：第一档 7 个，第二档 2 个（`s012`、`s013`）。**
   - 压测 04:24 UTC 手工停了（结果见本条最后一行）。本机 compose 起着（`make up`）。SKU 用到 13080，下次从 13081 起。
   - **盘**：`k3s-server` 根盘 16.1 GB 起压，`ServerDiskLow`（warning，15 GiB）压测期间在响；注入、恢复用了 `CHAOS_STEADY_SKIP=alerts`（手工确认过只有它）。第二次试跑之前仍然要先看盘。
-  - **没有提交**：`s012` 的 `scenario.yaml`、`truth.md`，`NOTES.md`，计划文件，本文件。
-  - **下一步**：①主人说提交就提交；②盘够了之后做第二次试跑（mutex、block 采样的阶梯对照，加 s010、s011、s009；主人的同意在，开始前说一声）；③B4 开始之前重试 Istio 的故障注入；④主人时间充足时做第一次盲测。
+  - **都提交并推送了**（`phase-4b`，最后一个是本文件的收尾提交；`4f6e934` 是 `s012` 进池的记录）。工作区干净。
+  - **盘可以扩（主人问的，2026-11-27 只读查过，没有动）**：`k3s-server` 虚拟机里没有未分配的空间（`vda` 60G，`vda1` 58.9G 已经占满，根分区用了 43G 剩 15G）；空间在宿主机上：`vmpool`（`/var/lib/libvirt/images`）590G 用了 123G、剩 468G，卷组 `ubuntu-vg` 另有 98.7G 没分。所以办法是把虚拟机的磁盘加大（比如 60G 到 100G）：宿主机上 `virsh blockresize`（或关机后 `qemu-img resize`），虚拟机里 `growpart /dev/vda 1` 加 `resize2fs /dev/vda1`，可以在线做、不丢数据。**等主人说做再做**；做完改 `docs/infra/hardware.md` 的虚拟机表和建虚拟机的脚本里的磁盘大小，并看 `ServerDiskLow` 消掉。这样第二次试跑不用清 Loki、Tempo。
+  - **下一步**：①主人同意后给 `k3s-server` 扩盘（上一行）；②盘够了之后做第二次试跑（mutex、block 采样的阶梯对照，加 s010、s011、s009；主人的同意在，开始前说一声）；③B4 开始之前重试 Istio 的故障注入；④主人时间充足时做第一次盲测。
   - 整段对账 [03:42:00, 04:25:30)：通过，三个常驻核对没有不一致，逐行对账差异 0。停压后 `MeshEndpointEjected` 消了，04:33 UTC 时只有 Watchdog 和 `ServerDiskLow`（根盘 14.6 GB）在响。
 
 - **现在（2026-11-27 约 02:20 UTC，上一条）**：**主人对上一条的四件事回了“都按建议，提交并推送”，都做了。**
