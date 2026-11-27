@@ -221,6 +221,12 @@ lint_scenario() {
   done
   # blind：试过（注入生效、到时恢复、答案对得上）才写 yes；不写就是 no，盲测不抽它。
   case "$(jq -r '.blind // "no"' <<<"$sj")" in yes | no) ;; *) lint_err "$id" "blind must be yes or no" ;; esac
+  # report：盲测注入之后打印给主人的一句“有人报了什么”，给完全安静的场景（没有告警、用户无感）一个入口。可以不写。
+  case "$(jq -r '(.report | type) // "null"' <<<"$sj")" in
+  null) ;;
+  string) [[ -n "$(jq -r '.report' <<<"$sj")" ]] || lint_err "$id" "report must not be empty (drop the field instead)" ;;
+  *) lint_err "$id" "report must be one line of text" ;;
+  esac
   # truth.md 的三栏
   if [[ -f "$dir/truth.md" ]]; then
     for f in "标准根因" "定位必需的关键证据" "容易误判成的原因"; do
@@ -770,6 +776,10 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
   if [[ "$WARMUP_SKIPPED" == 1 ]]; then state_set warmup_skipped yes; fi
   echo "run:    $run"
   echo "sha256: $sha   (of chaos/runs/$run/sealed.json; write it down)"
+  # 有 report 的场景，盲测时这一句是主人唯一的入口（它是场景作者写给诊断的人看的，不含根因）。
+  if [[ "$(jq -r '.report // ""' <<<"$sj")" != "" ]]; then
+    echo "report: $(jq -r '.report' <<<"$sj")"
+  fi
   if [[ "$blind" == false ]]; then
     echo "scenario $sid: method $m, risk $risk, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj")"
     echo "requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
