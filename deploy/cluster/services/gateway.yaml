@@ -21,6 +21,9 @@ istio:
   proxy: {cpu: 400m, memory: 64Mi, memoryLimit: 192Mi}
 
 config:
+  # mutex、block 剖析的采样（阶段 4 期间常开；起步值和开销的对照见设计 4b 第 8 节、chart 的 values 注释）。
+  DEBUG_MUTEX_FRACTION: "100"
+  DEBUG_BLOCK_RATE: "1ms"
   # 下游连 Service 名加 gRPC 端口：出站被自己的边车截获，按 deploy/cluster/mesh/ 的规则路由、限流、摘除。
   ORDER_ADDR: order:9081
   INVENTORY_ADDR: inventory:9082
