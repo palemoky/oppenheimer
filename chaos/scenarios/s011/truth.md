@@ -58,3 +58,13 @@ GC 的次数跟着翻几倍）合计估计每个 Pod 多 0.15 到 0.3 核，相�
 
 **和 s005（order 的 CPU 压力）的区别**：s005 是容器里多出来的 stress 进程，剖析里看不到 Go 代码；这个场景的 CPU 在 order 自己的进程里，
 剖析能指到函数。
+
+**带负载量过了（2026-11-27 08:44:08 起约 10 分钟，长期运行的那一套，稳态 570 请求/秒，运行 `r20261127-084408-6492`）**，和上面一致，症状比估的清楚：
+
+- order 两个 Pod 的业务容器 CPU（5 分钟窗口，注入前 → 第 9 分钟）：0.31、0.28 → **0.46、0.44 核**（每个多约 0.16 核，+55%）；`ListUserOrders` 的速率没有变（40.7 → 40.4 次/秒）。
+- 分配速率（`go_memory_allocated_bytes_total` 的 rate）：每个 Pod 约 9 → **约 100 MB/秒**（11 倍）；`go_memory_gc_goal_bytes` 71 → 65 MiB，没有涨。
+- 延迟：`ListUserOrders` p50 1.7 → 8.0 毫秒，p99 6.7 → 19.7 毫秒；`SubmitOrder` p99 20.6 → 25.1 毫秒（p50 不变）；`GetOrder` 不变。
+- 30 秒的 CPU 剖析（一个 Pod，采到 12.76 秒）：`ListUserOrders` 累计 27%，其中 `canonicalCurrency` → `regexp.MustCompile` → `regexp.compile` 24%；`runtime.mallocgc` 累计 13%。
+- 没有告警，五个 SLO 和探针没有变化（`expected_alerts` 空是对的）。关开关后 181 秒回到稳态，没有重启。
+- 没有核对的：堆剖析的 `alloc_space`、链路里 span 的形状、`container_cpu_cfs_throttled_periods_total`。
+- 标了 `blind: yes`，带一句 `report`（没有告警、用户无感，和 s013 同一类）。
