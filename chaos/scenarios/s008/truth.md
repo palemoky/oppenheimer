@@ -42,3 +42,21 @@ B1（2026-11-24，`oppenheimer-e2e`）试过：注入成功；在目标 Pod 里�
 
 没有核实的（要有负载和半小时以上）：连接到期之后错误实际怎么增长；orderindex 的连接池大小和寿命是不是默认值；消费者是不是“停住等”；
 查询的失败经 gateway 出去是什么状态码；Go 的解析器收到 `EPERM` 时的错误文字。**第一次在长期运行的那一套上做时由主会话盯着做一次（不盲）更稳妥。**
+
+**带负载量过了（2026-11-26 17:35:53 到 18:10:14 UTC，长期运行的那一套，稳态 570 请求/秒，运行 `r20261126-173553-0ef2`）**。大体和上面一致，不一样的地方：
+
+- **显现比上面写的快**：约 4 分半出现第一批解析失败（一个副本），10 分钟时约 3 次/秒，15 分钟时两个副本都在报、成功的只剩六成，
+  20 分钟起商家订单列表基本全部失败（成功的不到 1 次/秒，共约 20 次/秒）。原因是空闲连接 5 分钟就到期，不用等 30 分钟的寿命。“头十几分钟什么都看不出来”不成立。
+- Go 的错误文字：`dial tcp: lookup mysql-main-primary.mysql.svc on 10.43.0.10:53: write udp <Pod IP>:<端口>->10.43.0.10:53: write: operation not permitted`。
+- 连接池打开的连接数（`db_sql_connection_open`）两个副本、两个库都一路掉到 0，约 25 到 30 分钟时全空。
+- **调用方看到的不是降级而是内部错误**：orderindex 把这个错误原样返回，gRPC 状态是 `INTERNAL`（日志 `unhandled error in grpc handler`）；
+  边车把它算成失败，两个副本先后被摘除，之后 gateway 看到的大多是 `UNAVAILABLE`（约 19 次/秒），入口出 5xx。
+  这是一个真实的设计缺口（依赖坏了应当熔断并返回 `errx.Degraded`），登记在计划文件里；修了之后这个场景的告警和状态码会变。
+- 告警：`MeshEndpointEjected` 约 10 分钟时响；`DerivedDataLagging` 约 20 分钟；**`IngressGateway5xxHigh`（critical）约 25 分钟**（列表占流量约 3.5%）；
+  `ConsumerBlocked` 到 34 分钟才进 pending，没有响。**`ServiceMetricsMissing` 没有响**：orderindex 的指标全程都在（上报的连接没有断）。
+  `expected_alerts` 按这次的改了。
+- 消费者是“停住等”：`kafka handler failed, retrying`，同一个位点重试到 149 次以上，没有进死信；积压到 34 分钟时约 7.5 万条。Pod 没有重启。
+- **恢复之后还有一条后果**：故障期间跑的每小时对账（18:07 的 `recon-hourly`）把索引落后报成 613 处差异、退出码 1，**`ReconFoundDifferences`（critical）响了**，
+  脚本等了 900 秒没有等到稳态。积压约 15 分钟追完；同一个窗口重新逐行对账差异 0；按 runbook 手工 `create job --from=cronjob/recon-hourly` 复跑成功后这条告警消了。
+  失败的 Job 对象还在的时候 `KubeJobFailed`（warning）一直响。盲测时这是“故障结束之后才冒出来的 critical”，复盘时要讲。
+- 三个常驻核对和逐行对账（[17:35:53, 18:10:17) 和 [16:07:01, 18:10:17) 各一次）差异都是 0。

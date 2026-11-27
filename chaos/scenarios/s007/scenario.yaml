@@ -2,7 +2,7 @@
 id: s007
 method: chaos-mesh
 risk: 1
-blind: no
+blind: yes
 category: network
 target:
   workload: inventory
@@ -14,4 +14,4 @@ recover:
   notes:
     - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉
     - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
-expected_alerts: [MeshEndpointEjected]
+expected_alerts: []
