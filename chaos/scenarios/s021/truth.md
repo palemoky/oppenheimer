@@ -32,3 +32,14 @@ order 的所有 Pod 到订单库 0 的主库（`mysql-order-0-primary.mysql.svc`
 - “重启 order 会更糟”是推的（新进程启动要租节点号）：盲测时如果主人或者 Agent 选了重启，复盘里记下实际发生了什么。
 - 数据上要验的同 s020：恢复后三个常驻核对和逐行对账没有差异。第一次做时恢复加 `WAIT_RECON=1`。
 - 会响 critical 的告警，会发到 Telegram、触发集群里的 Agent 诊断。
+- **e2e 实测（2026-11-27 13:42 到 13:47 UTC，`r20261127-134252-6fa7`，没有负载，手工发请求）**：注入后约 25 秒，订单库 1 的用户下单从正常变成 503 `ORDER_LANDING_UNAVAILABLE`；
+  order 的日志是 `order id lease expired, rejecting admission` 和 `worker id lease renewal failed ... i/o timeout`；Pod 一直 Ready、没有重启。撤掉后恢复。
+- **带负载实测（2026-11-27 15:24:08 UTC 注入，15:32:49 恢复，`r20261127-152408-449d`，稳态 570 请求/秒，不盲）。和上面一致：**
+  - 下单：注入后 2 分钟的那次采样里受理成功已经只剩每秒 1 个，之后是 0；`order_landing_unavailable` 每秒 32 到 36（全部用户）。落库归零。
+    只有 `landing-db-0` 打开，`landing-db-1` 没有：另一半用户是被发号挡住的。
+  - 读：查订单 503 每秒约 6、504 约 1，订单列表 503 每秒约 2.5、504 约 0.5，p99 3005 毫秒；另一半用户的读正常。没有摘除（带负载时成功的请求混在中间）。
+  - 告警：`OrderLandingBreakerOpen`、`IngressGateway5xxHigh`、`SLOOrderCreateAvailabilityBurnFast`、`SLOOrderPayAvailabilityBurnFast`（critical）在 9 分钟内都响了；
+    `ConsumerDeadLettered`（warning）。**`ProbeFailing` 在这 9 分钟里没有响**（预期里写了它，没有查它的 `for` 是多长）。
+  - 所有 Pod 一直 Ready、没有重启。恢复后 337 秒回到稳态，三个常驻核对和逐行对账差异 0。
+  - 光看接口上的症状，它和 s020 的区别只有“下单是全部失败还是剩两成”和“哪一个落库熔断器打开”；要靠日志里的租约才能说清为什么全部失败。
+

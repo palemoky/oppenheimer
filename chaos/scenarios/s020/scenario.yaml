@@ -2,6 +2,7 @@
 id: s020
 method: chaos-mesh
 risk: 1
+blind: yes
 category: network
 target:
   workload: order
@@ -15,4 +16,4 @@ recover:
     - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉，挂住的连接恢复或者重建，落库的熔断器过一次试探后合上
     - 恢复后这个库上积压的落库、支付结果、outbox 自己追上；延迟关单的消息重试 10 次后进了死信的由兜底扫描处理
     - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
-expected_alerts: [OrderLandingBreakerOpen, SLOOrderCreateAvailabilityBurnFast, IngressGateway5xxHigh, MeshEndpointEjected]
+expected_alerts: [OrderLandingBreakerOpen, SLOOrderCreateAvailabilityBurnFast, IngressGateway5xxHigh, SLOOrderPayAvailabilityBurnFast, ConsumerDeadLettered, CDCLagging]

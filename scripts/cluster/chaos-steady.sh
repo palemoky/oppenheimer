@@ -9,6 +9,7 @@
 #   chaos-steady.sh stop  [--dry-run]   让它收尾退出（k6.sh 收到 TERM 会让发压机上的 k6 写出 summary 再退），同时删掉 started_at
 #   chaos-steady.sh check [--dry-run]   四项检查，全过退出 0：
 #       alerts  没有 warning 或 critical 的告警在响（Prometheus 的 ALERTS，firing；被静默的也算：静默只管通知，不代表故障不在）
+#               SLO 的中档、慢档燃烧告警（burn=medium|slow）不算：它们在上一个实验结束后还要响很久，见 QUERY_ALERTS 的注释
 #       load    gateway 的请求速率 >= 目标速率的 70%（压测真的在打）
 #       probe   常驻探针最近 5 分钟失败或跳过的比例 < 10%
 #       slo     五个 SLO 最近 5 分钟的错误比例都在预算以内（预算：可用性 0.1%，延迟类 1%），
@@ -155,7 +156,10 @@ sys.exit(0 if {"lt": a < b, "le": a <= b, "ge": a >= b}[op] else 1)' "$1" "$2" "
 # SLO 和探针的规则写死在 oppenheimer 上。
 slo_applies() { [[ "$NS" == oppenheimer ]]; }
 
-QUERY_ALERTS='ALERTS{alertstate="firing",severity=~"warning|critical",alertname!~"Watchdog|InfoInhibitor"}'
+# burn!~"medium|slow"：SLO 的中档、慢档看的是 30 分钟到几天的窗口，上一个实验结束后还要响半小时以上，
+# 算进来的话一天里第二个实验就注入不了（2026-11-27 B4 碰到的）。快档（5 分钟和 1 小时）仍然算；现在的错误比例另有 slo 那一项在查。
+# 没有 burn 标签的告警不受这个条件影响（空值不匹配这个正则）。
+QUERY_ALERTS='ALERTS{alertstate="firing",severity=~"warning|critical",alertname!~"Watchdog|InfoInhibitor",burn!~"medium|slow"}'
 QUERY_LOAD="sum(rate(http_server_request_duration_seconds_count{service_name=\"gateway\",k8s_namespace_name=\"$NS\"}[3m]))"
 QUERY_PROBE="sum(rate(probe_cycles_total{k8s_namespace_name=\"$NS\",outcome=~\"failed|skipped\"}[5m])) or vector(0)"
 QUERY_PROBE_ALL="sum(rate(probe_cycles_total{k8s_namespace_name=\"$NS\"}[5m]))"

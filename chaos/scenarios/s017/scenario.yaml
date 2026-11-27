@@ -2,6 +2,7 @@
 id: s017
 method: istio
 risk: 2
+blind: yes
 category: mesh
 target:
   workload: gateway
