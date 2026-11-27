@@ -16,3 +16,6 @@ recover:
     - 关掉开关（到 ttl 也会自己关），脚本做
     - 已经占住的内存关了开关不会释放，滚动重启目标工作负载（脚本做）
 expected_alerts: []
+blind: yes
+soak: 60m
+report: 容量巡检时看到 gateway 两个副本的内存比昨天同一时段高，没有用户报障

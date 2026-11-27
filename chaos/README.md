@@ -44,7 +44,9 @@ chaos/
 | `recover.restart` | 是 | 恢复时脚本要滚动重启的工作负载（可以是 `[]`）。泄漏类故障关了开关之后后果还在，要靠它 |
 | `recover.notes` | 是 | 恢复步骤的说明，给人看（可以是 `[]`） |
 | `blind` | 否 | `yes` 或 `no`，不写是 `no`。在集群上试过（注入生效、到时恢复、`truth.md` 的证据和实际对得上）才写 `yes`；`chaos-blind` 只从 `yes` 的里面抽 |
+| `also` | 否 | 在主方式之外再叠一种注入方式，唯一合法的值是 `chaos-mesh`，并且只有 `method: fault-switch` 时才能写。清单放在 `inject/mesh/`（见下）。不写就是只有主方式；没写 `also` 却有 `inject/mesh/` 目录，`lint` 报错（防止写了清单忘了字段） |
 | `report` | 否 | 一句“有人报了什么现象”，注入之后打印在终端上（盲测也打印）。只给完全安静的场景用：没有告警、用户无感，不给这一句诊断的人没有入口。只写现象，不写原因、不写该看哪里；不能有行尾注释 |
+| `soak` | 否 | 注入之后先放多久再开始排查，如 `60m`。给涨得慢的场景用：症状在 30 分钟的排查时限里还看不出来。注入之后终端打印“某个时刻之前不要开始排查”（盲测也打印，不说原因），30 分钟的时限从那个时刻算起；时刻记在运行的 `state.json`（`investigate_at`），`make chaos-status` 也会再打印一次。`soak` 加 30 分钟不能超过 `duration`（故障开关的还不能超过 `ttl`），`lint` 会查 |
 | `expected_alerts` | 是 | 预期会响的告警名（可以是 `[]`）。盲测时不看，复盘时和实际对照 |
 
 **YAML 的子集**：脚本里没有 YAML 库，用自带的小解析器读。只支持：顶层 `键: 值`，一层嵌套（缩进 2 个空格），
@@ -64,6 +66,12 @@ chaos/
   等 `CHAOS_FILE_SYNC_WAIT` 秒（默认 120，kubelet 把它同步进已经在跑的 Pod 要一个周期），再经管理端口打开；恢复时先从 Secret 里去掉，再关开关，
   再做 `recover.restart` 的滚动重启（所以 `persist: yes` 要求 `recover.restart` 含目标工作负载，`lint` 检查）。`recover --all` 无条件删掉这个 Secret。
   目标的 Deployment 要挂着它（chart 在部署带故障代码的镜像时自动挂；没挂的话 `persist: yes` 的注入会被拒绝）。
+  **叠加 Chaos Mesh（`scenario.yaml` 写 `also: chaos-mesh`）**：`inject/mesh/` 里放一个或几个 `*.yaml`，每个文件的要求和 `method: chaos-mesh` 的清单完全一样（同一段检查，见上面的 `chaos-mesh`）。
+  注入时先开故障开关（含 `persist` 那一路），再 `kubectl apply` 这些清单；任何一步失败都走撤销。恢复时顺序相反：先按运行标签删 Chaos Mesh 对象，再关开关。
+  至少要有一个 `*.yaml`。盲测时终端上看不出有没有 `also`；老的运行目录（`sealed.json` 没有 `also`）照常恢复。
+  清单里可以写运行时才知道的 Pod 地址：`__POD_IPS:<命名空间>:<标签选择器>__`，例如 `externalTargets: [__POD_IPS:redis:app.kubernetes.io/name=redis-cache__]`。
+  注入时脚本取这个命名空间里符合选择器、状态是 `Running` 的所有 Pod 的 IP，换成 `"10.42.1.5", "10.42.2.7"` 这样的列表（外面的方括号自己写）；一个地址都取不到就注入失败并撤销。
+  地址只写进运行目录的 `private.log`。选择器里不能有下划线（结尾的 `__` 靠它分界），`lint` 查写法；dry-run 不连集群，所以不渲染。
 - **`istio`**：一个或几个 `*.yaml`（VirtualService 等），`metadata.namespace: __TARGET_NS__`，名字和标签的规则同 `chaos-mesh`。脚本 `kubectl apply`，恢复时按标签删。
 - **`script`**：`run.sh`，接收一个参数 `inject` 或 `recover`，环境变量 `TARGET_NS`、`RUN_ID`、`RUN_DIR`、`KUBECONFIG`。恢复要能重复执行。
 
@@ -111,7 +119,12 @@ make chaos-reveal                # 打开答案，生成 docs/postmortems/ 里�
 别的命名空间一律拒绝（尤其 `monitoring`、`kube-system`、`istio-system`、`chaos-mesh`）。
 
 **盲测时脚本的约定**：终端、日志里不出现编号、目标、注入方式；这些只在 `chaos/runs/<运行号>/` 里（`sealed.json`、`private.log`），到 `reveal` 才读。
-唯一的例外是场景自己写的 `report`（见字段表）：那一句是故意给诊断的人看的。
+例外是场景自己写的 `report` 和 `soak`（见字段表）：`report` 那一句是故意给诊断的人看的；`soak` 让终端多出“某个时刻之前不要开始排查”一行，
+这一行本身就说明抽到的是涨得慢的那一类，是知道的、接受的泄漏。等的这段时间里不看集群、不看面板（看了就等于提前开始）。
+
+**池里有带 `soak` 的场景时压测要起得够长**（现在是第二档）：抽到哪个事先不知道，所以按最长的算：热身 30 分钟、`soak` 最长的那个（现在 60 分钟）、排查 30 分钟、恢复和对账约 10 分钟，
+一个实验就要 2 小时 10 分，默认的 `CHAOS_STEADY_DURATION=2h` 不够。做第二档的盲测时用 `CHAOS_STEADY_DURATION=4h`，SKU 的库存跟着加（每秒约 46 单，4 小时约 66 万单，20 个 SKU 每个备 4 万）。
+脚本不检查压测还能跑多久：压测在 `soak` 期间停了的话，到时稳态的面板上会看到流量没了，那一次作废重做。
 `sealed.json` 里有随机数，所以终端上那个 SHA-256 猜不出场景编号（编号空间很小，没有随机数的话可以穷举）。
 
 ## 盲测时的痕迹（4a 第 1 步冒烟的发现）

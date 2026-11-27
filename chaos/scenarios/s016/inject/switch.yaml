@@ -1,0 +1,4 @@
+switch: f03
+ttl: 20m
+# inventory 的内部端口（HTTP_ADDR，:8082）。注入经端口转发，每个副本各开一次。
+admin_port: 8082

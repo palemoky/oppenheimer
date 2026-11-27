@@ -71,6 +71,8 @@ RECOVER_WAIT="${CHAOS_RECOVER_WAIT:-900}"
 RECOVER_SETTLE="${CHAOS_RECOVER_SETTLE:-180}"
 RECON_WAIT="${CHAOS_RECON_WAIT:-1800}"
 STEADY_MIN_AGE="${CHAOS_STEADY_MIN_AGE:-1800}"
+# 盲测的排查时限（设计 4b 第 2 节第 7 项）。脚本不掐表，只用它检查 soak 加时限装不装得进故障的时长。
+BLIND_LIMIT_S=1800
 FILE_SYNC_WAIT="${CHAOS_FILE_SYNC_WAIT:-120}"
 # 进程重启后还在的那一路：开关名写进目标命名空间的这个 Secret 的这个键（chart 把它挂到 Pod 里，见 deploy/charts/service）。
 OV_SECRET=startup-overrides
@@ -197,7 +199,35 @@ bad_lines() {
     [[ "$l" =~ $3 ]] || printf '%s\n' "$l"
   done < <(grep -E "^[[:space:]]*$2" "$1" || true)
 }
+# __POD_IPS:<命名空间>:<标签选择器>__（render 和 lint 共用）。选择器里不能有下划线：结尾的 __ 靠它分界。
+POD_IPS_RE='__POD_IPS:[a-z0-9-]+:[A-Za-z0-9./=,!-]+__'
 lint_err() { echo "  $1: $2"; LINT_N=$((LINT_N + 1)); }
+
+# 一个 Chaos Mesh / Istio 清单的检查。method: chaos-mesh 的 inject/*.yaml 和 also: chaos-mesh 的 inject/mesh/*.yaml 共用这一份，
+# 两处的要求必须一样（恢复都靠运行标签，选择器都只能指向 CHAOS_NS）。
+lint_manifest() { # 编号 文件 chaos-mesh|istio
+  local id="$1" y="$2" m="$3"
+  grep -q '__RUN_ID__' "$y" || lint_err "$id" "$(basename "$y"): no __RUN_ID__ (name and label must carry the run id)"
+  grep -q "$RUN_LABEL: __RUN_ID__" "$y" || lint_err "$id" "$(basename "$y"): missing label $RUN_LABEL: __RUN_ID__"
+  # 选择器里的命名空间只能是占位符。
+  if [[ -n "$(bad_lines "$y" 'namespaces:' 'namespaces:[[:space:]]*\[__TARGET_NS__\][[:space:]]*$')" ]]; then
+    lint_err "$id" "$(basename "$y"): selector namespaces must be exactly [__TARGET_NS__]"
+  fi
+  if [[ "$m" == chaos-mesh ]]; then
+    grep -qE '^[[:space:]]*namespaces:' "$y" || lint_err "$id" "$(basename "$y"): no 'namespaces: [__TARGET_NS__]' selector"
+    if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*chaos-mesh[[:space:]]*$')" ]]; then
+      lint_err "$id" "$(basename "$y"): metadata.namespace must be chaos-mesh"
+    fi
+  else
+    if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*__TARGET_NS__[[:space:]]*$')" ]]; then
+      lint_err "$id" "$(basename "$y"): metadata.namespace must be __TARGET_NS__"
+    fi
+  fi
+  # 运行时才知道的 Pod 地址：写了 __POD_IPS 就必须是完整的 __POD_IPS:<命名空间>:<选择器>__，不然 render 不会替换，字面值会被 apply。
+  if sed -E "s|$POD_IPS_RE||g" "$y" | grep -q '__POD_IPS'; then
+    lint_err "$id" "$(basename "$y"): malformed __POD_IPS placeholder (want __POD_IPS:<namespace>:<label selector>__, no underscore in the selector)"
+  fi
+}
 
 lint_scenario() {
   local id="$1" dir="$SCEN_DIR/$1" sj m r f
@@ -227,6 +257,16 @@ lint_scenario() {
   string) [[ -n "$(jq -r '.report' <<<"$sj")" ]] || lint_err "$id" "report must not be empty (drop the field instead)" ;;
   *) lint_err "$id" "report must be one line of text" ;;
   esac
+  # soak：注入之后先放这么久再开始排查，给涨得慢、时限里看不出来的场景用。可以不写。
+  # 开始排查之后故障还要在：soak 加排查的时限不能超过 duration（故障开关的 ttl 在下面查）。
+  if [[ "$(jq -r 'has("soak")' <<<"$sj")" == true ]]; then
+    if [[ ! "$(jq -r '.soak | tostring' <<<"$sj")" =~ ^[1-9][0-9]*[smh]$ ]]; then
+      lint_err "$id" "soak must look like 30m, 1h and not be zero (drop the field instead)"
+    elif [[ "$(jq -r '.duration // ""' <<<"$sj")" =~ ^[0-9]+[smh]$ ]]; then
+      [[ $(($(dur_s "$(jq -r .soak <<<"$sj")") + BLIND_LIMIT_S)) -le "$(dur_s "$(jq -r .duration <<<"$sj")")" ]] ||
+        lint_err "$id" "soak plus the $(fmt_s "$BLIND_LIMIT_S") to investigate is longer than duration"
+    fi
+  fi
   # truth.md 的三栏
   if [[ -f "$dir/truth.md" ]]; then
     for f in "标准根因" "定位必需的关键证据" "容易误判成的原因"; do
@@ -243,22 +283,7 @@ lint_scenario() {
     for y in "$dir"/inject/*.yaml; do
       [[ -f "$y" ]] || continue
       n=$((n + 1))
-      grep -q '__RUN_ID__' "$y" || lint_err "$id" "$(basename "$y"): no __RUN_ID__ (name and label must carry the run id)"
-      grep -q "$RUN_LABEL: __RUN_ID__" "$y" || lint_err "$id" "$(basename "$y"): missing label $RUN_LABEL: __RUN_ID__"
-      # 选择器里的命名空间只能是占位符。
-      if [[ -n "$(bad_lines "$y" 'namespaces:' 'namespaces:[[:space:]]*\[__TARGET_NS__\][[:space:]]*$')" ]]; then
-        lint_err "$id" "$(basename "$y"): selector namespaces must be exactly [__TARGET_NS__]"
-      fi
-      if [[ "$m" == chaos-mesh ]]; then
-        grep -qE '^[[:space:]]*namespaces:' "$y" || lint_err "$id" "$(basename "$y"): no 'namespaces: [__TARGET_NS__]' selector"
-        if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*chaos-mesh[[:space:]]*$')" ]]; then
-          lint_err "$id" "$(basename "$y"): metadata.namespace must be chaos-mesh"
-        fi
-      else
-        if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*__TARGET_NS__[[:space:]]*$')" ]]; then
-          lint_err "$id" "$(basename "$y"): metadata.namespace must be __TARGET_NS__"
-        fi
-      fi
+      lint_manifest "$id" "$y" "$m"
     done
     [[ $n -gt 0 ]] || lint_err "$id" "inject/ has no *.yaml"
     ;;
@@ -283,6 +308,10 @@ lint_scenario() {
         if [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] && [[ "$(jq -r '.duration // ""' <<<"$sj")" =~ ^[0-9]+[smh]$ ]]; then
           [[ "$(dur_s "$(jq -r .ttl <<<"$sw")")" -le "$(dur_s "$(jq -r .duration <<<"$sj")")" ]] || lint_err "$id" "switch.yaml: ttl is longer than duration"
         fi
+        if [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] && [[ "$(jq -r '.soak // "" | tostring' <<<"$sj")" =~ ^[1-9][0-9]*[smh]$ ]]; then
+          [[ $(($(dur_s "$(jq -r .soak <<<"$sj")") + BLIND_LIMIT_S)) -le "$(dur_s "$(jq -r .ttl <<<"$sw")")" ]] ||
+            lint_err "$id" "switch.yaml: ttl is shorter than soak plus the $(fmt_s "$BLIND_LIMIT_S") to investigate"
+        fi
       fi
     else
       lint_err "$id" "inject/switch.yaml is missing"
@@ -292,7 +321,33 @@ lint_scenario() {
     [[ -x "$dir/inject/run.sh" ]] || lint_err "$id" "inject/run.sh is missing or not executable"
     ;;
   esac
+  # also：故障开关之外再叠一个 Chaos Mesh 对象（清单在 inject/mesh/）。没写 also 时不该有 inject/mesh/：防止写了清单却忘了字段。
+  if [[ "$(jq -r 'has("also")' <<<"$sj")" == true ]]; then
+    local a
+    a="$(jq -r '.also | tostring' <<<"$sj")"
+    if [[ "$a" != chaos-mesh ]]; then
+      lint_err "$id" "also must be chaos-mesh, got '$a'"
+    elif [[ "$m" != fault-switch ]]; then
+      lint_err "$id" "also is only allowed with method: fault-switch"
+    else
+      local n=0 y
+      for y in "$dir"/inject/mesh/*.yaml; do
+        [[ -f "$y" ]] || continue
+        n=$((n + 1))
+        lint_manifest "$id" "$y" chaos-mesh
+      done
+      [[ $n -gt 0 ]] || lint_err "$id" "also: chaos-mesh needs at least one inject/mesh/*.yaml"
+    fi
+  elif [[ -e "$dir/inject/mesh" ]]; then
+    lint_err "$id" "inject/mesh/ exists but scenario.yaml has no 'also: chaos-mesh'"
+  fi
 }
+
+at_epoch() { # 秒 [date 的格式] -> UTC 的时刻（BSD date 用 -r，GNU 用 -d @）
+  local f="${2:-+%Y-%m-%dT%H:%M:%SZ}"
+  date -u -r "$1" "$f" 2>/dev/null || date -u -d "@$1" "$f"
+}
+local_hm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M; } # 秒 -> 本地的时:分
 
 dur_s() { # 30s 5m 1h -> 秒
   local n="${1%[smh]}"
@@ -436,8 +491,32 @@ fault_each() {
 }
 
 # ---- 渲染清单 ----
+# 清单里的 __POD_IPS:<命名空间>:<标签选择器>__ 在这里换成运行中的 Pod 的 IP 列表（"10.42.1.5", "10.42.2.7"）：
+# 故障要指向另一个服务的 Pod（没有稳定的 Service 地址可用）时用。取不到一个地址就失败，不能带着空列表去 apply。
+# 地址只进私有日志。没有这个占位符的清单不多调 kubectl。
 render() { # 文件
-  sed -e "s|__TARGET_NS__|$TNS|g" -e "s|__RUN_ID__|$RUN|g" "$1"
+  local out phs ph spec ns sel ips lst
+  out="$(sed -e "s|__TARGET_NS__|$TNS|g" -e "s|__RUN_ID__|$RUN|g" "$1")" || return 1
+  phs="$(grep -oE "$POD_IPS_RE" <<<"$out" | sort -u || true)"
+  for ph in $phs; do
+    spec="${ph#__POD_IPS:}"
+    spec="${spec%__}"
+    ns="${spec%%:*}"
+    sel="${spec#*:}"
+    ips="$(kubectl -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running \
+      -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' 2>>"$PRIVLOG")" || { plog "render: listing pods ($ns, $sel) failed"; return 1; }
+    lst="$(grep -v '^$' <<<"$ips" | sed -e 's/.*/"&"/' | paste -sd, - | sed 's/,/, /g' || true)"
+    [[ -n "$lst" ]] || { plog "render: no running pod with $sel in $ns"; return 1; }
+    plog "render: $ph -> $lst"
+    out="${out//"$ph"/$lst}"
+  done
+  printf '%s\n' "$out"
+}
+# 渲染再 apply。先渲染进变量：渲染失败时 kubectl 一个字节也收不到，不依赖管道的退出码。
+apply_rendered() { # 文件
+  local out
+  out="$(render "$1")" || return 1
+  printf '%s\n' "$out" | run_q kubectl apply -f -
 }
 
 # ---- “进程重启后还在”：开关名写进 Secret（细节只进私有日志） ----
@@ -487,7 +566,7 @@ inject_by_method() {
   chaos-mesh | istio)
     for f in "$SCEN_DIR/$sid"/inject/*.yaml; do
       plog "apply $(basename "$f")"
-      render "$f" | run_q kubectl apply -f - || return 1
+      apply_rendered "$f" || return 1
     done
     ;;
   fault-switch)
@@ -506,6 +585,13 @@ inject_by_method() {
     fi
     plog "switch $sw on, ttl $ttl, port $port, workload $w"
     fault_each "$w" "$port" "/fault/$sw?mode=on&ttl=$ttl" || return 1
+    # also: chaos-mesh：开关开了之后再叠 Chaos Mesh 对象。顺序反过来的话，开关失败时已经有一半故障在跑。
+    if [[ "$(sealed '.also // ""')" == chaos-mesh ]]; then
+      for f in "$SCEN_DIR/$sid"/inject/mesh/*.yaml; do
+        plog "apply mesh/$(basename "$f")"
+        apply_rendered "$f" || return 1
+      done
+    fi
     ;;
   script)
     plog "script $sid inject"
@@ -514,17 +600,24 @@ inject_by_method() {
   esac
 }
 
+# 按运行标签删这个运行的 Chaos Mesh 对象。有失败返回 1，但每一类都会试。
+undo_mesh_objects() {
+  local k bad=0
+  for k in $(chaos_kinds); do
+    run_q kubectl -n "$CM" delete "$k" -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
+  done
+  return "$bad"
+}
+
 # 撤销一个运行：尽力而为，每一步失败只记录，不中止。返回 0 全部成功，1 有失败。
 undo_run() {
-  local m sid w bad=0 k
+  local m sid w bad=0
   m="$(sealed .method)"
   sid="$(sealed .scenario)"
   w="$(sealed .workload)"
   case "$m" in
   chaos-mesh)
-    for k in $(chaos_kinds); do
-      run_q kubectl -n "$CM" delete "$k" -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
-    done
+    undo_mesh_objects || bad=1
     ;;
   istio)
     run_q kubectl -n "$TNS" delete virtualservice,destinationrule,envoyfilter -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
@@ -533,6 +626,10 @@ undo_run() {
     local sw port
     sw="$(sealed .params.switch)"
     port="$(sealed .params.admin_port)"
+    # also: chaos-mesh：先删 Chaos Mesh 对象再关开关（和注入相反）：开关是根因，对象是叠上去的；老的运行目录没有 also 字段，走不到这里。
+    if [[ "$(sealed '.also // ""')" == chaos-mesh ]]; then
+      undo_mesh_objects || { bad=1; plog "deleting the chaos mesh objects failed; their own duration ends them"; }
+    fi
     # persist：先从 Secret 里去掉，再关开关，最后（下面）滚动重启：新 Pod 启动时读的是当时的 Secret。
     # 经端口关开关在 Pod 崩溃循环里会失败，只记一笔，不中止。
     if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
@@ -691,10 +788,11 @@ on_exit() {
 
 do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
   local blind="$1" sid="$2" pool="$3" dry="$4" confirm="$5" skip_warmup="${6:-0}"
-  local sj risk m
+  local sj risk m also
   sj="$(scenario_json "$sid")"
   risk="$(jq -r '.risk' <<<"$sj")"
   m="$(jq -r '.method' <<<"$sj")"
+  also="$(jq -r '.also // ""' <<<"$sj")"
   if [[ "$risk" == 3 ]]; then
     [[ "$blind" == false ]] || die "risk 3 scenarios are never run blind" 2
     [[ "$confirm" == "$sid" ]] || die "scenario $sid is risk 3 (may lose data or need a human decision): pass --confirm-risk3 $sid" 2
@@ -715,8 +813,9 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
     if [[ "$blind" == true ]]; then
       echo "would: pick one scenario from the pool (not shown), write chaos/runs/<run>/sealed.json, print only the run id and its SHA-256"
       echo "would: annotate namespace $TNS with $ANNOT=enabled, record the start time, inject, return"
+      echo "would: if the scenario asks for it, print a time before which you must not start investigating (the $(fmt_s "$BLIND_LIMIT_S") limit counts from that time)"
     else
-      echo "would: seal scenario $sid (risk $risk, method $m, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj"))"
+      echo "would: seal scenario $sid (risk $risk, method $m${also:+ + $also}, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj"))"
       echo "would: annotate namespace $TNS with $ANNOT=enabled, record the start time, then:"
       case "$m" in
       chaos-mesh) echo "  kubectl apply (objects in $CM, selector namespace $TNS):"; command ls "$SCEN_DIR/$sid/inject" | sed 's/^/    /' ;;
@@ -729,10 +828,17 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
           echo "         then wait ${FILE_SYNC_WAIT}s (CHAOS_FILE_SYNC_WAIT) for the volume sync, then:"
         fi
         echo "  PUT /fault/$(jq -r .switch <<<"$sw")?mode=on&ttl=$(jq -r .ttl <<<"$sw") on port $(jq -r .admin_port <<<"$sw") of every running pod of $(jq -r '.target.workload' <<<"$sj") (via kubectl port-forward)"
+        if [[ "$also" == chaos-mesh ]]; then
+          echo "  then: kubectl apply (objects in $CM, selector namespace $TNS; __POD_IPS placeholders are filled from the running pods at injection time):"
+          command ls "$SCEN_DIR/$sid/inject/mesh" | sed 's/^/    /'
+        fi
         ;;
       script) echo "  inject/run.sh inject" ;;
       esac
       echo "  requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
+      if [[ "$(jq -r '.soak // ""' <<<"$sj")" != "" ]]; then
+        echo "  soak: $(jq -r '.soak' <<<"$sj") (after injecting, print the time to start investigating: injection + soak; recorded as investigate_at in state.json)"
+      fi
     fi
     echo "on failure or Ctrl-C: undo (delete objects / remove the switch from the Secret if it was added, then switch off / run.sh recover / remove the annotation) and mark the run aborted"
     return 0
@@ -743,7 +849,7 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
   check_warmup "$skip_warmup"
   [[ -z "$(active_runs)" ]] || die "there is already an active run ($(active_runs | tr '\n' ' ')): recover it first" 1
   kubectl get ns "$TNS" >/dev/null 2>&1 || die "cannot reach the cluster or namespace $TNS does not exist" 2
-  if [[ "$m" == chaos-mesh ]]; then
+  if [[ "$m" == chaos-mesh || "$also" == chaos-mesh ]]; then
     kubectl -n "$CM" get deploy chaos-controller-manager >/dev/null 2>&1 || die "Chaos Mesh is not installed (make chaos-mesh)" 2
   fi
   check_steady
@@ -764,10 +870,10 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
   fi
   sealed_at="$(now)"
   jq -n --arg run "$run" --arg nonce "$nonce" --arg at "$sealed_at" --argjson blind "$blind" --arg pool "$pool" \
-    --arg sid "$sid" --argjson spec "$sj" --arg ns "$TNS" --argjson params "$params" \
+    --arg sid "$sid" --argjson spec "$sj" --arg ns "$TNS" --argjson params "$params" --arg also "$also" \
     '{run: $run, nonce: $nonce, sealed_at: $at, blind: $blind, pool: $pool, scenario: $sid, method: $spec.method, risk: $spec.risk,
       category: $spec.category, workload: $spec.target.workload, duration: $spec.duration, target_ns: $ns, params: $params,
-      scenario_spec: $spec}' >"$RUNDIR/sealed.json"
+      scenario_spec: $spec} + (if $also == "" then {} else {also: $also} end)' >"$RUNDIR/sealed.json"
   local sha
   sha="$(shasum -a 256 "$RUNDIR/sealed.json" | cut -d' ' -f1)"
   echo "$sha" >"$RUNDIR/sealed.sha256"
@@ -781,7 +887,7 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
     echo "report: $(jq -r '.report' <<<"$sj")"
   fi
   if [[ "$blind" == false ]]; then
-    echo "scenario $sid: method $m, risk $risk, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj")"
+    echo "scenario $sid: method $m${also:+ + $also}, risk $risk, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj")"
     echo "requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
   fi
 
@@ -800,6 +906,15 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
   INJECT_RUN=""
   trap - EXIT INT TERM
   echo "injected at $(state_get started_at). The fault ends by itself (duration/ttl); recover with: make chaos-recover"
+  # soak：涨得慢的场景，先放一段时间再排查。只说时刻，不说为什么（这一行本身说明抽到的是慢的那一类，和 report 一样是故意给的）。
+  local soak t
+  soak="$(jq -r '.soak // ""' <<<"$sj")"
+  if [[ -n "$soak" ]]; then
+    t=$(($(date +%s) + $(dur_s "$soak")))
+    state_set soak "$soak"
+    state_set investigate_at "$(at_epoch "$t")"
+    echo "do NOT start investigating before $(at_epoch "$t") (local $(local_hm "$t")): leave the cluster and the dashboards alone until then. The $(fmt_s "$BLIND_LIMIT_S") limit counts from that time."
+  fi
 }
 
 cmd_blind() {
@@ -971,7 +1086,7 @@ cmd_recover() {
   fi
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for the active run (${run:-the only active one}):"
-    echo "  - undo the injection (delete its objects / for a persisted switch: remove it from Secret $OV_SECRET first (delete the Secret when empty), then switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
+    echo "  - undo the injection (delete its objects (a fault switch with also: chaos-mesh: the Chaos Mesh objects first, then the switch) / for a persisted switch: remove it from Secret $OV_SECRET first (delete the Secret when empty), then switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
     echo "  - record the end time; wait ${RECOVER_SETTLE}s, then up to ${RECOVER_WAIT}s for chaos-steady.sh check to pass"
     echo "  - foreground: recon-check --metrics-only --from <start> --to <end> (retry while it says 'not covered yet', up to ${RECON_WAIT}s) -> chaos/runs/<run>/recon-metrics.txt, exit code into state recon_metrics_rc"
     echo "  - then recon-check --rows-only (row-level reconciliation) -> chaos/runs/<run>/recon.txt, exit code in recon-rows.rc:"
@@ -1264,6 +1379,8 @@ else:
 impact += ["", "- 注入的时刻：%s；恢复动作完成：%s；回到稳态：%s" % (started, ended, steady or "未记录")]
 if state.get("pods_same") == "no":
     impact += ["- 恢复时目标的副本和注入时不是同一批（有副本被换掉或者新增）：故障开关只对注入那一刻的副本生效，这次的故障中途可能变弱了"]
+if state.get("investigate_at"):
+    impact += ["- 注入后先放了 %s 才开始排查（场景的 `soak`）：约定的开始时刻 %s，30 分钟的时限从它算起" % (state.get("soak", ""), state["investigate_at"])]
 if state.get("warmup_skipped") == "yes":
     impact += ["- 注入时跳过了“压测先跑 30 分钟”的检查"]
 
@@ -1297,7 +1414,7 @@ with open(out_path, "w", encoding="utf-8") as f:
 PY
   state_set phase revealed
   state_set revealed_at "$(now)"
-  echo "run $run: scenario $sid, method $(sealed .method), risk $(sealed .risk), workload $(sealed .workload), namespace $(sealed .target_ns)"
+  echo "run $run: scenario $sid, method $(sealed .method)$(sealed '(.also // "") | if . == "" then "" else " + " + . end'), risk $(sealed .risk), workload $(sealed .workload), namespace $(sealed .target_ns)"
   echo "started $(state_get started_at), ended $(state_get ended_at)"
   echo "postmortem draft: $out"
   echo "--- truth:"
@@ -1307,7 +1424,7 @@ PY
 cmd_status() {
   local r n=0 d st why
   for r in $(active_runs); do
-    echo "active run $r (phase $(jq -r .phase "$RUNS_DIR/$r/state.json"))"
+    echo "active run $r (phase $(jq -r .phase "$RUNS_DIR/$r/state.json"))$(jq -r 'if .investigate_at then "; do not start investigating before " + .investigate_at else "" end' "$RUNS_DIR/$r/state.json")"
     n=$((n + 1))
   done
   [[ $n -gt 0 ]] || echo "no active run"

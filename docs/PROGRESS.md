@@ -4,7 +4,16 @@
 
 ## 当前状态
 
-- **现在（2026-11-27 约 09:50 UTC，这一条最新；新会话从这里开始）**：**主会话对上一条里没给过建议的两件补了建议，主人回“两个都按建议，登记吧”，登记了，没有动手。**
+- **现在（2026-11-27 约 11:00 UTC，这一条最新；新会话从这里开始）**：**主人说“提交推送后按进度继续”：登记的那一批提交并推送了（`6f9eead`），然后做了两项登记里不用上集群的部分。都没有连集群。之后主人回“提交并推送”和“（`s016` 上集群的做法）可以”：这一批提交并推送了（`git log` 看），下面写着“没有提交”的几处到这里作废。**
+  - **`soak` 写完了**（计划文件那一项勾了，细节在它下面）：`s009` 标了 `blind: yes`、`soak: 60m`、`report`。主会话直接写的，没有派 Sonnet（理由在计划文件）。
+  - **叠加场景的本机部分写完了**（计划文件那一项没有勾，下面有一段“本机的部分写了”）：脚本支持 `also: chaos-mesh` 和 `__POD_IPS:...__` 占位符（Sonnet 写，主会话读了 diff），场景 `s016` 写了、不进池。**上集群（e2e、带负载）还要主人对登记的做法说一句。**
+  - **第二档里标了 `blind: yes` 的是 5 个**（`s001`、`s009`、`s011`、`s012`、`s013`），不是之前记的 3 个（漏数了 `s001`）；第一档 7 个。**池里有 `s009` 之后第二档的盲测要 `CHAOS_STEADY_DURATION=4h`、20 个 SKU 每个 4 万**（`chaos/README.md`“怎么用”）。
+  - **改了没有提交的**（`git status`）：`scripts/cluster/chaos-run.sh`、`chaos/README.md`、`chaos/scenarios/s009/scenario.yaml`、新目录 `chaos/scenarios/s016/`、`NOTES.md`、设计 4b 第 4 节、计划文件、本文件，加上 `pkg/kafkax` 的三个测试文件（见下一行）。没有动非测试的 Go 代码，没有跑全量的 `make lint test`；`chaos-run.sh lint` 16 个场景过了。
+  - PR 22 在 `6f9eead` 上的 CI：**30 个 job 里 1 个失败**：`test (./pkg)` 的 `TestDelayConsumerConcurrentAfterDue`（`peak in-flight 1, want at least 2`）；这次提交只改了文档。原因是测试自己的毛病：记峰值用的是“读到比自己小再 `Store`”，两个 handler 同时在跑时后到的 1 会盖掉先到的 2（被测的代码确实并行了，同一个测试里前面等“两个在途”的那一步过了）。改成 CAS 的 `raisePeak`（`pkg/kafkax/helpers_test.go`，`delay_test.go` 和 `concurrent_test.go` 两处用），本机 `make test MODULES=$PWD/pkg` 只跑这几个用例 `-count=5` 过了，`make lint MODULES=$PWD/pkg` 0 个问题；**没有提交**，所以 PR 上那个红的还在，下次推送后再看。`pkg/worker/worker_test.go` 的 `TestNoConcurrentRounds` 有同类的写法（`peak.Store(max(peak.Load(), n))`），它丢更新只会让测试偏松、不会误报，没有改。耗时（`ci-watcher` 报的）：gateway 3 分 12 秒、order 4 分 35 秒、e2e 5 分 44 秒，持平。
+  - 集群的状态、SKU（下次从 13164 起）、没查的那 20 次 `STOCK_GATE_UNAVAILABLE`：照旧，这次没有碰。
+  - **下一步**：①主人说提交就提交这一批；②主人对叠加场景的做法说可以之后：`GO_TAGS=faults E2E_KEEP=1 make cluster-chaos` 起 e2e，在里面 `CHAOS_NS=oppenheimer-e2e` 注入 `s016`，看两步都生效（开关 `GET /fault`、`kubectl -n chaos-mesh get networkchaos`、inventory 到 Redis 的命令耗时多约 5 毫秒）、熔断器没开、恢复后都撤干净，再做“只有延迟”的对照；然后在长期运行的那一套上带稳态压测做一次；③B4 开始之前重试 Istio 的故障注入；④主人时间充足时做第一次盲测；⑤有空时查那 20 次。
+
+- **现在（2026-11-27 约 09:50 UTC，上一条）**：**主会话对上一条里没给过建议的两件补了建议，主人回“两个都按建议，登记吧”，登记了，没有动手。**
   - 计划文件“4b 实验清单”加了两项 checkbox：①盲测加“注入后先放一段时间再通知”（`soak` 字段；不动集群，可以直接写，Sonnet 写、主会话读 diff）；②把稳态下没有症状的那个场景和一种第一档的故障叠成一个新场景（要改注入脚本支持一个场景两种方式；**上集群之前还要主人对登记的做法说一句**，主人这次同意的是登记）。场景的内容和参数在 `chaos/scenarios/NOTES.md` 最后一节。
   - 上一条里“按不动的办”到这里作废；其余（集群的状态、SKU 从 13164 起、没查的那 20 次）照旧。
   - PR 22 在 `8ac98b5` 上的 CI 全过（`ci-watcher` 报的 33 个 job，主会话用 `gh pr checks 22` 核对了没有不通过的）。耗时是它报的：gateway 的测试 3 分 20 秒、order 4 分 23 秒，持平；e2e 5 分 42 秒，比平时的 4 到 5 分半略长，这三个提交没有改 Go 代码，没有查。
