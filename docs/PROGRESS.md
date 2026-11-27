@@ -4,7 +4,17 @@
 
 ## 当前状态
 
-- **现在（2026-11-27 约 02:20 UTC，这一条最新；新会话从这里开始）**：**主人对上一条的四件事回了“都按建议，提交并推送”，都做了。**
+- **现在（2026-11-27 约 04:30 UTC，这一条最新；新会话从这里开始）**：**主人回“两件都同意，提交并推送”，都做了：`s012` 换镜像带负载重试，触发了，进池了。**
+  - 提交 `cf5b130` 推送，PR 22 的 CI 38 个 job 全过（gateway 的测试 3 分 30 秒，前两次约 2 分半，这次没有动 gateway，当波动）。
+  - 五个服务 `cf5b130-p4`（`GO_TAGS=faults make deploy IMAGE_SERVICES="gateway order inventory payment orderindex"`），开关全关。
+  - 稳态压测 03:42:10 UTC 起（570 请求/秒，SKU 13061 到 13080 每个 2 万），04:13:10 注入 `s012`（运行 `r20261127-041310-f011`，不盲）：两个副本约 1 分钟、1 分半先后卡死，`MeshEndpointEjected`、`IngressGateway5xxHigh` 响了，goroutine 剖析和答案一致。04:18 恢复，181 秒回稳态，对账差异 0。结果在 `chaos/scenarios/s012/truth.md` 最后。`s012` 标了 `blind: yes`。**盲测的池：第一档 7 个，第二档 2 个（`s012`、`s013`）。**
+  - 压测 04:24 UTC 手工停了（结果见本条最后一行）。本机 compose 起着（`make up`）。SKU 用到 13080，下次从 13081 起。
+  - **盘**：`k3s-server` 根盘 16.1 GB 起压，`ServerDiskLow`（warning，15 GiB）压测期间在响；注入、恢复用了 `CHAOS_STEADY_SKIP=alerts`（手工确认过只有它）。第二次试跑之前仍然要先看盘。
+  - **没有提交**：`s012` 的 `scenario.yaml`、`truth.md`，`NOTES.md`，计划文件，本文件。
+  - **下一步**：①主人说提交就提交；②盘够了之后做第二次试跑（mutex、block 采样的阶梯对照，加 s010、s011、s009；主人的同意在，开始前说一声）；③B4 开始之前重试 Istio 的故障注入；④主人时间充足时做第一次盲测。
+  - 整段对账 [03:42:00, 04:25:30)：通过，三个常驻核对没有不一致，逐行对账差异 0。停压后 `MeshEndpointEjected` 消了，04:33 UTC 时只有 Watchdog 和 `ServerDiskLow`（根盘 14.6 GB）在响。
+
+- **现在（2026-11-27 约 02:20 UTC，上一条）**：**主人对上一条的四件事回了“都按建议，提交并推送”，都做了。**
   - ①失败的 Job `recon-hourly-29928607` 删了（主会话删的，主人同意后），`KubeJobFailed` 消了，现在只有 Watchdog 在响，`chaos-steady check` 不用再加 `CHAOS_STEADY_SKIP=alerts`。`kubectl` 要带 `KUBECONFIG=~/.kube/oppenheimer.yaml`。
   - ②盘：主会话在“等保留期”和“清 Loki、Tempo”之间没有给过建议，所以按不动数据的办：**不清，等保留期**。第二次试跑开始前先看 `k3s-server` 根盘剩多少，再跟主人说一声。
   - ③`s013` 进池了（`blind: yes`，第二档的池 1 个）。加了 `scenario.yaml` 的可选字段 `report`：注入之后终端打印一句“有人报了什么现象”，盲测也打印，给完全安静的场景一个入口（`chaos-run.sh` 的 `lint_scenario`、`do_inject`，`chaos/README.md` 的字段表）。`chaos-run.sh lint` 过了，`DRY_RUN=1` 走过；真注入时那一行没有对着集群看过。

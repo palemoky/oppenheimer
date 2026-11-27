@@ -14,4 +14,5 @@ recover:
   notes:
     - 关掉开关（到 ttl 也会自己关），脚本做。关掉之后新的请求不再碰那两把锁，商家订单列表马上恢复
     - 已经互相等住和排在后面的 goroutine 永远不会醒，关了开关也不会消失，滚动重启目标工作负载（脚本做）
-expected_alerts: [MeshEndpointEjected]
+blind: yes
+expected_alerts: [MeshEndpointEjected, IngressGateway5xxHigh]
