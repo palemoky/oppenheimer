@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s030
+method: script
+risk: 2
+category: redis
+target:
+  workload: order
+duration: 15m
+requires:
+  - 稳态的压测在跑
+  - 注入前看缓存 Redis 三个主节点的内存（maxmemory 128 MB，容器上限 192 MB）：哪个节点已经用过 80 MB 的话用 CX_BIG_FIELDS 把 key 改小
+recover:
+  restart: []
+  notes:
+    - 脚本让读它的循环停下并用 UNLINK 删掉这个 key（不用 DEL：DEL 在主线程里释放 30 MB，会卡一下）
+    - key 带过期时间（时长加 5 分钟），没有人恢复也会消失
+    - 被它挤出去的缓存自己重建
+report: 容量巡检时看到缓存 Redis 有一个主节点的内存和出流量比另外两个高出一截，没有用户报障
+expected_alerts: []

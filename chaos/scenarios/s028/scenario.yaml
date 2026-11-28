@@ -1,0 +1,18 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s028
+method: script
+risk: 2
+category: mysql
+target:
+  workload: inventory
+duration: 30m
+requires:
+  - 稳态的压测在跑
+  - 注入前看 mysql-main 现在的连接数（threads_connected）：默认把上限调到 30，现有连接比它多得多或者少得多时用 CX_MAX_CONNECTIONS 另给一个数（比现有连接数略小）
+recover:
+  restart: []
+  notes:
+    - 脚本把 max_connections 改回注入前读到的值；到 duration 后台任务也会自己改回去
+    - 是 SET GLOBAL 不是 PERSIST，mysql-main 的 Pod 重启也会回到配置文件里的值
+    - 各服务的连接池自己重新建连接，不用重启
+expected_alerts: [MySQLConnectionsHigh]

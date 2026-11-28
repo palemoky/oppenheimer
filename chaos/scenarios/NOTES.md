@@ -29,6 +29,17 @@
 | s019 | 1 | yes | chaos-mesh | inventory | inventory 的所有副本到调用方（gateway、order）的包慢 4 秒：查库存全挂，落库熔断器打开、下单被拒绝；验不雪崩 | e2e 和带负载（2026-11-27）。会响 critical |
 | s020 | 1 | yes | chaos-mesh | order | order 到订单库 1 主库的分区（挡 Service 的 ClusterIP，`__SVC_IP`）：一半用户受影响，库自己正常 | e2e 和带负载（2026-11-27）。会响 critical |
 | s021 | 1 | yes | chaos-mesh | order | order 到订单库 0 主库的分区：节点号的租约在这个库上，约 20 秒后所有用户的下单被拒绝 | e2e 和带负载（2026-11-27）。会响 critical |
+| s022 | 1 | no | script | inventory（mysql-main） | 一个没提交的事务锁住 `sku_stock` 正在卖的 20 行：应用库存增量的任务拿不到锁，`stock_pending` 积压；可能连带挡住预占的插入（要验） | 只在本机验了脚本 |
+| s023 | 1 | no | script | order（订单库 1 主库） | `orders_1` 的元数据锁被堵：长事务占共享锁，后面排一个排他的请求，这张表上所有语句挂住；连接数可能顶到上限 | 只在本机验了脚本 |
+| s024 | 1 | no | script | order（订单库 0 主库） | 三个并行的会话循环跑全表扫描加分组排序加深分页的统计语句，抢 CPU 和缓冲池 | 只在本机验了脚本；症状取决于表有多大 |
+| s025 | 1 | no | script | inventory（mysql-main） | 外来会话按相反的顺序加锁（先 `sku_stock` 后 `stock_pending`），和应用增量的事务死锁；带 `report` | 只在本机验了脚本；撞不撞得上、谁被回滚要验 |
+| s026 | 2 | no | script | order（订单库 1 从库） | 延迟复制 `SOURCE_DELAY = 180`：两个线程都在跑，从库稳定晚 3 分钟，CDC 和商家索引跟着晚 | 只在本机验了脚本 |
+| s027 | 2 | no | script | order（订单库 0 主库） | 单独的库里两轮大事务（200 万行插入、再全删）：提交时别的事务排队，从库和 CDC 出现尖峰 | 只在本机验了脚本（2 万行） |
+| s028 | 2 | no | script | inventory（mysql-main） | `SET GLOBAL max_connections = 30`：新连接被拒绝（1040），随连接到期逐渐显现 | 只在本机验了脚本；30 这个数要看了现有连接数再定 |
+| s029 | 1 | no | script | gateway（缓存 Redis 一个主节点） | 每秒一次空转的 Lua，占主线程约 250 毫秒：三分之一的缓存键和限流桶时有时无地慢 | 只在本机验了脚本 |
+| s030 | 2 | no | script | order（缓存 Redis） | 一个 30 MB 的 hash，每 2 秒被整个读一遍；带 `report` | 只在本机验了脚本（28.6 MB，一次读 48 毫秒） |
+| s031 | 2 | no | script | order（Kafka） | 给客户端号 `order` 设拉取配额（每 broker 每秒 2048 字节）：落库、支付结果、关单三个消费者拿不到消息 | 只在本机验了脚本；数值要试 |
+| s032 | 1 | no | script | orderindex（Kafka） | 外来的命令行消费者用同一个组名反复进组、退组：每 25 秒重平衡两次；带 `report` | 只在本机验了脚本 |
 
 每个场景自己的“没有核实的”写在它的 `truth.md` 的备注里。第二档新加的六个的 `risk` 是任务说明里统一写的 2：s010、s011 关了开关就恢复、不用重启，按 README 该是 1，带负载试过之后再定。
 
@@ -158,4 +169,39 @@
    夜里、探针那种一秒一个的流量下会出现。方向：对“分片的主库不通”的读返回带原因码的降级错误（`errx.Degraded`，不算 5xx），这和 2026-11-27 给 orderindex 下的“主库不通就该是 5xx”的结论在有多个分片的 order 上不一样。
 
 顺带：`ProbeFailing` 在 s021 的 9 分钟里没有响（s019 里响了），没有查两次差在哪。
+
+## B5 的第一、二档（2026-11-28 写了场景和脚本，没有连集群；上集群的步骤登记在计划文件“B5：中间件”，等主人同意）
+
+十一个场景 s022 到 s032，都是 `script` 方式（这种方式第一次有场景），都不带 `blind`。内容在上面的表和各自的 `truth.md`；答案都是按代码和配置推的。
+
+- **事实是三个 Haiku 的检索子 Agent 查的**（MySQL、Redis、Kafka 各一个，带行号），主会话只核对了和场景的机制直接有关的几处：inventory 应用增量的加锁顺序（`services/inventory/internal/store/pending.go`、`apply/applier.go`）、各服务的 Kafka 客户端号（都是服务名）、订单表的列。
+- **脚本的机制在本机 compose 上验过**（用一个把 `kubectl exec` 转成 `docker exec` 的桩）：十一个的注入、撤销、重复撤销；锁确实持有、元数据锁确实挡住别的会话、复制延迟设得上、配额查得到、外来的消费者进得了组。
+  没有验的是集群特有的：`kubectl exec` 起的后台任务在 exec 结束之后是不是还活着（本机的 `docker exec` 是活着的）、Strimzi 的 Kafka 镜像里有没有 `timeout`、Redis Cluster 下 `redis-cli -c` 那几步、按 Service 找主库 Pod。
+- **e2e 能隔离多少**：MySQL 的四个按库隔离（s022、s025 用 `e2e_inventory_db`，s023、s024 用 `e2e_order_db_N`），在 e2e 里试不影响长期运行的那一套的数据，但实例是同一个（s024 抢的是同一个实例的 CPU）。
+  **隔离不了的五个**：s026（从库的复制延迟是实例一级的）、s027（binlog、提交排队是实例一级的）、s028（`max_connections` 是实例一级的）、s029（缓存 Redis 的主线程是共用的）、s031（配额按客户端号，两套的 order 都叫 `order`）。
+  这五个在 e2e 里试等于在长期运行的那一套上试，所以放在“没有稳态压测、只有探针流量”的时候做，时间短。s030、s032 按键名和组名的前缀隔离。
+- **试的顺序（建议）**：先一个最简单的验机制（s029：不碰数据、一个循环），再 MySQL 的 s022、s025、s023、s024（e2e 里要有流量：`make cluster-chaos` 自带一轮发压），然后隔离不了的五个不带负载各试一次（只验注入、撤销、到时自己恢复），最后带稳态压测逐个做。
+  带负载的顺序从轻到重：s032、s030、s025、s029、s024、s026、s027、s028、s022、s031、s023。s022、s023、s031 的恢复加 `WAIT_RECON=1`。
+- **每个场景试的时候先看什么**写在各自 `truth.md` 的备注里。最没有把握的三件：s022 会不会连带挡住预占（是安静的场景还是拖住整个下单）；s023 挂住的语句被客户端放弃后库里的线程留不留（连接数会不会顶到 200）；s025 死锁撞不撞得上、谁被回滚。
+- **清单里这一批没有做成场景的，和理由**：
+  - 缺索引、统计信息过期：要改业务表的结构或者往里塞数据，按设计 4b 只在 e2e 里做，另行登记。s024 用“函数包裹列、深分页”覆盖了“索引失效”里不改表的那一部分。
+  - 主库宕机和切换、磁盘写满、Redis 主节点宕机、Redis 整体不可用、broker 宕机：第三档，逐个登记。
+  - 闸门 Redis 内存写满（验 `OrderGateMemoryFull`、`RedisGateMemoryHigh`）：闸门是两套共用的、没有地方先试，容器上限 1 GiB、`maxmemory` 768 MB，写满的过程里 AOF 重写可能把它顶到 OOM（那就成了主节点宕机）。按接近第三档的办，和第三档一起登记。
+  - 缓存 Redis 内存打满和淘汰：`allkeys-lru` 下淘汰的后果只是命中率下降，稳态下基本没有症状；s030 在分片接近上限时会顺带出现淘汰。
+  - 热 key：稳态压测的 SKU 本来就是 Zipf 分布，要“压垮一个分片”得有比发压机给得出的大得多的流量（而且同一个地址的请求先被按地址限流挡掉）。留到 B6 的秒杀叠加。`redis-cli --hotkeys` 要 LFU 的淘汰策略，缓存集群是 LRU：这一点可以在 s030 的复盘里顺带讲。
+  - 大量 key 同时过期：Redis 的主动过期每轮有时间上限，几十万个键同时过期只是几个周期的小抖动；应用一侧缓存的 TTL 带两成抖动。不值得单独做。
+  - 消费积压：s031 是。原来想过让 handler 变慢（要加故障开关），配额的做法不用改代码，而且“消费者没有任何错误”更难查。
+  - 消息乱序：从外面造不出来。重复投递由 s032 顺带覆盖（重平衡时在途的消息被重放）。
+- **读代码顺带核对的两件（设计 4b 第 1.3 节留给 B5 的）**：
+  - inventory 在 mysql-main 连不上时返回 `INTERNAL`（没有分类的错误走兜底），MySQL 上没有熔断器。这和 2026-11-27 对 orderindex 的结论一样：主库是它唯一的库，连不上就是整个不可用，被边车摘除是对的。“主库宕机”之前不用先修。
+  - 连接池的预算（数是检索子 Agent 报的）：mysql-main 合计约 260 到 300，上限 400；订单库每个实例 order 2×40 加 CDC、对账，上限 200。够。`deploy/cluster/monitoring/rules/middleware.yaml` 里 `MySQLConnectionsHigh` 的注释还按 order 4 个副本算，过期了，没有改。
+- **检索时看到的几处过期的注释，没有改**：`deploy/cluster/redis/redis-gate.yaml` 写幂等键 TTL 24 小时（代码是 1 小时）；`services/order/internal/service/protect.go` 的注释说 `order.submit` 集群上 8 个分区（`eventx` 是 4，集群上实际几个没有看）；`ConsumerNotConsuming` 的组名里没有 `recon.cdc-orders`、`order.order-close-delay`。
+- **脚本恢复不了时手工兜底**（`make chaos-recover` 失败、或者运行目录丢了）：
+  - MySQL 的会话类（s022、s023、s024、s025）：在对应实例的主库上看 `processlist` 里 root@127.0.0.1 的会话，`KILL`；Pod 里 `touch /tmp/.c-<运行号>.stop`。最坏等 `duration` 到（都不超过 15 分钟）。
+  - s026：从库上 `STOP REPLICA SQL_THREAD; CHANGE REPLICATION SOURCE TO SOURCE_DELAY = 0; START REPLICA SQL_THREAD;`
+  - s027：主库上 `DROP DATABASE IF EXISTS tmp_report;`
+  - s028：`SET GLOBAL max_connections = 400;`（mysql-main；订单库是 200）。连不上的话重启 mysql-main 的 Pod 也会回到配置文件的值，但那是一次主库重启，先问主人。
+  - s029、s030：Pod 里 `touch /tmp/.c-<运行号>.stop`；s030 再 `redis-cli -c unlink cache:export:orders:all`。
+  - s031：`kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type clients --entity-name order --delete-config consumer_byte_rate`
+  - s032：broker 的 Pod 里 `touch /tmp/.c-<运行号>.stop`，最多 15 秒后外来的成员退组。
 

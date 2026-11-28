@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s031
+method: script
+risk: 2
+category: kafka
+target:
+  workload: order
+duration: 15m
+requires:
+  - 稳态的压测在跑
+  - oppenheimer-e2e 不在（配额按客户端号，e2e 那一套的 order 会一起被限）
+  - 第一次做时恢复加 WAIT_RECON=1（落库慢 15 分钟，受理了没落库的订单要被回收）
+recover:
+  restart: []
+  notes:
+    - 脚本删掉这条配额并查一次确认没有了；到 duration 后台任务也会自己删
+    - 配额存在 Kafka 的元数据里，broker 重启也还在，不恢复就一直限着
+    - 积压的落库、支付结果、关单自己追上
+expected_alerts: [OrderBackpressureRejecting, OrderQueueNearWaitLimit]

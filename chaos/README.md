@@ -37,7 +37,7 @@ chaos/
 | `id` | 是 | 编号，必须和目录名一致 |
 | `method` | 是 | 注入方式：`chaos-mesh`、`fault-switch`、`istio`、`script` |
 | `risk` | 是 | 风险档 1、2、3（见下） |
-| `category` | 是 | 类别，给 `--pool` 抽签时筛选用：`pod`、`network`、`app`、`stress`、`time`、`dns`、`io`、`data`、`mesh`…（自由的词，保持小写） |
+| `category` | 是 | 类别，给 `--pool` 抽签时筛选用：`pod`、`network`、`app`、`stress`、`time`、`dns`、`io`、`data`、`mesh`、`mysql`、`redis`、`kafka`…（自由的词，保持小写） |
 | `target.workload` | 是 | 目标工作负载的名字（对应标签 `app.kubernetes.io/name`），**不写命名空间**：命名空间由脚本的环境变量 `CHAOS_NS` 定 |
 | `duration` | 是 | 预定时长，如 `5m`、`30m`、`1h`。Chaos Mesh 清单里的 `duration` 不能比它长；故障开关的 ttl 不能比它长 |
 | `requires` | 是 | 前置条件，给人看的清单（可以是 `[]`）。脚本不检查它们，`inject` 时打印出来 |
@@ -76,6 +76,15 @@ chaos/
   按 Pod 地址过滤匹配不上。headless 的 Service 没有这个地址（注入失败并撤销），用 `__POD_IPS`。这两个占位符在 `method: chaos-mesh` 的清单里同样可以用。
 - **`istio`**：一个或几个 `*.yaml`（VirtualService 等），`metadata.namespace: __TARGET_NS__`，名字和标签的规则同 `chaos-mesh`。脚本 `kubectl apply`，恢复时按标签删。
 - **`script`**：`run.sh`，接收一个参数 `inject` 或 `recover`，环境变量 `TARGET_NS`、`RUN_ID`、`RUN_DIR`、`KUBECONFIG`。恢复要能重复执行。
+  动中间件（MySQL、Redis、Kafka）的场景都是这一种。共用的函数在 `scripts/cluster/chaos-lib.sh`（`run.sh` 开头 source 它），约定：
+  - 故障要自己撑到 `duration`、到时自己结束：注入成功后脚本就退出了，所以持续的动作（占着一个会话、循环执行命令）放在中间件的 Pod 里做后台任务（`cx_bg`），不挂在本机的 `kubectl exec` 上；
+    任务带截止时刻，每一轮看一眼停止文件。Pod 里的文件叫 `/tmp/.c-<运行号>.*`，恢复时删掉。
+  - 恢复不靠杀进程（MySQL 的镜像里没有 `ps`、`pkill`）：循环类的建停止文件（`cx_stop`），占着 MySQL 会话的在库里 `KILL` 记下的连接号（`cx_mysql_kill`）。
+  - 改了会留下来的设置（复制延迟、`SET GLOBAL`、Kafka 的配额）的场景是第二档，并且另起一个到时自己改回去的后台任务：脚本的人不在了故障也会消失。
+  - 注入用的是哪个 Pod 记在运行目录的 `script-target`，恢复时用同一个。
+  - 中间件是 `oppenheimer` 和 `oppenheimer-e2e` 共用的，靠名字隔离：库名按 `TARGET_NS` 加 `e2e_` 前缀（`CX_DBP`），Redis 的键、Kafka 的 topic 和组名的前缀从目标工作负载的环境变量里读（`cx_app_env`）。
+    隔离不了的（实例一级的设置、按客户端号的配额）在场景的 `requires` 里写明。
+  - 起后台任务之后用 `cx_bg_check` 看一眼它的输出：任务是脱离的，不看的话注入“成功”而什么都没有发生。
 
 ## 三档风险
 

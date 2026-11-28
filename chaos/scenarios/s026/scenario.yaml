@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s026
+method: script
+risk: 2
+category: mysql
+target:
+  workload: order
+duration: 20m
+requires:
+  - 稳态的压测在跑
+  - 订单库 1 的从库复制正常（两个线程都在跑、延迟是 0）
+  - 避开整点前后（每小时的对账会把索引落后报成差异）
+recover:
+  restart: []
+  notes:
+    - 脚本在订单库 1 的从库上把复制延迟改回 0（要停、起一次 SQL 线程）；到 duration 后台任务也会自己改回去
+    - 这个设置重启也还在，不恢复就一直晚 3 分钟
+    - 改回去之后从库要把攒下的 3 分钟应用完，CDC 和商家索引跟着追上，要一两分钟
+expected_alerts: [MySQLReplicaLagHigh, CDCLagging, DerivedDataLagging]

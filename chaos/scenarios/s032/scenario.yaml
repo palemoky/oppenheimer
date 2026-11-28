@@ -1,0 +1,17 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s032
+method: script
+risk: 1
+category: kafka
+target:
+  workload: orderindex
+duration: 15m
+requires:
+  - 稳态的压测在跑（cdc.order.orders 上要有流量）
+recover:
+  restart: []
+  notes:
+    - 脚本让循环停下，等组里那个外来的成员退出（最多 15 秒）；到 duration 它自己结束
+    - 它不提交位点，分区还回去之后 orderindex 从原来的位点接着消费，没有要补的数据
+report: 看日志时注意到 orderindex 每隔十几秒打一次分区被收回又重新分配，以前没有这么频繁，没有用户报障
+expected_alerts: []

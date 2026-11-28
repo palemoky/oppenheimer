@@ -1,0 +1,17 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s025
+method: script
+risk: 1
+category: mysql
+target:
+  workload: inventory
+duration: 15m
+requires:
+  - 稳态的压测在跑（要有下单，inventory 的应用任务才有事务可以撞）
+recover:
+  restart: []
+  notes:
+    - 脚本让循环停下；到 duration 它自己结束
+    - 全是加锁的读，没有要清的数据
+report: 例行巡检时看到 mysql-main 的 InnoDB 死锁计数在涨，平时是不动的，没有用户报障
+expected_alerts: []
