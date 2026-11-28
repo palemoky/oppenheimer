@@ -81,6 +81,17 @@ func TestStockLastKnownVariant(t *testing.T) {
 		t.Errorf("switch off: %d concurrent lookups took %s, want under %s", n, d, n*rtt/2)
 	}
 
+	// 先量一次不排队的 Reserve 要多久。它写的是真的 MySQL，慢的机器上（CI，带 -race）一次就有几十毫秒：
+	// 下面比的是“开着开关时多出来多少”，不是绝对值。原来直接拿 Reserve 的耗时和查询总耗时的一半比，
+	// CI 上一次 79 毫秒的 Reserve 就把它判成了“跟着排队”（2026-11-27）。
+	start := time.Now()
+	if _, err := svc.Reserve(t.Context(), &inventoryv1.ReserveRequest{
+		OrderId: 2, Items: []*inventoryv1.ReserveItem{{SkuId: 2, Quantity: 1}},
+	}); err != nil {
+		t.Fatalf("baseline Reserve: %v", err)
+	}
+	base := time.Since(start)
+
 	if err := fault.Set("f03", true, time.Minute); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +101,7 @@ func TestStockLastKnownVariant(t *testing.T) {
 	done := make(chan time.Duration, 1)
 	go func() { done <- burst() }()
 	time.Sleep(rtt) // 让查询先排起队
-	start := time.Now()
+	start = time.Now()
 	if _, err := svc.Reserve(t.Context(), &inventoryv1.ReserveRequest{
 		OrderId: 1, Items: []*inventoryv1.ReserveItem{{SkuId: 1, Quantity: 1}},
 	}); err != nil {
@@ -101,7 +112,8 @@ func TestStockLastKnownVariant(t *testing.T) {
 	if want := n * rtt * 9 / 10; d < want {
 		t.Errorf("switch on: %d concurrent lookups took %s, want at least %s (one after another)", n, d, want)
 	}
-	if reserve > d/2 {
-		t.Errorf("switch on: Reserve took %s while lookups took %s, want Reserve not to wait for them", reserve, d)
+	// 跟着排队的话 Reserve 要等到查询都过完，比平时至少多出 (n-1)*rtt；不排队时多出来的只是 MySQL 自己的波动。
+	if reserve-base > d/2 {
+		t.Errorf("switch on: Reserve took %s (%s without the switch) while lookups took %s, want Reserve not to wait for them", reserve, base, d)
 	}
 }
