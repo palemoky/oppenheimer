@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s010
+method: fault-switch
+risk: 2
+category: app
+target:
+  workload: inventory
+duration: 30m
+requires:
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
+  - 稳态的压测在跑（查库存的读流量是触发条件，只有探针时几乎看不出来）
+  - inventory 开着查询缓存（STOCK_CACHE_TTL 不为 0，集群的默认就是 1 秒）
+  - 要看 mutex 和 block 剖析时，inventory 的 values 里先设 DEBUG_MUTEX_FRACTION 和 DEBUG_BLOCK_RATE（改了会重启 Pod，在注入之前做）
+recover:
+  restart: []
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做
+    - 关了之后排着的查询几毫秒内放完，不用重启；进程里留下的那张小表关着时不被读，不影响
+expected_alerts: []

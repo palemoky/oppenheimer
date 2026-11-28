@@ -1,0 +1,17 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s006
+method: chaos-mesh
+risk: 1
+blind: yes
+category: stress
+target:
+  workload: gateway
+duration: 5m
+requires:
+  - 目标工作负载至少 2 个副本
+  - 稳态的压测在跑
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉，被杀的容器 kubelet 自己拉起来
+expected_alerts: [ContainerOOMKilled]

@@ -1,0 +1,16 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s029
+method: script
+risk: 1
+category: redis
+target:
+  workload: gateway
+duration: 10m
+requires:
+  - 稳态的压测在跑
+recover:
+  restart: []
+  notes:
+    - 脚本让循环停下；到 duration 它自己结束
+    - 不读不写任何键，没有要清的数据
+expected_alerts: [RateLimitFallingBack]

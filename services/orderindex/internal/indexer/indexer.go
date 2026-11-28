@@ -77,6 +77,13 @@ const (
 // decodeChange 解码一条变更。archived 表示这是一条归档产生的 DELETE（只对 kindNoMerchant、kindRow 有意义）。
 // 返回的错误包着 ErrSchema 时说明消息与表结构不符，重试不会成功。
 func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived bool, err error) {
+	return decodeChangeWith(ch, decodeRow)
+}
+
+// decodeChangeWith 是 decodeChange，行映像交给 rowOf 解码（它和 decodeRow 的约定相同）。
+func decodeChangeWith(ch *cdcv1.RowChange, rowOf func(map[string]*cdcv1.Value) (store.Row, bool, error)) (
+	row store.Row, kind changeKind, archived bool, err error,
+) {
 	if ch.GetTable() != SourceTable {
 		return store.Row{}, kindIgnored, false, nil
 	}
@@ -94,7 +101,7 @@ func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived
 	default:
 		return store.Row{}, kindIgnored, false, nil
 	}
-	row, ok, err := decodeRow(img)
+	row, ok, err := rowOf(img)
 	if err != nil {
 		return store.Row{}, 0, false, fmt.Errorf("indexer: %s op=%s slot=%d gtid=%q %s image: %w",
 			ch.GetSource(), ch.GetOp(), ch.GetSlot(), ch.GetGtid(), imgName, err)
@@ -103,6 +110,26 @@ func decodeChange(ch *cdcv1.RowChange) (row store.Row, kind changeKind, archived
 		return store.Row{}, kindNoMerchant, archived, nil
 	}
 	return row, kindRow, archived, nil
+}
+
+// decodedChange 是一条变更解码后的结果，含义见 decodeChange。
+type decodedChange struct {
+	row      store.Row
+	kind     changeKind
+	archived bool
+}
+
+// decodeInOrder 按顺序逐条解码一批变更，返回和 changes 一一对应的结果；遇到第一条出错的就返回它的错误。
+func decodeInOrder(changes []*cdcv1.RowChange) ([]decodedChange, error) {
+	out := make([]decodedChange, len(changes))
+	for i, ch := range changes {
+		row, kind, archived, err := decodeChange(ch)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = decodedChange{row: row, kind: kind, archived: archived}
+	}
+	return out, nil
 }
 
 // rowKey 是索引行的主键。
@@ -125,15 +152,16 @@ func (ix *Indexer) Apply(ctx context.Context, changes []*cdcv1.RowChange) (Count
 		commits []int64 // 要写进索引的消息的 commit_micros，写完后算延迟
 		indexed int64   // 有商家、要写进索引的消息数（合并前）
 	)
-	for _, ch := range changes {
-		row, kind, archived, err := decodeChange(ch)
-		if err != nil {
-			return Counts{}, err
-		}
-		if archived {
+	decoded, err := decodeChanges(changes)
+	if err != nil {
+		return Counts{}, err
+	}
+	for i, d := range decoded {
+		ch, row := changes[i], d.row
+		if d.archived {
 			c.Archived++
 		}
-		switch kind {
+		switch d.kind {
 		case kindIgnored:
 			c.Ignored++
 			continue
@@ -197,18 +225,13 @@ func (ix *Indexer) Apply(ctx context.Context, changes []*cdcv1.RowChange) (Count
 // Store 的语句模板在构造时渲染好、只读，连接由 database/sql 的池分配；Stats 有锁。
 func (ix *Indexer) Handler(timeout time.Duration) kafkax.BatchHandler {
 	return func(ctx context.Context, msgs []kafkax.Message) error {
-		changes := make([]*cdcv1.RowChange, len(msgs))
-		for i, msg := range msgs {
-			ch := &cdcv1.RowChange{}
-			if err := proto.Unmarshal(msg.Value, ch); err != nil {
-				return kafkax.Permanent(fmt.Errorf("indexer: unmarshal row change (partition %d offset %d): %w",
-					msg.Partition, msg.Offset, err))
-			}
-			changes[i] = ch
+		changes, err := unmarshalChanges(msgs)
+		if err != nil {
+			return err
 		}
 		wctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		_, err := ix.Apply(wctx, changes)
+		_, err = ix.Apply(wctx, changes)
 		// 多条的批出错时 kafkax 会记一条告警再逐条回退，这里只在逐条（会原地重试、停住分区）时报错，
 		// 避免同一个问题在日志里报两遍，也只有这时才知道是哪一条。
 		if errors.Is(err, ErrSchema) && len(msgs) == 1 {
@@ -218,6 +241,29 @@ func (ix *Indexer) Handler(timeout time.Duration) kafkax.BatchHandler {
 		}
 		return err
 	}
+}
+
+// unmarshalInOrder 按顺序逐条反序列化一批消息，返回和 msgs 一一对应的变更；遇到第一条反序列化不了的就返回它的错误。
+func unmarshalInOrder(msgs []kafkax.Message) ([]*cdcv1.RowChange, error) {
+	changes := make([]*cdcv1.RowChange, len(msgs))
+	for i, msg := range msgs {
+		ch, err := unmarshalOne(msg)
+		if err != nil {
+			return nil, err
+		}
+		changes[i] = ch
+	}
+	return changes, nil
+}
+
+// unmarshalOne 反序列化一条消息。消息不是 RowChange 时返回 kafkax.Permanent，理由见 Handler。
+func unmarshalOne(msg kafkax.Message) (*cdcv1.RowChange, error) {
+	ch := &cdcv1.RowChange{}
+	if err := proto.Unmarshal(msg.Value, ch); err != nil {
+		return nil, kafkax.Permanent(fmt.Errorf("indexer: unmarshal row change (partition %d offset %d): %w",
+			msg.Partition, msg.Offset, err))
+	}
+	return ch, nil
 }
 
 // Stats 累计一段时间内的应用结果和端到端延迟。并发安全。

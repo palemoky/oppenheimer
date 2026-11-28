@@ -1,0 +1,21 @@
+# 对象建在 chaos-mesh，选择器指向目标命名空间；__TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。
+# order 的所有 Pod 到订单库 1 主库的包全部丢掉（网络分区，不是拒绝连接：连接挂住，等时限）。
+# 目标写 Service 的 ClusterIP：mysql-order-1-primary 是有 ClusterIP 的 Service，包离开 Pod 时目的地址还是它（同 s008 的写法）。
+# 只挡 order：cdc、对账、exporter、复制都不受影响，所以库本身的监控一切正常。到从库的 Service 不挡。
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: c-__RUN_ID__
+  namespace: chaos-mesh
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces: [__TARGET_NS__]
+    labelSelectors:
+      app.kubernetes.io/name: order
+  direction: to
+  externalTargets: [__SVC_IP:mysql:mysql-order-1-primary__]
+  duration: 10m

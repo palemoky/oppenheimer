@@ -2,21 +2,38 @@
 # 故障实验的注入脚本（make chaos-blind / chaos-inject / chaos-recover / chaos-reveal）。
 # 设计：docs/design/4a-chaos-prep.md 的 3.5；场景的格式：chaos/README.md。
 #
-#   chaos-run.sh blind   --pool <风险档>[:<类别>,...] [--dry-run]
+#   chaos-run.sh blind   --pool <风险档>[:<类别>,...] [--skip-warmup] [--dry-run]
 #       盲测：在池里随机抽一个场景（最近做过的降权），密封，注入。终端只打印运行号和 sealed.json 的 SHA-256。
 #       池的写法：1、1,2、1:pod,network（第三档拒绝盲测）。
-#   chaos-run.sh inject  --scenario <编号> [--confirm-risk3 <编号>] [--dry-run]
+#   chaos-run.sh inject  --scenario <编号> [--confirm-risk3 <编号>] [--skip-warmup] [--dry-run]
 #       不盲：指定场景，其余同上，会打印场景的内容。第三档要 --confirm-risk3 带上同一个编号。
-#   chaos-run.sh recover [--run <运行号>] [--no-recon] [--dry-run]
-#       恢复当前的运行（执行恢复步骤、去注解、记结束时刻），等回到稳态，等静止并调 recon-check，结果写进运行目录。
+#   blind 和 inject 注入之前（不是 dry-run）还有两道闸：
+#       压测要先跑够 CHAOS_STEADY_MIN_AGE 秒（默认 1800，读 chaos-steady.sh start 写的 tmp/chaos-steady/started_at）：
+#         不够、或者没有这个文件就拒绝。--skip-warmup 跳过（终端打一行说明，state.json 记 warmup_skipped: yes）；
+#         不跳过时 state.json 记 steady_age_s（注入时压测跑了多少秒）。
+#       前面的运行有没看过的对账不通过就拒绝：逐行对账的结果是 failed 或 error、或者前台指标那一段的退出码不是 0，
+#         而 chaos/runs/<运行号>/recon-rows.acked 不存在。看过之后：chaos-run.sh recon-ack --run <运行号>。
+#         逐行对账还在跑（running）不拦。老的运行目录（只有 state 里的 recon_rc）不拦。
+#   chaos-run.sh recover [--run <运行号>] [--no-recon] [--wait-recon] [--dry-run]
+#       恢复当前的运行（执行恢复步骤、去注解、记结束时刻），等回到稳态，然后对账，分两段：
+#         前台：recon-check --metrics-only（三个常驻核对的指标越过结束时刻、没有不一致；退出码 3 每 60 秒重试，最多 CHAOS_RECON_WAIT 秒），
+#               输出 recon-metrics.txt，退出码记进 state 的 recon_metrics_rc。通过就算这次实验的数据检查过了，可以开始下一个。
+#         后台：recon-check --rows-only（逐行对账，有负载时要几分钟）。nohup 脱离当前的 shell 和 make，
+#               输出 recon.txt，退出码写进 recon-rows.rc，pid 在 recon-rows.pid（后台进程不写 state.json）。
+#               结果看 chaos-run.sh status；不通过时拒绝下一次注入，直到 recon-ack。
+#         指标那一段不是 0、或者场景是第三档、或者给了 --wait-recon 时，逐行对账不放后台，在前台等它跑完。
+#         --no-recon 两段都不做。
 #   chaos-run.sh recover --all [--restart] [--dry-run]
 #       总闸：删掉所有 Chaos Mesh 的实验对象，关掉所有故障开关（五个服务的每个副本），删掉脚本建的 VirtualService 等，
 #       去掉注解，把还没恢复的运行标成已恢复。--restart 另外滚动重启那五个服务（泄漏类的后果要靠它清）。
 #       之后列出目标命名空间里还留着的 Pod*Chaos 对象和事件（盲测的运行没有 reveal 时只写文件，不打印）。
 #   chaos-run.sh reveal  [--run <运行号>] [--sha <终端上记下的摘要>] [--force]
 #       打开答案，按 docs/postmortems/TEMPLATE.md 生成复盘草稿。运行还没恢复时拒绝，--force 例外。
+#       后台的逐行对账还在跑就等它（每 15 秒看一次，最多 CHAOS_RECON_WAIT 秒）；--force 不等，草稿里写“逐行对账还没有跑完”。
+#   chaos-run.sh recon-ack --run <运行号>
+#       确认看过这个运行的对账结果（写 recon-rows.acked）。逐行对账还在跑时不能确认。
 #   chaos-run.sh lint [<编号>...]     检查场景目录的格式（不连集群）。不给编号就查全部。
-#   chaos-run.sh status               当前有没有进行中的运行（只打印运行号和阶段）。
+#   chaos-run.sh status               当前有没有进行中的运行，和逐行对账还在跑、或者不通过没确认的运行（只打印运行号和状态）。
 #
 # 环境变量：
 #   CHAOS_NS             目标命名空间，默认 oppenheimer，只允许 oppenheimer 和 oppenheimer-e2e
@@ -25,7 +42,10 @@
 #   CHAOS_RECOVER_WAIT   恢复后等回到稳态最多多少秒，默认 900
 #   CHAOS_RECOVER_SETTLE 恢复动作做完之后先等多少秒再开始查稳态，默认 180（稳态看的是 3 到 5 分钟窗口的比例，
 #                        刚撤掉注入、刚滚动重启时它还没有反应，马上查会 1 秒就过）
-#   CHAOS_RECON_WAIT     等 recon-check 核对到结束时刻最多多少秒，默认 1800
+#   CHAOS_RECON_WAIT     等 recon-check 核对到结束时刻最多多少秒，默认 1800（reveal 等后台的逐行对账也是这个上限）
+#   CHAOS_STEADY_MIN_AGE 注入时压测至少已经跑了多少秒，默认 1800
+#   CHAOS_FILE_SYNC_WAIT fault-switch 场景写了 persist: yes 时，写完 Secret 之后等多少秒再打开开关，默认 120
+#                        （kubelet 把 Secret 的变更同步进已经在跑的 Pod 的卷要一个同步周期；容器原地重启读的是卷里的文件）
 #
 # 一次只有一个进行中的运行。注入的步骤：检查稳态 -> 选 -> 密封 -> 加注解 -> 记开始时刻 -> 按方式注入。
 # 注入中途失败或者被 Ctrl-C：走一遍恢复（trap），运行标成 aborted。注入成功之后脚本就退出了，
@@ -50,6 +70,14 @@ RUNS_DIR="$ROOT/chaos/runs"
 RECOVER_WAIT="${CHAOS_RECOVER_WAIT:-900}"
 RECOVER_SETTLE="${CHAOS_RECOVER_SETTLE:-180}"
 RECON_WAIT="${CHAOS_RECON_WAIT:-1800}"
+STEADY_MIN_AGE="${CHAOS_STEADY_MIN_AGE:-1800}"
+# 盲测的排查时限（设计 4b 第 2 节第 7 项）。脚本不掐表，只用它检查 soak 加时限装不装得进故障的时长。
+BLIND_LIMIT_S=1800
+FILE_SYNC_WAIT="${CHAOS_FILE_SYNC_WAIT:-120}"
+# 进程重启后还在的那一路：开关名写进目标命名空间的这个 Secret 的这个键（chart 把它挂到 Pod 里，见 deploy/charts/service）。
+OV_SECRET=startup-overrides
+OV_KEY=enabled
+STEADY_STARTED_AT="$ROOT/tmp/chaos-steady/started_at"
 # 能注入的命名空间只有这两个。别的（尤其下面四个）永远拒绝。
 ALLOWED_NS="oppenheimer oppenheimer-e2e"
 # 带故障开关的五个服务和它们的管理端口（总闸逐个关）。
@@ -171,7 +199,40 @@ bad_lines() {
     [[ "$l" =~ $3 ]] || printf '%s\n' "$l"
   done < <(grep -E "^[[:space:]]*$2" "$1" || true)
 }
+# __POD_IPS:<命名空间>:<标签选择器>__（render 和 lint 共用）。选择器里不能有下划线：结尾的 __ 靠它分界。
+POD_IPS_RE='__POD_IPS:[a-z0-9-]+:[A-Za-z0-9./=,!-]+__'
+# __SVC_IP:<命名空间>:<Service 名>__：一个 Service 的 ClusterIP。
+SVC_IP_RE='__SVC_IP:[a-z0-9-]+:[a-z0-9-]+__'
 lint_err() { echo "  $1: $2"; LINT_N=$((LINT_N + 1)); }
+
+# 一个 Chaos Mesh / Istio 清单的检查。method: chaos-mesh 的 inject/*.yaml 和 also: chaos-mesh 的 inject/mesh/*.yaml 共用这一份，
+# 两处的要求必须一样（恢复都靠运行标签，选择器都只能指向 CHAOS_NS）。
+lint_manifest() { # 编号 文件 chaos-mesh|istio
+  local id="$1" y="$2" m="$3"
+  grep -q '__RUN_ID__' "$y" || lint_err "$id" "$(basename "$y"): no __RUN_ID__ (name and label must carry the run id)"
+  grep -q "$RUN_LABEL: __RUN_ID__" "$y" || lint_err "$id" "$(basename "$y"): missing label $RUN_LABEL: __RUN_ID__"
+  # 选择器里的命名空间只能是占位符。
+  if [[ -n "$(bad_lines "$y" 'namespaces:' 'namespaces:[[:space:]]*\[__TARGET_NS__\][[:space:]]*$')" ]]; then
+    lint_err "$id" "$(basename "$y"): selector namespaces must be exactly [__TARGET_NS__]"
+  fi
+  if [[ "$m" == chaos-mesh ]]; then
+    grep -qE '^[[:space:]]*namespaces:' "$y" || lint_err "$id" "$(basename "$y"): no 'namespaces: [__TARGET_NS__]' selector"
+    if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*chaos-mesh[[:space:]]*$')" ]]; then
+      lint_err "$id" "$(basename "$y"): metadata.namespace must be chaos-mesh"
+    fi
+  else
+    if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*__TARGET_NS__[[:space:]]*$')" ]]; then
+      lint_err "$id" "$(basename "$y"): metadata.namespace must be __TARGET_NS__"
+    fi
+  fi
+  # 运行时才知道的 Pod 地址：写了 __POD_IPS 就必须是完整的 __POD_IPS:<命名空间>:<选择器>__，不然 render 不会替换，字面值会被 apply。
+  if sed -E "s|$POD_IPS_RE||g" "$y" | grep -q '__POD_IPS'; then
+    lint_err "$id" "$(basename "$y"): malformed __POD_IPS placeholder (want __POD_IPS:<namespace>:<label selector>__, no underscore in the selector)"
+  fi
+  if sed -E "s|$SVC_IP_RE||g" "$y" | grep -q '__SVC_IP'; then
+    lint_err "$id" "$(basename "$y"): malformed __SVC_IP placeholder (want __SVC_IP:<namespace>:<service name>__)"
+  fi
+}
 
 lint_scenario() {
   local id="$1" dir="$SCEN_DIR/$1" sj m r f
@@ -193,6 +254,24 @@ lint_scenario() {
   for f in requires recover.notes recover.restart expected_alerts; do
     [[ "$(jq -r "(.${f} | type) // \"null\"" <<<"$sj")" == array ]] || lint_err "$id" "$f must be a list (use [] for none)"
   done
+  # blind：试过（注入生效、到时恢复、答案对得上）才写 yes；不写就是 no，盲测不抽它。
+  case "$(jq -r '.blind // "no"' <<<"$sj")" in yes | no) ;; *) lint_err "$id" "blind must be yes or no" ;; esac
+  # report：盲测注入之后打印给主人的一句“有人报了什么”，给完全安静的场景（没有告警、用户无感）一个入口。可以不写。
+  case "$(jq -r '(.report | type) // "null"' <<<"$sj")" in
+  null) ;;
+  string) [[ -n "$(jq -r '.report' <<<"$sj")" ]] || lint_err "$id" "report must not be empty (drop the field instead)" ;;
+  *) lint_err "$id" "report must be one line of text" ;;
+  esac
+  # soak：注入之后先放这么久再开始排查，给涨得慢、时限里看不出来的场景用。可以不写。
+  # 开始排查之后故障还要在：soak 加排查的时限不能超过 duration（故障开关的 ttl 在下面查）。
+  if [[ "$(jq -r 'has("soak")' <<<"$sj")" == true ]]; then
+    if [[ ! "$(jq -r '.soak | tostring' <<<"$sj")" =~ ^[1-9][0-9]*[smh]$ ]]; then
+      lint_err "$id" "soak must look like 30m, 1h and not be zero (drop the field instead)"
+    elif [[ "$(jq -r '.duration // ""' <<<"$sj")" =~ ^[0-9]+[smh]$ ]]; then
+      [[ $(($(dur_s "$(jq -r .soak <<<"$sj")") + BLIND_LIMIT_S)) -le "$(dur_s "$(jq -r .duration <<<"$sj")")" ]] ||
+        lint_err "$id" "soak plus the $(fmt_s "$BLIND_LIMIT_S") to investigate is longer than duration"
+    fi
+  fi
   # truth.md 的三栏
   if [[ -f "$dir/truth.md" ]]; then
     for f in "标准根因" "定位必需的关键证据" "容易误判成的原因"; do
@@ -209,22 +288,7 @@ lint_scenario() {
     for y in "$dir"/inject/*.yaml; do
       [[ -f "$y" ]] || continue
       n=$((n + 1))
-      grep -q '__RUN_ID__' "$y" || lint_err "$id" "$(basename "$y"): no __RUN_ID__ (name and label must carry the run id)"
-      grep -q "$RUN_LABEL: __RUN_ID__" "$y" || lint_err "$id" "$(basename "$y"): missing label $RUN_LABEL: __RUN_ID__"
-      # 选择器里的命名空间只能是占位符。
-      if [[ -n "$(bad_lines "$y" 'namespaces:' 'namespaces:[[:space:]]*\[__TARGET_NS__\][[:space:]]*$')" ]]; then
-        lint_err "$id" "$(basename "$y"): selector namespaces must be exactly [__TARGET_NS__]"
-      fi
-      if [[ "$m" == chaos-mesh ]]; then
-        grep -qE '^[[:space:]]*namespaces:' "$y" || lint_err "$id" "$(basename "$y"): no 'namespaces: [__TARGET_NS__]' selector"
-        if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*chaos-mesh[[:space:]]*$')" ]]; then
-          lint_err "$id" "$(basename "$y"): metadata.namespace must be chaos-mesh"
-        fi
-      else
-        if [[ -n "$(bad_lines "$y" 'namespace:' 'namespace:[[:space:]]*__TARGET_NS__[[:space:]]*$')" ]]; then
-          lint_err "$id" "$(basename "$y"): metadata.namespace must be __TARGET_NS__"
-        fi
-      fi
+      lint_manifest "$id" "$y" "$m"
     done
     [[ $n -gt 0 ]] || lint_err "$id" "inject/ has no *.yaml"
     ;;
@@ -237,8 +301,21 @@ lint_scenario() {
         [[ "$(jq -r '.switch // ""' <<<"$sw")" =~ ^f[0-9]{2}$ ]] || lint_err "$id" "switch.yaml: switch must be f01..f99"
         [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] || lint_err "$id" "switch.yaml: ttl is required (like 30m)"
         [[ "$(jq -r '.admin_port // ""' <<<"$sw")" =~ ^[0-9]+$ ]] || lint_err "$id" "switch.yaml: admin_port is required"
+        # persist：写了 yes 才走“进程重启后还在”那一路；不写是 no。yes 时恢复要靠滚动重启换掉 Pod，所以 recover.restart 要含目标。
+        case "$(jq -r '.persist // "no"' <<<"$sw")" in
+        yes)
+          [[ "$(jq -r --arg w "$(jq -r '.target.workload // ""' <<<"$sj")" '(.recover.restart // []) | index($w) // "" | tostring' <<<"$sj")" =~ ^[0-9]+$ ]] ||
+            lint_err "$id" "switch.yaml: persist: yes needs the target workload in recover.restart"
+          ;;
+        no) ;;
+        *) lint_err "$id" "switch.yaml: persist must be yes or no" ;;
+        esac
         if [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] && [[ "$(jq -r '.duration // ""' <<<"$sj")" =~ ^[0-9]+[smh]$ ]]; then
           [[ "$(dur_s "$(jq -r .ttl <<<"$sw")")" -le "$(dur_s "$(jq -r .duration <<<"$sj")")" ]] || lint_err "$id" "switch.yaml: ttl is longer than duration"
+        fi
+        if [[ "$(jq -r '.ttl // ""' <<<"$sw")" =~ ^[0-9]+[smh]$ ]] && [[ "$(jq -r '.soak // "" | tostring' <<<"$sj")" =~ ^[1-9][0-9]*[smh]$ ]]; then
+          [[ $(($(dur_s "$(jq -r .soak <<<"$sj")") + BLIND_LIMIT_S)) -le "$(dur_s "$(jq -r .ttl <<<"$sw")")" ]] ||
+            lint_err "$id" "switch.yaml: ttl is shorter than soak plus the $(fmt_s "$BLIND_LIMIT_S") to investigate"
         fi
       fi
     else
@@ -249,7 +326,33 @@ lint_scenario() {
     [[ -x "$dir/inject/run.sh" ]] || lint_err "$id" "inject/run.sh is missing or not executable"
     ;;
   esac
+  # also：故障开关之外再叠一个 Chaos Mesh 对象（清单在 inject/mesh/）。没写 also 时不该有 inject/mesh/：防止写了清单却忘了字段。
+  if [[ "$(jq -r 'has("also")' <<<"$sj")" == true ]]; then
+    local a
+    a="$(jq -r '.also | tostring' <<<"$sj")"
+    if [[ "$a" != chaos-mesh ]]; then
+      lint_err "$id" "also must be chaos-mesh, got '$a'"
+    elif [[ "$m" != fault-switch ]]; then
+      lint_err "$id" "also is only allowed with method: fault-switch"
+    else
+      local n=0 y
+      for y in "$dir"/inject/mesh/*.yaml; do
+        [[ -f "$y" ]] || continue
+        n=$((n + 1))
+        lint_manifest "$id" "$y" chaos-mesh
+      done
+      [[ $n -gt 0 ]] || lint_err "$id" "also: chaos-mesh needs at least one inject/mesh/*.yaml"
+    fi
+  elif [[ -e "$dir/inject/mesh" ]]; then
+    lint_err "$id" "inject/mesh/ exists but scenario.yaml has no 'also: chaos-mesh'"
+  fi
 }
+
+at_epoch() { # 秒 [date 的格式] -> UTC 的时刻（BSD date 用 -r，GNU 用 -d @）
+  local f="${2:-+%Y-%m-%dT%H:%M:%SZ}"
+  date -u -r "$1" "$f" 2>/dev/null || date -u -d "@$1" "$f"
+}
+local_hm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M; } # 秒 -> 本地的时:分
 
 dur_s() { # 30s 5m 1h -> 秒
   local n="${1%[smh]}"
@@ -316,6 +419,38 @@ the_active_run() { # 只有一个进行中的运行时打印它
   printf '%s' "$n"
 }
 
+# ---- 逐行对账的结果（后台跑的，只写 recon-rows.* 这几个文件，不碰 state.json）----
+# 运行目录 -> none | running | passed | failed | error
+recon_rows_state() {
+  local d="$1" rc pid
+  if [[ -f "$d/recon-rows.rc" ]]; then
+    rc="$(tr -d ' \n' <"$d/recon-rows.rc")"
+    case "$rc" in 0) echo passed ;; 1) echo failed ;; *) echo error ;; esac
+    return 0
+  fi
+  [[ -f "$d/recon-rows.pid" ]] || { echo none; return 0; }
+  pid="$(tr -d ' \n' <"$d/recon-rows.pid")"
+  # 进程在，并且确实是本脚本（pid 被别的进程复用时不能当成还在跑）。
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in *chaos-run.sh*) echo running; return 0 ;; esac
+  fi
+  # 进程不在了：它可能刚好在上面两步之间写完了结果，再看一次。
+  if [[ -f "$d/recon-rows.rc" ]]; then recon_rows_state "$d"; return 0; fi
+  echo error
+}
+# 运行目录 -> 前台指标那一段的退出码（没有就空）。
+recon_metrics_rc_of() { [[ -f "$1/state.json" ]] && jq -r '.recon_metrics_rc // empty' "$1/state.json" || true; }
+# 运行目录 -> 有没有没确认的不通过：打印原因（一行），没有就不打印。
+recon_unacked() {
+  local d="$1" st mrc out=""
+  [[ -f "$d/recon-rows.acked" ]] && return 0
+  st="$(recon_rows_state "$d")"
+  mrc="$(recon_metrics_rc_of "$d")"
+  case "$st" in failed | error) out="row-level reconciliation $st" ;; esac
+  if [[ -n "$mrc" && "$mrc" != 0 ]]; then out="${out:+$out; }recon metrics rc $mrc"; fi
+  [[ -z "$out" ]] || printf '%s' "$out"
+}
+
 # ---- 目标 Pod 和故障开关 ----
 PF_PID=""
 pods_of() { # 工作负载
@@ -361,8 +496,82 @@ fault_each() {
 }
 
 # ---- 渲染清单 ----
+# 清单里的 __POD_IPS:<命名空间>:<标签选择器>__ 在这里换成运行中的 Pod 的 IP 列表（"10.42.1.5", "10.42.2.7"）：
+# 故障要指向另一个服务的 Pod（没有稳定的 Service 地址可用）时用。取不到一个地址就失败，不能带着空列表去 apply。
+# 地址只进私有日志。没有这个占位符的清单不多调 kubectl。
 render() { # 文件
-  sed -e "s|__TARGET_NS__|$TNS|g" -e "s|__RUN_ID__|$RUN|g" "$1"
+  local out phs ph spec ns sel ips lst
+  out="$(sed -e "s|__TARGET_NS__|$TNS|g" -e "s|__RUN_ID__|$RUN|g" "$1")" || return 1
+  phs="$(grep -oE "$POD_IPS_RE" <<<"$out" | sort -u || true)"
+  for ph in $phs; do
+    spec="${ph#__POD_IPS:}"
+    spec="${spec%__}"
+    ns="${spec%%:*}"
+    sel="${spec#*:}"
+    ips="$(kubectl -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running \
+      -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' 2>>"$PRIVLOG")" || { plog "render: listing pods ($ns, $sel) failed"; return 1; }
+    lst="$(grep -v '^$' <<<"$ips" | sed -e 's/.*/"&"/' | paste -sd, - | sed 's/,/, /g' || true)"
+    [[ -n "$lst" ]] || { plog "render: no running pod with $sel in $ns"; return 1; }
+    plog "render: $ph -> $lst"
+    out="${out//"$ph"/$lst}"
+  done
+  # __SVC_IP:<命名空间>:<Service 名>__：换成这个 Service 的 ClusterIP（"10.43.7.21"）。目标是一个有 ClusterIP 的 Service 时用：
+  # 包离开 Pod 时目的地址还是 ClusterIP（DNAT 在节点上做），按 Pod 地址过滤匹配不上。headless 的（None）取不到地址，要用 __POD_IPS。
+  phs="$(grep -oE "$SVC_IP_RE" <<<"$out" | sort -u || true)"
+  for ph in $phs; do
+    spec="${ph#__SVC_IP:}"
+    spec="${spec%__}"
+    ns="${spec%%:*}"
+    sel="${spec#*:}"
+    ips="$(kubectl -n "$ns" get service "$sel" -o 'jsonpath={.spec.clusterIP}' 2>>"$PRIVLOG")" || { plog "render: reading service $ns/$sel failed"; return 1; }
+    [[ "$ips" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { plog "render: service $ns/$sel has no cluster ip (got '$ips'; headless?)"; return 1; }
+    plog "render: $ph -> $ips"
+    out="${out//"$ph"/\"$ips\"}"
+  done
+  printf '%s\n' "$out"
+}
+# 渲染再 apply。先渲染进变量：渲染失败时 kubectl 一个字节也收不到，不依赖管道的退出码。
+apply_rendered() { # 文件
+  local out
+  out="$(render "$1")" || return 1
+  printf '%s\n' "$out" | run_q kubectl apply -f -
+}
+
+# ---- “进程重启后还在”：开关名写进 Secret（细节只进私有日志） ----
+# 读 Secret 里现有的名字（逗号、空格、换行分隔），每行一个。Secret 不存在不算错。
+ov_read() {
+  local raw
+  raw="$(kubectl -n "$TNS" get secret "$OV_SECRET" --ignore-not-found -o "jsonpath={.data.$OV_KEY}" 2>>"$PRIVLOG")" || return 1
+  [[ -n "$raw" ]] || return 0
+  printf '%s' "$raw" | base64 -d | tr ',' ' ' | tr -s '[:space:]' '\n' | grep -v '^$' || true
+}
+# 把清单（标准输入，每行一个名字）写回：空就删掉 Secret，不空就建或更新。
+ov_write() {
+  local f rc=0
+  f="$(mktemp "${TMPDIR:-/tmp}/chaos-ov.XXXXXX")"
+  { grep -v '^$' || true; } | sort -u >"$f"
+  if [[ -s "$f" ]]; then
+    kubectl -n "$TNS" create secret generic "$OV_SECRET" "--from-file=$OV_KEY=$f" --dry-run=client -o yaml 2>>"$PRIVLOG" |
+      kubectl -n "$TNS" apply -f - >>"$PRIVLOG" 2>&1 || rc=1
+  else
+    kubectl -n "$TNS" delete secret "$OV_SECRET" --ignore-not-found >>"$PRIVLOG" 2>&1 || rc=1
+  fi
+  rm -f "$f"
+  return "$rc"
+}
+ov_add() { # 开关名
+  local cur
+  cur="$(ov_read)" || return 1
+  { printf '%s\n' "$cur"; printf '%s\n' "$1"; } | grep -v '^$' | ov_write
+}
+ov_remove() { # 开关名
+  local cur
+  cur="$(ov_read)" || return 1
+  { printf '%s\n' "$cur" | grep -vx -- "$1" || true; } | ov_write
+}
+# 目标的 Deployment 有没有挂这个卷（平时的镜像和部署没有：写了 Secret 也不会有任何效果，不如拒绝）。
+ov_mounted() { # 工作负载
+  [[ " $(kubectl -n "$TNS" get deploy "$1" -o 'jsonpath={.spec.template.spec.volumes[*].name}' 2>>"$PRIVLOG") " == *" $OV_SECRET "* ]]
 }
 
 # ---- 注入和撤销，按方式 ----
@@ -375,7 +584,7 @@ inject_by_method() {
   chaos-mesh | istio)
     for f in "$SCEN_DIR/$sid"/inject/*.yaml; do
       plog "apply $(basename "$f")"
-      render "$f" | run_q kubectl apply -f - || return 1
+      apply_rendered "$f" || return 1
     done
     ;;
   fault-switch)
@@ -384,8 +593,23 @@ inject_by_method() {
     ttl="$(sealed .params.ttl)"
     port="$(sealed .params.admin_port)"
     [[ -n "$ttl" ]] || { plog "fault switch without ttl refused"; return 1; }
+    if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
+      # 顺序：写 Secret -> 等 kubelet 同步 -> 再经端口打开。容器原地重启读的是卷里的文件，没同步完就崩会读到旧的。
+      ov_mounted "$w" || { plog "persist: $w does not mount $OV_SECRET (deployed without the faults build?)"; return 1; }
+      plog "persist: add $sw to $OV_SECRET/$OV_KEY"
+      ov_add "$sw" || { plog "persist: writing the secret failed"; return 1; }
+      plog "persist: waiting ${FILE_SYNC_WAIT}s for the volume sync"
+      sleep "$FILE_SYNC_WAIT"
+    fi
     plog "switch $sw on, ttl $ttl, port $port, workload $w"
     fault_each "$w" "$port" "/fault/$sw?mode=on&ttl=$ttl" || return 1
+    # also: chaos-mesh：开关开了之后再叠 Chaos Mesh 对象。顺序反过来的话，开关失败时已经有一半故障在跑。
+    if [[ "$(sealed '.also // ""')" == chaos-mesh ]]; then
+      for f in "$SCEN_DIR/$sid"/inject/mesh/*.yaml; do
+        plog "apply mesh/$(basename "$f")"
+        apply_rendered "$f" || return 1
+      done
+    fi
     ;;
   script)
     plog "script $sid inject"
@@ -394,17 +618,24 @@ inject_by_method() {
   esac
 }
 
+# 按运行标签删这个运行的 Chaos Mesh 对象。有失败返回 1，但每一类都会试。
+undo_mesh_objects() {
+  local k bad=0
+  for k in $(chaos_kinds); do
+    run_q kubectl -n "$CM" delete "$k" -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
+  done
+  return "$bad"
+}
+
 # 撤销一个运行：尽力而为，每一步失败只记录，不中止。返回 0 全部成功，1 有失败。
 undo_run() {
-  local m sid w bad=0 k
+  local m sid w bad=0
   m="$(sealed .method)"
   sid="$(sealed .scenario)"
   w="$(sealed .workload)"
   case "$m" in
   chaos-mesh)
-    for k in $(chaos_kinds); do
-      run_q kubectl -n "$CM" delete "$k" -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
-    done
+    undo_mesh_objects || bad=1
     ;;
   istio)
     run_q kubectl -n "$TNS" delete virtualservice,destinationrule,envoyfilter -l "$RUN_LABEL=$RUN" --ignore-not-found --timeout=90s || bad=1
@@ -413,7 +644,21 @@ undo_run() {
     local sw port
     sw="$(sealed .params.switch)"
     port="$(sealed .params.admin_port)"
-    fault_each "$w" "$port" "/fault/$sw?mode=off" || { bad=1; plog "switch off failed on some replica; the ttl will turn it off"; }
+    # also: chaos-mesh：先删 Chaos Mesh 对象再关开关（和注入相反）：开关是根因，对象是叠上去的；老的运行目录没有 also 字段，走不到这里。
+    if [[ "$(sealed '.also // ""')" == chaos-mesh ]]; then
+      undo_mesh_objects || { bad=1; plog "deleting the chaos mesh objects failed; their own duration ends them"; }
+    fi
+    # persist：先从 Secret 里去掉，再关开关，最后（下面）滚动重启：新 Pod 启动时读的是当时的 Secret。
+    # 经端口关开关在 Pod 崩溃循环里会失败，只记一笔，不中止。
+    if [[ "$(sealed '.params.persist // "no"')" == yes ]]; then
+      plog "persist: remove $sw from $OV_SECRET/$OV_KEY"
+      ov_remove "$sw" || { bad=1; plog "persist: removing from the secret failed"; }
+      # 这一类的 Pod 多半在崩溃循环里，端口转发连不上是常态；下面的滚动重启会把它们换掉（lint 保证 recover.restart 含目标），
+      # 新 Pod 读到的 Secret 里已经没有这个开关。所以关不掉不算恢复失败（第一次在 e2e 里试时因此误报过，2026-11-26）。
+      fault_each "$w" "$port" "/fault/$sw?mode=off" || plog "switch off failed on some replica (expected while crash-looping); the rollout replaces them"
+    else
+      fault_each "$w" "$port" "/fault/$sw?mode=off" || { bad=1; plog "switch off failed on some replica; the ttl will turn it off"; }
+    fi
     ;;
   script)
     TARGET_NS="$TNS" RUN_ID="$RUN" RUN_DIR="$RUNDIR" run_q "$SCEN_DIR/$sid/inject/run.sh" recover || bad=1
@@ -437,6 +682,53 @@ check_steady() {
   if ! "$HERE/chaos-steady.sh" check; then
     die "not in steady state: refusing to inject (fix it, or start the load with: make chaos-steady ARGS=start)" 1
   fi
+}
+
+# ---- 注入之前的两道闸：压测跑够了没有；前面的运行有没有没看过的对账不通过 ----
+STEADY_AGE="" WARMUP_SKIPPED=0
+fmt_s() { printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); }
+check_warmup() { # skip
+  local skip="$1" t age
+  STEADY_AGE=""
+  if [[ -f "$STEADY_STARTED_AT" ]]; then
+    t="$(tr -d ' \n' <"$STEADY_STARTED_AT")"
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+      age=$(($(date +%s) - t))
+      [[ $age -ge 0 ]] || age=0
+      STEADY_AGE="$age"
+    fi
+  fi
+  if [[ "$skip" == 1 ]]; then
+    WARMUP_SKIPPED=1
+    echo "warmup check skipped (--skip-warmup): steady load has run ${STEADY_AGE:-an unknown number of }s (the default minimum is ${STEADY_MIN_AGE}s)"
+    return 0
+  fi
+  if [[ -z "$STEADY_AGE" ]]; then
+    die "no start time for the steady load ($STEADY_STARTED_AT): the load is not running, or it was started by an older version of chaos-steady.sh. Start it with make chaos-steady ARGS=start and wait ${STEADY_MIN_AGE}s; to inject anyway: --skip-warmup (SKIP_WARMUP=1)" 1
+  fi
+  if [[ $STEADY_AGE -lt $STEADY_MIN_AGE ]]; then
+    die "the steady load has run only $(fmt_s "$STEADY_AGE") of the required $(fmt_s "$STEADY_MIN_AGE") (CHAOS_STEADY_MIN_AGE): wait $(fmt_s $((STEADY_MIN_AGE - STEADY_AGE))) more, or inject anyway with --skip-warmup (SKIP_WARMUP=1)" 1
+  fi
+  echo "steady load has run $(fmt_s "$STEADY_AGE") (minimum $(fmt_s "$STEADY_MIN_AGE"))"
+}
+
+# 扫所有运行目录：不通过又没确认的拦；逐行对账还在跑的只提示。
+check_recon_gate() {
+  local d r why st bad="" running=""
+  for d in "$RUNS_DIR"/r*/; do
+    [[ -f "${d}state.json" ]] || continue
+    r="$(basename "$d")"
+    why="$(recon_unacked "${d%/}")"
+    if [[ -n "$why" ]]; then
+      bad="$bad
+  run $r: $why (results: chaos/runs/$r/recon-metrics.txt, chaos/runs/$r/recon.txt); after reading them: make chaos-recon-ack RUN=$r"
+      continue
+    fi
+    st="$(recon_rows_state "${d%/}")"
+    [[ "$st" != running ]] || running="$running $r"
+  done
+  [[ -z "$bad" ]] || die "refusing to inject: an earlier run's reconciliation did not pass and nobody has looked at it yet:$bad" 1
+  [[ -z "$running" ]] || echo "note: row-level reconciliation still running in the background for:$running (make chaos-status); if it fails the next injection is refused"
 }
 
 # ---- 抽签 ----
@@ -473,13 +765,15 @@ pick_from_pool() { # 打印选中的编号
     risk="$(jq -r '.risk' <<<"$sj")"
     categ="$(jq -r '.category' <<<"$sj")"
     [[ ",$POOL_RISKS," == *",$risk,"* ]] || continue
+    # 没有试过的场景不进池（设计 4b 第 2 节第 2 项）。
+    [[ "$(jq -r '.blind // "no"' <<<"$sj")" == yes ]] || continue
     if [[ -n "$POOL_CATS" ]]; then [[ ",$POOL_CATS," == *",$categ,"* ]] || continue; fi
     w=4
     [[ " $recent" == *" $id "* ]] && w=1
     cands="$cands$id $w
 "
   done
-  [[ -n "$cands" ]] || die "no scenario in the pool" 2
+  [[ -n "$cands" ]] || die "no scenario in the pool (only scenarios marked 'blind: yes' are drawn)" 2
   printf '%s' "$cands" | python3 -I -c '
 import secrets, sys
 items = [l.split() for l in sys.stdin if l.strip()]
@@ -510,12 +804,13 @@ on_exit() {
   exit "$rc"
 }
 
-do_inject() { # blind(true|false) 编号 池描述 dry confirm
-  local blind="$1" sid="$2" pool="$3" dry="$4" confirm="$5"
-  local sj risk m
+do_inject() { # blind(true|false) 编号 池描述 dry confirm skip_warmup
+  local blind="$1" sid="$2" pool="$3" dry="$4" confirm="$5" skip_warmup="${6:-0}"
+  local sj risk m also
   sj="$(scenario_json "$sid")"
   risk="$(jq -r '.risk' <<<"$sj")"
   m="$(jq -r '.method' <<<"$sj")"
+  also="$(jq -r '.also // ""' <<<"$sj")"
   if [[ "$risk" == 3 ]]; then
     [[ "$blind" == false ]] || die "risk 3 scenarios are never run blind" 2
     [[ "$confirm" == "$sid" ]] || die "scenario $sid is risk 3 (may lose data or need a human decision): pass --confirm-risk3 $sid" 2
@@ -526,12 +821,19 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm
 
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster, no run directory is created"
+    if [[ "$skip_warmup" == 1 ]]; then
+      echo "would: skip the warmup check (--skip-warmup), record warmup_skipped in state.json"
+    else
+      echo "would: refuse unless the steady load has run at least ${STEADY_MIN_AGE}s (start time in $STEADY_STARTED_AT; --skip-warmup to skip), record steady_age_s in state.json"
+    fi
+    echo "would: refuse while an earlier run's row-level reconciliation (or its recon metrics) failed and is not acknowledged (make chaos-recon-ack RUN=<run>); a running one only prints a note"
     echo "would: check the steady state (chaos-steady.sh check), namespace $TNS"
     if [[ "$blind" == true ]]; then
       echo "would: pick one scenario from the pool (not shown), write chaos/runs/<run>/sealed.json, print only the run id and its SHA-256"
       echo "would: annotate namespace $TNS with $ANNOT=enabled, record the start time, inject, return"
+      echo "would: if the scenario asks for it, print a time before which you must not start investigating (the $(fmt_s "$BLIND_LIMIT_S") limit counts from that time)"
     else
-      echo "would: seal scenario $sid (risk $risk, method $m, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj"))"
+      echo "would: seal scenario $sid (risk $risk, method $m${also:+ + $also}, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj"))"
       echo "would: annotate namespace $TNS with $ANNOT=enabled, record the start time, then:"
       case "$m" in
       chaos-mesh) echo "  kubectl apply (objects in $CM, selector namespace $TNS):"; command ls "$SCEN_DIR/$sid/inject" | sed 's/^/    /' ;;
@@ -539,20 +841,33 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm
       fault-switch)
         local sw
         sw="$(yaml_to_json "$SCEN_DIR/$sid/inject/switch.yaml")"
+        if [[ "$(jq -r '.persist // "no"' <<<"$sw")" == yes ]]; then
+          echo "  first: add the switch to Secret $OV_SECRET (key $OV_KEY) in $TNS (merge, no duplicates), check the Deployment mounts it,"
+          echo "         then wait ${FILE_SYNC_WAIT}s (CHAOS_FILE_SYNC_WAIT) for the volume sync, then:"
+        fi
         echo "  PUT /fault/$(jq -r .switch <<<"$sw")?mode=on&ttl=$(jq -r .ttl <<<"$sw") on port $(jq -r .admin_port <<<"$sw") of every running pod of $(jq -r '.target.workload' <<<"$sj") (via kubectl port-forward)"
+        if [[ "$also" == chaos-mesh ]]; then
+          echo "  then: kubectl apply (objects in $CM, selector namespace $TNS; __POD_IPS placeholders are filled from the running pods at injection time):"
+          command ls "$SCEN_DIR/$sid/inject/mesh" | sed 's/^/    /'
+        fi
         ;;
       script) echo "  inject/run.sh inject" ;;
       esac
       echo "  requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
+      if [[ "$(jq -r '.soak // ""' <<<"$sj")" != "" ]]; then
+        echo "  soak: $(jq -r '.soak' <<<"$sj") (after injecting, print the time to start investigating: injection + soak; recorded as investigate_at in state.json)"
+      fi
     fi
-    echo "on failure or Ctrl-C: undo (delete objects / switch off / run.sh recover / remove the annotation) and mark the run aborted"
+    echo "on failure or Ctrl-C: undo (delete objects / remove the switch from the Secret if it was added, then switch off / run.sh recover / remove the annotation) and mark the run aborted"
     return 0
   fi
 
   need_cluster
+  check_recon_gate
+  check_warmup "$skip_warmup"
   [[ -z "$(active_runs)" ]] || die "there is already an active run ($(active_runs | tr '\n' ' ')): recover it first" 1
   kubectl get ns "$TNS" >/dev/null 2>&1 || die "cannot reach the cluster or namespace $TNS does not exist" 2
-  if [[ "$m" == chaos-mesh ]]; then
+  if [[ "$m" == chaos-mesh || "$also" == chaos-mesh ]]; then
     kubectl -n "$CM" get deploy chaos-controller-manager >/dev/null 2>&1 || die "Chaos Mesh is not installed (make chaos-mesh)" 2
   fi
   check_steady
@@ -573,18 +888,24 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm
   fi
   sealed_at="$(now)"
   jq -n --arg run "$run" --arg nonce "$nonce" --arg at "$sealed_at" --argjson blind "$blind" --arg pool "$pool" \
-    --arg sid "$sid" --argjson spec "$sj" --arg ns "$TNS" --argjson params "$params" \
+    --arg sid "$sid" --argjson spec "$sj" --arg ns "$TNS" --argjson params "$params" --arg also "$also" \
     '{run: $run, nonce: $nonce, sealed_at: $at, blind: $blind, pool: $pool, scenario: $sid, method: $spec.method, risk: $spec.risk,
       category: $spec.category, workload: $spec.target.workload, duration: $spec.duration, target_ns: $ns, params: $params,
-      scenario_spec: $spec}' >"$RUNDIR/sealed.json"
+      scenario_spec: $spec} + (if $also == "" then {} else {also: $also} end)' >"$RUNDIR/sealed.json"
   local sha
   sha="$(shasum -a 256 "$RUNDIR/sealed.json" | cut -d' ' -f1)"
   echo "$sha" >"$RUNDIR/sealed.sha256"
   jq -n --arg at "$sealed_at" '{phase: "injecting", sealed_at: $at}' >"$RUNDIR/state.json"
+  if [[ -n "$STEADY_AGE" ]]; then state_set steady_age_s "$STEADY_AGE"; fi
+  if [[ "$WARMUP_SKIPPED" == 1 ]]; then state_set warmup_skipped yes; fi
   echo "run:    $run"
   echo "sha256: $sha   (of chaos/runs/$run/sealed.json; write it down)"
+  # 有 report 的场景，盲测时这一句是主人唯一的入口（它是场景作者写给诊断的人看的，不含根因）。
+  if [[ "$(jq -r '.report // ""' <<<"$sj")" != "" ]]; then
+    echo "report: $(jq -r '.report' <<<"$sj")"
+  fi
   if [[ "$blind" == false ]]; then
-    echo "scenario $sid: method $m, risk $risk, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj")"
+    echo "scenario $sid: method $m${also:+ + $also}, risk $risk, workload $(jq -r '.target.workload' <<<"$sj"), duration $(jq -r '.duration' <<<"$sj")"
     echo "requires: $(jq -r '.requires | join("; ")' <<<"$sj")"
   fi
 
@@ -596,43 +917,56 @@ do_inject() { # blind(true|false) 编号 池描述 dry confirm
   plog "scenario $sid method $m"
   run_q kubectl annotate namespace "$TNS" "$ANNOT=enabled" --overwrite || die "cannot annotate namespace $TNS" 1
   state_set started_at "$(now)"
+  # 注入那一刻目标的副本：故障开关只对它们生效，恢复时比一下还是不是同一批（只进运行目录，不打印）。
+  state_set pods_at_inject "$(pods_of "$(jq -r '.target.workload' <<<"$sj")" | tr '\n' ' ' | sed 's/ *$//')"
   inject_by_method || die "injection failed (details in the run directory); undoing" 1
   state_set phase injected
   INJECT_RUN=""
   trap - EXIT INT TERM
   echo "injected at $(state_get started_at). The fault ends by itself (duration/ttl); recover with: make chaos-recover"
+  # soak：涨得慢的场景，先放一段时间再排查。只说时刻，不说为什么（这一行本身说明抽到的是慢的那一类，和 report 一样是故意给的）。
+  local soak t
+  soak="$(jq -r '.soak // ""' <<<"$sj")"
+  if [[ -n "$soak" ]]; then
+    t=$(($(date +%s) + $(dur_s "$soak")))
+    state_set soak "$soak"
+    state_set investigate_at "$(at_epoch "$t")"
+    echo "do NOT start investigating before $(at_epoch "$t") (local $(local_hm "$t")): leave the cluster and the dashboards alone until then. The $(fmt_s "$BLIND_LIMIT_S") limit counts from that time."
+  fi
 }
 
 cmd_blind() {
-  local pool="" dry=0
+  local pool="" dry=0 skip=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --pool) pool="${2:-}"; shift 2 ;;
+    --skip-warmup) skip=1; shift ;;
     --dry-run) dry=1; shift ;;
     *) die "unknown argument $1" 2 ;;
     esac
   done
-  [[ -n "$pool" ]] || die "usage: chaos-run.sh blind --pool <risk>[:<category>,...]  (e.g. 1 or 1,2:pod,network)" 2
+  [[ -n "$pool" ]] || die "usage: chaos-run.sh blind --pool <risk>[:<category>,...] [--skip-warmup]  (e.g. 1 or 1,2:pod,network)" 2
   check_ns
   parse_pool "$pool"
   local sid
   sid="$(pick_from_pool)"
-  do_inject true "$sid" "$pool" "$dry" ""
+  do_inject true "$sid" "$pool" "$dry" "" "$skip"
 }
 
 cmd_inject() {
-  local sid="" dry=0 confirm=""
+  local sid="" dry=0 confirm="" skip=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --scenario) sid="${2:-}"; shift 2 ;;
     --confirm-risk3) confirm="${2:-}"; shift 2 ;;
+    --skip-warmup) skip=1; shift ;;
     --dry-run) dry=1; shift ;;
     *) die "unknown argument $1" 2 ;;
     esac
   done
-  [[ -n "$sid" ]] || die "usage: chaos-run.sh inject --scenario <id> [--confirm-risk3 <id>] [--dry-run]" 2
+  [[ -n "$sid" ]] || die "usage: chaos-run.sh inject --scenario <id> [--confirm-risk3 <id>] [--skip-warmup] [--dry-run]" 2
   check_ns
-  do_inject false "$sid" "" "$dry" "$confirm"
+  do_inject false "$sid" "" "$dry" "$confirm" "$skip"
 }
 
 # ---- recover ----
@@ -655,6 +989,7 @@ recover_all() { # restart dry
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for namespaces: $ALLOWED_NS"
     echo "  - delete every Chaos Mesh experiment object in all namespaces (every kind of the chaos-mesh.org CRDs except Pod*Chaos)"
+    echo "  - delete Secret $OV_SECRET in each of those namespaces (if present), before anything is restarted"
     echo "  - on every running pod of $SERVICES (name:admin port): GET /fault via kubectl port-forward, then switch off every switch listed"
     echo "  - delete VirtualService/DestinationRule/EnvoyFilter carrying the label $RUN_LABEL"
     echo "  - run recover for scripts of active runs, remove the annotation $ANNOT"
@@ -672,6 +1007,8 @@ recover_all() { # restart dry
   for ns in $ALLOWED_NS; do
     kubectl get ns "$ns" >/dev/null 2>&1 || continue
     TNS="$ns"
+    # 重启之前无条件删掉：新 Pod 启动时读的是当时的 Secret。不存在不算错。
+    kubectl -n "$ns" delete secret "$OV_SECRET" --ignore-not-found >>"$PRIVLOG" 2>&1 || { bad=1; echo "  could not delete the startup list in $ns (see log)"; }
     for s in $SERVICES; do
       w="${s%%:*}"
       port="${s##*:}"
@@ -748,13 +1085,14 @@ pf_each_off() { # 工作负载 端口
 }
 
 cmd_recover() {
-  local all=0 restart=0 dry=0 run="" recon=1
+  local all=0 restart=0 dry=0 run="" recon=1 wait_recon=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
     --all) all=1; shift ;;
     --restart) restart=1; shift ;;
     --run) run="${2:-}"; shift 2 ;;
     --no-recon) recon=0; shift ;;
+    --wait-recon) wait_recon=1; shift ;;
     --dry-run) dry=1; shift ;;
     *) die "unknown argument $1" 2 ;;
     esac
@@ -766,9 +1104,13 @@ cmd_recover() {
   fi
   if [[ "$dry" == 1 ]]; then
     echo "dry-run: nothing is sent to the cluster. Would, for the active run (${run:-the only active one}):"
-    echo "  - undo the injection (delete its objects / switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
+    echo "  - undo the injection (delete its objects (a fault switch with also: chaos-mesh: the Chaos Mesh objects first, then the switch) / for a persisted switch: remove it from Secret $OV_SECRET first (delete the Secret when empty), then switch off on every replica / run.sh recover), rollout restart what the scenario lists, remove the annotation"
     echo "  - record the end time; wait ${RECOVER_SETTLE}s, then up to ${RECOVER_WAIT}s for chaos-steady.sh check to pass"
-    echo "  - recon-check --from <start> --to <end> (retry while it says 'not covered yet', up to ${RECON_WAIT}s) -> chaos/runs/<run>/recon.txt"
+    echo "  - foreground: recon-check --metrics-only --from <start> --to <end> (retry while it says 'not covered yet', up to ${RECON_WAIT}s) -> chaos/runs/<run>/recon-metrics.txt, exit code into state recon_metrics_rc"
+    echo "  - then recon-check --rows-only (row-level reconciliation) -> chaos/runs/<run>/recon.txt, exit code in recon-rows.rc:"
+    echo "      in the background (nohup, survives this shell and make; result via make chaos-status) when the metrics part passed;"
+    echo "      in the foreground (waits for it) when the metrics part did not pass, the scenario is risk 3, or --wait-recon is given"
+    echo "  - --no-recon does neither"
     return 0
   fi
   need_cluster
@@ -781,6 +1123,12 @@ cmd_recover() {
   esac
   echo "==> recovering run $run"
   local bad=0
+  # 撤销之前：目标的副本和注入时是不是同一批（不是的话，故障开关在新副本上没有开过；复盘草稿里会写）。
+  local pods_now
+  pods_now="$(pods_of "$(sealed .workload)" | tr '\n' ' ' | sed 's/ *$//' || true)"
+  if [[ -n "$(state_get pods_at_inject)" ]]; then
+    state_set pods_same "$([[ "$pods_now" == "$(state_get pods_at_inject)" ]] && echo yes || echo no)"
+  fi
   undo_run || bad=1
   state_set ended_at "$(now)"
   state_set phase recovered
@@ -814,27 +1162,107 @@ cmd_recover() {
     echo "recon-check skipped (--no-recon)"
     return "$bad"
   fi
-  # 对账检查：TO 之后核对要走过一轮才算覆盖到（exit 3），等。
-  echo "==> recon-check from $(state_get started_at) to $(state_get ended_at)"
+  # 对账检查，两段。前台：三个常驻核对的指标。TO 之后核对要走过一轮才算覆盖到（exit 3），等。
+  local from to
+  from="$(state_get started_at)"
+  to="$(state_get ended_at)"
+  echo "==> recon-check (metrics) from $from to $to"
   sleep 2
-  local rc=0 out="$RUNDIR/recon.txt"
+  local rc=0 out="$RUNDIR/recon-metrics.txt"
   t0="$(date +%s)"
   while true; do
     rc=0
-    "$HERE/recon-check.sh" --from "$(state_get started_at)" --to "$(state_get ended_at)" >"$out" 2>&1 || rc=$?
+    "$HERE/recon-check.sh" --metrics-only --from "$from" --to "$to" >"$out" 2>&1 || rc=$?
     [[ $rc -eq 3 ]] || break
     if [[ $(($(date +%s) - t0)) -ge $RECON_WAIT ]]; then break; fi
     sleep 60
   done
-  state_set recon_rc "$rc"
+  state_set recon_metrics_rc "$rc"
   case "$rc" in
-  0) echo "    recon-check: no differences (chaos/runs/$run/recon.txt)" ;;
-  1) echo "!! recon-check: DIFFERENCES found (chaos/runs/$run/recon.txt)" >&2; bad=1 ;;
-  3) echo "!! recon-check: the checkers have not covered the end time after ${RECON_WAIT}s; run recon-check by hand later" >&2; bad=1 ;;
-  *) echo "!! recon-check: no conclusion (exit $rc, see chaos/runs/$run/recon.txt)" >&2; bad=1 ;;
+  0) echo "    recon-check (metrics): no differences, covered past the end time (chaos/runs/$run/recon-metrics.txt)" ;;
+  1) echo "!! recon-check (metrics): DIFFERENCES found (chaos/runs/$run/recon-metrics.txt)" >&2; bad=1 ;;
+  3) echo "!! recon-check (metrics): the checkers have not covered the end time after ${RECON_WAIT}s; run recon-check by hand later" >&2; bad=1 ;;
+  *) echo "!! recon-check (metrics): no conclusion (exit $rc, see chaos/runs/$run/recon-metrics.txt)" >&2; bad=1 ;;
   esac
+
+  # 后台（或者同步）：逐行对账。指标不是 0（有差异时逐行的结果正是要看的）、第三档、--wait-recon 都在前台等。
+  rm -f "$RUNDIR/recon-rows.rc" "$RUNDIR/recon-rows.pid" "$RUNDIR/recon-rows.acked"
+  local sync=0 bgpid
+  if [[ $rc -ne 0 || $wait_recon -eq 1 || "$(sealed .risk)" == 3 ]]; then sync=1; fi
+  if [[ $sync -eq 0 ]]; then
+    nohup "$HERE/chaos-run.sh" _recon-rows "$run" </dev/null >/dev/null 2>&1 &
+    bgpid=$!
+    echo "$bgpid" >"$RUNDIR/recon-rows.pid"
+    disown "$bgpid" 2>/dev/null || true
+    echo "==> row-level reconciliation runs in the background (pid $bgpid); result: make chaos-status, files chaos/runs/$run/recon.txt and recon-rows.rc."
+    echo "    You can start the next experiment; if it fails, the next injection is refused until: make chaos-recon-ack RUN=$run"
+  else
+    echo "==> row-level reconciliation (waiting for it: this takes a few minutes)"
+    recon_rows_job "$run" || true
+    case "$(recon_rows_state "$RUNDIR")" in
+    passed) echo "    recon-check (rows): no differences (chaos/runs/$run/recon.txt)" ;;
+    failed) echo "!! recon-check (rows): DIFFERENCES found (chaos/runs/$run/recon.txt)" >&2; bad=1 ;;
+    *) echo "!! recon-check (rows): no conclusion (see chaos/runs/$run/recon.txt)" >&2; bad=1 ;;
+    esac
+  fi
   echo "==> done. Reveal the answer with: make chaos-reveal"
   return "$bad"
+}
+
+# 逐行对账本体：在当前进程里跑（前台同步用），或者由隐藏的子命令 _recon-rows 在后台调用。
+# 只写 recon.txt、recon-rows.pid、recon-rows.rc，不碰 state.json（state_set 是写临时文件再 mv，和前台并发会互相盖掉）。
+recon_rows_job() { # 运行号
+  local r="$1" d="$RUNS_DIR/$1" rc=0 from to
+  RECON_CHILD=""
+  from="$(jq -r '.started_at' "$d/state.json")"
+  to="$(jq -r '.ended_at' "$d/state.json")"
+  echo "$$" >"$d/recon-rows.pid"
+  # 被 TERM、HUP、INT 时把子进程一起带走，并且留下结果（退出码 143），不要让它变成没人管的孤儿。
+  # shellcheck disable=SC2064
+  trap "[[ -z \"\$RECON_CHILD\" ]] || kill \"\$RECON_CHILD\" 2>/dev/null; echo 143 >'$d/recon-rows.rc.tmp'; mv '$d/recon-rows.rc.tmp' '$d/recon-rows.rc'; exit 143" TERM HUP INT
+  "$HERE/recon-check.sh" --rows-only --from "$from" --to "$to" >"$d/recon.txt" 2>&1 &
+  RECON_CHILD=$!
+  wait "$RECON_CHILD" || rc=$?
+  trap - TERM HUP INT
+  RECON_CHILD=""
+  # 先写临时文件再 mv：读的一方看到 rc 文件时里面一定有内容。
+  echo "$rc" >"$d/recon-rows.rc.tmp"
+  mv "$d/recon-rows.rc.tmp" "$d/recon-rows.rc"
+  return 0
+}
+
+# 隐藏的子命令：由 recover 用 nohup 调起。不通过时在 macOS 上弹一条通知（只有运行号）。
+cmd_recon_rows() {
+  local r="${1:-}"
+  [[ -n "$r" ]] || die "usage: chaos-run.sh _recon-rows <run>" 2
+  use_run "$r"
+  recon_rows_job "$r"
+  if [[ "$(recon_rows_state "$RUNDIR")" != passed ]] && command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"row-level reconciliation did not pass: run $r (make chaos-status)\" with title \"chaos\"" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_recon_ack() {
+  local run=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --run) run="${2:-}"; shift 2 ;;
+    *) die "unknown argument $1" 2 ;;
+    esac
+  done
+  [[ -n "$run" ]] || die "usage: chaos-run.sh recon-ack --run <run>" 2
+  use_run "$run"
+  local st mrc
+  st="$(recon_rows_state "$RUNDIR")"
+  mrc="$(recon_metrics_rc_of "$RUNDIR")"
+  [[ "$st" != running ]] || die "run $run: the row-level reconciliation is still running; wait for the result (make chaos-status) before acknowledging" 1
+  if [[ -f "$RUNDIR/recon-rows.acked" ]]; then echo "run $run: already acknowledged ($(cat "$RUNDIR/recon-rows.acked"))"; return 0; fi
+  if [[ -z "$(recon_unacked "$RUNDIR")" ]]; then
+    echo "run $run: nothing to acknowledge (rows: $st, metrics rc: ${mrc:-none})"
+    return 0
+  fi
+  now >"$RUNDIR/recon-rows.acked"
+  echo "run $run: acknowledged (rows: $st, metrics rc: ${mrc:-none}); injection is no longer blocked by it"
 }
 
 # ---- reveal ----
@@ -873,22 +1301,47 @@ cmd_reveal() {
     die "sealed.json does not match chaos/runs/$run/sealed.sha256" 1
   fi
   [[ -n "$sha" ]] && echo "sealed.json matches the SHA-256 you gave"
+  # 后台的逐行对账还在跑就等它：复盘草稿要它的结果。--force 不等。
+  local rows_st t0 waited n=0
+  rows_st="$(recon_rows_state "$RUNDIR")"
+  if [[ "$rows_st" == running && $force -eq 0 ]]; then
+    t0="$(date +%s)"
+    while [[ "$rows_st" == running ]]; do
+      waited=$(($(date +%s) - t0))
+      if [[ $waited -ge $RECON_WAIT ]]; then
+        echo "!! the row-level reconciliation of run $run is still running after ${RECON_WAIT}s; the draft will say so" >&2
+        break
+      fi
+      if [[ $((n % 4)) -eq 0 ]]; then echo "waiting for the background row-level reconciliation of run $run (${waited}s of at most ${RECON_WAIT}s)"; fi
+      n=$((n + 1))
+      sleep 15
+      rows_st="$(recon_rows_state "$RUNDIR")"
+    done
+  fi
   local sid date_s out
   sid="$(sealed .scenario)"
   date_s="$(sealed .sealed_at | cut -c1-10)"
   out="$ROOT/docs/postmortems/$date_s-$run.md"
   mkdir -p "$ROOT/docs/postmortems"
   [[ ! -e "$out" ]] || die "$out already exists" 1
-  python3 -I - "$ROOT/docs/postmortems/TEMPLATE.md" "$SCEN_DIR/$sid/truth.md" "$RUNDIR/sealed.json" "$RUNDIR/state.json" "$RUNDIR/recon.txt" "$out" <<'PY'
+  python3 -I - "$ROOT/docs/postmortems/TEMPLATE.md" "$SCEN_DIR/$sid/truth.md" "$RUNDIR" "$out" "$rows_st" <<'PY'
 import json, re, sys
 
-tpl_path, truth_path, sealed_path, state_path, recon_path, out_path = sys.argv[1:]
-sealed = json.load(open(sealed_path, encoding="utf-8"))
-state = json.load(open(state_path, encoding="utf-8"))
-try:
-    recon = open(recon_path, encoding="utf-8").read().strip().splitlines()
-except FileNotFoundError:
-    recon = []
+tpl_path, truth_path, run_dir, out_path, rows_st = sys.argv[1:]
+sealed = json.load(open(run_dir + "/sealed.json", encoding="utf-8"))
+state = json.load(open(run_dir + "/state.json", encoding="utf-8"))
+
+def read_lines(name):
+    try:
+        return open(run_dir + "/" + name, encoding="utf-8").read().strip().splitlines()
+    except FileNotFoundError:
+        return []
+
+def read_text(name):
+    return "\n".join(read_lines(name)).strip()
+
+metrics_out = read_lines("recon-metrics.txt")
+rows_out = read_lines("recon.txt")
 
 # truth.md 按 "## " 分栏
 truth = {}
@@ -916,11 +1369,38 @@ run = sealed["run"]
 started = state.get("started_at", "")
 ended = state.get("ended_at", "")
 steady = state.get("steady_again_at", "")
-rc = state.get("recon_rc", "")
-impact = ["", "- 对账检查（recon-check）退出码：%s（0 无差异，1 有差异，3 还没核对到结束时刻；原文在 `chaos/runs/%s/recon.txt`）" % (rc if rc != "" else "未运行", run)]
-impact += ["- 注入的时刻：%s；恢复动作完成：%s；回到稳态：%s" % (started, ended, steady or "未记录")]
-if recon:
-    impact += ["", "```", *recon[-12:], "```"]
+metrics_rc = state.get("recon_metrics_rc", "")
+old_rc = state.get("recon_rc", "")
+impact = [""]
+if metrics_rc == "" and old_rc != "":
+    # 老的运行目录：只有一个退出码，recon.txt 里是指标和逐行合在一起的输出。
+    impact += ["- 对账检查（recon-check）退出码：%s（0 无差异，1 有差异，3 还没核对到结束时刻；原文在 `chaos/runs/%s/recon.txt`）" % (old_rc, run)]
+    if rows_out:
+        impact += ["", "```", *rows_out[-12:], "```"]
+else:
+    meaning = "0 无差异，1 有差异，3 还没核对到结束时刻，其他没有结论"
+    impact += ["- 对账检查，指标那一段（recon-check --metrics-only，前台）退出码：%s（%s；原文在 `chaos/runs/%s/recon-metrics.txt`）" % (metrics_rc if metrics_rc != "" else "未运行", meaning, run)]
+    if metrics_out:
+        impact += ["", "```", *metrics_out[-8:], "```", ""]
+    rows_rc = read_text("recon-rows.rc")
+    if rows_st == "running":
+        rows_line = "逐行对账还没有跑完（后台进程还在跑，结果会写进 `chaos/runs/%s/recon.txt` 和 `recon-rows.rc`，跑完后补进这一节）" % run
+    elif rows_st == "none":
+        rows_line = "逐行对账没有跑（--no-recon，或者恢复在这一步之前就中止了）"
+    elif rows_rc == "":
+        rows_line = "逐行对账没有留下结果：后台进程在写出退出码之前就没了（被杀、或者机器关了）；原文（可能不全）在 `chaos/runs/%s/recon.txt`" % run
+    else:
+        rows_line = "逐行对账（recon-check --rows-only，后台）退出码：%s（0 无差异，1 有差异，其他没有结论；原文在 `chaos/runs/%s/recon.txt`）" % (rows_rc, run)
+    impact += ["- " + rows_line]
+    if rows_out and rows_st != "none":
+        impact += ["", "```", *rows_out[-12:], "```"]
+impact += ["", "- 注入的时刻：%s；恢复动作完成：%s；回到稳态：%s" % (started, ended, steady or "未记录")]
+if state.get("pods_same") == "no":
+    impact += ["- 恢复时目标的副本和注入时不是同一批（有副本被换掉或者新增）：故障开关只对注入那一刻的副本生效，这次的故障中途可能变弱了"]
+if state.get("investigate_at"):
+    impact += ["- 注入后先放了 %s 才开始排查（场景的 `soak`）：约定的开始时刻 %s，30 分钟的时限从它算起" % (state.get("soak", ""), state["investigate_at"])]
+if state.get("warmup_skipped") == "yes":
+    impact += ["- 注入时跳过了“压测先跑 30 分钟”的检查"]
 
 out = []
 for line in open(tpl_path, encoding="utf-8").read().splitlines():
@@ -952,7 +1432,7 @@ with open(out_path, "w", encoding="utf-8") as f:
 PY
   state_set phase revealed
   state_set revealed_at "$(now)"
-  echo "run $run: scenario $sid, method $(sealed .method), risk $(sealed .risk), workload $(sealed .workload), namespace $(sealed .target_ns)"
+  echo "run $run: scenario $sid, method $(sealed .method)$(sealed '(.also // "") | if . == "" then "" else " + " + . end'), risk $(sealed .risk), workload $(sealed .workload), namespace $(sealed .target_ns)"
   echo "started $(state_get started_at), ended $(state_get ended_at)"
   echo "postmortem draft: $out"
   echo "--- truth:"
@@ -960,12 +1440,24 @@ PY
 }
 
 cmd_status() {
-  local r n=0
+  local r n=0 d st why
   for r in $(active_runs); do
-    echo "active run $r (phase $(jq -r .phase "$RUNS_DIR/$r/state.json"))"
+    echo "active run $r (phase $(jq -r .phase "$RUNS_DIR/$r/state.json"))$(jq -r 'if .investigate_at then "; do not start investigating before " + .investigate_at else "" end' "$RUNS_DIR/$r/state.json")"
     n=$((n + 1))
   done
   [[ $n -gt 0 ]] || echo "no active run"
+  # 对账：逐行对账还在跑的，和不通过、没确认的（只打印运行号和状态，不打印场景的内容）。
+  for d in "$RUNS_DIR"/r*/; do
+    [[ -f "${d}state.json" ]] || continue
+    r="$(basename "$d")"
+    st="$(recon_rows_state "${d%/}")"
+    why="$(recon_unacked "${d%/}")"
+    if [[ -n "$why" ]]; then
+      echo "run $r: NOT PASSED and not acknowledged ($why): chaos/runs/$r/recon.txt; next injection is refused until: make chaos-recon-ack RUN=$r"
+    elif [[ "$st" == running ]]; then
+      echo "run $r: row-level reconciliation running in the background"
+    fi
+  done
 }
 
 cmd="${1:-}"
@@ -975,8 +1467,10 @@ blind) cmd_blind "$@" ;;
 inject) cmd_inject "$@" ;;
 recover) cmd_recover "$@" ;;
 reveal) cmd_reveal "$@" ;;
+recon-ack) cmd_recon_ack "$@" ;;
+_recon-rows) cmd_recon_rows "$@" ;;
 lint) cmd_lint "$@" ;;
 status) cmd_status ;;
--h | --help | "") sed -n '2,32p' "${BASH_SOURCE[0]}"; [[ -n "$cmd" ]] || exit 2 ;;
-*) die "usage: chaos-run.sh blind|inject|recover|reveal|lint|status (see --help)" 2 ;;
+-h | --help | "") sed -n '2,53p' "${BASH_SOURCE[0]}"; [[ -n "$cmd" ]] || exit 2 ;;
+*) die "usage: chaos-run.sh blind|inject|recover|reveal|recon-ack|lint|status (see --help)" 2 ;;
 esac

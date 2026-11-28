@@ -1,0 +1,20 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s011
+method: fault-switch
+risk: 2
+category: app
+target:
+  workload: order
+duration: 30m
+requires:
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
+  - 稳态的压测在跑（k6 mixed；症状来自查订单列表的流量，没有列表请求时没有表现）
+  - 库里有订单多于一页（20 单）的用户（压测跑过一阵、Zipf 头部的用户自然就有）
+recover:
+  restart: []
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做
+    - 不用重启：多出来的是每个请求当场花掉的 CPU 和分配，关了开关之后下一个请求起就回到平时，堆不留东西
+expected_alerts: []
+blind: yes
+report: 例行巡检时看到 order 两个副本的 CPU 比一小时前高了一截，入口的请求量没有变，没有用户报障

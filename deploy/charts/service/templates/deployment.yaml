@@ -150,6 +150,11 @@ spec:
             - name: {{ .name }}
               value: {{ .value | quote }}
             {{- end }}
+            {{- if .Values.startupOverrides.enabled }}
+            # 阶段 4：启动时读的一份开关清单（pkg/fault）。见 values.yaml 的 startupOverrides。
+            - name: STARTUP_OVERRIDES_FILE
+              value: /etc/startup-overrides/enabled
+            {{- end }}
           startupProbe:
             httpGet:
               path: /healthz
@@ -188,6 +193,19 @@ spec:
             # 根文件系统只读，给 os.TempDir 一个可写的地方。
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.startupOverrides.enabled }}
+            # 整个 Secret 作为目录挂载，不用 subPath：subPath 的文件不会随 Secret 更新。
+            - name: startup-overrides
+              mountPath: /etc/startup-overrides
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.startupOverrides.enabled }}
+        - name: startup-overrides
+          secret:
+            secretName: startup-overrides
+            # 平时没有这个 Secret，Pod 照常启动。
+            optional: true
+        {{- end }}

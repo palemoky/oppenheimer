@@ -1,0 +1,18 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s008
+method: chaos-mesh
+risk: 1
+blind: yes
+category: dns
+target:
+  workload: orderindex
+duration: 35m
+requires:
+  - 稳态的压测在跑（商家订单列表的读和商家索引的写都要有）
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉，之后新建连接就能成功
+    - 消费者在数据库连不上期间是停住等的（不进死信），恢复后自己追上
+    - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
+expected_alerts: [MeshEndpointEjected, DerivedDataLagging, IngressGateway5xxHigh, ReconFoundDifferences]

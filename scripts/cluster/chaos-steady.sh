@@ -2,10 +2,14 @@
 # 故障实验的稳态：一条固定速率的压测，和“现在是不是稳态”的检查（make chaos-steady ARGS=start|stop|check）。
 # 设计：docs/design/4a-chaos-prep.md 的 3.6。
 #
-#   chaos-steady.sh start [--dry-run]   在发压机上起 k6 mixed（后台，经 scripts/cluster/k6.sh），固定速率
-#   chaos-steady.sh stop  [--dry-run]   让它收尾退出（k6.sh 收到 TERM 会让发压机上的 k6 写出 summary 再退）
+#   chaos-steady.sh start [--dry-run]   在发压机上起 k6 mixed（后台，经 scripts/cluster/k6.sh），固定速率。
+#                                       起成功后把启动时刻（Unix 秒）写进 tmp/chaos-steady/started_at：
+#                                       chaos-run.sh 的 blind 和 inject 要压测先跑够 CHAOS_STEADY_MIN_AGE 秒（默认 1800）才肯注入，
+#                                       不然诊断的一方会把“流量刚上来”当成故障的原因（上一次走通时 13 分钟就注入了）
+#   chaos-steady.sh stop  [--dry-run]   让它收尾退出（k6.sh 收到 TERM 会让发压机上的 k6 写出 summary 再退），同时删掉 started_at
 #   chaos-steady.sh check [--dry-run]   四项检查，全过退出 0：
 #       alerts  没有 warning 或 critical 的告警在响（Prometheus 的 ALERTS，firing；被静默的也算：静默只管通知，不代表故障不在）
+#               SLO 的中档、慢档燃烧告警（burn=medium|slow）不算：它们在上一个实验结束后还要响很久，见 QUERY_ALERTS 的注释
 #       load    gateway 的请求速率 >= 目标速率的 70%（压测真的在打）
 #       probe   常驻探针最近 5 分钟失败或跳过的比例 < 10%
 #       slo     五个 SLO 最近 5 分钟的错误比例都在预算以内（预算：可用性 0.1%，延迟类 1%），
@@ -31,7 +35,7 @@
 #   CHAOS_STEADY_SKIP       跳过的检查项，空格分隔（alerts load probe slo）；跳过的会打印出来
 #   MERCHANTS 等            透传给 k6（见 test/k6/README.md）
 #
-# 状态文件：tmp/chaos-steady/（pid、日志）。macOS 自带的 bash 3.2 能运行。
+# 状态文件：tmp/chaos-steady/（pid、日志、started_at）。macOS 自带的 bash 3.2 能运行。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -47,6 +51,7 @@ SKIP=" ${CHAOS_STEADY_SKIP:-} "
 STATE="$ROOT/tmp/chaos-steady"
 PIDFILE="$STATE/k6.pid"
 LOGFILE="$STATE/k6.log"
+STARTED_AT="$STATE/started_at"
 
 cmd="${1:-}"
 [[ $# -gt 0 ]] && shift
@@ -72,7 +77,7 @@ cmd_start() {
   fi
   echo "k6 mixed at RATE=$RATE for $DURATION against SKUS=$skus (30% of the 1907 req/s knee, docs/notes/3b-capacity.md section 1)"
   if [[ $DRY -eq 1 ]]; then
-    echo "dry-run: would run: RATE=$RATE DURATION=$DURATION SKUS=$skus scripts/cluster/k6.sh mixed  (background, log $LOGFILE)"
+    echo "dry-run: would run: RATE=$RATE DURATION=$DURATION SKUS=$skus scripts/cluster/k6.sh mixed  (background, log $LOGFILE), then write the start time to $STARTED_AT"
     return 0
   fi
   if pid_alive; then
@@ -80,6 +85,7 @@ cmd_start() {
     exit 1
   fi
   mkdir -p "$STATE"
+  rm -f "$STARTED_AT"
   RATE="$RATE" DURATION="$DURATION" SKUS="$skus" nohup "$HERE/k6.sh" mixed >"$LOGFILE" 2>&1 &
   echo $! >"$PIDFILE"
   sleep 5
@@ -89,17 +95,19 @@ cmd_start() {
     rm -f "$PIDFILE"
     exit 1
   fi
+  # 启动时刻：k6.sh 活过了 5 秒才算起成功；chaos-run.sh 用它判断压测跑了多久。
+  date +%s >"$STARTED_AT"
   echo "started (pid $(cat "$PIDFILE")); log $LOGFILE. Metrics reach Prometheus about 3 minutes later; run check after that."
 }
 
 cmd_stop() {
   if [[ $DRY -eq 1 ]]; then
-    echo "dry-run: would send TERM to the pid in $PIDFILE and wait for it to exit"
+    echo "dry-run: would send TERM to the pid in $PIDFILE and wait for it to exit, then remove $STARTED_AT"
     return 0
   fi
   if ! pid_alive; then
     echo "not running (no live pid in $PIDFILE)"
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$STARTED_AT"
     return 0
   fi
   local pid i
@@ -114,7 +122,7 @@ cmd_stop() {
     echo "k6.sh (pid $pid) did not exit in 60 seconds; see $LOGFILE" >&2
     exit 1
   fi
-  rm -f "$PIDFILE"
+  rm -f "$PIDFILE" "$STARTED_AT"
   echo "stopped"
 }
 
@@ -148,7 +156,10 @@ sys.exit(0 if {"lt": a < b, "le": a <= b, "ge": a >= b}[op] else 1)' "$1" "$2" "
 # SLO 和探针的规则写死在 oppenheimer 上。
 slo_applies() { [[ "$NS" == oppenheimer ]]; }
 
-QUERY_ALERTS='ALERTS{alertstate="firing",severity=~"warning|critical",alertname!~"Watchdog|InfoInhibitor"}'
+# burn!~"medium|slow"：SLO 的中档、慢档看的是 30 分钟到几天的窗口，上一个实验结束后还要响半小时以上，
+# 算进来的话一天里第二个实验就注入不了（2026-11-27 B4 碰到的）。快档（5 分钟和 1 小时）仍然算；现在的错误比例另有 slo 那一项在查。
+# 没有 burn 标签的告警不受这个条件影响（空值不匹配这个正则）。
+QUERY_ALERTS='ALERTS{alertstate="firing",severity=~"warning|critical",alertname!~"Watchdog|InfoInhibitor",burn!~"medium|slow"}'
 QUERY_LOAD="sum(rate(http_server_request_duration_seconds_count{service_name=\"gateway\",k8s_namespace_name=\"$NS\"}[3m]))"
 QUERY_PROBE="sum(rate(probe_cycles_total{k8s_namespace_name=\"$NS\",outcome=~\"failed|skipped\"}[5m])) or vector(0)"
 QUERY_PROBE_ALL="sum(rate(probe_cycles_total{k8s_namespace_name=\"$NS\"}[5m]))"
@@ -232,6 +243,6 @@ case "$cmd" in
 start) cmd_start ;;
 stop) cmd_stop ;;
 check) cmd_check ;;
--h | --help | "") sed -n '2,35p' "${BASH_SOURCE[0]}"; [[ -n "$cmd" ]] || exit 2 ;;
+-h | --help | "") sed -n '2,37p' "${BASH_SOURCE[0]}"; [[ -n "$cmd" ]] || exit 2 ;;
 *) echo "usage: chaos-steady.sh start|stop|check [--dry-run]" >&2; exit 2 ;;
 esac

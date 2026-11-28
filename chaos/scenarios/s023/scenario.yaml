@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s023
+method: script
+risk: 1
+category: mysql
+target:
+  workload: order
+duration: 10m
+requires:
+  - 稳态的压测在跑（用户要分布在各个 slot 上）
+  - 第一次做时恢复加 WAIT_RECON=1（一张订单表 10 分钟读写不了再恢复，是对落库重试、回收和补偿的考验）
+  - 注入前看一眼 mysql-order-1 主库的连接数（threads_connected）和 max_connections（200）
+recover:
+  restart: []
+  notes:
+    - 脚本在订单库 1 的主库上先 KILL 排队的那个会话、再 KILL 占着元数据锁的那个；到 duration 两个都自己结束
+    - 挂住的语句随后各自执行或者已经被客户端放弃，连接数回落要几十秒
+    - 连接数顶到上限的话脚本自己的连接也可能进不去（root 多一个保留的名额），那时等 duration 到
+expected_alerts: []

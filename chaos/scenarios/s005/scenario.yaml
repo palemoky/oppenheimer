@@ -1,0 +1,16 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s005
+method: chaos-mesh
+risk: 1
+blind: yes
+category: stress
+target:
+  workload: order
+duration: 10m
+requires:
+  - 稳态的压测在跑（否则看不出对延迟的影响）
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉
+expected_alerts: []

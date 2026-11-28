@@ -422,7 +422,10 @@ spec:
             description: "受理的队列在变长，再长下去背压会开始拒绝下单。显示成 +Inf 时是落库的速率为 0：order.submit 的消费者停了。"
             runbook_url: https://github.com/palemoky/oppenheimer/blob/main/docs/runbooks/order-backlog.md
         # 受理成功的比例比一小时前低了一半以上。分母去掉业务上正常的拒绝（售罄、限购、重复提交、参数不对），
-        # 这样大促时售罄变多不会响。要求现在和一小时前都有流量（每秒不低于 0.2 个）。
+        # 这样大促时售罄变多不会响。要求现在有流量（每秒不低于 0.2 个）。
+        # 一小时前没有流量时（探针停过、服务刚恢复的头一个小时）右边是 0/0 的 NaN，和 NaN 比大小一律不成立，
+        # 原来这条告警在那一个小时里是瞎的，for 也会被打断（2026-11-26 用历史数据核对的，设计 3c 第 8 节）。
+        # 所以右边用 > 0 滤掉 NaN（和 0），没有值时拿 1 当基线：退回“受理比例低于一半”这个绝对的门槛。
         # 它和可用性的 SLO 互补：这里连 429、409 之外的“非 5xx 的失败”也算，比如降级。
         - alert: OrderAdmitRateDropped
           expr: |
@@ -433,9 +436,13 @@ spec:
             )
               < 0.5 *
             (
-              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}[10m] offset 1h))
-                /
-              sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome!~"insufficient_stock|purchase_limit_exceeded|duplicate|invalid_argument|sku_not_found|idempotency_key_reused"}[10m] offset 1h))
+              (
+                sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome="admitted"}[10m] offset 1h))
+                  /
+                sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer",outcome!~"insufficient_stock|purchase_limit_exceeded|duplicate|invalid_argument|sku_not_found|idempotency_key_reused"}[10m] offset 1h))
+                > 0
+              )
+              or on() vector(1)
             )
             and
             sum(rate(order_admissions_total{k8s_namespace_name="oppenheimer"}[10m])) >= 0.2

@@ -12,6 +12,9 @@
 #   scripts/cluster/recon-check.sh --from 2026-11-24T10:00:00Z --to 2026-11-24T10:20:00Z [--dry-run]
 #   --dry-run  只打印要执行的查询和命令，不连集群、不起 Job
 #   --metrics-only  只做第 1 件（不起 Job）
+#   --rows-only     只做第 2 件（起逐行对账的 Job，不查指标），和 --metrics-only 互斥。chaos-run.sh recover 把这一件放到后台：
+#                   后台跑的时候下一个实验可能已经开始，而指标的窗口是 [FROM, 现在]，会把下一个实验的不一致算进来；
+#                   指标那一半已经在前台查过了。这个模式下不会有退出码 3（没有“还没核对到”这回事）。
 #
 # 退出码：0 通过；1 有差异（指标不是 0，或者逐行对账退出码 1）；2 用法不对或者查询、Job 出了错（没有结论）；
 #         3 没有差异，但还没有核对到 TO，等一会儿再跑。有差异比没核对到优先。
@@ -38,19 +41,24 @@ CHECK_MARGIN=120    # 钱的核对要在 TO 之后多少秒开始的一轮才算
 MIN_RATE_WINDOW=150 # increase 的窗口至少这么长：指标每 60 秒导出一次，窗口里要有两个点以上
 JOB_TIMEOUT="${RECON_CHECK_TIMEOUT:-35m}" # 等逐行对账的 Job（模板的 activeDeadlineSeconds 是 30 分钟，重试最多再加一点）
 
-FROM="" TO="" DRY=0 ROWS=1
+FROM="" TO="" DRY=0 ROWS=1 METRICS=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
   --from) FROM="${2:-}"; shift 2 ;;
   --to) TO="${2:-}"; shift 2 ;;
   --dry-run) DRY=1; shift ;;
   --metrics-only) ROWS=0; shift ;;
-  -h | --help) sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+  --rows-only) METRICS=0; shift ;;
+  -h | --help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
   *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
 if [[ -z "$FROM" || -z "$TO" ]]; then
-  echo "usage: recon-check.sh --from <RFC3339> --to <RFC3339> [--dry-run] [--metrics-only]  (make recon-check FROM=... TO=...)" >&2
+  echo "usage: recon-check.sh --from <RFC3339> --to <RFC3339> [--dry-run] [--metrics-only | --rows-only]  (make recon-check FROM=... TO=...)" >&2
+  exit 2
+fi
+if [[ "$ROWS" -eq 0 && "$METRICS" -eq 0 ]]; then
+  echo "--metrics-only and --rows-only exclude each other" >&2
   exit 2
 fi
 
@@ -110,57 +118,59 @@ is_ge() { python3 -I -c 'import sys; v=sys.argv[1]; sys.exit(0 if v!="none" and 
 DIFF=0 PENDING=0 ERR=0
 say() { printf '%s\n' "$*"; }
 
-echo "==> 1/2 常驻核对的指标（窗口 $FROM 到现在，要求核对越过 ${TO}）"
+if [[ "$METRICS" -eq 1 ]]; then
+  echo "==> 1/2 常驻核对的指标（窗口 $FROM 到现在，要求核对越过 ${TO}）"
 
-# ---- 没有不一致 ----
-v="$(promql "钱：笔数和金额的差的最大值" "max_over_time(max(recon_totals_mismatch{$SEL})[${W}s:$STEP])")" || ERR=1
-if [[ "$DRY" -eq 1 ]]; then :
-elif [[ "$v" == none ]]; then say "  钱      没有数据：recon_totals_mismatch 在这段时间没有序列，核对没在跑，不能算 0"; PENDING=1
-elif is_pos "$v"; then say "  钱      有差异：recon_totals_mismatch 最大 ${v}（见 docs/runbooks/payment-totals.md）"; DIFF=1
-else say "  钱      差异是 0"; fi
-
-v="$(promql "库存：不一致的 SKU 数的最大值" "max_over_time(max(recon_stock_mismatch_skus{$SEL})[${W}s:$STEP])")" || ERR=1
-if [[ "$DRY" -eq 1 ]]; then :
-elif [[ "$v" == none ]]; then say "  库存    没有数据：recon_stock_mismatch_skus 在这段时间没有序列，核对没在跑，不能算 0"; PENDING=1
-elif is_pos "$v"; then say "  库存    有差异：不一致的 SKU 最大 ${v}（见 docs/runbooks/recon-stock.md）"; DIFF=1
-else say "  库存    差异是 0"; fi
-
-# 计数器：increase 加上“窗口开头没有、之后出现”的序列的值（第一次出现时 increase 是 0，规则里也是这样补的）。
-M="recon_changes_checked_total{$SEL,result=\"mismatch\"}"
-v="$(promql "变更：mismatch 的增加" "(sum(increase(${M}[${W}s])) or vector(0)) + (sum(${M} unless ${M} offset ${W}s) or vector(0))")" || ERR=1
-if [[ "$DRY" -eq 1 ]]; then :
-elif is_pos "$v"; then say "  变更    有差异：mismatch 增加了 ${v}（见 docs/runbooks/recon-changes.md）"; DIFF=1
-else say "  变更    mismatch 没有增加"; fi
-
-# ---- 核对到了 TO ----
-if [[ "$SINCE_CHECKED" -lt "$MIN_RATE_WINDOW" ]]; then
-  # 窗口太短：指标每 60 秒导出一次，increase 要窗口里至少两个点，不够时没有结果，会被读成“没有成功的一轮”
-  # （2026-11-24 真跑时遇到的：TO 在 3 分钟前，窗口只有 60 秒）。
-  say "  钱、库存  距 TO 才 ${SINCE_TO} 秒，还量不出 TO 之后有没有成功的一轮（要 TO 之后 $((CHECK_MARGIN + MIN_RATE_WINDOW)) 秒以上）"
-  PENDING=1
-else
-  R="${SINCE_CHECKED}s"
-  v="$(promql "钱：TO 之后开始的成功的一轮" "sum(increase(recon_totals_runs_total{$SEL,outcome=\"ok\"}[$R]))")" || ERR=1
+  # ---- 没有不一致 ----
+  v="$(promql "钱：笔数和金额的差的最大值" "max_over_time(max(recon_totals_mismatch{$SEL})[${W}s:$STEP])")" || ERR=1
   if [[ "$DRY" -eq 1 ]]; then :
-  elif is_pos "$v"; then say "  钱      TO 之后有成功的一轮（$v 轮）"
-  else say "  钱      还没核对到 TO：TO 之后没有成功的一轮"; PENDING=1; fi
+  elif [[ "$v" == none ]]; then say "  钱      没有数据：recon_totals_mismatch 在这段时间没有序列，核对没在跑，不能算 0"; PENDING=1
+  elif is_pos "$v"; then say "  钱      有差异：recon_totals_mismatch 最大 ${v}（见 docs/runbooks/payment-totals.md）"; DIFF=1
+  else say "  钱      差异是 0"; fi
 
-  v="$(promql "库存：TO 之后成功的快的一轮" "sum(increase(recon_stock_runs_total{$SEL,kind=\"quick\",outcome=\"ok\"}[$R]))")" || ERR=1
+  v="$(promql "库存：不一致的 SKU 数的最大值" "max_over_time(max(recon_stock_mismatch_skus{$SEL})[${W}s:$STEP])")" || ERR=1
   if [[ "$DRY" -eq 1 ]]; then :
-  elif is_pos "$v"; then say "  库存    预占：TO 之后有成功的一轮（$v 轮）"
-  else say "  库存    预占还没核对到 TO：TO 之后没有成功的快的一轮"; PENDING=1; fi
+  elif [[ "$v" == none ]]; then say "  库存    没有数据：recon_stock_mismatch_skus 在这段时间没有序列，核对没在跑，不能算 0"; PENDING=1
+  elif is_pos "$v"; then say "  库存    有差异：不一致的 SKU 最大 ${v}（见 docs/runbooks/recon-stock.md）"; DIFF=1
+  else say "  库存    差异是 0"; fi
 
-  v="$(promql "库存：TO 之后成功的完整的一轮" "sum(increase(recon_stock_runs_total{$SEL,kind=\"full\",outcome=\"ok\"}[$R]))")" || ERR=1
+  # 计数器：increase 加上“窗口开头没有、之后出现”的序列的值（第一次出现时 increase 是 0，规则里也是这样补的）。
+  M="recon_changes_checked_total{$SEL,result=\"mismatch\"}"
+  v="$(promql "变更：mismatch 的增加" "(sum(increase(${M}[${W}s])) or vector(0)) + (sum(${M} unless ${M} offset ${W}s) or vector(0))")" || ERR=1
   if [[ "$DRY" -eq 1 ]]; then :
-  elif is_pos "$v"; then say "  库存    已售：TO 之后有成功的完整的一轮"
-  else say "  库存    已售还没核对到 TO：完整的一轮 5 分钟一次（-full-every），等下一轮"; PENDING=1; fi
+  elif is_pos "$v"; then say "  变更    有差异：mismatch 增加了 ${v}（见 docs/runbooks/recon-changes.md）"; DIFF=1
+  else say "  变更    mismatch 没有增加"; fi
+
+  # ---- 核对到了 TO ----
+  if [[ "$SINCE_CHECKED" -lt "$MIN_RATE_WINDOW" ]]; then
+    # 窗口太短：指标每 60 秒导出一次，increase 要窗口里至少两个点，不够时没有结果，会被读成“没有成功的一轮”
+    # （2026-11-24 真跑时遇到的：TO 在 3 分钟前，窗口只有 60 秒）。
+    say "  钱、库存  距 TO 才 ${SINCE_TO} 秒，还量不出 TO 之后有没有成功的一轮（要 TO 之后 $((CHECK_MARGIN + MIN_RATE_WINDOW)) 秒以上）"
+    PENDING=1
+  else
+    R="${SINCE_CHECKED}s"
+    v="$(promql "钱：TO 之后开始的成功的一轮" "sum(increase(recon_totals_runs_total{$SEL,outcome=\"ok\"}[$R]))")" || ERR=1
+    if [[ "$DRY" -eq 1 ]]; then :
+    elif is_pos "$v"; then say "  钱      TO 之后有成功的一轮（$v 轮）"
+    else say "  钱      还没核对到 TO：TO 之后没有成功的一轮"; PENDING=1; fi
+
+    v="$(promql "库存：TO 之后成功的快的一轮" "sum(increase(recon_stock_runs_total{$SEL,kind=\"quick\",outcome=\"ok\"}[$R]))")" || ERR=1
+    if [[ "$DRY" -eq 1 ]]; then :
+    elif is_pos "$v"; then say "  库存    预占：TO 之后有成功的一轮（$v 轮）"
+    else say "  库存    预占还没核对到 TO：TO 之后没有成功的快的一轮"; PENDING=1; fi
+
+    v="$(promql "库存：TO 之后成功的完整的一轮" "sum(increase(recon_stock_runs_total{$SEL,kind=\"full\",outcome=\"ok\"}[$R]))")" || ERR=1
+    if [[ "$DRY" -eq 1 ]]; then :
+    elif is_pos "$v"; then say "  库存    已售：TO 之后有成功的完整的一轮"
+    else say "  库存    已售还没核对到 TO：完整的一轮 5 分钟一次（-full-every），等下一轮"; PENDING=1; fi
+  fi
+
+  v="$(promql "变更：核对到的提交时刻（Unix 秒）" "max(recon_changes_verified_through{$SEL})")" || ERR=1
+  if [[ "$DRY" -eq 1 ]]; then :
+  elif [[ "$v" == none ]]; then say "  变更    没有 recon_changes_verified_through：核对没起来，或者还没有核对过变更"; PENDING=1
+  elif is_ge "$v" "$TO_E"; then say "  变更    核对到了 ${v}，越过 TO（${TO_E}）"
+  else say "  变更    还没核对到 TO：核对到 ${v}，TO 是 ${TO_E}（订单库没有新的写入时它不会往前走）"; PENDING=1; fi
 fi
-
-v="$(promql "变更：核对到的提交时刻（Unix 秒）" "max(recon_changes_verified_through{$SEL})")" || ERR=1
-if [[ "$DRY" -eq 1 ]]; then :
-elif [[ "$v" == none ]]; then say "  变更    没有 recon_changes_verified_through：核对没起来，或者还没有核对过变更"; PENDING=1
-elif is_ge "$v" "$TO_E"; then say "  变更    核对到了 ${v}，越过 TO（${TO_E}）"
-else say "  变更    还没核对到 TO：核对到 ${v}，TO 是 ${TO_E}（订单库没有新的写入时它不会往前走）"; PENDING=1; fi
 
 # ---- 逐行对账 ----
 if [[ "$ROWS" -eq 1 ]]; then
@@ -226,4 +236,10 @@ elif [[ "$PENDING" -eq 1 ]]; then
   echo "  还不能说差异是 0：有核对还没有越过 TO（上面标了还没核对到或者没有数据的几项）。等一会儿再跑同样的命令。"
   exit 3
 fi
-echo "  通过：三样核对到 $TO 之后都没有不一致，逐行对账 [$FROM, $TO) 差异是 0。"
+if [[ "$METRICS" -eq 0 ]]; then
+  echo "  通过：逐行对账 [$FROM, $TO) 差异是 0（--rows-only：没有查指标）。"
+elif [[ "$ROWS" -eq 0 ]]; then
+  echo "  通过：三样核对到 $TO 之后都没有不一致（--metrics-only：没有跑逐行对账）。"
+else
+  echo "  通过：三样核对到 $TO 之后都没有不一致，逐行对账 [$FROM, $TO) 差异是 0。"
+fi

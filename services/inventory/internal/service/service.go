@@ -440,18 +440,22 @@ func StockCacheKey(skuID int64) string {
 // GetStock 实现 InventoryServiceServer。启用缓存时，返回的消息可能被并发调用共享，不能修改。
 func (s *Service) GetStock(ctx context.Context, req *inventoryv1.GetStockRequest) (*inventoryv1.GetStockResponse, error) {
 	skuID := req.GetSkuId()
+	resp, found, err := s.stock(ctx, skuID)
+	return s.stockResult(ctx, skuID, resp, found, err)
+}
+
+// lookupStock 查一个 SKU 的库存：开了缓存时经过缓存，否则读库。
+func (s *Service) lookupStock(ctx context.Context, skuID int64) (*inventoryv1.GetStockResponse, bool, error) {
 	if s.stockCache == nil {
-		resp, found, err := s.loadStock(ctx, skuID)
-		return s.stockResult(ctx, skuID, resp, found, err)
+		return s.loadStock(ctx, skuID)
 	}
-	resp, found, err := s.stockCache.Get(ctx, StockCacheKey(skuID), func(ctx context.Context) (cache.Loaded[*inventoryv1.GetStockResponse], error) {
+	return s.stockCache.Get(ctx, StockCacheKey(skuID), func(ctx context.Context) (cache.Loaded[*inventoryv1.GetStockResponse], error) {
 		resp, found, err := s.loadStock(ctx, skuID)
 		if err != nil {
 			return cache.Loaded[*inventoryv1.GetStockResponse]{}, err
 		}
 		return cache.Loaded[*inventoryv1.GetStockResponse]{Value: resp, Found: found, TTL: s.stockCacheTTL}, nil
 	})
-	return s.stockResult(ctx, skuID, resp, found, err)
 }
 
 // loadStock 从库里读库存，转成响应。

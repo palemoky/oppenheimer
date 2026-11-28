@@ -2,6 +2,7 @@
 id: s001
 method: fault-switch
 risk: 2
+blind: yes
 category: app
 target:
   workload: gateway

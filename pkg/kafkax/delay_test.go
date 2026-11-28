@@ -161,9 +161,7 @@ func TestDelayConsumerConcurrentAfterDue(t *testing.T) {
 	release := make(chan struct{})
 	rec := &recorder{}
 	startDelayConsumer(t, concurrentConfig(t, e, 4), clock, func(ctx context.Context, m kafkax.Message) error {
-		if n := inFlight.Add(1); n > peak.Load() {
-			peak.Store(n) // 只用来判断“有没有并行过”，不需要精确的最大值
-		}
+		raisePeak(&peak, inFlight.Add(1))
 		defer inFlight.Add(-1)
 		select {
 		case <-release:

@@ -2,6 +2,7 @@
 id: s002
 method: chaos-mesh
 risk: 1
+blind: yes
 category: pod
 target:
   workload: inventory

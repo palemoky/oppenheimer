@@ -1,0 +1,18 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s012
+method: fault-switch
+risk: 2
+category: app
+target:
+  workload: orderindex
+duration: 30m
+requires:
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
+  - 稳态的压测在跑，并且有商家订单列表的读（k6 mixed 里约 5%）；没有这类请求时这个场景没有任何表现
+recover:
+  restart: [orderindex]
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做。关掉之后新的请求不再碰那两把锁，商家订单列表马上恢复
+    - 已经互相等住和排在后面的 goroutine 永远不会醒，关了开关也不会消失，滚动重启目标工作负载（脚本做）
+blind: yes
+expected_alerts: [MeshEndpointEjected, IngressGateway5xxHigh]

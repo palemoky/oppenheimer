@@ -1,0 +1,5 @@
+switch: f08
+ttl: 30m
+# orderindex 的管理端口（HTTP_ADDR，8084），注入要经端口转发，每个副本各开一次。
+# 只经这个端口打开的开关在进程内存里，orderindex 重启就复位：制造积压时重启的是 cdc，不是 orderindex（见 scenario.yaml 的 requires）。
+admin_port: 8084

@@ -45,6 +45,7 @@
 #   CHAOS_VICTIMS         在名单里的服务，空格分隔，默认 "gateway order inventory payment"（可加 orderindex、cdc）
 #   CHAOS_FORCE           设为 1 时 --grace-period=0 --force（相当于 kill -9），默认 0：正常的优雅期（摘流 15 秒、停止 20 秒）
 #   CHAOS_RECON_PAIRS     recon 比哪几对，默认 payment,stock,replica,index（本机只有 payment,stock：没有从库和商家索引）
+#   CHAOS_EXTRA_OVERLAY   再叠一层 values 的目录（common.yaml、<服务>.yaml），默认没有
 #   CHAOS_RECON_RECHECK   recon 发现差异后隔多久复查，默认 30s（本机 1s：商家索引经 cdc 异步追上，wait-quiet 不等它）
 #   IMAGE_TAG、E2E_SKIP_IMAGES、E2E_KEEP、E2E_RUN_ID（默认当前 Unix 时间）、E2E_NAMESPACE（默认 oppenheimer-e2e）：同 e2e.sh
 #
@@ -70,7 +71,9 @@ NS="${E2E_NAMESPACE:-oppenheimer-e2e}"
 export E2E_NAMESPACE="$NS"
 export E2E_RUN_ID="${E2E_RUN_ID:-$(date +%s)}"
 # services.sh 在 e2e 那两层 values 上再叠这一层。
-export E2E_OVERLAY_DIR="$ROOT/deploy/cluster/services/chaos"
+# CHAOS_EXTRA_OVERLAY：在 chaos/ 之后再叠一层（目录，格式同 E2E_OVERLAY_DIR）。集群的 CPU requests 接近占满时
+# 用它把个别服务的副本数调小，否则多出来的副本 Pending、部署超时（2026-11-26 遇到）。
+export E2E_OVERLAY_DIR="$ROOT/deploy/cluster/services/chaos${CHAOS_EXTRA_OVERLAY:+:$CHAOS_EXTRA_OVERLAY}"
 JOB_TEMPLATE="$ROOT/deploy/cluster/chaos/load-job.yaml"
 PHASE_SCRIPT="$ROOT/deploy/cluster/chaos/phase.sh"
 JOB="chaos"

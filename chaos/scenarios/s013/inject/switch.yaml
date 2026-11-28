@@ -1,0 +1,4 @@
+switch: f06
+ttl: 30m
+# order 的管理端口，注入要经端口转发，每个副本各开一次。
+admin_port: 8081

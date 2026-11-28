@@ -1,0 +1,37 @@
+# __TARGET_NS__ 和 __RUN_ID__ 由 chaos-run.sh 填。写法是设计 4b 第 9 节试出来的那一种（Istio 1.32）。
+# 选中 gateway 的边车，在出站的 HTTP 过滤器链里、router 之前插故障过滤器，只对去 payment 的那个出站 cluster 生效：
+# 20% 的调用由 gateway 自己的边车直接回 gRPC UNAVAILABLE（14），请求没有发给 payment。
+# 写法和 Istio 的版本绑着：升级 Istio 之后先在 e2e 里重新验一次。
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: c-__RUN_ID__
+  namespace: __TARGET_NS__
+  labels:
+    oppenheimer.chaos/run: __RUN_ID__
+spec:
+  workloadSelector:
+    labels:
+      app.kubernetes.io/name: gateway
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_OUTBOUND
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.fault
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+            upstream_cluster: "outbound|9083||payment.__TARGET_NS__.svc.cluster.local"
+            abort:
+              grpc_status: 14
+              percentage:
+                numerator: 20
+                denominator: HUNDRED

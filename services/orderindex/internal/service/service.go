@@ -62,7 +62,7 @@ func (s *Service) ListMerchantOrders(ctx context.Context, req *orderindexv1.List
 		return nil, errx.New(codes.InvalidArgument, errx.ReasonInvalidArgument, "unknown status %d", int32(status))
 	}
 
-	rows, err := s.store.List(ctx, store.ListQuery{
+	rows, err := s.listRows(ctx, store.ListQuery{
 		MerchantID:    req.GetMerchantId(),
 		Status:        int32(status),
 		BeforeOrderID: req.GetBeforeOrderId(),

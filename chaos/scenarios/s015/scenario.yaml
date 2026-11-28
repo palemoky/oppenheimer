@@ -1,0 +1,20 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s015
+method: fault-switch
+risk: 2
+category: data
+target:
+  workload: orderindex
+duration: 30m
+requires:
+  - 只在 oppenheimer-e2e 里做（CHAOS_NS=oppenheimer-e2e）：这个场景会写坏商家索引（派生数据），不在 oppenheimer 里做
+  - 镜像是带故障代码的构建（GO_TAGS=faults）
+  - 稳态的压测在 oppenheimer-e2e 上跑着，有下单和付款（同一个订单几秒之内有好几次变更）
+  - 要有积压才会触发：消费者跟得上时一批只有一两条，开关开着也没有任何表现。开关打开之后把 cdc 缩到 0、等一分钟以上再恢复（不是重启 orderindex；滚动重启 cdc 的停顿太短），cdc 追赶的那段时间里 orderindex 一批几百条
+recover:
+  restart: []
+  notes:
+    - 关掉开关（到 ttl 也会自己关），脚本做。关掉之后新的批不再出错，但已经写坏的索引行不会自己好
+    - 对注入的时间窗口跑一次带 -repair 的逐行对账（只修商家索引），把落后的行按订单库改回来；要手工做，脚本的 recover 不修
+    - 修完再跑一次不带 -repair 的逐行对账，差异为 0 才算恢复
+expected_alerts: []

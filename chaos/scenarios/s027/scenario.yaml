@@ -1,0 +1,19 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s027
+method: script
+risk: 2
+category: mysql
+target:
+  workload: order
+duration: 15m
+requires:
+  - 稳态的压测在跑
+  - 注入前看订单库 0 主库和从库所在的盘（主从的 binlog 各多约 1.8 GB，还有同样大小的临时文件），剩余不到 10 GB 不做
+  - 第一次做之前先在没有负载时用 CX_BIG_ROWS=200000 试一次，看 cdc 读到这么大的事务时内存涨多少
+recover:
+  restart: []
+  notes:
+    - 脚本让循环停下并删掉 tmp_report 这个库（正在跑的大语句会让删库等它，最多等 5 分钟）
+    - binlog 不用清，一天后过期
+    - 删库这一条也会复制到从库、经过 cdc（它不认识这张表，跳过）
+expected_alerts: []

@@ -1,0 +1,24 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+# s010 的开关叠上“inventory 到缓存 Redis 慢 5 毫秒”。2026-11-27 在 e2e 和长期运行的那一套上各试过一次（truth.md 的“实测”）。
+id: s016
+method: fault-switch
+also: chaos-mesh
+risk: 2
+category: app
+target:
+  workload: inventory
+duration: 20m
+requires:
+  - 镜像是带故障代码的构建（GO_TAGS=faults，tag 的后缀是 -p4）
+  - 稳态的压测在跑（查库存的读流量是触发条件，只有探针时几乎看不出来）
+  - inventory 开着查询缓存（STOCK_CACHE_TTL 不为 0，集群的默认就是 1 秒）
+  - Chaos Mesh 装着（make chaos-mesh）
+  - 缓存 Redis 的 6 个 Pod 都在运行（延迟按注入那一刻的 Pod 地址加，之后重建的 Pod 不受影响）
+recover:
+  restart: []
+  notes:
+    - 先删 Chaos Mesh 对象、再关开关，脚本做；两样到时也都会自己结束
+    - 不用重启：延迟撤掉、开关关掉之后排着的查询很快放完
+expected_alerts: []
+blind: yes
+report: 有用户反馈商品页上的库存数字出来得比平时慢，没有报错；监控上没有告警在响

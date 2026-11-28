@@ -8,6 +8,9 @@ istio:
   proxy: {cpu: 250m, memory: 64Mi, memoryLimit: 192Mi}   # 三项要一起写，原因见 gateway.yaml
 
 config:
+  # mutex、block 剖析的采样（阶段 4 期间常开；起步值和开销的对照见设计 4b 第 8 节、chart 的 values 注释）。
+  DEBUG_MUTEX_FRACTION: "100"
+  DEBUG_BLOCK_RATE: "1ms"
   KAFKA_BROKERS: kafka-kafka-bootstrap.kafka.svc:9092
   REDIS_ADDR: sentinel://gate@redis-gate-sentinel.redis.svc:26379
   CACHE_REDIS_ADDR: cluster://redis-cache.redis.svc:6379

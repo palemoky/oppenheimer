@@ -1,0 +1,4 @@
+switch: f05
+ttl: 30m
+# orderindex 的管理端口（HTTP_ADDR，8084），注入要经端口转发，每个副本各开一次。
+admin_port: 8084

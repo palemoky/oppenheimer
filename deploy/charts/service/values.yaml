@@ -126,3 +126,11 @@ route:
   # 可选的 maxParallelRequests：在途请求数的上限，不写是 1024。
   # 可选的 connectionIdleTimeout（比如 30s）：入口到这个服务的连接空闲多久关掉，不写是 Envoy 的默认值 1 小时。
   circuitBreaker: {}
+
+# 阶段 4 的“重启后还在”的那条路（设计 4b）：打开后，Pod 把命名空间里名为 startup-overrides 的 Secret（可以不存在）
+# 作为目录只读挂到 /etc/startup-overrides，并设 STARTUP_OVERRIDES_FILE 指向其中的 enabled 文件。
+# 带 -tags faults 的镜像启动时读它，里面列出的开关一登记就是开着的。Secret 由 scripts/cluster/chaos-run.sh 写。
+# 这里的名字有意不带 fault、chaos 之类的词：诊断 Agent 读得到 Pod 的规格。
+# 默认关；scripts/cluster/services.sh 在 GO_TAGS 里有 faults 时对五个业务服务（不含 cdc）打开。
+startupOverrides:
+  enabled: false

@@ -1,0 +1,20 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s018
+method: chaos-mesh
+risk: 1
+blind: yes
+category: network
+target:
+  workload: order
+duration: 10m
+requires:
+  - 稳态的压测在跑（下单、查订单、订单列表、发起支付都经过 order）
+  - order 是两个副本、都 Ready（只有一个副本时这个场景变成整个 order 对调用方不可用）
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉
+    - 撤掉之后调用方的边车还要等这一次摘除期满才重新用那个副本（摘除时间随次数加长，10 分钟后可能到一分钟上下）
+    - 注入期间超时的下单里有一部分其实受理成功了（响应在路上慢了），这些订单照常落库、没人付款、到支付时限关单
+    - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
+expected_alerts: [MeshEndpointEjected, SLOOrderPayAvailabilityBurnFast, IngressGateway5xxHigh, SLOOrderCreateAvailabilityBurnFast]

@@ -135,7 +135,7 @@ func (s *server) GetOrder(c *gin.Context, rawOrderID oas.OrderId) {
 		return
 	}
 	otelx.SetOrder(c.Request.Context(), orderID, userID(c))
-	resp, err := s.deps.Order.GetOrder(c.Request.Context(), &orderv1.GetOrderRequest{OrderId: orderID, UserId: userID(c)})
+	resp, err := s.orderDetail(c.Request.Context(), &orderv1.GetOrderRequest{OrderId: orderID, UserId: userID(c)})
 	if err != nil {
 		s.writeGRPCError(c, err)
 		return

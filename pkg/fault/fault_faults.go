@@ -48,7 +48,7 @@ func (t *Toggle) On() bool { return t.on.Load() }
 var (
 	regMu   sync.Mutex
 	toggles = map[string]*Toggle{}
-	// fromFile 是 FAULT_FILE 里列出的开关。业务包的包级变量在本包的 init 之后才初始化，
+	// fromFile 是 FileEnv 指的文件里列出的开关。业务包的包级变量在本包的 init 之后才初始化，
 	// 所以先记下来，登记的时候再打开。
 	fromFile = map[string]bool{}
 )

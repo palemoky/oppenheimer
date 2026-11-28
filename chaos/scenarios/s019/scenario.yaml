@@ -1,0 +1,21 @@
+# 字段的含义见 chaos/README.md。主人在实验之前不读这个目录（设计第 2 节第 3 项）。
+id: s019
+method: chaos-mesh
+risk: 1
+blind: yes
+category: network
+target:
+  workload: inventory
+duration: 10m
+requires:
+  - 稳态的压测在跑
+  - 压测用的 SKU 都预热过（受理时不用同步调 WarmUp）
+  - 第一次做时恢复加 WAIT_RECON=1（落库停 10 分钟再恢复，是对回收和补偿的考验）
+recover:
+  restart: []
+  notes:
+    - 没有恢复动作：duration 到了 Chaos Mesh 自己撤掉
+    - 撤掉之后调用方的边车还要等这一次摘除期满才重新用 inventory，落库的熔断器再过一次试探才合上，之后积压的订单落库
+    - 注入期间下单基本全部被拒绝（503，带原因码），查库存全部失败；这是预期的保护，不是没恢复
+    - 目标命名空间里会留下 PodNetworkChaos 对象（chaos/README.md 的“盲测时的痕迹”）
+expected_alerts: [IngressGateway5xxHigh, SLOOrderCreateAvailabilityBurnFast, MeshEndpointEjected, MeshConcurrencyLimitOverflow, OrderLandingBreakerOpen, ProbeFailing]
